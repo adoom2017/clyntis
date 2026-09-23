@@ -1,70 +1,143 @@
 # clyntis
 
-Rust proxy core, CLI, desktop TUN adapter and versioned C host API. This branch
-replaces the Go product; the previous implementation remains on `Alpha` and in
-Git history.
+clyntis is a Rust proxy core with a desktop CLI and a versioned C host API. It
+implements a focused subset of Clash-style configuration; it is not a drop-in
+replacement for every protocol or configuration option.
 
-Protocol code is maintained here for VLESS TCP, WebSocket and gRPC, with TLS,
-REALITY, XTLS Vision and UDP/XUDP. BoringSSL is the only TLS backend. Trojan and
-Hysteria2 entries remain parseable for configuration/group compatibility, but
-selecting either protocol returns an explicit unavailable-protocol error.
+## Features and limits
 
-## Build and Run
+- **Inbound:** HTTP/CONNECT, SOCKS5 and mixed proxy listeners; optional DNS
+  listener and desktop TUN. HTTP/SOCKS authentication is supported.
+- **Outbound:** DIRECT, REJECT and VLESS over TCP, WebSocket or gRPC, including
+  TLS, REALITY, XTLS Vision and UDP/XUDP. BoringSSL is the TLS backend.
+- **Routing:** rule/global/direct modes, select and url-test groups, domain/IP
+  rules, GeoIP/GeoSite and rule providers.
+- **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
+  redir-host modes.
+- **Desktop and host integration:** Windows Wintun, macOS utun and Linux TUN;
+  route recovery after an interrupted session; a reduced local controller with
+  configuration, proxy selection, connections, traffic and logs; and a C ABI for
+  embedding in mobile or other hosts.
 
-Install Rust 1.93.1 with the platform C/C++ compiler. BoringSSL additionally
-requires CMake, NASM and LLVM/libclang on Windows; the vendored build discovers
-`libclang.dll` beside `clang.exe`. The checked-in toolchain and Cargo.lock pin the
-build.
+Trojan and Hysteria2 entries can be parsed for configuration compatibility, but
+their outbound protocols are **not implemented**: selecting one fails instead of
+silently using another proxy. Unknown or unsupported configuration fields fail
+validation. `--vless-only` removes unavailable outbounds and replaces dangling
+references with REJECT, not DIRECT.
+
+## Requirements
+
+- Rust **1.93.1** (pinned in `rust-toolchain.toml`), a C/C++ compiler, CMake and
+  Clang/libclang for the vendored BoringSSL build.
+- On Windows, use an MSVC toolchain, NASM and LLVM/Clang with `libclang.dll`
+  beside `clang.exe`. PowerShell 7 is required for the `.ps1` helper scripts.
+- Desktop TUN requires administrator/root privileges. Windows TUN also requires
+  the official `wintun.dll` beside `clyntis.exe`; the driver is not bundled.
+
+## Build
+
+From the repository root:
 
 ```sh
-cargo build --release --locked
+cargo build -p clyntis --release --locked
 cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-./target/release/clyntis -f examples/vless.yaml -t
-./target/release/clyntis -f examples/vless.yaml
 ```
 
-Use `target/release/clyntis.exe` on Windows. Set actual server credentials in a
-configuration based on [examples/vless.yaml](examples/vless.yaml). No production
-server is bundled.
+The executable is `target/release/clyntis` on macOS/Linux or
+`target/release/clyntis.exe` on Windows. On Windows, the toolchain helper checks
+the native prerequisites and sets `LIBCLANG_PATH` for the build:
 
-HTTP/CONNECT, SOCKS5 and mixed listeners share rules, select/url-test groups,
-DNS/fake-IP and traffic accounting. The reduced controller defaults to loopback;
-remote binds require a Bearer secret. Unknown or unsupported fields report a
-configuration error. Complete configuration replacement requires a new core;
-mode, rules and group selection support online updates.
+```powershell
+pwsh -File scripts/check-boringssl-toolchain.ps1 build -p clyntis --release --locked
+```
 
-## Legacy Configuration
+The pinned `Cargo.lock` is used by these commands. Optional external protocol
+oracles and privileged TUN tests need their own environment and are not part of
+the basic run path.
 
-`-f`, `-d`, `-t`, `-v`, `-p` and `--action encrypt/decrypt` remain available.
-AES-CFB128/Base64 files use the previous byte-length key padding and fixed IV.
-This legacy format has no authentication tag; decrypted YAML is validated before
-use. Invalid Base64, invalid decrypted configuration and output overwrites fail.
+## Quick start
+
+The included VLESS example uses **placeholder** server details. Copy it to a
+local, ignored `config.yaml` and replace the server address, UUID, TLS server
+name and other fields with your own values before connecting:
+
+```sh
+cp examples/vless.yaml config.yaml
+./target/release/clyntis -f config.yaml -t
+./target/release/clyntis -f config.yaml
+```
+
+On Windows, use `Copy-Item examples/vless.yaml config.yaml` and
+`.\target\release\clyntis.exe` in place of the Unix commands. `-t` validates
+the configuration and exits without opening listeners; it does not test the
+remote server. The example opens a local mixed HTTP/SOCKS port at `127.0.0.1:7890`.
+Once a real server is configured, a separate terminal can use it with:
+
+```sh
+curl -x http://127.0.0.1:7890 https://example.com/
+```
+
+The example also enables a loopback controller at `127.0.0.1:9090`; check it
+with `curl http://127.0.0.1:9090/version`. Binding the controller to a non-loopback
+address requires a configured Bearer secret.
+
+By default clyntis reads `config.yaml` from the current directory. Use `-f`
+to choose a file (or `-f -` for standard input), and `-d` to set the configuration
+directory. For example:
+
+```sh
+./target/release/clyntis -d /path/to/config-directory
+./target/release/clyntis -f config.yaml --test-resources
+```
+
+`--test-resources` loads and validates routing resources such as GeoIP/GeoSite
+and rule providers; unlike `-t`, this may need access to their configured sources.
+Run `clyntis --help` for all CLI options.
+
+### TUN and recovery
+
+TUN is disabled unless `tun.enable: true` is set in the configuration. It
+changes system routes, so run it only on a machine where you have administrator
+or root access. Use `--no-tun` to run the proxy listeners without TUN even when
+the configuration enables it. If a TUN session is interrupted, restore the
+routes with the same configuration directory and privileges:
+
+```sh
+./target/release/clyntis -d /path/to/config-directory --recover-tun
+```
+
+On Windows, run the corresponding `.exe` in an elevated shell. Before upgrading
+from an older binary after an interrupted session, recover with that binary
+first because the journal filename changed with the project name.
+
+### Legacy configuration encryption
+
+The CLI retains the previous AES-CFB128/Base64 configuration format:
 
 ```sh
 clyntis -f config.yaml --action encrypt
-clyntis -f config-encrypt.yaml -p PASSWORD
 clyntis -f config-encrypt.yaml --action decrypt
 ```
 
-Interactive encryption/decryption prompts for the password when omitted.
-Noninteractive callers supply `-p`. Logs support level overrides, bounded file
-rotation and controller events without exposing configured credentials.
+The password is prompted when omitted; `-p` supplies it non-interactively.
+Outputs are written to `config-encrypt.yaml` or `config-decrypt.yaml` by default
+and never overwrite existing files. This legacy format is **not authenticated**;
+do not treat it as a modern secret-storage format.
 
-## Platform and Delivery
+## Packages and embedding
 
-Windows maintenance scripts use PowerShell 7 (`.ps1`). On macOS and Linux, run
-the corresponding Bash scripts (`.sh`) for packaging, mobile builds, offline
-snapshots and interoperability tests. `scripts/prepare-offline.*` creates an
-offline source archive, and `scripts/package-release.*` builds a local release
-package with the CLI, host libraries, header and license notices. See
-[third-party patches](third-party/README.md) for vendored changes.
+After fetching locked dependencies, the local packaging scripts build offline
+and write a release archive under the ignored `dist/` directory:
 
-TUN must be explicitly enabled; desktop use requires root/administrator rights
-and Windows additionally needs official `wintun.dll`. An interrupted session can
-be restored with `clyntis -d CONFIG_DIRECTORY --recover-tun`.
+```sh
+cargo fetch --locked
+bash scripts/package-release.sh
+```
 
-Windows/macOS native TUN and iOS compilation still require their stated host
-prerequisites. Linux native TUN and Android arm64 compilation have separate test
-records; they do not substitute for Windows/macOS or mobile runtime acceptance.
-Nothing is automatically pushed or published by local build/package scripts.
+On Windows, run `cargo fetch --locked` followed by
+`pwsh -File scripts/package-release.ps1`. These scripts do not publish artifacts.
+The package contains the CLI, examples, licenses, C libraries and
+`crates/ffi/include/clyntis.h`. For a separate host-library build, use
+`cargo build -p meta-ffi --release --locked`; mobile target builds use the
+`scripts/check-mobile.sh` or `scripts/check-mobile.ps1` helpers with the relevant
+SDK/NDK installed.
