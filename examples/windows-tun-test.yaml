@@ -1,0 +1,29 @@
+# Windows manual TUN acceptance: DIRECT first, no proxy credentials required.
+# This configuration changes routes when run without -t; use an elevated shell.
+ipv6: false
+mixed-port: 17890
+allow-lan: false
+external-controller: 127.0.0.1:19090
+secret: local-manual-test-only
+rules:
+  - MATCH,DIRECT
+dns:
+  enable: true
+  listen: 127.0.0.1:11053
+  enhanced-mode: fake-ip
+  nameserver: [https://1.1.1.1/dns-query]
+  default-nameserver: [1.1.1.1]
+tun:
+  enable: true
+  device: clyntis-test
+  auto-route: true
+  auto-detect-interface: true
+  mtu: 1500
+  dns-hijack: [any:53]
+log:
+  log-level: debug
+  log-path: logs/windows-tun-test.log
+  max-size: 10
+  max-age: 3
+  max-backups: 3
+  compress: true

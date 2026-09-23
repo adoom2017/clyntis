@@ -1,0 +1,25 @@
+diff --git a/ssl/internal.h b/ssl/internal.h
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -918,6 +918,6 @@ Span<const NamedGroup> NamedGroups();
+ 
+ // kNumNamedGroups is the number of supported groups.
+-constexpr size_t kNumNamedGroups = 8u;
++constexpr size_t kNumNamedGroups = 10u;
+ 
+ // DefaultSupportedGroupIds returns the list of IDs for the default groups that
+ // are supported when the caller hasn't explicitly configured supported groups.
+diff --git a/ssl/ssl_key_share.cc b/ssl/ssl_key_share.cc
+--- a/ssl/ssl_key_share.cc
++++ b/ssl/ssl_key_share.cc
+@@ -553,6 +553,10 @@ constexpr NamedGroup kNamedGroups[] = {
+     {NID_ML_KEM_1024, SSL_GROUP_MLKEM1024, "MLKEM1024", ""},
+     {NID_P256Kyber768Draft00, SSL_GROUP_P256_KYBER768_DRAFT00,
+      "P256Kyber768Draft00", "P256Kyber768D00"},
++    // Advertised for browser compatibility. They are not configured as key
++    // shares; a peer which selects one in HelloRetryRequest fails cleanly.
++    {-1000, 256, "ffdhe2048", ""},
++    {-1001, 257, "ffdhe3072", ""},
+ };
+ 
+ static_assert(std::size(kNamedGroups) == kNumNamedGroups,

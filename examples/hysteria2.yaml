@@ -1,0 +1,28 @@
+mixed-port: 7890
+allow-lan: false
+external-controller: 127.0.0.1:9090
+mode: rule
+log-level: info
+proxies:
+  - name: hy2
+    type: hysteria2
+    server: proxy.example.com
+    port: 443
+    password: replace-with-server-password
+    sni: proxy.example.com
+    udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [hy2, DIRECT]
+rules:
+  - DOMAIN-SUFFIX,local,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - MATCH,PROXY
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  nameserver: [https://1.1.1.1/dns-query]
+tun:
+  enable: false

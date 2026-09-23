@@ -1,0 +1,42 @@
+# Replace the documentation address and UUID with your server configuration.
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+
+proxies:
+  - name: vless-tls
+    type: vless
+    server: 192.0.2.1
+    port: 443
+    uuid: 11223344-5566-7788-99aa-bbccddeeff00
+    tls: true
+    servername: proxy.example.com
+    skip-cert-verify: false
+    udp: true
+    packet-encoding: xudp
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [vless-tls, DIRECT]
+
+rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+  - MATCH,Proxy
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  nameserver: [https://1.1.1.1/dns-query]
+  default-nameserver: [1.1.1.1]
+
+log:
+  log-path: logs/clyntis.log
+  max-size: 10
+  max-age: 3
+  max-backups: 5
+  compress: true

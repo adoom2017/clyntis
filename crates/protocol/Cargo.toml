@@ -1,0 +1,49 @@
+[package]
+name = "meta-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[features]
+fuzzing = []
+[dependencies]
+meta-config.workspace = true
+meta-platform.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+rand.workspace = true
+boring.workspace = true
+boring-sys.workspace = true
+tokio-boring.workspace = true
+webpki-root-certs.workspace = true
+http.workspace = true
+blake2.workspace = true
+tracing.workspace = true
+socket2.workspace = true
+serde.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+x509-parser = "0.18"
+futures-util = "0.3"
+h2 = "0.4"
+httparse = "1"
+sha1 = "0.10"
+foreign-types-shared = "0.3"
+brotli.workspace = true
+flate2.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
+serde_json.workspace = true
+tempfile = "3"
+pem-rfc7468 = { version = "0.7", features = ["std"] }

@@ -1,0 +1,22 @@
+[package]
+name = "meta-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+socket2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ipnet.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", target_os = "android"))'.dependencies]
+tun-rs = { version = "=2.8.9", features = ["async_tokio"] }
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+route_manager = "=0.2.9"
+netdev = { version = "=0.46.2", default-features = false, features = ["gateway", "apple-system-configuration-extra"] }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }

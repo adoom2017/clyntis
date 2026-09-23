@@ -1,0 +1,54 @@
+[workspace]
+members = ["crates/config", "crates/protocol", "crates/platform", "crates/core", "crates/cli", "crates/ffi"]
+resolver = "2"
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+serde_path_to_error = "0.1"
+bytes = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+aes = "0.8"
+cfb-mode = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+ipnet = { version = "2", features = ["serde"] }
+rand = "0.8"
+boring = "=5.2.0"
+boring-sys = "=5.2.0"
+tokio-boring = "=5.2.0"
+webpki-root-certs = "1.0.9"
+http = "1"
+blake2 = "0.10"
+tracing = "0.1"
+socket2 = { version = "0.6", features = ["all"] }
+brotli = "8.0.2"
+flate2 = "1.1.9"
+zstd = "0.13.3"
+meta-config = { path = "crates/config" }
+meta-protocol = { path = "crates/protocol" }
+meta-platform = { path = "crates/platform" }
+meta-core = { path = "crates/core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+[patch.crates-io]
+boring-sys = { path = "third-party/boring-sys" }
+route_manager = { path = "third-party/route_manager" }

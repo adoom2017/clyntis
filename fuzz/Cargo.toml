@@ -1,0 +1,37 @@
+[package]
+name = "meta-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+meta-protocol = { path = "../crates/protocol", features = ["fuzzing"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "vless_frames"
+path = "fuzz_targets/vless_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xudp_frames"
+path = "fuzz_targets/xudp_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vision_frames"
+path = "fuzz_targets/vision_frames.rs"
+test = false
+doc = false
+bench = false
