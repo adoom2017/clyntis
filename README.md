@@ -134,6 +134,36 @@ cargo fetch --locked
 bash scripts/package-release.sh
 ```
 
+On macOS, the script signs the executable and dylib with the sole available
+Developer ID Application identity (hardened runtime and secure timestamp) before
+generating the manifest and archive. If several identities are installed, select
+one explicitly with `CLYNTIS_CODESIGN_IDENTITY` (SHA-1 fingerprint or full
+identity name), for example:
+
+```sh
+CLYNTIS_CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' bash scripts/package-release.sh
+```
+
+With no Developer ID identity, the package remains unsigned (as on CI); set
+`CLYNTIS_CODESIGN=off` to opt out locally. Signing requires timestamp-service
+access. To notarize, first store a `notarytool` keychain profile using your
+Apple ID, app-specific password, and the **same team** as the signing identity
+(or use an App Store Connect API key):
+
+```sh
+xcrun notarytool store-credentials clyntis-notary --apple-id 'you@example.com' --team-id YOURTEAMID
+CLYNTIS_CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+  CLYNTIS_NOTARY_PROFILE=clyntis-notary bash scripts/package-release.sh
+```
+
+When `CLYNTIS_NOTARY_PROFILE` is set, the script submits a signed DMG with
+`notarytool --wait`, requires an Accepted result, then staples and validates its
+ticket. The resulting `.dmg` and `.tar.gz` each have a `.sha256` sidecar. Use the
+DMG for offline-verifiable distribution; tickets cannot be stapled to a tarball
+or standalone CLI. Notarization needs network access and is opt-in so CI and
+local offline builds remain unchanged. Do not put passwords or API keys in the
+repository.
+
 On Windows, run `cargo fetch --locked` followed by
 `pwsh -File scripts/package-release.ps1`. These scripts do not publish artifacts.
 The package contains the CLI, examples, licenses, C libraries and
