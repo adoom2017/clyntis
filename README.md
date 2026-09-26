@@ -94,13 +94,43 @@ directory. For example:
 and rule providers; unlike `-t`, this may need access to their configured sources.
 Run `clyntis --help` for all CLI options.
 
+`log-level: debug` enables diagnostic events. If `log.log-path` is set, logs
+go to that file relative to `-d`; the startup message prints the effective
+level and full destination. Remove `log.log-path` to write logs to the terminal.
+The top-level `log-level` takes precedence when both locations specify a level.
+
 ### TUN and recovery
 
 TUN is disabled unless `tun.enable: true` is set in the configuration. It
 changes system routes, so run it only on a machine where you have administrator
-or root access. Use `--no-tun` to run the proxy listeners without TUN even when
-the configuration enables it. If a TUN session is interrupted, restore the
-routes with the same configuration directory and privileges:
+or root access. On macOS the capture routes use the nonzero subranges used by
+sing-tun's Darwin `BuildAutoRouteRanges` (IPv4 starts at `1.0.0.0/8`, IPv6 at
+`100::/8`). Zero-address `/1` routes are avoided because XNU treats their
+destination as a default-route key, which can break interface-bound egress.
+Use `--no-tun` to run the proxy listeners without TUN even when
+the configuration enables it. On macOS, `tun.auto-detect-interface` probes
+physical exits against `example.com:443` and configured proxy endpoints before
+and after installing routes, including when there is only one candidate,
+and reopens the TUN on a different exit when
+needed. Use `--test-egress` to run only the probe without TUN, or set
+`tun.auto-detect-interface` to keep probing exits every 15 seconds while running;
+an exit change updates routes and socket bindings, closes old sessions, and
+rebinds automatic DNS when the local IPv4 address changes. Use
+`tun.interface` to select an interface explicitly. `tun.auto-dns` defaults to `false`,
+preserving the system's existing DNS services. Literal public DNS upstreams
+receive physical host routes so the proxy's own DNS queries avoid the TUN.
+Setting `tun.auto-dns: true` when TUN, auto-route and the DNS listener are
+enabled, or passing `--auto-dns` on macOS for a single run, listens on port 53
+of the selected physical interface's own IPv4 address and temporarily sets that
+network service's DNS to the same address. Enabled physical services with IPv4
+addresses are also covered because macOS's default DNS service can differ from
+the proxy's selected egress. Each service's original DNS is journaled and restored
+independently. Only local host requests are answered on this additional listener.
+VPN services, including Tailscale's scoped DNS, are not changed. This does not edit
+`/etc/resolv.conf` directly. A VPN or Network Extension with its own default
+resolver can still take precedence over the physical service's DNS. If a TUN
+session is interrupted, restore its routes and macOS DNS with the same
+configuration directory and privileges:
 
 ```sh
 ./target/release/clyntis -d /path/to/config-directory --recover-tun

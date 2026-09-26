@@ -318,6 +318,7 @@ pub struct Tun {
     pub stack: String,
     pub device: String,
     pub auto_route: bool,
+    pub auto_dns: bool,
     pub auto_detect_interface: bool,
     pub interface: Option<String>,
     pub mtu: u16,
@@ -331,6 +332,7 @@ impl Default for Tun {
             stack: "gvisor".into(),
             device: "clyntis".into(),
             auto_route: true,
+            auto_dns: false,
             auto_detect_interface: true,
             interface: None,
             mtu: 1500,
@@ -386,7 +388,13 @@ impl Config {
         }
         cfg.external_controller = cfg.external_controller.as_deref().map(listen);
         cfg.dns.listen = listen(&cfg.dns.listen);
-        if cfg.log_level != "info" {
+        // The top-level Clash option wins when explicitly present, including
+        // `info`; otherwise the nested logging option remains supported.
+        let document: serde_yaml::Value = serde_yaml::from_slice(bytes)?;
+        if document
+            .as_mapping()
+            .is_some_and(|mapping| mapping.contains_key(serde_yaml::Value::from("log-level")))
+        {
             cfg.log.log_level.clone_from(&cfg.log_level);
         } else {
             cfg.log_level.clone_from(&cfg.log.log_level);
@@ -818,6 +826,8 @@ mod tests {
         assert_eq!(cfg.log.max_size, 10);
         let cfg = Config::parse(b"log-level: warning\nlog:\n  log-level: debug\n").unwrap();
         assert_eq!(cfg.log.log_level, "warning");
+        let cfg = Config::parse(b"log-level: info\nlog:\n  log-level: debug\n").unwrap();
+        assert_eq!(cfg.log.log_level, "info");
         assert!(Config::parse(b"dns:\n  nameserver: [tls://1.1.1.1]\n").is_ok());
         assert!(Config::parse(b"dns:\n  nameserver: [quic://1.1.1.1]\n").is_err());
     }

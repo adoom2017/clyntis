@@ -1,4 +1,29 @@
 use super::*;
+
+#[test]
+fn restores_valid_fake_entries_alongside_legacy_url_label() {
+    let resolver = Resolver::new(Dns::default(), std::sync::Arc::new(meta_platform::DefaultHooks));
+    let valid_ip = resolver.fake_address("persist.test", false).unwrap();
+    let mut entries = resolver.export_fake();
+    entries.push((r"https\:\/\/im.dingtalk.com".into(), "198.18.0.35".parse().unwrap()));
+    let next = Resolver::new(Dns::default(), std::sync::Arc::new(meta_platform::DefaultHooks));
+    next.import_fake(&entries).unwrap();
+    assert_eq!(next.original(valid_ip).as_deref(), Some("persist.test"));
+    assert_eq!(next.export_fake().len(), 1);
+    assert_eq!(next.fake_address("new.test", false).unwrap(), "198.18.0.36".parse::<IpAddr>().unwrap());
+}
+
+#[tokio::test]
+async fn url_label_in_wire_query_cannot_poison_fake_ip_profile() {
+    let resolver = Resolver::new(Dns::default(), std::sync::Arc::new(meta_platform::DefaultHooks));
+    let name = Name::from_labels([b"https://im".as_slice(), b"dingtalk", b"com"]).unwrap();
+    let mut query = Message::new();
+    query.set_id(87).add_query(Query::query(name, RecordType::A));
+    let response = Message::from_vec(&resolver.answer(&query.to_vec().unwrap()).await.unwrap()).unwrap();
+    assert_eq!(response.id(), 87);
+    assert_eq!(response.response_code(), ResponseCode::FormErr);
+    assert!(resolver.export_fake().is_empty());
+}
 use hickory_proto::rr::rdata::SOA;
 use std::sync::{
     Arc,

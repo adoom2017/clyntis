@@ -141,15 +141,37 @@ pub struct Connection {
 pub struct Running {
     core: Arc<Core>,
     tasks: JoinSet<()>,
+    system_dns_tasks: JoinSet<()>,
     pub addresses: Vec<SocketAddr>,
 }
 impl Running {
+    pub async fn rebind_system_dns(&mut self, address: SocketAddr) -> Result<()> {
+        let configured: SocketAddr = self.core.config.dns.listen.parse()?;
+        let mut tasks = JoinSet::new();
+        if configured.port() != address.port()
+            || (!configured.ip().is_unspecified() && configured.ip() != address.ip())
+        {
+            let udp = tokio::net::UdpSocket::bind(address).await
+                .with_context(|| format!("cannot rebind system DNS UDP at {address}"))?;
+            let tcp = tokio::net::TcpListener::bind(address).await
+                .with_context(|| format!("cannot rebind system DNS TCP at {address}"))?;
+            let core = self.core.clone();
+            tasks.spawn(async move { inbound::dns_udp_local(core, udp, address.ip()).await; });
+            let core = self.core.clone();
+            tasks.spawn(async move { inbound::dns_tcp_local(core, tcp, address.ip()).await; });
+        }
+        self.system_dns_tasks.abort_all();
+        while self.system_dns_tasks.join_next().await.is_some() {}
+        self.system_dns_tasks = tasks;
+        Ok(())
+    }
     pub async fn shutdown(mut self) {
         if self.core.save_profile().is_err() {
             tracing::warn!("cannot save profile");
         }
         self.core.stop.cancel();
         self.tasks.abort_all();
+        self.system_dns_tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
         *self.core.lifecycle.lock().unwrap() = false;
     }
@@ -217,6 +239,13 @@ impl Core {
         self: &Arc<Self>,
         packets: Option<Arc<dyn meta_platform::PacketIo>>,
     ) -> Result<Running> {
+        self.start_with_packets_and_system_dns(packets, None).await
+    }
+    pub async fn start_with_packets_and_system_dns(
+        self: &Arc<Self>,
+        packets: Option<Arc<dyn meta_platform::PacketIo>>,
+        system_dns: Option<SocketAddr>,
+    ) -> Result<Running> {
         ensure!(
             self.config.tun.enable == packets.is_some(),
             "tun.enable requires a host PacketIo; disable TUN for listener-only operation"
@@ -229,7 +258,7 @@ impl Core {
             );
             *started = true;
         }
-        let result = self.start_inner(packets).await;
+        let result = self.start_inner(packets, system_dns).await;
         if result.is_err() {
             self.stop.cancel();
             *self.lifecycle.lock().unwrap() = false;
@@ -239,14 +268,16 @@ impl Core {
     async fn start_inner(
         self: &Arc<Self>,
         packets: Option<Arc<dyn meta_platform::PacketIo>>,
+        system_dns: Option<SocketAddr>,
     ) -> Result<Running> {
-        self.prepare_resources(false).await?;
-        self.load_profile()?;
+        self.prepare_resources(false).await.context("cannot prepare routing resources")?;
+        self.load_profile().context("cannot load saved profile")?;
         let mut tasks = JoinSet::new();
+        let mut system_dns_tasks = JoinSet::new();
         let mut addresses = vec![];
         if self.config.ntp.enable {
             let core = self.clone();
-            tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(core.config.ntp.interval.saturating_mul(60)));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}}tokio::select!{_=core.stop.cancelled()=>break,result=core.sync_ntp()=>{if result.is_err(){tracing::warn!("NTP synchronization failed; retaining current clock offset");}}}}});
+            tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(core.config.ntp.interval.saturating_mul(60)));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}}tokio::select!{_=core.stop.cancelled()=>break,result=core.sync_ntp()=>{if let Err(error)=result {tracing::warn!(%error,"NTP synchronization failed; retaining current clock offset");}}}}});
         }
         if self.config.profile.store_fake_ip || self.config.profile.store_selected {
             let core = self.clone();
@@ -317,6 +348,21 @@ impl Core {
             tasks.spawn(async move {
                 inbound::dns_tcp(core, tcp).await;
             });
+            if let Some(system_dns) = system_dns {
+                let configured: SocketAddr = self.config.dns.listen.parse()?;
+                if configured.port() != system_dns.port()
+                    || (!configured.ip().is_unspecified() && configured.ip() != system_dns.ip())
+                {
+                    let udp = tokio::net::UdpSocket::bind(system_dns).await
+                        .with_context(|| format!("cannot bind macOS system DNS UDP listener at {system_dns}"))?;
+                    let tcp = tokio::net::TcpListener::bind(system_dns).await
+                        .with_context(|| format!("cannot bind macOS system DNS TCP listener at {system_dns}"))?;
+                    let core = self.clone();
+                    system_dns_tasks.spawn(async move { inbound::dns_udp_local(core, udp, system_dns.ip()).await; });
+                    let core = self.clone();
+                    system_dns_tasks.spawn(async move { inbound::dns_tcp_local(core, tcp, system_dns.ip()).await; });
+                }
+            }
         }
         if let Some(addr) = &self.config.external_controller {
             let listener = tokio::net::TcpListener::bind(addr)
@@ -367,6 +413,7 @@ impl Core {
             });
         }
         Ok(Running {
+            system_dns_tasks,
             core: self.clone(),
             tasks,
             addresses,
@@ -573,7 +620,7 @@ impl Core {
                     if index > 0 {
                         tokio::time::sleep(Duration::from_millis(50 * index as u64)).await;
                     }
-                    tokio::time::timeout(
+                    let result = tokio::time::timeout(
                         Duration::from_secs(5),
                         meta_platform::tcp_connect_options(
                             addr,
@@ -582,15 +629,25 @@ impl Core {
                             tfo,
                         ),
                     )
-                    .await
+                    .await;
+                    (addr, result)
                 });
             }
-            while let Some(result) = attempts.next().await {
-                if let Ok(Ok(stream)) = result {
-                    return Ok(stream);
+            let mut last = anyhow::anyhow!("no destination address");
+            while let Some((addr, result)) = attempts.next().await {
+                match result {
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(error)) => {
+                        tracing::debug!(%addr, %error, "TCP connect failed");
+                        last = error.context(format!("TCP connect to {addr}"));
+                    }
+                    Err(_) => {
+                        tracing::debug!(%addr, "TCP connect timed out");
+                        last = anyhow::anyhow!("TCP connect to {addr} timed out");
+                    }
                 }
             }
-            bail!("all concurrent connection attempts failed");
+            return Err(last);
         }
         let mut last = anyhow::anyhow!("no destination address");
         for addr in addresses {
@@ -606,8 +663,14 @@ impl Core {
             .await
             {
                 Ok(Ok(s)) => return Ok(s),
-                Ok(Err(e)) => last = e,
-                Err(e) => last = e.into(),
+                Ok(Err(error)) => {
+                    tracing::debug!(%addr, %error, "TCP connect failed");
+                    last = error.context(format!("TCP connect to {addr}"));
+                }
+                Err(_) => {
+                    tracing::debug!(%addr, "TCP connect timed out");
+                    last = anyhow::anyhow!("TCP connect to {addr} timed out");
+                }
             }
         }
         Err(last)

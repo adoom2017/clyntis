@@ -1,5 +1,5 @@
 use crate::Core;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
@@ -20,9 +20,11 @@ impl Core {
             Err(e) => return Err(e.into()),
         };
         ensure!(metadata.len() <= 8 * 1024 * 1024, "profile too large");
-        let saved: Saved = serde_json::from_slice(&std::fs::read(path)?)?;
+        let saved: Saved = serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("invalid saved profile at {}", path.display()))?;
         if self.config.profile.store_fake_ip {
-            self.resolver.import_fake(&saved.fake)?;
+            self.resolver.import_fake(&saved.fake)
+                .with_context(|| format!("cannot restore fake-IP mappings from {}", path.display()))?;
         }
         if self.config.profile.store_selected {
             let mut policy = self.policy.write().unwrap();

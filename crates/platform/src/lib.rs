@@ -4,6 +4,10 @@ use async_trait::async_trait;
 use std::{net::SocketAddr, sync::Arc};
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub mod desktop;
+#[cfg(target_os = "macos")]
+pub mod macos_dns;
+#[cfg(target_os = "macos")]
+pub const MACOS_TUN_DNS_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(198, 19, 255, 254);
 #[cfg(any(
     target_os = "windows",
     target_os = "macos",
@@ -16,6 +20,7 @@ pub trait PlatformHooks: Send + Sync + std::fmt::Debug {
     /// Called before connect/send. Android hosts protect this socket from VPN
     /// capture; desktop hosts may bind the physical interface. Failure is fatal.
     fn protect_socket(&self, socket: &socket2::Socket) -> Result<()>;
+    fn egress_description(&self, _destination: SocketAddr) -> Option<String> { None }
     fn prepare_socket(
         &self,
         socket: &socket2::Socket,
@@ -81,7 +86,10 @@ pub async fn tcp_connect_options(
     hooks.prepare_socket(&socket, Some(addr))?;
     let stream: std::net::TcpStream = socket.into();
     let socket = tokio::net::TcpSocket::from_std_stream(stream);
-    let stream = socket.connect(addr).await?;
+    let stream = socket.connect(addr).await.map_err(|error| {
+        tracing::debug!(%addr, egress = ?hooks.egress_description(addr), %error, "physical TCP connection failed");
+        error
+    })?;
     stream.set_nodelay(true)?;
     Ok(stream)
 }

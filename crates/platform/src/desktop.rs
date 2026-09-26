@@ -26,6 +26,21 @@ pub struct Network {
     pub local_networks: Vec<IpNet>,
 }
 
+#[cfg(target_os = "macos")]
+pub fn local_ipv4_address(interface: &ExitInterface) -> Result<std::net::Ipv4Addr> {
+    let device = netdev::get_interfaces()
+        .into_iter()
+        .find(|device| device.index == interface.index && device.name == interface.name)
+        .context("physical DNS interface disappeared")?;
+    ensure!(device.is_up() && !device.is_loopback() && !device.is_tun(), "invalid physical DNS interface");
+    device
+        .ipv4
+        .iter()
+        .map(|network| network.addr())
+        .find(|address| !address.is_unspecified() && !address.is_link_local())
+        .context("physical DNS interface has no usable IPv4 address")
+}
+
 #[cfg(windows)]
 fn interface_metric(index: u32, ipv6: bool) -> Result<u32> {
     use windows_sys::Win32::{
@@ -162,6 +177,38 @@ pub fn discover(interface: Option<&str>, excluded_index: Option<u32>) -> Result<
     Ok(network)
 }
 
+#[cfg(target_os = "macos")]
+pub fn ipv4_egress_candidates() -> Result<Vec<ExitInterface>> {
+    let interfaces = netdev::get_interfaces();
+    let mut candidates = Vec::new();
+    for route in RouteManager::new()?.list()? {
+        if route.prefix() != 0 || !route.destination().is_ipv4() {
+            continue;
+        }
+        let Some(index) = route.if_index() else {
+            continue;
+        };
+        let Some(device) = interfaces.iter().find(|device| device.index == index) else {
+            continue;
+        };
+        if !device.is_up() || !device.is_physical() || device.is_loopback() || device.is_tun() {
+            continue;
+        }
+        if candidates
+            .iter()
+            .any(|candidate: &ExitInterface| candidate.index == index)
+        {
+            continue;
+        }
+        candidates.push(ExitInterface {
+            index,
+            name: device.name.clone(),
+            gateway: route.gateway().filter(|ip| !ip.is_unspecified()),
+        });
+    }
+    Ok(candidates)
+}
+
 #[derive(Debug)]
 pub struct EgressHooks {
     network: RwLock<Network>,
@@ -180,6 +227,11 @@ impl EgressHooks {
     }
 }
 impl PlatformHooks for EgressHooks {
+    fn egress_description(&self, destination: SocketAddr) -> Option<String> {
+        let network = self.network.read().unwrap();
+        let interface = if destination.is_ipv4() { &network.ipv4 } else { &network.ipv6 };
+        interface.as_ref().map(|interface| format!("{} index={} gateway={:?}", interface.name, interface.index, interface.gateway))
+    }
     fn protect_socket(&self, socket: &socket2::Socket) -> Result<()> {
         self.prepare_socket(socket, None)
     }
@@ -418,6 +470,7 @@ pub struct DesktopTun {
     auto_route: bool,
     ipv6: bool,
     capture_dns: bool,
+    upstream_dns: Vec<IpAddr>,
 }
 pub struct Options<'a> {
     pub name: &'a str,
@@ -427,6 +480,7 @@ pub struct Options<'a> {
     pub interface: Option<&'a str>,
     pub exclusions: &'a [IpNet],
     pub capture_dns: bool,
+    pub upstream_dns: &'a [IpAddr],
     pub directory: &'a Path,
 }
 
@@ -448,6 +502,25 @@ fn built_in_local_exclusions(network: &Network, ipv6: bool) -> Result<Vec<IpNet>
     prefixes.sort();
     prefixes.dedup();
     Ok(prefixes)
+}
+
+fn tun_capture_prefixes(ipv6: bool) -> Result<Vec<IpNet>> {
+    // XNU's SA_DEFAULT/rt_primary_default checks the destination address,
+    // not the prefix length. A 0.0.0.0/1 or ::/1 route can therefore alter the
+    // primary scope and shadow node_lookup_default for IP_BOUND_IF sockets.
+    // Match sing-tun's Darwin BuildAutoRouteRanges: leave 0/8 and ::/8 alone
+    // and cover the remaining space without any zero-address route key.
+    #[cfg(target_os = "macos")]
+    let prefixes = &[
+        "1.0.0.0/8", "2.0.0.0/7", "4.0.0.0/6", "8.0.0.0/5",
+        "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/1",
+        "100::/8", "200::/7", "400::/6", "800::/5",
+        "1000::/4", "2000::/3", "4000::/2", "8000::/1",
+    ][..];
+    #[cfg(not(target_os = "macos"))]
+    let prefixes = &["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"][..];
+    let prefixes = prefixes.iter().map(|prefix| prefix.parse()).collect::<Result<Vec<IpNet>, _>>()?;
+    Ok(prefixes.into_iter().filter(|prefix| ipv6 || prefix.addr().is_ipv4()).collect())
 }
 
 impl DesktopTun {
@@ -483,6 +556,7 @@ impl DesktopTun {
             auto_route: options.auto_route,
             ipv6: options.ipv6,
             capture_dns: options.capture_dns,
+            upstream_dns: options.upstream_dns.to_vec(),
         };
         let desired = desktop.desired_routes()?;
         desktop.transaction.journal.dns_servers = desktop.hooks.network().dns_servers;
@@ -497,11 +571,7 @@ impl DesktopTun {
         }
         let network = self.hooks.network();
         let mut routes = vec![];
-        for prefix in ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"] {
-            let prefix: IpNet = prefix.parse()?;
-            if prefix.addr().is_ipv6() && !self.ipv6 {
-                continue;
-            }
+        for prefix in tun_capture_prefixes(self.ipv6)? {
             routes.push(RouteSpec {
                 network: prefix,
                 interface: self.tunnel.clone(),
@@ -515,6 +585,20 @@ impl DesktopTun {
                 routes.push(RouteSpec {
                     network: IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 })?,
                     interface: self.tunnel.clone(),
+                });
+            }
+        }
+        #[cfg(target_os = "macos")]
+        for ip in self.upstream_dns.iter().copied() {
+            let interface = if ip.is_ipv4() {
+                &network.ipv4
+            } else {
+                &network.ipv6
+            };
+            if let Some(interface) = interface {
+                routes.push(RouteSpec {
+                    network: IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 })?,
+                    interface: interface.clone(),
                 });
             }
         }
@@ -554,8 +638,14 @@ impl DesktopTun {
         Ok(routes)
     }
     pub fn refresh(&mut self) -> Result<bool> {
-        let network = discover(self.selected_interface.as_deref(), Some(self.tunnel.index))?;
-        if network == self.hooks.network() {
+        let mut network = discover(self.selected_interface.as_deref(), Some(self.tunnel.index))?;
+        let previous = self.hooks.network();
+        // DNS settings may change when the macOS service is pointed at our
+        // local listener. Without DNS host routes this is not an egress change.
+        if !self.capture_dns {
+            network.dns_servers = previous.dns_servers.clone();
+        }
+        if network == previous {
             return Ok(false);
         }
         self.hooks.replace(network.clone());
@@ -563,6 +653,10 @@ impl DesktopTun {
         self.transaction
             .apply(self.desired_routes()?, &mut RouteManager::new()?)?;
         Ok(true)
+    }
+    pub fn select_interface(&mut self, interface: &str) -> Result<bool> {
+        self.selected_interface = Some(interface.to_owned());
+        self.refresh()
     }
     pub fn restore(&mut self) -> Result<()> {
         self.transaction.restore(&mut RouteManager::new()?)
@@ -592,6 +686,34 @@ pub fn recover(directory: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_capture_preserves_default_route_keys_and_has_no_gaps() {
+        let prefixes = tun_capture_prefixes(true).unwrap();
+        assert!(prefixes.iter().all(|prefix| !prefix.network().is_unspecified()));
+        let v4: Vec<_> = prefixes.iter().filter_map(|prefix| match prefix {
+            IpNet::V4(net) => Some(*net), _ => None,
+        }).collect();
+        assert_eq!(v4.first().unwrap().network(), "1.0.0.0".parse::<std::net::Ipv4Addr>().unwrap());
+        assert_eq!(v4.last().unwrap().broadcast(), std::net::Ipv4Addr::BROADCAST);
+        for pair in v4.windows(2) {
+            assert_eq!(u32::from(pair[0].broadcast()).checked_add(1), Some(u32::from(pair[1].network())));
+        }
+        let v6: Vec<_> = prefixes.iter().filter_map(|prefix| match prefix {
+            IpNet::V6(net) => Some(*net), _ => None,
+        }).collect();
+        assert_eq!(v6.first().unwrap().network(), "100::".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(u128::from(v6.last().unwrap().broadcast()), u128::MAX);
+        for pair in v6.windows(2) {
+            assert_eq!(u128::from(pair[0].broadcast()).checked_add(1), Some(u128::from(pair[1].network())));
+        }
+        let v4_only = tun_capture_prefixes(false).unwrap();
+        assert_eq!(v4_only.len(), v4.len());
+        for target in ["17.137.162.3", "173.242.123.155", "28.0.0.52", "106.11.35.100"] {
+            let target: IpAddr = target.parse().unwrap();
+            assert_eq!(v4_only.iter().filter(|net| net.contains(&target)).count(), 1);
+        }
+    }
     #[cfg(windows)]
     #[test]
     fn windows_route_order_includes_family_specific_interface_metrics() {
@@ -668,6 +790,25 @@ mod tests {
             self.routes.retain(|r| r != route);
             Ok(())
         }
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_route_transaction_preserves_physical_default() {
+        let directory = std::env::temp_dir().join(format!("clyntis-default-route-{}", uuid::Uuid::new_v4()));
+        let default = Route::new("0.0.0.0".parse().unwrap(), 0)
+            .with_gateway("192.168.2.1".parse().unwrap()).with_if_index(14);
+        let mut backend = MemoryRoutes { routes: vec![default.clone()], fail_after: usize::MAX };
+        let mut transaction = Transaction::open(&directory).unwrap();
+        let desired = tun_capture_prefixes(false).unwrap().into_iter().map(|network| RouteSpec {
+            network, interface: ExitInterface { index: 99, name: "test-tun".into(), gateway: None },
+        }).collect();
+        transaction.apply(desired, &mut backend).unwrap();
+        let zero_keys: Vec<_> = backend.routes.iter().filter(|route| route.destination().is_unspecified()).collect();
+        assert_eq!(zero_keys, vec![&default]);
+        transaction.restore(&mut backend).unwrap();
+        assert_eq!(backend.routes, vec![default]);
+        drop(transaction);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn route_failure_recovery_and_exclusive_lifecycle() {

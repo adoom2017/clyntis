@@ -189,8 +189,8 @@ impl Resolver {
             next4: 2,
             next6: 2,
         };
+        let mut skipped = 0usize;
         for (name, ip) in entries {
-            absolute_name(name)?;
             let name = name.trim_end_matches('.').to_ascii_lowercase();
             match ip {
                 IpAddr::V4(ip) => {
@@ -213,6 +213,14 @@ impl Resolver {
                         .max(n.checked_add(1).context("saved pool overflow")?);
                 }
             }
+            // Older versions allocated fake addresses for wire labels that
+            // the upstream hostname parser cannot encode. Preserve valid
+            // mappings and advance past discarded addresses so cached clients
+            // cannot accidentally reach a newly assigned, unrelated hostname.
+            if absolute_name(&name).is_err() {
+                skipped += 1;
+                continue;
+            }
             ensure!(
                 map.by_ip.insert(*ip, name.clone()).is_none()
                     && map.by_name.insert((name, ip.is_ipv6()), *ip).is_none(),
@@ -220,6 +228,9 @@ impl Resolver {
             );
         }
         *self.fake.lock().unwrap() = map;
+        if skipped != 0 {
+            tracing::warn!(skipped, "ignored unsupported hostnames in saved fake-IP cache; valid mappings retained");
+        }
         Ok(())
     }
     pub fn clear_cache(&self) {
@@ -258,14 +269,33 @@ impl Resolver {
             }
         });
         let mut addresses = vec![];
-        for r in a.into_iter().chain(aaaa).flatten() {
-            match r.data() {
+        for record in [&a, &aaaa]
+            .into_iter()
+            .filter_map(|result| result.as_ref().ok())
+            .flatten()
+        {
+            match record.data() {
                 RData::A(ip) => addresses.push(SocketAddr::new(IpAddr::V4(ip.0), port)),
                 RData::AAAA(ip) => addresses.push(SocketAddr::new(IpAddr::V6(ip.0), port)),
                 _ => {}
             }
         }
-        ensure!(!addresses.is_empty(), "DNS lookup returned no addresses");
+        if addresses.is_empty() {
+            let mut failures = Vec::new();
+            if let Err(error) = a {
+                failures.push(format!("A: {error:#}"));
+            }
+            if let Err(error) = aaaa {
+                failures.push(format!("AAAA: {error:#}"));
+            }
+            if failures.is_empty() {
+                anyhow::bail!("DNS lookup for {host} returned no addresses");
+            }
+            anyhow::bail!(
+                "DNS lookup for {host} returned no addresses ({})",
+                failures.join("; ")
+            );
+        }
         Ok(addresses)
     }
     async fn records(&self, host: &str, kind: RecordType) -> Result<Vec<Record>> {
@@ -276,6 +306,13 @@ impl Resolver {
             .set_recursion_desired(true)
             .add_query(query);
         let response = self.cached_exchange(&request).await?;
+        tracing::debug!(
+            %host,
+            record_type = ?kind,
+            response_code = ?response.response_code(),
+            answers = response.answers().len(),
+            "DNS lookup response"
+        );
         ensure!(
             response.response_code() == ResponseCode::NoError
                 || response.response_code() == ResponseCode::NXDomain,
@@ -401,8 +438,14 @@ impl Resolver {
             .await
             {
                 Ok(Ok(response)) => return Ok(response),
-                Ok(Err(e)) => error = e,
-                Err(e) => error = e.into(),
+                Ok(Err(e)) => {
+                    tracing::debug!(%upstream, error = %e, "DNS upstream failed");
+                    error = e.context(format!("DNS upstream {upstream}"));
+                }
+                Err(_) => {
+                    tracing::debug!(%upstream, "DNS upstream timed out");
+                    error = anyhow::anyhow!("DNS upstream {upstream} timed out");
+                }
             }
         }
         Err(error)
@@ -646,6 +689,10 @@ impl Resolver {
             && query.query_class() == DNSClass::IN
             && matches!(query.query_type(), RecordType::A | RecordType::AAAA)
         {
+            if absolute_name(&host).is_err() {
+                response.set_response_code(ResponseCode::FormErr);
+                return Ok(response.to_vec()?);
+            }
             let ip = match self.fake_address(&host, query.query_type() == RecordType::AAAA) {
                 Ok(ip) => ip,
                 Err(_) => {
@@ -671,6 +718,7 @@ impl Resolver {
         Ok(response.to_vec()?)
     }
     fn fake_address(&self, host: &str, v6: bool) -> Result<IpAddr> {
+        absolute_name(host).context("unsupported fake-IP hostname")?;
         let mut map = self.fake.lock().unwrap();
         let key = (host.into(), v6);
         if let Some(ip) = map.by_name.get(&key) {

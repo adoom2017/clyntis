@@ -330,16 +330,79 @@ async fn http_connection(core: Arc<Core>, stream: &mut TcpStream, peer: SocketAd
     core.relay_io(stream, target, outbound, node).await
 }
 pub async fn dns_udp(core: Arc<Core>, socket: UdpSocket) {
+    dns_udp_inner(core, socket, None).await;
+}
+pub async fn dns_udp_local(core: Arc<Core>, socket: UdpSocket, local_ip: std::net::IpAddr) {
+    dns_udp_inner(core, socket, Some(local_ip)).await;
+}
+async fn dns_udp_inner(core: Arc<Core>, socket: UdpSocket, local_ip: Option<std::net::IpAddr>) {
     let socket = Arc::new(socket);
     let mut bytes = vec![0; 65535];
     let mut tasks = JoinSet::new();
     loop {
-        tokio::select! {_=core.stop.cancelled()=>break,_=tasks.join_next(),if !tasks.is_empty()=>{},received=socket.recv_from(&mut bytes)=>{let Ok((n,peer))=received else{break;};if tasks.len()>=256{continue;}let request=bytes[..n].to_vec();let socket=socket.clone();let core=core.clone();tasks.spawn(async move{if let Ok(Ok(reply))=tokio::time::timeout(Duration::from_secs(10),core.resolver.answer(&request)).await{let _=socket.send_to(&reply,peer).await;}});}}
+        tokio::select! {
+            _ = core.stop.cancelled() => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => {},
+            received = socket.recv_from(&mut bytes) => {
+                let Ok((n, peer)) = received else { break; };
+                if local_ip.is_some_and(|ip| !peer.ip().is_loopback() && peer.ip() != ip) { continue; }
+                if tasks.len() >= 256 { continue; }
+                let request = bytes[..n].to_vec();
+                let socket = socket.clone();
+                let core = core.clone();
+                tasks.spawn(async move {
+                    match tokio::time::timeout(Duration::from_secs(10), core.resolver.answer(&request)).await {
+                        Ok(Ok(reply)) => {
+                            tracing::debug!(%peer, request_bytes = request.len(), response_bytes = reply.len(), "DNS UDP query answered");
+                            if let Err(error) = socket.send_to(&reply, peer).await {
+                                tracing::debug!(%peer, %error, "DNS UDP response send failed");
+                            }
+                        }
+                        Ok(Err(error)) => tracing::debug!(%peer, %error, "DNS UDP query failed"),
+                        Err(_) => tracing::debug!(%peer, "DNS UDP query timed out"),
+                    }
+                });
+            }
+        }
     }
 }
 pub async fn dns_tcp(core: Arc<Core>, listener: TcpListener) {
+    dns_tcp_inner(core, listener, None).await;
+}
+pub async fn dns_tcp_local(core: Arc<Core>, listener: TcpListener, local_ip: std::net::IpAddr) {
+    dns_tcp_inner(core, listener, Some(local_ip)).await;
+}
+async fn dns_tcp_inner(core: Arc<Core>, listener: TcpListener, local_ip: Option<std::net::IpAddr>) {
     let mut tasks = JoinSet::new();
     loop {
-        tokio::select! {_=core.stop.cancelled()=>break,_=tasks.join_next(),if !tasks.is_empty()=>{},accepted=listener.accept()=>{let Ok((mut stream,_))=accepted else{break;};if tasks.len()>=256{continue;}let core=core.clone();tasks.spawn(async move {let run=async{for _ in 0..100 {let n=stream.read_u16().await?;let mut bytes=vec![0;n as usize];stream.read_exact(&mut bytes).await?;let reply=core.resolver.answer(&bytes).await?;stream.write_u16(reply.len() as u16).await?;stream.write_all(&reply).await?;}Ok::<_,anyhow::Error>(())};let _=tokio::time::timeout(Duration::from_secs(30),run).await;});}}
+        tokio::select! {
+            _ = core.stop.cancelled() => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => {},
+            accepted = listener.accept() => {
+                let Ok((mut stream, peer)) = accepted else { break; };
+                if local_ip.is_some_and(|ip| !peer.ip().is_loopback() && peer.ip() != ip) { continue; }
+                if tasks.len() >= 256 { continue; }
+                let core = core.clone();
+                tasks.spawn(async move {
+                    let run = async {
+                        for _ in 0..100 {
+                            let n = stream.read_u16().await?;
+                            let mut bytes = vec![0; n as usize];
+                            stream.read_exact(&mut bytes).await?;
+                            let reply = core.resolver.answer(&bytes).await?;
+                            tracing::debug!(%peer, request_bytes = bytes.len(), response_bytes = reply.len(), "DNS TCP query answered");
+                            stream.write_u16(reply.len() as u16).await?;
+                            stream.write_all(&reply).await?;
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(30), run).await {
+                        Ok(Err(error)) => tracing::debug!(%peer, %error, "DNS TCP query failed"),
+                        Err(_) => tracing::debug!(%peer, "DNS TCP connection timed out"),
+                        Ok(Ok(())) => {},
+                    }
+                });
+            }
+        }
     }
 }

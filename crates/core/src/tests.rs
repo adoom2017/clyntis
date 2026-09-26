@@ -3,6 +3,43 @@ use tokio::io::AsyncReadExt;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn additional_system_dns_listener_answers_local_queries() {
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let mut config = Config::default();
+    config.dns.enable = true;
+    config.dns.listen = "127.0.0.1:0".into();
+    config.dns.enhanced_mode = "fake-ip".into();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let mut running = core.start_with_packets_and_system_dns(None, Some(address)).await.unwrap();
+    let mut query = hickory_proto::op::Message::new();
+    query.set_id(79).add_query(hickory_proto::op::Query::query(
+        hickory_proto::rr::Name::from_ascii("system-dns.test").unwrap(),
+        hickory_proto::rr::RecordType::A,
+    ));
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.send_to(&query.to_vec().unwrap(), address).await.unwrap();
+    let mut buffer = [0u8; 4096];
+    let (size, _) = tokio::time::timeout(std::time::Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await.unwrap().unwrap();
+    let answer = hickory_proto::op::Message::from_vec(&buffer[..size]).unwrap();
+    assert_eq!(answer.id(), 79);
+    assert_eq!(answer.answers().len(), 1);
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replacement = reservation.local_addr().unwrap();
+    drop(reservation);
+    running.rebind_system_dns(replacement).await.unwrap();
+    socket.send_to(&query.to_vec().unwrap(), replacement).await.unwrap();
+    let (size, _) = tokio::time::timeout(std::time::Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await.unwrap().unwrap();
+    assert_eq!(hickory_proto::op::Message::from_vec(&buffer[..size]).unwrap().id(), 79);
+    assert!(tokio::net::TcpListener::bind(address).await.is_ok());
+    assert!(tokio::net::UdpSocket::bind(address).await.is_ok());
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn listener_conflicts_identify_service_transport_and_address() {
     for label in [
         "HTTP proxy",

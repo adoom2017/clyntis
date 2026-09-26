@@ -270,6 +270,11 @@ async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> 
                 let mut bytes = vec![0; n as usize];
                 stream.read_exact(&mut bytes).await?;
                 let response = core.resolver.answer(&bytes).await?;
+                tracing::debug!(
+                    request_bytes = bytes.len(),
+                    response_bytes = response.len(),
+                    "TUN DNS TCP query answered"
+                );
                 stream.write_u16(response.len() as u16).await?;
                 stream.write_all(&response).await?;
             }
@@ -298,10 +303,18 @@ async fn udp_session(
         while let Some(packet) =
             tokio::time::timeout(Duration::from_secs(120), input.recv()).await?
         {
-            if let Ok(Ok(payload)) =
-                tokio::time::timeout(Duration::from_secs(10), core.resolver.answer(&packet)).await
+            match tokio::time::timeout(Duration::from_secs(10), core.resolver.answer(&packet)).await
             {
-                let _ = output.try_send(Reply { flow, payload });
+                Ok(Ok(payload)) => {
+                    tracing::debug!(
+                        request_bytes = packet.len(),
+                        response_bytes = payload.len(),
+                        "TUN DNS UDP query answered"
+                    );
+                    let _ = output.try_send(Reply { flow, payload });
+                }
+                Ok(Err(error)) => tracing::debug!(%error, "TUN DNS UDP query failed"),
+                Err(_) => tracing::debug!("TUN DNS UDP query timed out"),
             }
         }
         return Ok(());
