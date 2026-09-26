@@ -43,6 +43,14 @@ fn pair() -> (Arc<Packets>, Arc<Packets>) {
 }
 
 async fn client(packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp: bool) -> Vec<u8> {
+    let expected = payload.len();
+    client_stream(packets, target, payload, tcp, expected, None).await
+}
+
+async fn client_stream(
+    packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp: bool,
+    expected: usize, progress: Option<mpsc::UnboundedSender<usize>>,
+) -> Vec<u8> {
     let started = Instant::now();
     let now = || NetInstant::from_millis(started.elapsed().as_millis() as i64);
     let (outgoing, mut output) = mpsc::channel(256);
@@ -92,7 +100,7 @@ async fn client(packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp
         if tcp {
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             assert!(
-                started.elapsed() < Duration::from_secs(8),
+                started.elapsed() < Duration::from_secs(if progress.is_some() { 900 } else { 8 }),
                 "TCP {target} state {:?}, sent {sent}, received {}",
                 socket.state(),
                 result.len()
@@ -104,14 +112,17 @@ async fn client(packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp
                 socket
                     .recv(|bytes| {
                         result.extend_from_slice(bytes);
+                        if let Some(progress) = &progress {
+                            let _ = progress.send(result.len());
+                        }
                         (bytes.len(), ())
                     })
                     .unwrap();
             }
-            if result.len() == payload.len() {
+            if result.len() == expected {
                 socket.close();
             }
-            if result.len() == payload.len() && !socket.is_open() {
+            if result.len() == expected && !socket.is_open() {
                 return result;
             }
         } else {
@@ -135,7 +146,7 @@ async fn client(packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp
         tokio::select! {
             n = packets.recv(&mut packet) => {
                 let n = n.unwrap();
-                if let Some(packet) = fragments.accept(&packet[..n], Instant::now()) {
+                if let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) {
                     device.incoming.push_back(packet.into_owned());
                 }
             },
@@ -298,4 +309,54 @@ async fn udp_upload_does_not_cancel_a_partial_vless_response() {
         assert_eq!(replies.recv().await.unwrap().payload, b"pong");
         core.stop.cancel(); session.await.unwrap().unwrap();
     }).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn tun_sse_resumes_after_six_minutes_with_tcp_keepalive() {
+    let (device, host_io) = pair();
+    let mut config = CoreConfig::default();
+    config.tun.enable = true;
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let running = core.start_with_packets(Some(device)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let request = b"GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let first = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: first\n\n";
+    let last = b"data: resumed\n\n";
+    let (progress, mut received) = mpsc::unbounded_channel();
+    let client = tokio::spawn(client_stream(
+        host_io,
+        target,
+        request.to_vec(),
+        true,
+        first.len() + last.len(),
+        Some(progress),
+    ));
+    let (mut server, _) = listener.accept().await.unwrap();
+    server
+        .read_exact(&mut vec![0; request.len()])
+        .await
+        .unwrap();
+    server.write_all(first).await.unwrap();
+    while received.recv().await.unwrap() < first.len() {}
+    // Keep polling both TCP stacks so their keepalive probes are acknowledged,
+    // but send no application bytes for longer than the former idle cutoff.
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !client.is_finished(),
+            "TUN closed a live idle SSE connection"
+        );
+    }
+    assert_eq!(core.connections().len(), 1, "idle SSE relay was removed");
+    server.write_all(last).await.unwrap();
+    server.shutdown().await.unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, [first.as_slice(), last.as_slice()].concat());
+    assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
+    running.shutdown().await;
 }

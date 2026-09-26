@@ -21,12 +21,13 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::mpsc,
     task::JoinSet,
+    time::Instant,
 };
 use tokio_util::{sync::PollSender, task::AbortOnDropHandle};
 
@@ -48,7 +49,7 @@ struct TcpFlow {
     output: mpsc::Receiver<Vec<u8>>,
     pending: Option<(Vec<u8>, usize)>,
     eof: bool,
-    last: Instant,
+    created: Instant,
     task: tokio::task::AbortHandle,
 }
 struct UdpFlow {
@@ -423,7 +424,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 ensure!(n <= packet.len(), "PacketIo returned invalid length");
                 if n == 0 { continue; }
                 if !core.config.ipv6 && packet[0] >> 4 == 6 { continue; }
-                let Some(packet) = fragments.accept(&packet[..n], Instant::now()) else { continue; };
+                let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) else { continue; };
                 if let Some((flow, syn)) = sniff(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }
                     if flow.tcp && syn && !tcp_flows.contains_key(&flow) && tcp_flows.len() < MAX_TCP {
@@ -437,7 +438,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                         let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)) };
                         let core = core.clone();
                         let task = tasks.spawn(async move { (flow, tcp_session(core, flow, stream).await) });
-                        tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, last: Instant::now(), task });
+                        tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
                     } else if !flow.tcp && !ports.contains_key(&flow.target) && ports.len() < MAX_PORTS {
                         let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 65535]);
                         let mut socket = udp::Socket::new(buffer(), buffer());
@@ -451,16 +452,17 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
         }
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
-            fragments.expire(last_expiry);
+            fragments.expire(last_expiry.into());
         }
         iface.poll(now(), &mut device, &mut sockets);
         while let Some(result) = tasks.try_join_next() {
             if let Ok((flow, result)) = result {
                 if flow.tcp {
-                    if let Some(state) = tcp_flows.get_mut(&flow)
-                        && result.is_err()
-                    {
-                        sockets.get_mut::<tcp::Socket>(state.handle).abort();
+                    if let Err(error) = result {
+                        tracing::debug!(source = %flow.source, target = %flow.target, %error, "TUN TCP session failed");
+                        if let Some(state) = tcp_flows.get_mut(&flow) {
+                            sockets.get_mut::<tcp::Socket>(state.handle).abort();
+                        }
                     }
                 } else {
                     udp_flows.remove(&flow);
@@ -470,11 +472,10 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
         let mut retired = vec![];
         tcp_flows.retain(|_, state| {
             let socket = sockets.get_mut::<tcp::Socket>(state.handle);
-            if state.last.elapsed() > Duration::from_secs(300) {
-                socket.abort();
-            }
+            // Keepalive ACKs count as liveness in smoltcp. Do not impose a
+            // separate application-data deadline on an established stream.
             if matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
-                && state.last.elapsed() > Duration::from_secs(30)
+                && state.created.elapsed() > Duration::from_secs(30)
             {
                 socket.abort();
             }
@@ -494,7 +495,6 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     permit.send(bytes[..n].to_vec());
                     (n, ())
                 });
-                state.last = Instant::now();
             }
             if !socket.may_recv()
                 && !matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
@@ -522,7 +522,6 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     break;
                 }
                 *offset += n;
-                state.last = Instant::now();
                 if *offset == bytes.len() {
                     state.pending = None;
                 }

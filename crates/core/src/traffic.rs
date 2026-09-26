@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -17,16 +17,8 @@ pub(crate) struct State {
     info: Connection,
     upload: AtomicU64,
     download: AtomicU64,
-    started: Instant,
-    active: AtomicU64,
 }
 impl State {
-    pub(crate) fn idle(&self) -> Duration {
-        Duration::from_millis(
-            (self.started.elapsed().as_millis() as u64)
-                .saturating_sub(self.active.load(Ordering::Relaxed)),
-        )
-    }
     pub(crate) fn snapshot(&self) -> Connection {
         let mut info = self.info.clone();
         info.upload = self.upload.load(Ordering::Relaxed);
@@ -63,8 +55,6 @@ impl Tracker {
             info,
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
-            started: Instant::now(),
-            active: AtomicU64::new(0),
         });
         {
             let mut connections = core.connections.lock().unwrap();
@@ -87,10 +77,6 @@ impl Tracker {
         };
         local.fetch_add(n as u64, Ordering::Relaxed);
         total.fetch_add(n as u64, Ordering::Relaxed);
-        self.state.active.store(
-            self.state.started.elapsed().as_millis() as u64,
-            Ordering::Relaxed,
-        );
     }
 }
 impl Drop for Tracker {

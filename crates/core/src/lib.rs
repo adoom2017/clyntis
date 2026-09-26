@@ -965,20 +965,14 @@ impl Core {
             inner: outbound,
             tracker,
         };
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        let state = outbound.tracker.state.clone();
-        let idle = async {
-            loop {
-                interval.tick().await;
-                if state.idle() >= Duration::from_secs(300) {
-                    break;
-                }
-            }
-        };
+        // Application silence is valid for SSE and other long-lived streams.
+        // TCP keepalive detects dead peers; only EOF, I/O errors or explicit
+        // cancellation should tear down an otherwise healthy relay.
         tokio::select! {
-            _=cancel.cancelled()=>{},
-            _=idle=>{},
-            result=tokio::io::copy_bidirectional(&mut inbound,&mut outbound)=>{result?;},
+            _ = cancel.cancelled() => {
+                tracing::debug!(id = %outbound.tracker.state.snapshot().id, "TCP relay cancelled");
+            },
+            result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => { result?; },
         }
         Ok(())
     }

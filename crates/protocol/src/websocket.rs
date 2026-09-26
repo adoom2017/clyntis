@@ -257,7 +257,10 @@ impl WsStream {
                 self.payload = data;
                 self.payload_at = 0;
             }
-            8 => self.closed = true,
+            8 => {
+                self.closed = true;
+                self.outgoing.extend(Self::frame(&data, 8));
+            }
             9 => self.outgoing.extend(Self::frame(&data, 10)),
             10 => {}
             _ => return Err(io::Error::other("unsupported WebSocket frame")),
@@ -272,49 +275,76 @@ impl AsyncRead for WsStream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.upgraded {
-            match self.parse_upgrade() {
-                Ok(true) => {}
-                Ok(false) => {
-                    let mut scratch = [0u8; 2048];
-                    let mut read = ReadBuf::new(&mut scratch);
-                    ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
-                    if read.filled().is_empty() {
-                        return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
-                    }
-                    self.incoming.extend_from_slice(read.filled());
-                    return self.poll_read(cx, out);
-                }
-                Err(e) => return Poll::Ready(Err(io::Error::other(e))),
-            }
-        }
-        if self.raw {
-            if !self.incoming.is_empty() {
-                let count = out.remaining().min(self.incoming.len());
-                out.put_slice(&self.incoming[..count]);
-                self.incoming.drain(..count);
-                return Poll::Ready(Ok(()));
-            }
-            return Pin::new(&mut self.inner).poll_read(cx, out);
-        }
-        if self.payload_at < self.payload.len() {
-            let n = out.remaining().min(self.payload.len() - self.payload_at);
-            out.put_slice(&self.payload[self.payload_at..self.payload_at + n]);
-            self.payload_at += n;
+        if out.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+        let mut frames = 0;
         loop {
-            if self.closed {
+            // Drive buffered writes and control replies even on download-only
+            // streams. A blocked writer must not prevent reading the peer.
+            let flushed = self.flush_outgoing(cx);
+            if let Poll::Ready(Err(error)) = flushed {
+                return Poll::Ready(Err(error));
+            }
+            if !self.upgraded {
+                match self.parse_upgrade() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if self.incoming.len() >= MAX_HEADERS {
+                            return Poll::Ready(Err(io::Error::other(
+                                "WebSocket response headers too large",
+                            )));
+                        }
+                        let mut scratch = [0u8; 2048];
+                        let mut read = ReadBuf::new(&mut scratch);
+                        ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
+                        if read.filled().is_empty() {
+                            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
+                        }
+                        self.incoming.extend_from_slice(read.filled());
+                        continue;
+                    }
+                    Err(e) => return Poll::Ready(Err(io::Error::other(e))),
+                }
+            }
+            if self.raw {
+                if !self.incoming.is_empty() {
+                    let count = out.remaining().min(self.incoming.len());
+                    out.put_slice(&self.incoming[..count]);
+                    self.incoming.drain(..count);
+                    return Poll::Ready(Ok(()));
+                }
+                return Pin::new(&mut self.inner).poll_read(cx, out);
+            }
+            if self.payload_at < self.payload.len() {
+                let n = out.remaining().min(self.payload.len() - self.payload_at);
+                out.put_slice(&self.payload[self.payload_at..self.payload_at + n]);
+                self.payload_at += n;
                 return Poll::Ready(Ok(()));
             }
-            if self.parse_frame()? && self.payload_at < self.payload.len() {
-                return self.poll_read(cx, out);
+            if self.closed {
+                ready!(flushed)?;
+                return Poll::Ready(Ok(()));
+            }
+            if self.parse_frame()? {
+                // A Ping/Pong or empty data frame may be followed by an event
+                // already in incoming. Do not wait for another socket read.
+                frames += 1;
+                if frames >= 64 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                continue;
             }
             let mut scratch = [0u8; 8192];
             let mut read = ReadBuf::new(&mut scratch);
             ready!(Pin::new(&mut self.inner).poll_read(cx, &mut read))?;
             if read.filled().is_empty() {
-                return Poll::Ready(Ok(()));
+                return Poll::Ready(if self.incoming.is_empty() {
+                    Ok(())
+                } else {
+                    Err(io::ErrorKind::UnexpectedEof.into())
+                });
             }
             self.incoming.extend_from_slice(read.filled());
         }
@@ -328,6 +358,12 @@ impl AsyncWrite for WsStream {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         ready!(self.flush_outgoing(cx))?;
+        if self.closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         if self.raw {
             return Pin::new(&mut self.inner).poll_write(cx, bytes);
         }
@@ -373,6 +409,91 @@ mod tests {
             *byte ^= mask[index % 4];
         }
         payload
+    }
+
+    fn upgraded_stream(inner: tokio::io::DuplexStream) -> WsStream {
+        let mut stream = WsStream::new(Box::new(inner), false, None);
+        stream.upgraded = true;
+        stream
+    }
+
+    #[tokio::test]
+    async fn download_only_stream_replies_to_ping_without_application_writes() {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut stream = upgraded_stream(client);
+            let peer = async {
+                server.write_all(b"\x89\x04ping").await.unwrap();
+                assert_eq!(server.read_u8().await.unwrap(), 0x8a);
+                assert_eq!(server.read_u8().await.unwrap(), 0x84);
+                let mut mask = [0; 4];
+                server.read_exact(&mut mask).await.unwrap();
+                let mut pong = [0; 4];
+                server.read_exact(&mut pong).await.unwrap();
+                for (i, byte) in pong.iter_mut().enumerate() {
+                    *byte ^= mask[i % 4];
+                }
+                assert_eq!(&pong, b"ping");
+                server.write_all(b"\x82\x09data: x\n\n").await.unwrap();
+            };
+            let reader = async {
+                let mut event = [0; 9];
+                stream.read_exact(&mut event).await.unwrap();
+                assert_eq!(&event, b"data: x\n\n");
+            };
+            tokio::join!(peer, reader);
+        })
+        .await
+        .expect("SSE download stalled waiting for a Pong");
+    }
+
+    #[tokio::test]
+    async fn buffered_control_and_empty_frames_do_not_stall_events() {
+        for prefix in [b"\x8a\x00", b"\x82\x00", b"\x89\x00"] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut stream = upgraded_stream(client);
+            let bytes = [prefix.as_slice(), b"\x82\x09data: x\n\n"].concat();
+            server.write_all(&bytes).await.unwrap();
+            let mut event = [0; 9];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                stream.read_exact(&mut event),
+            )
+            .await
+            .expect("buffered SSE event waited for another network read")
+            .unwrap();
+            assert_eq!(&event, b"data: x\n\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn close_frame_finishes_read_before_peer_tcp_close() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let mut stream = upgraded_stream(client);
+        server.write_all(b"\x88\x00").await.unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut byte),)
+                .await
+                .expect("Close frame did not finish the stream")
+                .unwrap(),
+            0
+        );
+        assert_eq!(server.read_u8().await.unwrap(), 0x88);
+    }
+
+    #[tokio::test]
+    async fn truncated_frame_is_not_clean_eof() {
+        for bytes in [b"\x82".as_slice(), b"\x82\x09data:"] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut stream = upgraded_stream(client);
+            server.write_all(bytes).await.unwrap();
+            server.shutdown().await.unwrap();
+            assert_eq!(
+                stream.read(&mut [0; 32]).await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
     }
 
     #[tokio::test]

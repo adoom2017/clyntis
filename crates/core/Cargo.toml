@@ -33,6 +33,7 @@ socket2.workspace = true
 sha2 = "0.10"
 smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-udp", "socket-icmp"] }
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dev-dependencies]
 route_manager = "=0.2.9"

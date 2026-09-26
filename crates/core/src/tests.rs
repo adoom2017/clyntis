@@ -637,3 +637,43 @@ async fn socks_udp_reconnects_after_outbound_closes() {
     .await
     .unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn tcp_relay_survives_six_minutes_without_application_data() {
+    let core = Core::new(Config::default(), Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let (mut client, inbound) = tokio::io::duplex(1024);
+    let (outbound, mut peer) = tokio::io::duplex(1024);
+    let owner = core.clone();
+    let relay = tokio::spawn(async move {
+        owner
+            .relay(
+                Box::new(inbound),
+                Target::new("sse.test", 443).unwrap(),
+                Box::new(outbound),
+                "DIRECT".into(),
+            )
+            .await
+    });
+    client.write_all(b"request").await.unwrap();
+    peer.read_exact(&mut [0; 7]).await.unwrap();
+    tokio::time::advance(Duration::from_secs(360)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !relay.is_finished(),
+        "idle SSE connection was forcibly closed"
+    );
+    peer.write_all(b"data: resumed\n\n").await.unwrap();
+    let mut event = [0; 15];
+    client.read_exact(&mut event).await.unwrap();
+    assert_eq!(&event, b"data: resumed\n\n");
+    // Half-close the upload while allowing the download to continue.
+    client.shutdown().await.unwrap();
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    peer.write_all(b"data: final\n\n").await.unwrap();
+    peer.shutdown().await.unwrap();
+    let mut remaining = vec![];
+    client.read_to_end(&mut remaining).await.unwrap();
+    assert_eq!(remaining, b"data: final\n\n");
+    relay.await.unwrap().unwrap();
+    assert!(core.connections().is_empty());
+}

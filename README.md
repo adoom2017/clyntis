@@ -99,6 +99,12 @@ go to that file relative to `-d`; the startup message prints the effective
 level and full destination. Remove `log.log-path` to write logs to the terminal.
 The top-level `log-level` takes precedence when both locations specify a level.
 
+TCP relays, including TUN sessions, allow long periods without application data
+(for example while waiting for the next SSE event). They do not impose a fixed
+five-minute application-idle cutoff. TCP keepalive and transport errors detect
+dead peers; explicit connection closure, shutdown and network changes still end
+sessions. Upstream servers and intermediate proxies may impose their own limits.
+
 ### TUN and recovery
 
 TUN is disabled unless `tun.enable: true` is set in the configuration. It
