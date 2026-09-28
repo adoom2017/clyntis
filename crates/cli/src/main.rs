@@ -582,8 +582,8 @@ fn run(mut args: Args) -> Result<()> {
     runtime.block_on(async {
         eprintln!("TLS backend: BoringSSL; default client fingerprint: {}", config.global_client_fingerprint);
         if config.tun.enable{eprintln!("Compatibility: TUN uses the native Rust/smoltcp stack; stack labels do not select a Go gVisor implementation.");}
-        let automatic_dns = cfg!(target_os = "macos")
-            && config.tun.auto_route
+        #[cfg(target_os = "macos")]
+        let automatic_dns = config.tun.auto_route
             && config.tun.auto_dns
             && config.dns.enable;
         let upstream_dns = if config.dns.enable {
