@@ -141,6 +141,9 @@ async fn detect_macos_egress(
     let mut proxy_targets: Vec<SocketAddr> = config
         .proxies
         .iter()
+        // Probe only supported TCP outbounds. Hysteria2 uses UDP/QUIC;
+        // a TCP refusal on its port says nothing about egress reachability.
+        .filter(|proxy| proxy.kind == ProxyKind::Vless)
         .filter_map(|proxy| {
             proxy
                 .server
