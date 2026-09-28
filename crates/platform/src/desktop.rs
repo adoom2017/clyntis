@@ -482,6 +482,7 @@ pub struct DesktopTun {
     auto_route: bool,
     ipv6: bool,
     capture_dns: bool,
+    #[cfg(target_os = "macos")]
     upstream_dns: Vec<IpAddr>,
 }
 pub struct Options<'a> {
@@ -586,6 +587,7 @@ impl DesktopTun {
             auto_route: options.auto_route,
             ipv6: options.ipv6,
             capture_dns: options.capture_dns,
+            #[cfg(target_os = "macos")]
             upstream_dns: options.upstream_dns.to_vec(),
         };
         let desired = desktop.desired_routes()?;
