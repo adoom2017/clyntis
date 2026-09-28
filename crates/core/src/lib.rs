@@ -151,14 +151,20 @@ impl Running {
         if configured.port() != address.port()
             || (!configured.ip().is_unspecified() && configured.ip() != address.ip())
         {
-            let udp = tokio::net::UdpSocket::bind(address).await
+            let udp = tokio::net::UdpSocket::bind(address)
+                .await
                 .with_context(|| format!("cannot rebind system DNS UDP at {address}"))?;
-            let tcp = tokio::net::TcpListener::bind(address).await
+            let tcp = tokio::net::TcpListener::bind(address)
+                .await
                 .with_context(|| format!("cannot rebind system DNS TCP at {address}"))?;
             let core = self.core.clone();
-            tasks.spawn(async move { inbound::dns_udp_local(core, udp, address.ip()).await; });
+            tasks.spawn(async move {
+                inbound::dns_udp_local(core, udp, address.ip()).await;
+            });
             let core = self.core.clone();
-            tasks.spawn(async move { inbound::dns_tcp_local(core, tcp, address.ip()).await; });
+            tasks.spawn(async move {
+                inbound::dns_tcp_local(core, tcp, address.ip()).await;
+            });
         }
         self.system_dns_tasks.abort_all();
         while self.system_dns_tasks.join_next().await.is_some() {}
@@ -270,7 +276,9 @@ impl Core {
         packets: Option<Arc<dyn meta_platform::PacketIo>>,
         system_dns: Option<SocketAddr>,
     ) -> Result<Running> {
-        self.prepare_resources(false).await.context("cannot prepare routing resources")?;
+        self.prepare_resources(false)
+            .await
+            .context("cannot prepare routing resources")?;
         self.load_profile().context("cannot load saved profile")?;
         let mut tasks = JoinSet::new();
         let mut system_dns_tasks = JoinSet::new();
@@ -353,14 +361,24 @@ impl Core {
                 if configured.port() != system_dns.port()
                     || (!configured.ip().is_unspecified() && configured.ip() != system_dns.ip())
                 {
-                    let udp = tokio::net::UdpSocket::bind(system_dns).await
-                        .with_context(|| format!("cannot bind macOS system DNS UDP listener at {system_dns}"))?;
-                    let tcp = tokio::net::TcpListener::bind(system_dns).await
-                        .with_context(|| format!("cannot bind macOS system DNS TCP listener at {system_dns}"))?;
+                    let udp = tokio::net::UdpSocket::bind(system_dns)
+                        .await
+                        .with_context(|| {
+                            format!("cannot bind macOS system DNS UDP listener at {system_dns}")
+                        })?;
+                    let tcp = tokio::net::TcpListener::bind(system_dns)
+                        .await
+                        .with_context(|| {
+                            format!("cannot bind macOS system DNS TCP listener at {system_dns}")
+                        })?;
                     let core = self.clone();
-                    system_dns_tasks.spawn(async move { inbound::dns_udp_local(core, udp, system_dns.ip()).await; });
+                    system_dns_tasks.spawn(async move {
+                        inbound::dns_udp_local(core, udp, system_dns.ip()).await;
+                    });
                     let core = self.clone();
-                    system_dns_tasks.spawn(async move { inbound::dns_tcp_local(core, tcp, system_dns.ip()).await; });
+                    system_dns_tasks.spawn(async move {
+                        inbound::dns_tcp_local(core, tcp, system_dns.ip()).await;
+                    });
                 }
             }
         }

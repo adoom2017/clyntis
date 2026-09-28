@@ -32,7 +32,8 @@ enum SavedState {
 }
 
 fn managed_services(list: &str, interfaces: &[String]) -> Vec<String> {
-    let mut services: Vec<_> = interfaces.iter()
+    let mut services: Vec<_> = interfaces
+        .iter()
         .filter_map(|interface| service_for_interface(list, interface))
         .collect();
     services.sort();
@@ -113,8 +114,12 @@ fn flush_system_dns_cache() {
     ] {
         match Command::new(program).args(args).status() {
             Ok(status) if status.success() => {}
-            Ok(status) => tracing::debug!(%program, ?status, "macOS DNS cache refresh command failed"),
-            Err(error) => tracing::debug!(%program, %error, "macOS DNS cache refresh command unavailable"),
+            Ok(status) => {
+                tracing::debug!(%program, ?status, "macOS DNS cache refresh command failed")
+            }
+            Err(error) => {
+                tracing::debug!(%program, %error, "macOS DNS cache refresh command unavailable")
+            }
         }
     }
 }
@@ -155,24 +160,32 @@ fn restore_state_with(
         SavedState::Services(states) => states,
         SavedState::Legacy(state) => vec![state],
     };
-    ensure!(!states.is_empty() && states.len() <= 64, "invalid DNS recovery service count");
-    for state in &states {
     ensure!(
-        !state.service.is_empty()
-            && state.service.len() <= 256
-            && !state.service.chars().any(char::is_control)
-            && state.servers.len() <= 16
-            && state
-                .servers
-                .iter()
-                .all(|server| server.parse::<std::net::IpAddr>().is_ok())
-            && (state.managed_server == LEGACY_MANAGED_SERVER
-                || state.managed_server == crate::MACOS_TUN_DNS_IP.to_string()
-                || state.managed_server.parse::<Ipv4Addr>().is_ok_and(|address| {
-                    !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
-                })),
-        "invalid DNS recovery state"
+        !states.is_empty() && states.len() <= 64,
+        "invalid DNS recovery service count"
     );
+    for state in &states {
+        ensure!(
+            !state.service.is_empty()
+                && state.service.len() <= 256
+                && !state.service.chars().any(char::is_control)
+                && state.servers.len() <= 16
+                && state
+                    .servers
+                    .iter()
+                    .all(|server| server.parse::<std::net::IpAddr>().is_ok())
+                && (state.managed_server == LEGACY_MANAGED_SERVER
+                    || state.managed_server == crate::MACOS_TUN_DNS_IP.to_string()
+                    || state
+                        .managed_server
+                        .parse::<Ipv4Addr>()
+                        .is_ok_and(|address| {
+                            !address.is_unspecified()
+                                && !address.is_multicast()
+                                && !address.is_broadcast()
+                        })),
+            "invalid DNS recovery state"
+        );
     }
     for state in states {
         if get(&state.service)? == [state.managed_server.clone()] {
@@ -184,7 +197,9 @@ fn restore_state_with(
 }
 
 fn restore_state(path: &Path) -> Result<()> {
-    if !path.exists() { return Ok(()); }
+    if !path.exists() {
+        return Ok(());
+    }
     let result = restore_state_with(path, configured_servers, set_servers);
     flush_system_dns_cache();
     result
@@ -214,15 +229,31 @@ impl MacDns {
         // macOS's primary DNS service follows service order, independently of
         // the egress selected by our socket probes. Cover enabled physical
         // services so an unusable Ethernet default cannot retain stale DNS.
-        let mut interfaces: Vec<_> = netdev::get_interfaces().into_iter()
-            .filter(|device| device.is_up() && !device.is_loopback() && !device.is_tun() && !device.ipv4.is_empty())
-            .map(|device| device.name).collect();
+        let mut interfaces: Vec<_> = netdev::get_interfaces()
+            .into_iter()
+            .filter(|device| {
+                device.is_up()
+                    && !device.is_loopback()
+                    && !device.is_tun()
+                    && !device.ipv4.is_empty()
+            })
+            .map(|device| device.name)
+            .collect();
         interfaces.push(interface.to_owned());
         let mut services = managed_services(&list, &interfaces);
-        if !services.contains(&service) { services.push(service); }
-        let states: Vec<_> = services.into_iter().map(|service| {
-            Ok(State { servers: configured_servers(&service)?, service, managed_server: server.to_string() })
-        }).collect::<Result<_>>()?;
+        if !services.contains(&service) {
+            services.push(service);
+        }
+        let states: Vec<_> = services
+            .into_iter()
+            .map(|service| {
+                Ok(State {
+                    servers: configured_servers(&service)?,
+                    service,
+                    managed_server: server.to_string(),
+                })
+            })
+            .collect::<Result<_>>()?;
         save(&path, &states)?;
         let mut dns = Self {
             directory: directory.to_owned(),
@@ -231,7 +262,9 @@ impl MacDns {
             active: true,
         };
         for state in &states {
-            if let Err(error) = set_servers(&state.service, std::slice::from_ref(&state.managed_server)) {
+            if let Err(error) =
+                set_servers(&state.service, std::slice::from_ref(&state.managed_server))
+            {
                 let _ = dns.restore();
                 return Err(error);
             }
@@ -290,7 +323,10 @@ mod tests {
         assert_eq!(service_for_interface(list, "en1"), None);
         assert_eq!(service_for_interface(list, "utun5"), None);
         assert_eq!(
-            managed_services(list, &["en0".into(), "en7".into(), "en1".into(), "utun10".into()]),
+            managed_services(
+                list,
+                &["en0".into(), "en7".into(), "en1".into(), "utun10".into()]
+            ),
             vec!["USB 10/100/1000 LAN", "Wi-Fi"]
         );
     }
@@ -301,8 +337,16 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let path = state_path(&directory);
         let states = vec![
-            State { service: "Ethernet".into(), servers: vec!["223.5.5.5".into()], managed_server: "10.0.12.90".into() },
-            State { service: "Wi-Fi".into(), servers: vec![], managed_server: "10.0.12.90".into() },
+            State {
+                service: "Ethernet".into(),
+                servers: vec!["223.5.5.5".into()],
+                managed_server: "10.0.12.90".into(),
+            },
+            State {
+                service: "Wi-Fi".into(),
+                servers: vec![],
+                managed_server: "10.0.12.90".into(),
+            },
         ];
         save(&path, &states).unwrap();
         let mut current = std::collections::HashMap::from([
@@ -310,18 +354,32 @@ mod tests {
             ("Wi-Fi".to_string(), vec!["10.0.12.90".to_string()]),
         ]);
         let initial = current.clone();
-        assert!(restore_state_with(&path, |service| Ok(initial[service].clone()), |service, servers| {
-            if service == "Wi-Fi" { anyhow::bail!("injected failure"); }
-            current.insert(service.to_string(), servers.to_vec());
-            Ok(())
-        }).is_err());
+        assert!(
+            restore_state_with(
+                &path,
+                |service| Ok(initial[service].clone()),
+                |service, servers| {
+                    if service == "Wi-Fi" {
+                        anyhow::bail!("injected failure");
+                    }
+                    current.insert(service.to_string(), servers.to_vec());
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
         assert!(path.exists());
         let initial = current.clone();
-        restore_state_with(&path, |service| Ok(initial[service].clone()), |service, servers| {
-            assert_eq!(service, "Wi-Fi");
-            current.insert(service.to_string(), servers.to_vec());
-            Ok(())
-        }).unwrap();
+        restore_state_with(
+            &path,
+            |service| Ok(initial[service].clone()),
+            |service, servers| {
+                assert_eq!(service, "Wi-Fi");
+                current.insert(service.to_string(), servers.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(current["Ethernet"], vec!["223.5.5.5"]);
         assert!(current["Wi-Fi"].is_empty());
         std::fs::remove_dir_all(directory).unwrap();

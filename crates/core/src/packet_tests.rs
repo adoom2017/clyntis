@@ -48,8 +48,12 @@ async fn client(packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp
 }
 
 async fn client_stream(
-    packets: Arc<Packets>, target: SocketAddr, payload: Vec<u8>, tcp: bool,
-    expected: usize, progress: Option<mpsc::UnboundedSender<usize>>,
+    packets: Arc<Packets>,
+    target: SocketAddr,
+    payload: Vec<u8>,
+    tcp: bool,
+    expected: usize,
+    progress: Option<mpsc::UnboundedSender<usize>>,
 ) -> Vec<u8> {
     let started = Instant::now();
     let now = || NetInstant::from_millis(started.elapsed().as_millis() as i64);

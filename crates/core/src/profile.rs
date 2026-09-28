@@ -23,8 +23,9 @@ impl Core {
         let saved: Saved = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("invalid saved profile at {}", path.display()))?;
         if self.config.profile.store_fake_ip {
-            self.resolver.import_fake(&saved.fake)
-                .with_context(|| format!("cannot restore fake-IP mappings from {}", path.display()))?;
+            self.resolver.import_fake(&saved.fake).with_context(|| {
+                format!("cannot restore fake-IP mappings from {}", path.display())
+            })?;
         }
         if self.config.profile.store_selected {
             let mut policy = self.policy.write().unwrap();

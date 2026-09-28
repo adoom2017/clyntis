@@ -20,7 +20,9 @@ pub trait PlatformHooks: Send + Sync + std::fmt::Debug {
     /// Called before connect/send. Android hosts protect this socket from VPN
     /// capture; desktop hosts may bind the physical interface. Failure is fatal.
     fn protect_socket(&self, socket: &socket2::Socket) -> Result<()>;
-    fn egress_description(&self, _destination: SocketAddr) -> Option<String> { None }
+    fn egress_description(&self, _destination: SocketAddr) -> Option<String> {
+        None
+    }
     fn prepare_socket(
         &self,
         socket: &socket2::Socket,

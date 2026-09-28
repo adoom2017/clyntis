@@ -229,7 +229,10 @@ impl Resolver {
         }
         *self.fake.lock().unwrap() = map;
         if skipped != 0 {
-            tracing::warn!(skipped, "ignored unsupported hostnames in saved fake-IP cache; valid mappings retained");
+            tracing::warn!(
+                skipped,
+                "ignored unsupported hostnames in saved fake-IP cache; valid mappings retained"
+            );
         }
         Ok(())
     }

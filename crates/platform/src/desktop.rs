@@ -32,7 +32,10 @@ pub fn local_ipv4_address(interface: &ExitInterface) -> Result<std::net::Ipv4Add
         .into_iter()
         .find(|device| device.index == interface.index && device.name == interface.name)
         .context("physical DNS interface disappeared")?;
-    ensure!(device.is_up() && !device.is_loopback() && !device.is_tun(), "invalid physical DNS interface");
+    ensure!(
+        device.is_up() && !device.is_loopback() && !device.is_tun(),
+        "invalid physical DNS interface"
+    );
     device
         .ipv4
         .iter()
@@ -229,8 +232,17 @@ impl EgressHooks {
 impl PlatformHooks for EgressHooks {
     fn egress_description(&self, destination: SocketAddr) -> Option<String> {
         let network = self.network.read().unwrap();
-        let interface = if destination.is_ipv4() { &network.ipv4 } else { &network.ipv6 };
-        interface.as_ref().map(|interface| format!("{} index={} gateway={:?}", interface.name, interface.index, interface.gateway))
+        let interface = if destination.is_ipv4() {
+            &network.ipv4
+        } else {
+            &network.ipv6
+        };
+        interface.as_ref().map(|interface| {
+            format!(
+                "{} index={} gateway={:?}",
+                interface.name, interface.index, interface.gateway
+            )
+        })
     }
     fn protect_socket(&self, socket: &socket2::Socket) -> Result<()> {
         self.prepare_socket(socket, None)
@@ -512,15 +524,33 @@ fn tun_capture_prefixes(ipv6: bool) -> Result<Vec<IpNet>> {
     // and cover the remaining space without any zero-address route key.
     #[cfg(target_os = "macos")]
     let prefixes = &[
-        "1.0.0.0/8", "2.0.0.0/7", "4.0.0.0/6", "8.0.0.0/5",
-        "16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/1",
-        "100::/8", "200::/7", "400::/6", "800::/5",
-        "1000::/4", "2000::/3", "4000::/2", "8000::/1",
+        "1.0.0.0/8",
+        "2.0.0.0/7",
+        "4.0.0.0/6",
+        "8.0.0.0/5",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1",
+        "100::/8",
+        "200::/7",
+        "400::/6",
+        "800::/5",
+        "1000::/4",
+        "2000::/3",
+        "4000::/2",
+        "8000::/1",
     ][..];
     #[cfg(not(target_os = "macos"))]
     let prefixes = &["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"][..];
-    let prefixes = prefixes.iter().map(|prefix| prefix.parse()).collect::<Result<Vec<IpNet>, _>>()?;
-    Ok(prefixes.into_iter().filter(|prefix| ipv6 || prefix.addr().is_ipv4()).collect())
+    let prefixes = prefixes
+        .iter()
+        .map(|prefix| prefix.parse())
+        .collect::<Result<Vec<IpNet>, _>>()?;
+    Ok(prefixes
+        .into_iter()
+        .filter(|prefix| ipv6 || prefix.addr().is_ipv4())
+        .collect())
 }
 
 impl DesktopTun {
@@ -690,28 +720,63 @@ mod tests {
     #[test]
     fn darwin_capture_preserves_default_route_keys_and_has_no_gaps() {
         let prefixes = tun_capture_prefixes(true).unwrap();
-        assert!(prefixes.iter().all(|prefix| !prefix.network().is_unspecified()));
-        let v4: Vec<_> = prefixes.iter().filter_map(|prefix| match prefix {
-            IpNet::V4(net) => Some(*net), _ => None,
-        }).collect();
-        assert_eq!(v4.first().unwrap().network(), "1.0.0.0".parse::<std::net::Ipv4Addr>().unwrap());
-        assert_eq!(v4.last().unwrap().broadcast(), std::net::Ipv4Addr::BROADCAST);
+        assert!(
+            prefixes
+                .iter()
+                .all(|prefix| !prefix.network().is_unspecified())
+        );
+        let v4: Vec<_> = prefixes
+            .iter()
+            .filter_map(|prefix| match prefix {
+                IpNet::V4(net) => Some(*net),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            v4.first().unwrap().network(),
+            "1.0.0.0".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            v4.last().unwrap().broadcast(),
+            std::net::Ipv4Addr::BROADCAST
+        );
         for pair in v4.windows(2) {
-            assert_eq!(u32::from(pair[0].broadcast()).checked_add(1), Some(u32::from(pair[1].network())));
+            assert_eq!(
+                u32::from(pair[0].broadcast()).checked_add(1),
+                Some(u32::from(pair[1].network()))
+            );
         }
-        let v6: Vec<_> = prefixes.iter().filter_map(|prefix| match prefix {
-            IpNet::V6(net) => Some(*net), _ => None,
-        }).collect();
-        assert_eq!(v6.first().unwrap().network(), "100::".parse::<std::net::Ipv6Addr>().unwrap());
+        let v6: Vec<_> = prefixes
+            .iter()
+            .filter_map(|prefix| match prefix {
+                IpNet::V6(net) => Some(*net),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            v6.first().unwrap().network(),
+            "100::".parse::<std::net::Ipv6Addr>().unwrap()
+        );
         assert_eq!(u128::from(v6.last().unwrap().broadcast()), u128::MAX);
         for pair in v6.windows(2) {
-            assert_eq!(u128::from(pair[0].broadcast()).checked_add(1), Some(u128::from(pair[1].network())));
+            assert_eq!(
+                u128::from(pair[0].broadcast()).checked_add(1),
+                Some(u128::from(pair[1].network()))
+            );
         }
         let v4_only = tun_capture_prefixes(false).unwrap();
         assert_eq!(v4_only.len(), v4.len());
-        for target in ["17.137.162.3", "173.242.123.155", "28.0.0.52", "106.11.35.100"] {
+        for target in [
+            "17.137.162.3",
+            "173.242.123.155",
+            "28.0.0.52",
+            "106.11.35.100",
+        ] {
             let target: IpAddr = target.parse().unwrap();
-            assert_eq!(v4_only.iter().filter(|net| net.contains(&target)).count(), 1);
+            assert_eq!(
+                v4_only.iter().filter(|net| net.contains(&target)).count(),
+                1
+            );
         }
     }
     #[cfg(windows)]
@@ -794,16 +859,34 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn darwin_route_transaction_preserves_physical_default() {
-        let directory = std::env::temp_dir().join(format!("clyntis-default-route-{}", uuid::Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-default-route-{}", uuid::Uuid::new_v4()));
         let default = Route::new("0.0.0.0".parse().unwrap(), 0)
-            .with_gateway("192.168.2.1".parse().unwrap()).with_if_index(14);
-        let mut backend = MemoryRoutes { routes: vec![default.clone()], fail_after: usize::MAX };
+            .with_gateway("192.168.2.1".parse().unwrap())
+            .with_if_index(14);
+        let mut backend = MemoryRoutes {
+            routes: vec![default.clone()],
+            fail_after: usize::MAX,
+        };
         let mut transaction = Transaction::open(&directory).unwrap();
-        let desired = tun_capture_prefixes(false).unwrap().into_iter().map(|network| RouteSpec {
-            network, interface: ExitInterface { index: 99, name: "test-tun".into(), gateway: None },
-        }).collect();
+        let desired = tun_capture_prefixes(false)
+            .unwrap()
+            .into_iter()
+            .map(|network| RouteSpec {
+                network,
+                interface: ExitInterface {
+                    index: 99,
+                    name: "test-tun".into(),
+                    gateway: None,
+                },
+            })
+            .collect();
         transaction.apply(desired, &mut backend).unwrap();
-        let zero_keys: Vec<_> = backend.routes.iter().filter(|route| route.destination().is_unspecified()).collect();
+        let zero_keys: Vec<_> = backend
+            .routes
+            .iter()
+            .filter(|route| route.destination().is_unspecified())
+            .collect();
         assert_eq!(zero_keys, vec![&default]);
         transaction.restore(&mut backend).unwrap();
         assert_eq!(backend.routes, vec![default]);
