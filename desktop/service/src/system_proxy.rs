@@ -156,12 +156,10 @@ fn services() -> Result<Vec<String>> {
 }
 #[cfg(target_os = "macos")]
 fn snapshot(service: &str) -> Result<Snapshot> {
-    Ok(Snapshot(serde_json::from_str(&native(
-        "proxy-read",
-        Some(service),
-        None,
-    )?)
-    .context("系统代理辅助程序 proxy-read 未返回有效的 JSON")?))
+    Ok(Snapshot(
+        serde_json::from_str(&native("proxy-read", Some(service), None)?)
+            .context("系统代理辅助程序 proxy-read 未返回有效的 JSON")?,
+    ))
 }
 #[cfg(target_os = "macos")]
 fn desired(original: &Snapshot, port: u16) -> Snapshot {
@@ -224,8 +222,9 @@ fn snapshot(_: &str) -> Result<Snapshot> {
         ),
         None,
     )?;
-    Ok(Snapshot(serde_json::from_str(&value)
-        .context("Windows 系统代理读取结果不是有效的 JSON")?))
+    Ok(Snapshot(
+        serde_json::from_str(&value).context("Windows 系统代理读取结果不是有效的 JSON")?,
+    ))
 }
 #[cfg(windows)]
 fn desired(original: &Snapshot, port: u16) -> Snapshot {
@@ -288,7 +287,10 @@ mod tests {
         assert!(message.contains("系统代理恢复记录"));
         assert!(message.contains("system-proxy.json"));
         assert!(message.contains("expected value"));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "<html>not json</html>");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "<html>not json</html>"
+        );
     }
     #[test]
     fn interrupted_application_restores_original_values() {

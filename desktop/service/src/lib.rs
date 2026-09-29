@@ -1,9 +1,9 @@
-pub mod diagnostics;
 pub mod client;
-pub mod update;
+pub mod diagnostics;
 pub mod system_proxy;
 pub mod transport;
 pub mod trusted;
+pub mod update;
 
 pub const SERVICE_NAME: &str = "org.clyntis.desktop.service";
 pub const PIPE_NAME: &str = r"\\.\pipe\org.clyntis.desktop.service.v1";

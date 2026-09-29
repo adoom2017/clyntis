@@ -69,43 +69,36 @@ const pages: {
   id: Page;
   label: string;
   icon: typeof Gauge;
-  subtitle: string;
 }[] = [
   {
     id: "overview",
     label: "概览",
     icon: Gauge,
-    subtitle: "你的网络，一目了然。",
   },
   {
     id: "proxies",
     label: "代理节点",
     icon: Globe2,
-    subtitle: "选择适合你的连接线路。",
   },
   {
     id: "profiles",
     label: "配置管理",
     icon: Layers3,
-    subtitle: "管理配置文件与订阅更新。",
   },
   {
     id: "connections",
     label: "网络连接",
     icon: Network,
-    subtitle: "查看流经 Clyntis 的每一次连接。",
   },
   {
     id: "logs",
     label: "运行日志",
     icon: Terminal,
-    subtitle: "查看内核运行状态，定位连接问题。",
   },
   {
     id: "settings",
     label: "设置",
     icon: Settings2,
-    subtitle: "让 Clyntis 按照你的习惯工作。",
   },
 ];
 
@@ -264,6 +257,8 @@ export default function App() {
             <button
               key={id}
               className={`nav-item ${page === id ? "active" : ""}`}
+              aria-label={label}
+              title={label}
               onClick={() => setPage(id)}
               aria-current={page === id ? "page" : undefined}
             >
@@ -293,6 +288,10 @@ export default function App() {
             {currentPage.label}
           </span>
           <div className="topbar-right">
+            <span className={`status-pill ${running ? "connected" : ""}`}>
+              <span className={`status-dot ${running ? "online" : ""}`} />
+              {statusText[state.status]}
+            </span>
             <span className="local-badge">
               <ShieldCheck size={13} />
               本地运行
@@ -301,16 +300,6 @@ export default function App() {
           </div>
         </header>
         <div className="content">
-          <div className="page-heading">
-            <div>
-              <h1>{currentPage.label}</h1>
-              <p>{currentPage.subtitle}</p>
-            </div>
-            <span className={`status-pill ${running ? "connected" : ""}`}>
-              <span className={`status-dot ${running ? "online" : ""}`} />
-              {statusText[state.status]}
-            </span>
-          </div>
           {state.serviceStatus === "updating" && (
             <div className="alert" role="status">
               正在安装或更新网络辅助服务。若系统请求授权，请允许 Clyntis
