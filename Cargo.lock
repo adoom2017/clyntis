@@ -546,18 +546,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "chrono",
  "clap",
- "flate2",
  "meta-config",
  "meta-core",
  "meta-platform",
+ "meta-runtime",
  "rpassword",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
- "tracing-subscriber",
  "zeroize",
 ]
 
@@ -1736,6 +1735,24 @@ dependencies = [
  "x509-parser",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "meta-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "flate2",
+ "meta-config",
+ "meta-core",
+ "meta-platform",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -54,3 +54,11 @@ config-decrypt.yaml
 *.key
 *.p12
 *.pfx
+
+# Desktop build output (desktop source has an independent workspace).
+/desktop/node_modules/
+/desktop/dist/
+/desktop/target/
+/desktop/src-tauri/binaries/
+/desktop/src-tauri/gen/
+/desktop/*.tsbuildinfo

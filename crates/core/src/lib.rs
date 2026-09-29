@@ -143,6 +143,7 @@ pub struct Running {
     tasks: JoinSet<()>,
     system_dns_tasks: JoinSet<()>,
     pub addresses: Vec<SocketAddr>,
+    pub controller_address: Option<SocketAddr>,
 }
 impl Running {
     pub async fn rebind_system_dns(&mut self, address: SocketAddr) -> Result<()> {
@@ -283,6 +284,7 @@ impl Core {
         let mut tasks = JoinSet::new();
         let mut system_dns_tasks = JoinSet::new();
         let mut addresses = vec![];
+        let mut controller_address = None;
         if self.config.ntp.enable {
             let core = self.clone();
             tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(core.config.ntp.interval.saturating_mul(60)));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}}tokio::select!{_=core.stop.cancelled()=>break,result=core.sync_ntp()=>{if let Err(error)=result {tracing::warn!(%error,"NTP synchronization failed; retaining current clock offset");}}}}});
@@ -386,6 +388,7 @@ impl Core {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("cannot bind controller TCP listener at {addr}"))?;
+            controller_address = Some(listener.local_addr()?);
             let core = self.clone();
             let stop = self.stop.clone();
             tasks.spawn(async move {
@@ -435,6 +438,7 @@ impl Core {
             core: self.clone(),
             tasks,
             addresses,
+            controller_address,
         })
     }
     pub fn restore_target(&self, target: &Target) -> Target {

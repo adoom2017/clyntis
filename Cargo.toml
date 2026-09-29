@@ -1,7 +1,7 @@
 [workspace]
-members = ["crates/config", "crates/protocol", "crates/platform", "crates/core", "crates/cli", "crates/ffi"]
+members = ["crates/config", "crates/protocol", "crates/platform", "crates/core", "crates/cli", "crates/ffi", "crates/runtime"]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["fuzz", "desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -42,6 +42,7 @@ meta-config = { path = "crates/config" }
 meta-protocol = { path = "crates/protocol" }
 meta-platform = { path = "crates/platform" }
 meta-core = { path = "crates/core" }
+meta-runtime = { path = "crates/runtime" }
 
 [profile.release]
 lto = "thin"
