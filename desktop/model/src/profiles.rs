@@ -1,0 +1,414 @@
+use crate::{CONFIG_LIMIT, atomic_write, now, private_dir, read_limited, settings::Settings};
+use anyhow::{Context, Result, ensure};
+use meta_config::{Config, ProxyKind};
+use serde::{Deserialize, Serialize};
+use serde_yaml::{Mapping, Value};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+};
+use uuid::Uuid;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    pub id: Uuid,
+    pub name: String,
+    pub url: Option<String>,
+    pub yaml: String,
+    pub pending: Option<String>,
+    pub previous: Option<String>,
+    pub last_checked: u64,
+    pub last_error: Option<String>,
+    pub mode: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub source: String,
+    pub pending: bool,
+    pub last_checked: u64,
+    pub last_error: Option<String>,
+}
+impl Profile {
+    pub fn summary(&self) -> ProfileSummary {
+        ProfileSummary {
+            id: self.id,
+            name: self.name.clone(),
+            source: self
+                .url
+                .as_ref()
+                .and_then(|s| reqwest::Url::parse(s).ok())
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "本地文件".into()),
+            pending: self.pending.is_some(),
+            last_checked: self.last_checked,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Store {
+    pub root: PathBuf,
+}
+impl Store {
+    pub fn new(root: PathBuf) -> Result<Self> {
+        private_dir(&root)?;
+        private_dir(&root.join("profiles"))?;
+        Ok(Self { root })
+    }
+    pub fn directory(&self, id: Uuid) -> PathBuf {
+        self.root.join("profiles").join(id.to_string())
+    }
+    pub fn runtime_dir(&self, id: Uuid) -> PathBuf {
+        self.directory(id).join("runtime")
+    }
+    pub fn list(&self) -> Result<Vec<ProfileSummary>> {
+        let mut profiles = Vec::new();
+        for entry in fs::read_dir(self.root.join("profiles"))? {
+            let entry = entry?;
+            if let Ok(id) = Uuid::parse_str(&entry.file_name().to_string_lossy()) {
+                profiles.push(self.get(id)?.summary());
+            }
+        }
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(profiles)
+    }
+    pub fn get(&self, id: Uuid) -> Result<Profile> {
+        Ok(serde_json::from_slice(&read_limited(
+            &self.directory(id).join("profile.json"),
+            CONFIG_LIMIT * 3 + 65536,
+        )?)?)
+    }
+    pub fn save(&self, profile: &Profile) -> Result<()> {
+        validate(&profile.yaml)?;
+        atomic_write(
+            &self.directory(profile.id).join("profile.json"),
+            &serde_json::to_vec(profile)?,
+        )
+    }
+    pub fn create(&self, name: String, yaml: String, url: Option<String>) -> Result<Profile> {
+        ensure!(
+            !name.trim().is_empty() && name.len() <= 256,
+            "配置名称不能为空且不能超过 256 字节"
+        );
+        let config = validate(&yaml)?;
+        if let Some(url) = &url {
+            subscription_url(url)?;
+        }
+        let profile = Profile {
+            id: Uuid::new_v4(),
+            name: name.trim().into(),
+            yaml,
+            url,
+            pending: None,
+            previous: None,
+            last_checked: now(),
+            last_error: None,
+            mode: serde_json::to_value(config.mode)?
+                .as_str()
+                .unwrap_or("rule")
+                .into(),
+        };
+        self.save(&profile)?;
+        private_dir(&self.runtime_dir(profile.id))?;
+        Ok(profile)
+    }
+    pub fn delete(&self, id: Uuid) -> Result<()> {
+        self.get(id)?;
+        fs::remove_dir_all(self.directory(id))?;
+        Ok(())
+    }
+    pub fn settings(&self) -> Result<Settings> {
+        let path = self.root.join("settings.json");
+        if !path.exists() {
+            return Ok(Settings::default());
+        }
+        let settings: Settings = serde_json::from_slice(&read_limited(&path, 65536)?)?;
+        settings.validate()?;
+        Ok(settings)
+    }
+    pub fn save_settings(&self, settings: &Settings) -> Result<()> {
+        settings.validate()?;
+        atomic_write(
+            &self.root.join("settings.json"),
+            &serde_json::to_vec(settings)?,
+        )
+    }
+    pub fn selected(&self) -> Result<Option<Uuid>> {
+        let path = self.root.join("selected.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let id: Option<Uuid> = serde_json::from_slice(&read_limited(&path, 1024)?)?;
+        Ok(id.filter(|id| self.directory(*id).exists()))
+    }
+    pub fn select(&self, id: Option<Uuid>) -> Result<()> {
+        if let Some(id) = id {
+            self.get(id)?;
+        }
+        atomic_write(&self.root.join("selected.json"), &serde_json::to_vec(&id)?)
+    }
+    pub fn import_file(&self, path: &Path) -> Result<Profile> {
+        let yaml = String::from_utf8(read_limited(path, CONFIG_LIMIT)?)?;
+        let config = validate(&yaml)?;
+        let source = path.parent().context("无法读取配置目录")?.canonicalize()?;
+        let profile = self.create(
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into(),
+            yaml,
+            None,
+        )?;
+        let result = (|| {
+            for name in resource_names(&config) {
+                let relative = safe_relative(&name)?;
+                let file = source.join(&relative);
+                if !file.exists() {
+                    continue;
+                }
+                let file = file.canonicalize()?;
+                ensure!(file.starts_with(&source), "资源不能指向配置目录外部");
+                atomic_write(
+                    &self.runtime_dir(profile.id).join(relative),
+                    &read_limited(&file, 128 * 1024 * 1024)?,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = self.delete(profile.id);
+            return Err(error);
+        }
+        Ok(profile)
+    }
+}
+
+pub fn resource_names(config: &Config) -> Vec<String> {
+    let mut names = vec!["geoip.dat".into(), "geosite.dat".into()];
+    names.extend(
+        config
+            .rule_providers
+            .values()
+            .filter(|p| !p.path.is_empty())
+            .map(|p| p.path.clone()),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub fn safe_relative(path: &str) -> Result<PathBuf> {
+    ensure!(
+        path.len() <= 512 && !path.contains([':', '\\']),
+        "资源路径必须使用可移植的相对路径"
+    );
+    let path = Path::new(path);
+    ensure!(
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_) | Component::CurDir)),
+        "资源必须使用配置目录内的相对路径"
+    );
+    // The journals and application data may never be overwritten by a provider.
+    ensure!(
+        path.components()
+            .all(|part| matches!(part, Component::CurDir)
+                || !part.as_os_str().to_string_lossy().starts_with('.')),
+        "资源路径不能包含隐藏文件"
+    );
+    let name = path
+        .file_name()
+        .context("资源路径必须包含文件名")?
+        .to_string_lossy();
+    ensure!(
+        !name.starts_with("clyntis-")
+            && !matches!(
+                name.as_ref(),
+                "profile.json" | "settings.json" | "selected.json"
+            ),
+        "资源路径与运行文件冲突"
+    );
+    Ok(path.to_owned())
+}
+
+pub fn validate(yaml: &str) -> Result<Config> {
+    ensure!(yaml.len() <= CONFIG_LIMIT, "配置超过 24 MiB");
+    let config = Config::parse(yaml.as_bytes()).context("配置校验失败")?;
+    let unsupported: Vec<_> = config
+        .proxies
+        .iter()
+        .filter(|p| p.kind != ProxyKind::Vless)
+        .map(|p| p.name.as_str())
+        .collect();
+    ensure!(
+        unsupported.is_empty(),
+        "当前仅支持 VLESS，以下节点协议未实现：{}",
+        unsupported.join("、")
+    );
+    for provider in config.rule_providers.values() {
+        if !provider.path.is_empty() {
+            safe_relative(&provider.path)?;
+        }
+    }
+    Ok(config)
+}
+
+/// Operate on the YAML document, never Serialize(Config): credentials are skip_serializing.
+pub fn runtime_yaml(profile: &Profile, settings: &Settings, secret: &str) -> Result<String> {
+    validate(&profile.yaml)?;
+    settings.validate()?;
+    let mut document: Value = serde_yaml::from_str(&profile.yaml)?;
+    let map = document.as_mapping_mut().context("配置必须是 YAML 对象")?;
+    for (key, value) in [
+        ("port", Value::from(0)),
+        ("socks-port", Value::from(0)),
+        ("mixed-port", Value::from(settings.mixed_port)),
+        ("allow-lan", Value::from(settings.allow_lan)),
+        (
+            "bind-address",
+            Value::from(if settings.allow_lan {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            }),
+        ),
+        ("external-controller", Value::from("127.0.0.1:0")),
+        ("external-ui", Value::from("")),
+        ("secret", Value::from(secret)),
+        ("mode", Value::from(profile.mode.clone())),
+    ] {
+        map.insert(Value::from(key), value);
+    }
+    // Logging must never write to a path supplied by a downloaded configuration.
+    nested(map, "log")?.insert(Value::from("log-path"), Value::from(""));
+    nested(map, "profile")?.insert(Value::from("store-selected"), Value::from(true));
+    let tun = nested(map, "tun")?;
+    let enabled = settings.capture == crate::settings::Capture::Tun;
+    tun.insert(Value::from("enable"), Value::from(enabled));
+    tun.insert(Value::from("auto-dns"), Value::from(settings.auto_dns));
+    tun.insert(Value::from("auto-route"), Value::from(enabled));
+    if let Some(interface) = settings.tun_interface.as_ref().filter(|s| !s.is_empty()) {
+        tun.insert(Value::from("interface"), Value::from(interface.clone()));
+    } else {
+        tun.remove(Value::from("interface"));
+    }
+    if enabled {
+        nested(map, "dns")?.insert(Value::from("enable"), Value::from(true));
+    }
+    let yaml = serde_yaml::to_string(&document)?;
+    validate(&yaml)?;
+    Ok(yaml)
+}
+fn nested<'a>(map: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
+    map.entry(Value::from(key))
+        .or_insert(Value::Mapping(Mapping::new()))
+        .as_mapping_mut()
+        .context("配置项必须是对象")
+}
+
+pub fn subscription_url(url: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(url).context("订阅 URL 无效")?;
+    ensure!(
+        url.scheme() == "https" && url.host_str().is_some(),
+        "订阅需要使用 HTTPS URL"
+    );
+    ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "请将订阅令牌放在 URL 路径或查询参数中"
+    );
+    Ok(url)
+}
+
+pub async fn download(url: &str) -> Result<String> {
+    let url = subscription_url(url)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("Clyntis-Desktop/0.1")
+        .build()?;
+    // Do not return reqwest errors verbatim: they contain private subscription URLs.
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("订阅下载失败，请检查网络和 URL"))?;
+    ensure!(
+        response.status().is_success(),
+        "订阅服务器返回 HTTP {}",
+        response.status().as_u16()
+    );
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|n| n <= CONFIG_LIMIT as u64),
+        "订阅超过 24 MiB"
+    );
+    let mut data = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!("订阅下载中断"))?
+    {
+        ensure!(data.len() + chunk.len() <= CONFIG_LIMIT, "订阅超过 24 MiB");
+        data.extend_from_slice(&chunk);
+    }
+    let yaml = String::from_utf8(data).context("订阅不是 UTF-8 YAML")?;
+    validate(&yaml)?;
+    Ok(yaml)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const YAML: &str = "mixed-port: 7890\nproxies:\n- name: test\n  type: vless\n  server: example.com\n  port: 443\n  uuid: 11111111-1111-4111-8111-111111111111\nrules:\n- MATCH,DIRECT\n";
+    #[test]
+    fn credentials_survive_runtime_overrides_and_disk_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        let profile = store.create("test".into(), YAML.into(), None).unwrap();
+        let saved = store.get(profile.id).unwrap();
+        assert_eq!(saved.yaml, YAML);
+        let yaml = runtime_yaml(&saved, &Settings::default(), "test-secret").unwrap();
+        assert!(yaml.contains("11111111-1111-4111-8111-111111111111"));
+        let config = validate(&yaml).unwrap();
+        assert_eq!(config.secret, "test-secret");
+        assert_eq!(config.external_controller.as_deref(), Some("127.0.0.1:0"));
+        assert!(!config.tun.enable);
+    }
+    #[test]
+    fn invalid_save_preserves_previous_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        let mut profile = store.create("test".into(), YAML.into(), None).unwrap();
+        profile.yaml = "unknown: value".into();
+        assert!(store.save(&profile).is_err());
+        assert_eq!(store.get(profile.id).unwrap().yaml, YAML);
+    }
+    #[test]
+    fn resource_paths_cannot_escape_or_overwrite_journals() {
+        for path in [
+            "../x",
+            "/tmp/x",
+            ".meta-profile.json",
+            "clyntis-tun-state.json",
+            "a/../b",
+        ] {
+            assert!(safe_relative(path).is_err(), "{path}");
+        }
+        assert!(safe_relative("rule_provider/example.yaml").is_ok());
+    }
+    #[test]
+    fn unsupported_protocols_and_non_yaml_are_rejected() {
+        assert!(validate(&YAML.replace("type: vless", "type: trojan")).is_err());
+        assert!(validate("dmxlc3M6Ly9mb28=").is_err());
+        assert!(subscription_url("http://example.com/sub").is_err());
+    }
+}

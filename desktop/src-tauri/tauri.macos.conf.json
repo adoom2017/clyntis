@@ -1,0 +1,15 @@
+{
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "externalBin": [
+      "binaries/clyntis-runner",
+      "binaries/clyntis-service",
+      "binaries/clyntis-service-manager"
+    ],
+    "macOS": {
+      "files": {
+        "Library/LaunchDaemons/org.clyntis.desktop.service.plist": "../packaging/macos/org.clyntis.desktop.service.plist"
+      }
+    }
+  }
+}

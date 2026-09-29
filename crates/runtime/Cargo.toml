@@ -1,0 +1,19 @@
+[package]
+name = "meta-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+meta-core.workspace = true
+meta-config.workspace = true
+meta-platform.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+[dev-dependencies]
+tempfile = "3"

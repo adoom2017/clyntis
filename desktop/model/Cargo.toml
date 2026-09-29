@@ -1,0 +1,18 @@
+[package]
+name = "clyntis-desktop-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true
+meta-config.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tempfile = "3"
+regex = "1"
+[dev-dependencies]
+

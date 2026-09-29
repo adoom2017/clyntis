@@ -1,0 +1,59 @@
+name: Desktop App
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Rust toolchain
+        run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
+      - name: Windows native prerequisites
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: node packaging/prepare.mjs --debug
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Runner lifecycle integration (macOS)
+        if: runner.os == 'macOS'
+        run: python3 tests/runner_integration.py target/debug/clyntis-runner
+      - name: Runner lifecycle integration (Windows)
+        if: runner.os == 'Windows'
+        run: python tests/runner_integration.py target/debug/clyntis-runner.exe
+      - name: Build installer
+        run: npm run desktop:build
+      - uses: actions/upload-artifact@v6
+        with:
+          name: clyntis-desktop-${{ matrix.os }}
+          path: |
+            desktop/target/release/bundle/dmg/*.dmg
+            desktop/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

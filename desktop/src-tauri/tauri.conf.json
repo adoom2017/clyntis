@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Clyntis",
+  "version": "0.1.0",
+  "identifier": "org.clyntis.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Clyntis",
+        "width": 1180,
+        "height": 790,
+        "minWidth": 900,
+        "minHeight": 620,
+        "backgroundColor": "#f6f7f9"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; connect-src ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; base-uri 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Clyntis 代理桌面客户端",
+    "license": "GPL-3.0-only",
+    "resources": { "../../LICENSE": "LICENSE", "../README.md": "README.md" },
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "externalBin": ["binaries/clyntis-runner", "binaries/clyntis-service"],
+    "macOS": { "minimumSystemVersion": "13.0", "hardenedRuntime": true },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true,
+        "installerHooks": "../packaging/windows/hooks.nsh"
+      }
+    }
+  }
+}

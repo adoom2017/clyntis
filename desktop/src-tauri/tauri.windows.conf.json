@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "binaries/wintun.dll": "wintun.dll",
+      "binaries/wintun-LICENSE.txt": "wintun-LICENSE.txt"
+    }
+  }
+}
