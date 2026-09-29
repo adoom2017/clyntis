@@ -70,6 +70,27 @@ struct ServiceManager {
         try check(SecRequirementCreateWithString(expression as CFString, [], &requirement))
         try check(SecCodeCheckValidity(guest!, SecCSFlags(rawValue: kSecCSStrictValidate), requirement))
     }
+    static func restartService() throws {
+        // SIGTERM lets the daemon restore routes/DNS before KeepAlive starts the new bundle binary.
+        let restart = Process()
+        restart.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        restart.arguments = ["kill", "SIGTERM", "system/org.clyntis.desktop.service"]
+        restart.standardError = Pipe()
+        try restart.run()
+        restart.waitUntilExit()
+        if restart.terminationStatus == 0 { return }
+        let authorization = Process()
+        authorization.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        authorization.arguments = ["-e", "do shell script \"/bin/launchctl kill SIGTERM system/org.clyntis.desktop.service || /bin/launchctl kickstart system/org.clyntis.desktop.service\" with administrator privileges with prompt \"Clyntis 需要重新启动网络辅助服务以完成更新。该服务用于创建 TUN 虚拟网卡、设置路由、DNS 和系统代理；退出代理时恢复网络设置。\""]
+        let errors = Pipe()
+        authorization.standardError = errors
+        try authorization.run()
+        authorization.waitUntilExit()
+        guard authorization.terminationStatus == 0 else {
+            let detail = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw NSError(domain: "Clyntis", code: 10, userInfo: [NSLocalizedDescriptionKey: "辅助服务更新未完成，管理员授权被取消或系统拒绝操作。\n\(detail)"])
+        }
+    }
     static func main() async {
         do {
             let args = CommandLine.arguments
@@ -79,10 +100,22 @@ struct ServiceManager {
             }
             let service = SMAppService.daemon(plistName: "org.clyntis.desktop.service.plist")
             switch args.dropFirst().first {
-            case "install":
-                if service.status == .enabled { try await service.unregister() }
-                if service.status != .enabled && service.status != .requiresApproval { try service.register() }
+            case "install", "update":
+                let wasEnabled = service.status == .enabled
+                // Registration is idempotent. Unregistering an enabled daemon
+                // here can disable its BTM entry and leave it unable to bootstrap.
+                if service.status != .enabled && service.status != .requiresApproval {
+                    do { try service.register() }
+                    catch {
+                        if (error as NSError).code == Int(EPERM) {
+                            SMAppService.openSystemSettingsLoginItems()
+                            throw NSError(domain: "Clyntis", code: 9, userInfo: [NSLocalizedDescriptionKey: "macOS 禁止启动该后台项目。请在系统设置 → 通用 → 登录项与扩展中允许 Clyntis（可能显示为证书开发者名称）在后台运行，然后重试。"])
+                        }
+                        throw error
+                    }
+                }
                 if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+                if args[1] == "update" && wasEnabled { try restartService() }
             case "uninstall":
                 if service.status != .notRegistered { try await service.unregister() }
             case "status": break

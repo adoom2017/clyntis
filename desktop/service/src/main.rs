@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use clyntis_desktop_model::protocol::FrameReader;
 use clyntis_desktop_model::{
     private_dir,
     profiles::{safe_relative, validate},
@@ -6,12 +7,10 @@ use clyntis_desktop_model::{
 };
 use clyntis_desktop_service::{system_proxy::ProxyGuard, transport};
 use std::{path::PathBuf, process::Stdio, time::Duration};
-use tokio::{
-    io::BufReader,
-    process::{Child, ChildStdin, ChildStdout},
-};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+mod diagnostics;
 
 #[cfg(windows)]
 mod windows;
@@ -91,10 +90,39 @@ async fn serve(stop: CancellationToken) -> Result<()> {
 struct Runner {
     child: Child,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    output: FrameReader<ChildStdout>,
     directory: PathBuf,
+    diagnostics: diagnostics::Diagnostics,
+    stderr_task: tokio::task::JoinHandle<()>,
+    exit_error: Option<String>,
 }
 impl Runner {
+    async fn check(&mut self) -> Result<()> {
+        if let Some(error) = &self.exit_error {
+            anyhow::bail!("{error}");
+        }
+        if let Some(status) = self.child.try_wait()? {
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut self.stderr_task).await;
+            let message = tokio::time::timeout(
+                Duration::from_secs(1),
+                protocol::read_frame(&mut self.output),
+            )
+            .await;
+            let detail = match message {
+                Ok(Ok(Some(line))) => match serde_json::from_str::<Response>(&line) {
+                    Ok(Response::Error { message, .. }) => message,
+                    _ => self.diagnostics.tail(),
+                },
+                _ => self.diagnostics.tail(),
+            };
+            self.diagnostics
+                .record(&self.directory, &format!("内核退出（{status}）：{detail}"));
+            let error = format!("内核进程已退出（{status}）：{detail}");
+            self.exit_error = Some(error.clone());
+            anyhow::bail!("{error}");
+        }
+        Ok(())
+    }
     async fn stop(&mut self) -> Result<()> {
         let _ = protocol::write_frame(&mut self.input, &Request::Stop { version: VERSION }).await;
         match tokio::time::timeout(Duration::from_secs(20), self.child.wait()).await {
@@ -106,8 +134,53 @@ impl Runner {
                 self.child.wait().await?;
             }
         }
-        meta_runtime::recover(&self.directory)?;
-        Ok(())
+        let exit = if self
+            .child
+            .try_wait()?
+            .is_some_and(|status| !status.success())
+        {
+            self.check().await
+        } else {
+            Ok(())
+        };
+        let recovery = meta_runtime::recover(&self.directory);
+        exit.and(recovery)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runner_exit_reports_status_and_structured_error() {
+        let directory = std::env::temp_dir().join(format!("clyntis-exit-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' '{\"event\":\"error\",\"version\":1,\"message\":\"cannot update TUN routing: File exists\"}'; exit 7"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = FrameReader::new(child.stdout.take().unwrap());
+        child.wait().await.unwrap();
+        let mut runner = Runner {
+            child,
+            input,
+            output,
+            directory: directory.clone(),
+            diagnostics: diagnostics::Diagnostics::default(),
+            stderr_task: tokio::spawn(async {}),
+            exit_error: None,
+        };
+        let error = runner.check().await.unwrap_err().to_string();
+        assert_eq!(runner.check().await.unwrap_err().to_string(), error);
+        assert!(error.contains("7"));
+        assert!(error.contains("cannot update TUN routing: File exists"));
+        assert!(
+            std::fs::read_to_string(directory.join("clyntis-runner.log"))
+                .unwrap()
+                .contains("File exists")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -116,7 +189,7 @@ async fn session(
     root: &std::path::Path,
     stop: CancellationToken,
 ) -> Result<()> {
-    let mut stream = BufReader::new(stream);
+    let mut stream = FrameReader::new(stream);
     let mut runner: Option<Runner> = None;
     let mut proxy = ProxyGuard::recover(root.join("system-proxy.json"))?;
     let mut refresh = tokio::time::interval(Duration::from_secs(5));
@@ -129,16 +202,19 @@ async fn session(
             _ = tokio::time::sleep_until(deadline) => anyhow::bail!("desktop heartbeat expired"),
             _ = refresh.tick() => {
                 proxy.refresh()?;
-                if let Some(child) = &mut runner { ensure!(child.child.try_wait()?.is_none(), "core exited unexpectedly"); }
+                if let Some(child) = &mut runner { child.check().await?; }
             },
             line = protocol::read_frame(&mut stream) => {
                 let Some(line) = line? else { break; };
-                let request: Request = serde_json::from_str(&line)?;
+                let request: Request = serde_json::from_str(&line).context("桌面请求不是有效的 JSON")?;
                 ensure!(request.version() == VERSION, "IPC version mismatch");
                 deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 let response = match request {
-                    Request::Ping { .. } => Response::Ok { version: VERSION },
-                    Request::Status { .. } => Response::Status { version: VERSION, running: runner.is_some() },
+                    Request::Ping { .. } => {
+                        if let Some(child) = &mut runner { child.check().await?; }
+                        Response::Ok { version: VERSION }
+                    },
+                    Request::Status { .. } => Response::Status { version: VERSION, running: runner.is_some(), build: Some(protocol::SERVICE_BUILD.into()) },
                     Request::Proxy { port, .. } => {
                         #[cfg(windows)] { let _ = port; anyhow::bail!("system proxy must run in the user session"); }
                         #[cfg(not(windows))] { proxy.enable(port)?; Response::Ok { version: VERSION } }
@@ -170,12 +246,17 @@ async fn session(
                             clyntis_desktop_model::atomic_write(&directory.join(safe_relative(&name)?), &bytes)?;
                         }
                         let mut command = tokio::process::Command::new(clyntis_desktop_service::sibling("clyntis-runner")?);
-                        command.arg("--directory").arg(&directory).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+                        command.arg("--directory").arg(&directory).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
                         #[cfg(windows)] command.creation_flags(0x08000000);
                         let mut child = command.spawn()?;
                         let input = child.stdin.take().context("missing runner stdin")?;
-                        let output = BufReader::new(child.stdout.take().context("missing runner stdout")?);
-                        runner = Some(Runner { child, input, output, directory });
+                        let output = FrameReader::new(child.stdout.take().context("missing runner stdout")?);
+                        let stderr = child.stderr.take().context("missing runner stderr")?;
+                        let diagnostics = diagnostics::Diagnostics::default();
+                        let capture = diagnostics.clone();
+                        let log_directory = directory.clone();
+                        let stderr_task = tokio::spawn(async move { capture.capture(stderr, log_directory).await; });
+                        runner = Some(Runner { child, input, output, directory, diagnostics, stderr_task, exit_error: None });
                         let child = runner.as_mut().unwrap();
                         protocol::write_frame(&mut child.input, &Request::Start { version, yaml, profile_id, system_proxy_port: None }).await?;
                         let line = tokio::select! {
@@ -183,7 +264,7 @@ async fn session(
                             result = tokio::time::timeout(Duration::from_secs(100), protocol::read_frame(&mut child.output)) => result??.context("runner exited before ready")?,
                         };
                         deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                        let response: Response = serde_json::from_str(&line)?;
+                        let response: Response = serde_json::from_str(&line).context("内核启动响应不是有效的 JSON")?;
                         if let Response::Error { message, .. } = response { anyhow::bail!("{message}"); }
                         response
                     },

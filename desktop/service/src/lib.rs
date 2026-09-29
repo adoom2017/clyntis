@@ -1,4 +1,6 @@
+pub mod diagnostics;
 pub mod client;
+pub mod update;
 pub mod system_proxy;
 pub mod transport;
 pub mod trusted;

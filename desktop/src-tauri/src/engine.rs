@@ -37,7 +37,7 @@ pub fn log(app: &tauri::AppHandle, logs: &Logs, level: &str, message: &str) {
 struct Process {
     child: Child,
     input: ChildStdin,
-    output: BufReader<ChildStdout>,
+    output: protocol::FrameReader<ChildStdout>,
 }
 pub struct Engine {
     process: Option<Process>,
@@ -70,7 +70,7 @@ impl Engine {
         let mut process = None;
         let mut service = None;
         let controller = if settings.capture == Capture::Tun {
-            let mut connection = Client::connect().await?;
+            let mut connection = Client::connect_current().await?;
             let config = validate(&yaml)?;
             let mut total = 0;
             for name in resource_names(&config) {
@@ -111,10 +111,13 @@ impl Engine {
                 .spawn()
                 .context("无法启动内核，请重新构建或安装完整桌面应用")?;
             let mut input = child.stdin.take().context("runner stdin missing")?;
-            let mut output = BufReader::new(child.stdout.take().context("runner stdout missing")?);
+            let mut output =
+                protocol::FrameReader::new(child.stdout.take().context("runner stdout missing")?);
             if let Some(stderr) = child.stderr.take() {
                 let app = app.clone();
                 let logs = logs.clone();
+                let directory = store.runtime_dir(profile.id);
+                let diagnostics = clyntis_desktop_service::diagnostics::Diagnostics::default();
                 tokio::spawn(async move {
                     use tokio::io::AsyncBufReadExt;
                     let mut reader = BufReader::new(stderr);
@@ -126,6 +129,7 @@ impl Engine {
                             _ => {}
                         }
                         if line.len() < 65536 {
+                            diagnostics.record(&directory, line.trim());
                             log(&app, &logs, "info", line.trim());
                         }
                     }
@@ -137,7 +141,8 @@ impl Engine {
                     .await
                     .context("内核启动超时，请检查订阅资源和网络")??
                     .context("内核在启动完成前退出，请查看日志")?;
-            let address = ready(serde_json::from_str(&first)?)?;
+            let address =
+                ready(serde_json::from_str(&first).context("内核启动响应不是有效的 JSON")?)?;
             process = Some(Process {
                 child,
                 input,
@@ -162,7 +167,7 @@ impl Engine {
         #[cfg(target_os = "macos")]
         if settings.capture == Capture::System {
             let result = async {
-                let mut service = Client::connect().await?;
+                let mut service = Client::connect_current().await?;
                 service
                     .request(&Request::Proxy {
                         version: VERSION,
@@ -234,8 +239,14 @@ impl Engine {
         if let Some(error) = self.heartbeat_error.lock().unwrap().clone() {
             anyhow::bail!("{error}");
         }
-        self.request(reqwest::Method::GET, &["version"], None)
-            .await?;
+        if let Err(error) = self.request(reqwest::Method::GET, &["version"], None).await {
+            // The local HTTP listener may close before the next heartbeat.
+            // Ask the supervisor for the runner's exit status and actual error.
+            if let Some(service) = &self.service {
+                service.lock().await.ping().await?;
+            }
+            return Err(error);
+        }
         Ok(())
     }
     pub async fn stop(&mut self) -> Result<()> {

@@ -425,6 +425,22 @@ impl Transaction {
         Ok(())
     }
     fn apply(&mut self, desired: Vec<RouteSpec>, backend: &mut impl Routes) -> Result<()> {
+        // Darwin keys unscoped routes by destination/prefix, not interface.
+        // Remove only journal-owned conflicting routes before adding their
+        // replacements. Keep the old entries journaled until apply completes so
+        // recovery can handle a failure at any point in the switch.
+        let replaced: Vec<_> = self
+            .journal
+            .routes
+            .iter()
+            .filter(|old| {
+                !desired.contains(old) && desired.iter().any(|new| new.network == old.network)
+            })
+            .cloned()
+            .collect();
+        for old in replaced {
+            self.remove(&old, backend)?;
+        }
         let present = backend.list()?;
         for spec in &desired {
             if present.iter().any(|r| spec.matches(r)) {
@@ -857,6 +873,59 @@ mod tests {
             self.routes.retain(|r| r != route);
             Ok(())
         }
+    }
+    #[test]
+    fn replacing_owned_egress_routes_does_not_add_duplicate_prefixes() {
+        struct UniquePrefixes(Vec<Route>);
+        impl Routes for UniquePrefixes {
+            fn list(&mut self) -> Result<Vec<Route>> {
+                Ok(self.0.clone())
+            }
+            fn add(&mut self, route: &Route) -> Result<()> {
+                ensure!(
+                    !self
+                        .0
+                        .iter()
+                        .any(|old| old.network() == route.network()
+                            && old.prefix() == route.prefix()),
+                    "File exists (os error 17)"
+                );
+                self.0.push(route.clone());
+                Ok(())
+            }
+            fn delete(&mut self, route: &Route) -> Result<()> {
+                self.0.retain(|old| old != route);
+                Ok(())
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-egress-{}", uuid::Uuid::new_v4()));
+        let old = RouteSpec {
+            network: "223.5.5.5/32".parse().unwrap(),
+            interface: ExitInterface {
+                index: 7,
+                name: "en7".into(),
+                gateway: Some("192.168.2.1".parse().unwrap()),
+            },
+        };
+        let new = RouteSpec {
+            interface: ExitInterface {
+                index: 10,
+                name: "en0".into(),
+                gateway: Some("192.168.1.1".parse().unwrap()),
+            },
+            ..old.clone()
+        };
+        let external = Route::new("192.0.2.0".parse().unwrap(), 24).with_if_index(1);
+        let mut backend = UniquePrefixes(vec![external.clone()]);
+        let mut transaction = Transaction::open(&directory).unwrap();
+        transaction.apply(vec![old], &mut backend).unwrap();
+        transaction.apply(vec![new.clone()], &mut backend).unwrap();
+        assert_eq!(backend.0, vec![external.clone(), new.route()]);
+        transaction.restore(&mut backend).unwrap();
+        assert_eq!(backend.0, vec![external]);
+        drop(transaction);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(target_os = "macos")]
     #[test]

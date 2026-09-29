@@ -9,6 +9,12 @@ use std::{
 };
 use uuid::Uuid;
 
+#[derive(Serialize)]
+pub struct ImportResult {
+    pub profile: ProfileSummary,
+    pub warnings: Vec<crate::import::ImportWarning>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -79,10 +85,9 @@ impl Store {
         Ok(profiles)
     }
     pub fn get(&self, id: Uuid) -> Result<Profile> {
-        Ok(serde_json::from_slice(&read_limited(
-            &self.directory(id).join("profile.json"),
-            CONFIG_LIMIT * 3 + 65536,
-        )?)?)
+        let path = self.directory(id).join("profile.json");
+        serde_json::from_slice(&read_limited(&path, CONFIG_LIMIT * 3 + 65536)?)
+            .with_context(|| format!("配置文件不是有效的 JSON：{}", path.display()))
     }
     pub fn save(&self, profile: &Profile) -> Result<()> {
         validate(&profile.yaml)?;
@@ -128,7 +133,8 @@ impl Store {
         if !path.exists() {
             return Ok(Settings::default());
         }
-        let settings: Settings = serde_json::from_slice(&read_limited(&path, 65536)?)?;
+        let settings: Settings = serde_json::from_slice(&read_limited(&path, 65536)?)
+            .with_context(|| format!("设置文件不是有效的 JSON：{}", path.display()))?;
         settings.validate()?;
         Ok(settings)
     }
@@ -144,7 +150,8 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
-        let id: Option<Uuid> = serde_json::from_slice(&read_limited(&path, 1024)?)?;
+        let id: Option<Uuid> = serde_json::from_slice(&read_limited(&path, 1024)?)
+            .with_context(|| format!("配置选择记录不是有效的 JSON：{}", path.display()))?;
         Ok(id.filter(|id| self.directory(*id).exists()))
     }
     pub fn select(&self, id: Option<Uuid>) -> Result<()> {
@@ -153,8 +160,9 @@ impl Store {
         }
         atomic_write(&self.root.join("selected.json"), &serde_json::to_vec(&id)?)
     }
-    pub fn import_file(&self, path: &Path) -> Result<Profile> {
+    pub fn import_file(&self, path: &Path) -> Result<ImportResult> {
         let yaml = String::from_utf8(read_limited(path, CONFIG_LIMIT)?)?;
+        let (yaml, warnings) = crate::import::compatible_yaml(&yaml)?;
         let config = validate(&yaml)?;
         let source = path.parent().context("无法读取配置目录")?.canonicalize()?;
         let profile = self.create(
@@ -185,7 +193,24 @@ impl Store {
             let _ = self.delete(profile.id);
             return Err(error);
         }
-        Ok(profile)
+        Ok(ImportResult {
+            profile: profile.summary(),
+            warnings,
+        })
+    }
+
+    pub fn import_subscription(
+        &self,
+        name: String,
+        yaml: &str,
+        url: String,
+    ) -> Result<ImportResult> {
+        let (yaml, warnings) = crate::import::compatible_yaml(yaml)?;
+        let profile = self.create(name, yaml, Some(url))?;
+        Ok(ImportResult {
+            profile: profile.summary(),
+            warnings,
+        })
     }
 }
 
@@ -327,6 +352,12 @@ pub fn subscription_url(url: &str) -> Result<reqwest::Url> {
 }
 
 pub async fn download(url: &str) -> Result<String> {
+    let yaml = download_source(url).await?;
+    validate(&yaml)?;
+    Ok(yaml)
+}
+
+pub async fn download_source(url: &str) -> Result<String> {
     let url = subscription_url(url)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -361,7 +392,6 @@ pub async fn download(url: &str) -> Result<String> {
         data.extend_from_slice(&chunk);
     }
     let yaml = String::from_utf8(data).context("订阅不是 UTF-8 YAML")?;
-    validate(&yaml)?;
     Ok(yaml)
 }
 

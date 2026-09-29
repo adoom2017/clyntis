@@ -27,7 +27,8 @@ npm run desktop:dev
 - 六个页面：概览、代理节点、配置管理、网络连接、运行日志、设置；简体中文、浅色/深色/系统主题。
 - 手动代理、系统代理、TUN 为互斥接管方式。默认手动代理，登录启动和自动连接默认关闭。
 - 导入本地 YAML，或下载 HTTPS 完整 YAML 订阅；不转换 Base64 列表和单节点链接。
-- 严格使用现有内核支持范围。Trojan、Hysteria2 及未知字段会拒绝启用，不自动降级或删除节点。
+- 导入文件或新增订阅时，只保留兼容项并生成独立的新配置，不覆盖原文件或已有配置。Trojan、Hysteria2、未知字段和无效项会被跳过，并立即显示清单；失效的代理组成员与规则引用也会清理。兼容节点的凭据及规则集 URL 保留。无法解析的 YAML 仍会报错。
+- 编辑、启用及订阅更新继续严格校验内核支持范围。
 - 原始 YAML、待应用版本、上一版本保存在同一原子写入文档中；运行副本从 YAML 文档生成，
   不使用会省略凭据的 `Serialize(Config)`。原文注释保留；运行副本的格式可能变化。
 - 桌面设置覆盖混合监听端口、LAN 开关、接管方式、物理接口、TUN 自动 DNS；
@@ -39,6 +40,9 @@ npm run desktop:dev
 - 代理模式即时生效并保存；节点选择由内核配置缓存持久化。
 - 关闭窗口隐藏到托盘。托盘退出和系统正常退出先恢复代理/TUN/DNS，再终止内核。
 - 日志最多保留 2,000 条，显示和导出前隐藏 URL、UUID 与常见凭据字段。
+- 启动失败等桌面错误写入应用数据目录下的 `clyntis-runner.log`；普通模式的内核标准错误写入
+  `profiles/<配置 ID>/runtime/clyntis-runner.log`，TUN 模式则写入服务配置目录。日志脱敏后按 1 MiB
+  轮转并保留一份历史日志。内核退出时优先显示退出码和实际错误，便于区分路由失败与进程崩溃。
 
 应用数据：macOS 的 `~/Library/Application Support/org.clyntis.desktop`；Windows 的
 `%APPDATA%\org.clyntis.desktop`（以 Tauri `app_data_dir()` 为准）。配置包含凭据，属于本地私有数据，
@@ -75,8 +79,8 @@ npm run desktop:build
 ```
 
 产物位于 `target/release/bundle/`：Windows NSIS 安装包、macOS `.app` / DMG。
-脚本按宿主架构构建；交叉构建时，先安装对应 Rust target，运行
-`CLYNTIS_DESKTOP_TARGET=<target> node packaging/prepare.mjs`，再将同一 `--target` 传给 Tauri。
+脚本按宿主架构构建；交叉构建时，先安装对应 Rust target，再运行
+`npm run desktop:build -- --target <target>`，辅助程序和主应用会使用同一目标架构。
 推荐按平台/架构分别使用本机构建机器。
 
 Windows 安装到 Program Files；首次在设置页安装服务时触发 UAC。
@@ -84,11 +88,28 @@ Windows 安装到 Program Files；首次在设置页安装服务时触发 UAC。
 升级/卸载钩子先停止和卸载服务，网络恢复失败时中止操作。
 NSIS 使用 Tauri 的 `bundle.windows` 签名配置（证书、时间戳或 `signCommand`）；凭据由发布环境注入。
 
-macOS 将应用移至 `/Applications` 后，在设置页安装后台服务；SMAppService 可能要求在系统设置中
-允许后台运行。正式构建设置 Tauri 的 `APPLE_SIGNING_IDENTITY`，并提供
-`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` 或 App Store Connect API 凭据完成公证。
-服务、runner、原生适配程序和主应用必须使用同一个 Developer ID Team。
-构建时还需设置公开的 `CLYNTIS_SIGNING_TEAM_ID`（打包脚本默认取 `APPLE_TEAM_ID`）；
+macOS 的 `desktop:build` 自动从本机钥匙串选择唯一的有效 **Developer ID Application**
+证书（需要对应私钥），提取 Team ID 并写入辅助服务构建环境；不选择 Apple Development 或
+Mac App Store 证书。如果有多张证书，用 `APPLE_SIGNING_IDENTITY` 指定完整名称或 SHA-1 指纹：
+
+```sh
+APPLE_SIGNING_IDENTITY='Developer ID Application: Your Name (YOURTEAMID)' npm run desktop:build
+```
+
+脚本先签名服务、runner 和原生适配程序，再由 Tauri 签名主应用及 DMG，启用 Hardened Runtime
+和安全时间戳；打包结束后校验各程序的固定 identifier 与同一 Team ID。已设置的
+`CLYNTIS_SIGNING_TEAM_ID` 或 `APPLE_TEAM_ID` 必须与证书一致，否则构建立即报错。
+时间戳需要能连接 Apple 签名服务器。无证书的 CI/普通代理验证显式使用
+`npm run desktop:build -- --unsigned`，该包不支持 macOS 系统代理和 TUN。
+
+签名与公证是独立步骤。对外分发时，还需提供
+`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` 或 App Store Connect API 凭据，由 Tauri 完成公证。
+将签名应用移至 `/Applications` 后，在设置页安装后台服务；SMAppService 可能要求在系统设置中
+允许后台运行。安装按钮不会注销已启用的服务。更新应用包后，已运行的服务仍可能持有旧内核；
+需要在系统设置中关闭再开启对应后台项目，或由管理员执行
+`sudo launchctl kickstart -k system/org.clyntis.desktop.service` 重启已注册的服务。
+如果提示 `Operation not permitted` 且服务未注册，先重新允许后台项目，再安装；此时 kickstart 不适用。
+服务、runner、原生适配程序和主应用必须使用同一个 Developer ID Team；
 服务将 runner 和原生适配程序复制到 root 私有目录，校验固定 Team ID 与程序 identifier 后才执行，
 防止应用目录被替换后导致提权执行未经验证的程序。
 未签名 CI 包仅用于构建与普通代理验证，不能视为已验证的 TUN 发行版。
@@ -117,3 +138,20 @@ Windows 的最后一条命令使用 `python` 和 `clyntis-runner.exe`。
 这些检查会改变系统网络，应在测试机执行，不能用回环测试或 CI 成功代替。
 
 首版不包含 Linux GUI、Windows ARM64、自动升级、云同步、订阅转换、新协议或可视化规则编辑器。
+
+### 辅助服务自动更新
+
+应用启动时会检查已安装的后台服务；首次使用 TUN 或 macOS 系统代理时自动安装。
+应用与运行中的服务通过 IPC 比较构建指纹，旧版服务缺少指纹也会触发更新。
+指纹由共享 Rust 模型的 build.rs 根据内核、服务、runner、平台脚本和依赖锁文件生成，
+同一套源码构建的主应用及 sidecar 必须一起分发；可通过 CLYNTIS_BUILD_ID 区分发布构建。
+
+更新与连接操作串行执行，先停止当前内核并恢复网络。macOS 保留 SMAppService 注册，
+发送 SIGTERM 让服务完成清理，再由 launchd KeepAlive 启动新版并刷新受保护的辅助程序副本；
+权限不足时弹出带用途说明的管理员授权。Windows 经 UAC 停止服务、更新注册路径并启动。
+界面同时说明授权用于虚拟网卡、路由、DNS 和系统代理。若 macOS 要求允许后台项目，
+会打开系统设置并提示授权后再次启动；取消授权不再继续连接，也不会循环弹窗。
+只有重连确认构建指纹一致才允许使用服务，最长等待 75 秒；无需手动卸载重装。
+
+验证发布包时，应从旧版已运行服务覆盖升级，检查启动时更新、授权取消、后台项目禁用、
+服务启动失败，以及第二次启动不再更新。未签名开发包不能验证 macOS 特权更新流程。

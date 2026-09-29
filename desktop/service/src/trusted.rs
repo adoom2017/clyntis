@@ -25,7 +25,7 @@ pub fn prepare(directory: &std::path::Path) -> anyhow::Result<()> {
             clyntis_desktop_model::atomic_write(&staged, &bytes)?;
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o700))?;
             let requirement = format!(
-                "anchor apple generic and certificate leaf[subject.OU] = \"{team}\" and identifier \"{name}\""
+                "=anchor apple generic and certificate leaf[subject.OU] = \"{team}\" and identifier \"{name}\""
             );
             let output = std::process::Command::new("/usr/bin/codesign")
                 .args(["--verify", "--strict", "-R", &requirement])

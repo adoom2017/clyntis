@@ -12,7 +12,7 @@ pub fn autostart(app: &tauri::AppHandle, enabled: bool) -> Result<()> {
 
 pub async fn service(action: &str) -> Result<String> {
     ensure!(
-        ["install", "uninstall", "status"].contains(&action),
+        ["install", "update", "uninstall", "status"].contains(&action),
         "invalid service action"
     );
     #[cfg(target_os = "macos")]
@@ -55,7 +55,7 @@ pub async fn service(action: &str) -> Result<String> {
             output.status.success(),
             "辅助服务操作失败或管理员授权被取消"
         );
-        Ok(if action == "install" {
+        Ok(if action == "install" || action == "update" {
             "installed"
         } else {
             "not_installed"
@@ -66,4 +66,24 @@ pub async fn service(action: &str) -> Result<String> {
     {
         anyhow::bail!("不支持的平台")
     }
+}
+
+/// A live response is required: registration status alone says nothing about the running build.
+pub async fn service_is_current() -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(12), async {
+        let mut client = clyntis_desktop_service::client::Client::connect().await?;
+        client.is_current().await
+    })
+    .await
+    .is_ok_and(|result| result.unwrap_or(false))
+}
+
+pub async fn update_service() -> Result<String> {
+    let status = service("update").await?;
+    clyntis_desktop_service::update::verify(
+        status,
+        service_is_current,
+        std::time::Duration::from_secs(75),
+    )
+    .await
 }

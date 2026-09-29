@@ -9,7 +9,7 @@
     "test": "vitest run",
     "tauri": "tauri",
     "desktop:dev": "node packaging/prepare.mjs --debug && tauri dev",
-    "desktop:build": "node packaging/prepare.mjs && tauri build"
+    "desktop:build": "node packaging/build.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",

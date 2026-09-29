@@ -49,7 +49,7 @@ jobs:
         if: runner.os == 'Windows'
         run: python tests/runner_integration.py target/debug/clyntis-runner.exe
       - name: Build installer
-        run: npm run desktop:build
+        run: npm run desktop:build -- --unsigned
       - uses: actions/upload-artifact@v6
         with:
           name: clyntis-desktop-${{ matrix.os }}

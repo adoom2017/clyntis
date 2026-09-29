@@ -110,8 +110,39 @@ impl Desktop {
     pub fn report(&self, error: &anyhow::Error) {
         let message = clyntis_desktop_model::redact(&format!("{error:#}"));
         self.view.lock().unwrap().error = Some(message.clone());
+        clyntis_desktop_service::diagnostics::Diagnostics::default()
+            .record(&self.store.root, &message);
         engine::log(&self.app, &self.logs, "error", &message);
         self.notify();
+    }
+    // Call only while holding operation: never restart a service used by an active engine.
+    async fn ensure_service(&self) -> Result<()> {
+        if platform::service_is_current().await {
+            self.view.lock().unwrap().service_status = "current".into();
+            self.notify();
+            return Ok(());
+        }
+        self.view.lock().unwrap().service_status = "updating".into();
+        self.notify();
+        engine::log(
+            &self.app,
+            &self.logs,
+            "info",
+            "正在安装或更新网络辅助服务。系统可能请求管理员或后台运行授权，用于配置 TUN、路由、DNS 和系统代理，并在停止时恢复网络设置。",
+        );
+        match platform::update_service().await {
+            Ok(_) => {
+                self.view.lock().unwrap().service_status = "current".into();
+                self.notify();
+                Ok(())
+            }
+            Err(error) => {
+                self.view.lock().unwrap().service_status = "update_failed".into();
+                self.notify();
+                self.report(&error);
+                Err(error)
+            }
+        }
     }
     async fn replace(
         &self,
@@ -130,6 +161,14 @@ impl Desktop {
             }
         }
         self.status("starting", None);
+        if (settings.capture == Capture::Tun
+            || (cfg!(target_os = "macos") && settings.capture == Capture::System))
+            && let Err(error) = self.ensure_service().await
+        {
+            operation.active = None;
+            self.status("failed", Some(format!("{error:#}")));
+            return Err(error);
+        }
         match Engine::launch(
             &self.app,
             self.logs.clone(),
@@ -369,28 +408,38 @@ pub async fn save_settings(state: State<'_, Desktop>, settings: Settings) -> Rep
     state.settings(settings).await.map_err(error)
 }
 #[tauri::command]
-pub async fn import_profile(state: State<'_, Desktop>, path: String) -> Reply<()> {
+pub async fn import_profile(
+    state: State<'_, Desktop>,
+    path: String,
+) -> Reply<profiles::ImportResult> {
     let _guard = state.operation.lock().await;
-    let profile = state
+    let result = state
         .store
         .import_file(std::path::Path::new(&path))
         .map_err(error)?;
     if state.store.selected().map_err(error)?.is_none() {
-        state.store.select(Some(profile.id)).map_err(error)?;
+        state.store.select(Some(result.profile.id)).map_err(error)?;
     }
     state.notify();
-    Ok(())
+    Ok(result)
 }
 #[tauri::command]
-pub async fn add_subscription(state: State<'_, Desktop>, name: String, url: String) -> Reply<()> {
-    let yaml = profiles::download(&url).await.map_err(error)?;
+pub async fn add_subscription(
+    state: State<'_, Desktop>,
+    name: String,
+    url: String,
+) -> Reply<profiles::ImportResult> {
+    let yaml = profiles::download_source(&url).await.map_err(error)?;
     let _guard = state.operation.lock().await;
-    let profile = state.store.create(name, yaml, Some(url)).map_err(error)?;
+    let result = state
+        .store
+        .import_subscription(name, &yaml, url)
+        .map_err(error)?;
     if state.store.selected().map_err(error)?.is_none() {
-        state.store.select(Some(profile.id)).map_err(error)?;
+        state.store.select(Some(result.profile.id)).map_err(error)?;
     }
     state.notify();
-    Ok(())
+    Ok(result)
 }
 #[tauri::command]
 pub fn read_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<Profile> {
@@ -537,10 +586,8 @@ pub fn export_logs(state: State<'_, Desktop>, path: String) -> Reply<()> {
 pub async fn install_service(state: State<'_, Desktop>) -> Reply<String> {
     let mut op = state.operation.lock().await;
     state.stop_locked(&mut op).await.map_err(error)?;
-    let result = platform::service("install").await.map_err(error)?;
-    state.view.lock().unwrap().service_status = result.clone();
-    state.notify();
-    Ok(result)
+    state.ensure_service().await.map_err(error)?;
+    Ok("current".into())
 }
 #[tauri::command]
 pub async fn uninstall_service(state: State<'_, Desktop>) -> Reply<String> {
@@ -562,9 +609,21 @@ pub async fn background(app: tauri::AppHandle) {
     let status = platform::service("status")
         .await
         .unwrap_or_else(|_| "not_installed".into());
-    state.view.lock().unwrap().service_status = status;
+    state.view.lock().unwrap().service_status = status.clone();
     state.notify();
-    if state.store.settings().is_ok_and(|s| s.auto_connect)
+    // Do not install unused privileged features merely because the app opened.
+    let update_ok = if ["enabled", "installed"].contains(&status.as_str()) {
+        let op = state.operation.lock().await;
+        if op.engine.is_none() {
+            state.ensure_service().await.is_ok()
+        } else {
+            true
+        }
+    } else {
+        true
+    };
+    if update_ok
+        && state.store.settings().is_ok_and(|s| s.auto_connect)
         && let Err(e) = state.start().await
     {
         state.report(&e);
@@ -604,7 +663,10 @@ pub async fn background(app: tauri::AppHandle) {
             && let Some(engine) = &mut op.engine
             && let Err(error) = engine.health().await
         {
-            let _ = state.stop_locked(&mut op).await;
+            let error = match state.stop_locked(&mut op).await {
+                Ok(()) => error,
+                Err(cleanup) => anyhow::anyhow!("{error:#}；停止及恢复详情：{cleanup:#}"),
+            };
             state.status("failed", Some(error.to_string()));
             state.report(&error);
         }

@@ -24,6 +24,18 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("desktop workflows", () => {
+  it("explains system authorization while updating the helper", async () => {
+    invoke.mockResolvedValue({
+      ...structuredClone(initial),
+      serviceStatus: "updating",
+    });
+    render(<App />);
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "虚拟网卡、路由、DNS 和系统代理",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("恢复网络设置");
+  });
+
   it("does not connect without a profile and offers an import path", async () => {
     render(<App />);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("snapshot"));
@@ -73,6 +85,33 @@ describe("desktop workflows", () => {
     );
     expect(screen.getAllByText("未连接").length).toBeGreaterThan(0);
   });
+  it("shows skipped items after importing a new compatible profile", async () => {
+    open.mockResolvedValue("/tmp/mixed.yaml");
+    invoke.mockImplementation(async (command) => {
+      if (command === "import_profile")
+        return {
+          profile: { id: "new-id", name: "mixed" },
+          warnings: [{ path: "proxies[1]", reason: "不支持的协议，已跳过" }],
+        };
+      return structuredClone(initial);
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "配置管理" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "导入文件" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "导入文件" }));
+    expect(
+      await screen.findByRole("dialog", { name: "已导入兼容项" }),
+    ).toHaveTextContent("原文件和已有配置未被覆盖");
+    expect(screen.getByText("proxies[1]")).toBeInTheDocument();
+    expect(screen.getByText("不支持的协议，已跳过")).toBeInTheDocument();
+    expect(invoke).toHaveBeenCalledWith("import_profile", {
+      path: "/tmp/mixed.yaml",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "知道了" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
   it("keeps network takeover and autostart off by default", async () => {
     render(<App />);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("snapshot"));
@@ -87,6 +126,38 @@ describe("desktop workflows", () => {
     expect(
       screen.getByRole("switch", { name: "允许局域网访问" }),
     ).toHaveAttribute("aria-checked", "false");
+  });
+  it("keeps the compatibility report visible after adding a subscription", async () => {
+    invoke.mockImplementation(async (command) => {
+      if (command === "add_subscription")
+        return {
+          profile: { id: "subscription-id", name: "日常订阅" },
+          warnings: [{ path: "unknown", reason: "不支持的字段，已跳过" }],
+        };
+      return structuredClone(initial);
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "配置管理" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "添加订阅" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "添加订阅" }));
+    fireEvent.change(screen.getByLabelText("配置名称"), {
+      target: { value: "日常订阅" },
+    });
+    fireEvent.change(screen.getByLabelText("订阅 URL"), {
+      target: { value: "https://example.com/sub" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "下载并校验" }));
+    expect(
+      await screen.findByRole("dialog", { name: "已导入兼容项" }),
+    ).toHaveTextContent("日常订阅");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "导入文件" })).toBeEnabled(),
+    );
+    expect(
+      screen.getByRole("dialog", { name: "已导入兼容项" }),
+    ).toHaveTextContent("unknown");
   });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");

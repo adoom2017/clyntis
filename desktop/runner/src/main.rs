@@ -1,15 +1,16 @@
 //! A single core per process. Stdin is a private inherited pipe, never a TCP endpoint.
 use anyhow::{Context, Result, ensure};
+use clyntis_desktop_model::protocol::FrameReader;
 use clyntis_desktop_model::{
     profiles::validate,
     protocol::{self, Request, Response, VERSION},
 };
-use tokio::io::BufReader;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
+        eprintln!("{}", clyntis_desktop_model::redact(&format!("{error:#}")));
         let _ = protocol::write_frame(
             &mut tokio::io::stdout(),
             &Response::Error {
@@ -31,7 +32,7 @@ async fn run() -> Result<()> {
     let directory = std::path::PathBuf::from(args.next().context("missing data directory")?);
     ensure!(args.next().is_none(), "unexpected arguments");
     clyntis_desktop_model::private_dir(&directory)?;
-    let mut input = BufReader::new(tokio::io::stdin());
+    let mut input = FrameReader::new(tokio::io::stdin());
     let first = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         protocol::read_frame(&mut input),
@@ -43,7 +44,7 @@ async fn run() -> Result<()> {
         yaml,
         system_proxy_port,
         ..
-    } = serde_json::from_str(&first)?
+    } = serde_json::from_str(&first).context("内核启动请求不是有效的 JSON")?
     else {
         anyhow::bail!("expected start");
     };

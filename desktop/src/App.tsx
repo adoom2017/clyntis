@@ -49,6 +49,7 @@ import {
   type Connection,
   type Connections,
   type Log,
+  type ImportResult,
   type Mode,
   type Profile,
   type Proxy,
@@ -191,29 +192,59 @@ export default function App() {
     if (state.status === "stopped" || state.status === "failed") setTraffic([]);
   }, [state.status]);
   const running = state.status === "running";
-  const transitioning = ["starting", "stopping", "recovering"].includes(
-    state.status,
-  );
+  const transitioning =
+    state.serviceStatus === "updating" ||
+    ["starting", "stopping", "recovering"].includes(state.status);
   const disabled = busy || transitioning || !loaded;
   const selected = state.profiles.find((p) => p.id === state.selected);
   const currentPage = pages.find((p) => p.id === page)!;
+  const showImportResult = (result: ImportResult) => {
+    setPage("profiles");
+    if (result.warnings.length) {
+      setModal(
+        <Modal title="已导入兼容项" onClose={() => setModal(null)}>
+          <p>
+            已生成新配置「{result.profile.name}」，原文件和已有配置未被覆盖。
+          </p>
+          <p>以下 {result.warnings.length} 项不兼容，已跳过：</p>
+          <ul className="import-warnings">
+            {result.warnings.map((warning, index) => (
+              <li key={index}>
+                <strong>{warning.path}</strong>
+                <span>{warning.reason}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="modal-actions">
+            <button className="button primary" onClick={() => setModal(null)}>
+              知道了
+            </button>
+          </div>
+        </Modal>,
+      );
+    } else {
+      setModal(null);
+      setNotice(`已生成新配置「${result.profile.name}」`);
+    }
+  };
   const importFile = async () => {
     const path = await open({
       multiple: false,
       filters: [{ name: "YAML 配置", extensions: ["yaml", "yml"] }],
     });
-    if (typeof path === "string") await invoke("import_profile", { path });
+    if (typeof path === "string")
+      showImportResult(await invoke<ImportResult>("import_profile", { path }));
   };
   const addSubscription = () =>
     setModal(
       <SubscriptionForm
         onClose={() => setModal(null)}
         onSubmit={async (name, url) => {
-          const ok = await perform(
-            () => invoke("add_subscription", { name, url }),
-            "订阅已添加",
-          );
-          if (ok) setModal(null);
+          const ok = await perform(async () => {
+            showImportResult(
+              await invoke<ImportResult>("add_subscription", { name, url }),
+            );
+          });
           return ok;
         }}
       />,
@@ -280,6 +311,12 @@ export default function App() {
               {statusText[state.status]}
             </span>
           </div>
+          {state.serviceStatus === "updating" && (
+            <div className="alert" role="status">
+              正在安装或更新网络辅助服务。若系统请求授权，请允许 Clyntis
+              配置虚拟网卡、路由、DNS 和系统代理；停止代理时会恢复网络设置。
+            </div>
+          )}
           {(error || state.error) && (
             <div className="alert" role="alert">
               <CircleHelp size={18} />
@@ -688,7 +725,7 @@ export default function App() {
                 <CircleHelp size={16} />
                 <span>
                   支持 VLESS
-                  配置。未实现的协议或未知字段会显示具体错误，不会自动修改你的节点与规则。
+                  配置。导入时会提示并跳过不兼容项，生成新配置，原文件和已有配置不会被覆盖。
                 </span>
               </div>
             </>
@@ -1534,6 +1571,9 @@ function SettingsPage({
           <span className="tiny-tag">
             {{
               checking: "检查中",
+              current: "已更新至当前版本",
+              updating: "正在安装 / 更新",
+              update_failed: "更新未完成，启动时重试",
               installed: "已安装",
               enabled: "已启用",
               requires_approval: "等待系统授权",
@@ -1544,7 +1584,8 @@ function SettingsPage({
         </div>
         <p className="muted small">
           TUN 和 macOS
-          系统代理需要辅助服务。首次安装由操作系统请求授权；界面始终以普通用户运行。
+          系统代理需要辅助服务。应用会自动检查并更新服务，无需卸载重装。系统授权用于配置虚拟网卡、路由、DNS
+          和系统代理，停止时恢复网络设置；界面始终以普通用户运行。
         </p>
         <div className="service-actions">
           <button
@@ -1558,7 +1599,7 @@ function SettingsPage({
             }
           >
             <ShieldCheck size={16} />
-            安装 / 授权服务
+            检查更新 / 授权服务
           </button>
           <button
             className="text-button danger"

@@ -1,5 +1,4 @@
 //! A write-ahead journal records exactly the settings this application owns.
-#[cfg(windows)]
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use clyntis_desktop_model::{atomic_write, read_limited};
@@ -25,7 +24,8 @@ pub struct ProxyGuard {
 impl ProxyGuard {
     pub fn recover(path: PathBuf) -> Result<Self> {
         let journal = if path.exists() {
-            serde_json::from_slice(&read_limited(&path, 1024 * 1024)?)?
+            serde_json::from_slice(&read_limited(&path, 1024 * 1024)?)
+                .with_context(|| format!("系统代理恢复记录不是有效的 JSON：{}", path.display()))?
         } else {
             Journal::default()
         };
@@ -151,7 +151,8 @@ fn native(action: &str, service: Option<&str>, value: Option<&Snapshot>) -> Resu
 }
 #[cfg(target_os = "macos")]
 fn services() -> Result<Vec<String>> {
-    Ok(serde_json::from_str(&native("proxy-list", None, None)?)?)
+    serde_json::from_str(&native("proxy-list", None, None)?)
+        .context("系统代理辅助程序 proxy-list 未返回有效的 JSON")
 }
 #[cfg(target_os = "macos")]
 fn snapshot(service: &str) -> Result<Snapshot> {
@@ -159,7 +160,8 @@ fn snapshot(service: &str) -> Result<Snapshot> {
         "proxy-read",
         Some(service),
         None,
-    )?)?))
+    )?)
+    .context("系统代理辅助程序 proxy-read 未返回有效的 JSON")?))
 }
 #[cfg(target_os = "macos")]
 fn desired(original: &Snapshot, port: u16) -> Snapshot {
@@ -222,7 +224,8 @@ fn snapshot(_: &str) -> Result<Snapshot> {
         ),
         None,
     )?;
-    Ok(Snapshot(serde_json::from_str(&value)?))
+    Ok(Snapshot(serde_json::from_str(&value)
+        .context("Windows 系统代理读取结果不是有效的 JSON")?))
 }
 #[cfg(windows)]
 fn desired(original: &Snapshot, port: u16) -> Snapshot {
@@ -274,6 +277,18 @@ mod tests {
     use super::*;
     fn snapshot(value: serde_json::Value) -> Snapshot {
         Snapshot(serde_json::from_value(value).unwrap())
+    }
+    #[test]
+    fn invalid_recovery_journal_identifies_source_and_preserves_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("system-proxy.json");
+        std::fs::write(&path, "<html>not json</html>").unwrap();
+        let error = ProxyGuard::recover(path.clone()).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("系统代理恢复记录"));
+        assert!(message.contains("system-proxy.json"));
+        assert!(message.contains("expected value"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "<html>not json</html>");
     }
     #[test]
     fn interrupted_application_restores_original_values() {

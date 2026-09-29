@@ -1188,6 +1188,19 @@ td:nth-child(4) {
   width: 100%;
   padding: 11px 12px;
 }
+.import-warnings {
+  max-height: 40vh;
+  overflow: auto;
+  padding-left: 24px;
+  overflow-wrap: anywhere;
+}
+.import-warnings li {
+  margin-bottom: 12px;
+}
+.import-warnings span {
+  display: block;
+  color: var(--muted);
+}
 .modal-actions {
   display: flex;
   align-items: center;

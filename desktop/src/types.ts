@@ -26,6 +26,10 @@ export interface ProfileSummary {
   lastChecked: number;
   lastError: string | null;
 }
+export interface ImportResult {
+  profile: ProfileSummary;
+  warnings: { path: string; reason: string }[];
+}
 export interface Profile extends Omit<ProfileSummary, "pending" | "source"> {
   yaml: string;
   pending: string | null;

@@ -9,6 +9,12 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import {
+  helpers,
+  resolveIdentity,
+  signingEnvironment,
+  verifySignature,
+} from "./signing.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const debug = process.argv.includes("--debug");
@@ -27,6 +33,13 @@ const host = spawnSync("rustc", ["-vV"], { encoding: "utf8" }).stdout.match(
   /^host: (.+)$/m,
 )[1];
 const target = process.env.CLYNTIS_DESKTOP_TARGET || host;
+const explicitTarget = !!process.env.CLYNTIS_DESKTOP_TARGET;
+let env = { ...process.env, MACOSX_DEPLOYMENT_TARGET: "13.0" };
+let identity;
+if (target.includes("apple") && env.APPLE_SIGNING_IDENTITY) {
+  identity = resolveIdentity(env);
+  env = signingEnvironment(env, identity);
+}
 if (
   ![
     "aarch64-apple-darwin",
@@ -44,21 +57,19 @@ const args = [
   "clyntis-desktop-service",
 ];
 if (!debug) args.push("--release");
-if (target !== host) args.push("--target", target);
+if (explicitTarget) args.push("--target", target);
 run("cargo", args, {
   env: {
-    ...process.env,
-    MACOSX_DEPLOYMENT_TARGET: "13.0",
+    ...env,
     CLYNTIS_SIGNING_TEAM_ID:
-      process.env.CLYNTIS_SIGNING_TEAM_ID || process.env.APPLE_TEAM_ID || "",
+      env.CLYNTIS_SIGNING_TEAM_ID || env.APPLE_TEAM_ID || "",
   },
 });
 const bin = join(root, "src-tauri", "binaries");
 mkdirSync(bin, { recursive: true });
 const build = join(
-  root,
-  "target",
-  ...(target !== host ? [target] : []),
+  resolve(root, env.CARGO_TARGET_DIR || "target"),
+  ...(explicitTarget ? [target] : []),
   debug ? "debug" : "release",
 );
 const extension = target.includes("windows") ? ".exe" : "";
@@ -85,24 +96,15 @@ if (target.includes("apple")) {
     join(build, "clyntis-service-manager"),
     join(bin, `clyntis-service-manager-${target}`),
   );
-  if (process.env.APPLE_SIGNING_IDENTITY) {
-    if (!(process.env.CLYNTIS_SIGNING_TEAM_ID || process.env.APPLE_TEAM_ID)) {
-      throw new Error(
-        "Signed service builds require CLYNTIS_SIGNING_TEAM_ID or APPLE_TEAM_ID",
-      );
-    }
+  if (identity) {
     // Rust's linker creates hashed ad-hoc identifiers. Pin the production
     // identifiers before Tauri signs the nested bundle so the service can
     // verify the exact roles of its immutable helper copies.
-    for (const name of [
-      "clyntis-runner",
-      "clyntis-service",
-      "clyntis-service-manager",
-    ]) {
+    for (const name of helpers) {
       run("/usr/bin/codesign", [
         "--force",
         "--sign",
-        process.env.APPLE_SIGNING_IDENTITY,
+        identity.hash,
         "--identifier",
         name,
         "--options",
@@ -110,6 +112,7 @@ if (target.includes("apple")) {
         "--timestamp",
         join(bin, `${name}-${target}`),
       ]);
+      verifySignature(join(bin, `${name}-${target}`), name, identity.team);
     }
   }
 }

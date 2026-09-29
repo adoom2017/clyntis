@@ -16,7 +16,8 @@ define_windows_service!(ffi_main, service_main);
 
 pub fn entry() {
     let result = match std::env::args().nth(1).as_deref() {
-        Some("--install") => install(),
+        Some("--install") => install(false),
+        Some("--update") => install(true),
         Some("--uninstall") => uninstall(),
         None => service_dispatcher::start(NAME, ffi_main).map_err(Into::into),
         _ => Err(anyhow::anyhow!("invalid service command")),
@@ -81,31 +82,51 @@ pub fn protect_data(directory: &std::path::Path) -> Result<()> {
     ensure!(status.success(), "cannot protect service data directory");
     Ok(())
 }
-fn install() -> Result<()> {
+fn install(restart: bool) -> Result<()> {
     let path = trusted_install_path()?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
-    let access = ServiceAccess::START | ServiceAccess::QUERY_STATUS;
+    let access = ServiceAccess::START
+        | ServiceAccess::QUERY_STATUS
+        | ServiceAccess::STOP
+        | ServiceAccess::CHANGE_CONFIG;
+    let info = ServiceInfo {
+        name: NAME.into(),
+        display_name: "Clyntis Network Service".into(),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: path,
+        launch_arguments: vec![],
+        dependencies: vec![],
+        account_name: None,
+        account_password: None,
+    };
     let service = match manager.open_service(NAME, access) {
         Ok(service) => service,
-        Err(_) => manager.create_service(
-            &ServiceInfo {
-                name: NAME.into(),
-                display_name: "Clyntis Network Service".into(),
-                service_type: ServiceType::OWN_PROCESS,
-                start_type: ServiceStartType::AutoStart,
-                error_control: ServiceErrorControl::Normal,
-                executable_path: path,
-                launch_arguments: vec![],
-                dependencies: vec![],
-                account_name: None,
-                account_password: None,
-            },
-            access,
-        )?,
+        Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
+            manager.create_service(&info, access)?
+        }
+        Err(error) => return Err(error.into()),
     };
+    if restart && service.query_status()?.current_state != ServiceState::Stopped {
+        if service.query_status()?.current_state != ServiceState::StopPending {
+            service.stop()?;
+        }
+        for _ in 0..180 {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        ensure!(
+            service.query_status()?.current_state == ServiceState::Stopped,
+            "辅助服务仍在恢复网络设置，更新已停止，请稍后重试"
+        );
+    }
+    service.change_config(&info)?;
     if service.query_status()?.current_state != ServiceState::Running {
         service.start::<&str>(&[])?;
     }
