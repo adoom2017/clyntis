@@ -183,8 +183,16 @@ fn apply(service: &str, target: &Snapshot) -> Result<()> {
 fn powershell(script: &str, input: Option<&str>) -> Result<String> {
     use std::io::Write;
     use std::os::windows::process::CommandExt;
+    // Windows PowerShell otherwise uses the machine's legacy console code page.
+    // Both the JSON sent on stdin and the result consumed by Rust are UTF-8.
+    let script = format!(
+        "$ErrorActionPreference='Stop'; \
+         [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false); \
+         [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); \
+         $OutputEncoding = [Console]::OutputEncoding; {script}"
+    );
     let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(0x08000000)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -274,6 +282,31 @@ fn apply(_: &str, _: &Snapshot) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn powershell_preserves_unicode_json() {
+        let value =
+            serde_json::json!({"proxy": "代理.example", "path": "C:\\用户\\配置", "symbol": "🌐"});
+        let output = powershell(
+            "$value = [Console]::In.ReadToEnd() | ConvertFrom-Json; $value | ConvertTo-Json -Compress",
+            Some(&value.to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            value
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_proxy_snapshot_is_readable() {
+        // Read only: validate the native WinINet/registry bridge without changing proxy settings.
+        let value = super::snapshot("current-user").unwrap();
+        assert!(value.0.contains_key("ConnectionFlags"));
+        assert!(value.0.contains_key("ProxyEnable"));
+    }
+
     fn snapshot(value: serde_json::Value) -> Snapshot {
         Snapshot(serde_json::from_value(value).unwrap())
     }

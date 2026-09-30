@@ -73,6 +73,19 @@ pub fn redact(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn atomic_write_replaces_existing_file_in_unicode_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("配置 files").join("settings.json");
+        super::atomic_write(&path, b"original").unwrap();
+        super::atomic_write(&path, "更新".as_bytes()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "更新");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
     fn log_redaction_hides_authorization_json_fields_urls_and_uuid() {
         let output = super::redact(
             r#"Authorization: Bearer abcdef123 password=private "secret":"hidden" https://example.com/sub?token=private 11111111-1111-4111-8111-111111111111"#,
