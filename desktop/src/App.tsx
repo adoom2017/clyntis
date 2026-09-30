@@ -8,6 +8,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import brandIcon from "../src-tauri/icons/clyntis-v3/brand-128.png";
 import {
   Activity,
   ArrowDown,
@@ -246,7 +247,7 @@ export default function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-icon">c</span>
+          <img className="brand-icon" src={brandIcon} alt="" />
           <span>
             Clyntis<span className="brand-caption">DESKTOP</span>
           </span>
@@ -296,7 +297,7 @@ export default function App() {
               <ShieldCheck size={13} />
               本地运行
             </span>
-            <span className="avatar">C</span>
+            <img className="topbar-brand-icon" src={brandIcon} alt="" />
           </div>
         </header>
         <div className="content">

@@ -190,16 +190,12 @@ h3 {
   font-weight: 650;
 }
 .brand-icon {
-  background: #257e62;
-  color: #fff;
-  font-size: 38px;
-  font-weight: 700;
-  line-height: 38px;
+  display: block;
+  flex-shrink: 0;
   width: 39px;
   height: 39px;
-  text-align: center;
+  object-fit: cover;
   border-radius: 12px;
-  padding-bottom: 4px;
 }
 .brand-caption {
   display: block;
@@ -315,16 +311,13 @@ main {
   color: var(--muted);
   font-size: 10px;
 }
-.avatar {
+.topbar-brand-icon {
   width: 28px;
   height: 28px;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  color: var(--accent);
-  display: grid;
-  place-items: center;
-  font-size: 11px;
-  font-weight: 650;
+  border-radius: 9px;
+  display: block;
+  flex-shrink: 0;
+  object-fit: cover;
 }
 .content {
   width: 100%;

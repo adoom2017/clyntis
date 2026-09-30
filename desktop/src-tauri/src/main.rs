@@ -11,6 +11,11 @@ use tauri::{
     tray::{TrayIconBuilder, TrayIconEvent},
 };
 
+#[cfg(target_os = "macos")]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/clyntis-v3/tray-template.png");
+#[cfg(not(target_os = "macos"))]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/clyntis-v3/64x64.png");
+
 fn main() {
     let autostart = tauri_plugin_autostart::Builder::new();
     #[cfg(target_os = "macos")]
@@ -61,9 +66,8 @@ fn main() {
                 ],
             )?;
             TrayIconBuilder::new()
-                .icon(tauri::image::Image::from_bytes(include_bytes!(
-                    "../icons/tray.png"
-                ))?)
+                .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
+                .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Clyntis")
                 .menu(&menu)
                 .show_menu_on_left_click(false)

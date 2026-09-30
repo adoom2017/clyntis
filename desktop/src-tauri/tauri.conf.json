@@ -32,7 +32,7 @@
     "shortDescription": "Clyntis 代理桌面客户端",
     "license": "GPL-3.0-only",
     "resources": { "../../LICENSE": "LICENSE", "../README.md": "README.md" },
-    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "icon": ["icons/clyntis-v3/icon.png", "icons/clyntis-v3/icon.ico", "icons/clyntis-v3/icon.icns"],
     "externalBin": ["binaries/clyntis-runner", "binaries/clyntis-service"],
     "macOS": { "minimumSystemVersion": "13.0", "hardenedRuntime": true },
     "windows": {
