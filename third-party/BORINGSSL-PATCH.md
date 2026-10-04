@@ -25,6 +25,10 @@ The vendored copy adds narrowly scoped client APIs required by the proxy core:
   flags to avoid a CMake cache reset that re-enables tests; `BUILD_TESTING=OFF`
   keeps benchmark executable probes off the host. Only `crypto` and `ssl` are built.
 
+- The build script reports patch application on stderr (shown with
+  `cargo build -vv`) rather than as `cargo:warning`, so routine builds are
+  warning-free; genuine configuration warnings are unchanged.
+
 The Rust crate remains version-pinned to 5.2.0. Browser profile data lives in
 `crates/protocol/src/tls.rs`; protocol implementations do not depend on BoringSSL
 internals. Changes to this patch require rebuilding `boring-sys` and running the

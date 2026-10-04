@@ -478,6 +478,8 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
     params
 }
 
+// Patch progress is routine, so it goes to build-script stderr (visible with
+// `cargo build -vv`) instead of `cargo:warning`, which flags it on every build.
 fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     if config.env.assume_patched || config.env.path.is_some() {
         println!(
@@ -509,30 +511,30 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     }
 
     if config.features.allow_crl_extensions_bad_version {
-        println!(
-            "cargo:warning=applying the patch for disabling cert version \
+        eprintln!(
+            "applying the patch for disabling cert version \
             validation for extensions"
         );
         apply_patch(config, "bad-cert-verification.patch")?;
     }
 
-    println!("cargo:warning=applying post quantum crypto patch to boringssl");
+    eprintln!("applying post quantum crypto patch to boringssl");
     apply_patch(config, "boring-pq.patch")?;
-    println!("cargo:warning=applying browser profile patch to boringssl");
+    eprintln!("applying browser profile patch to boringssl");
     apply_patch(config, "browser-profile.patch")?;
 
     if config.features.rpk {
-        println!("cargo:warning=applying RPK patch to boringssl");
+        eprintln!("applying RPK patch to boringssl");
         apply_patch(config, "rpk.patch")?;
     }
 
     if config.features.underscore_wildcards {
-        println!("cargo:warning=applying underscore wildcards patch to boringssl");
+        eprintln!("applying underscore wildcards patch to boringssl");
         apply_patch(config, "underscore-wildcards.patch")?;
     }
 
     if config.features.relax_cert_validation {
-        println!("cargo:warning=applying RSA key-usage enforcement relaxation patch");
+        eprintln!("applying RSA key-usage enforcement relaxation patch");
         apply_patch(config, "relax-cert-validation.patch")?;
     }
 
