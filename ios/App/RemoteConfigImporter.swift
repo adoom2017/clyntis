@@ -4,11 +4,18 @@ enum RemoteConfigImporter {
     static func url(from address: String) throws -> URL {
         guard let url = URL(string: address.trimmingCharacters(in: .whitespacesAndNewlines),
                             encodingInvalidCharacters: false),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-              let host = url.host, !host.isEmpty, url.user == nil, url.password == nil else {
-            throw ClientError.message("请输入有效的 HTTP 或 HTTPS 配置链接。")
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
+              scheme == "https" || (scheme == "http" && isLoopback(host)) else {
+            throw ClientError.message("请输入 HTTPS 配置链接。")
         }
         return url
+    }
+
+    // Configurations carry node credentials, so plain HTTP is only allowed when it never leaves the device.
+    private static func isLoopback(_ host: String) -> Bool {
+        let host = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        return host == "localhost" || host == "::1" || host.hasPrefix("127.")
     }
 
     static func download(from url: URL, encrypted: Bool) async throws -> Data {

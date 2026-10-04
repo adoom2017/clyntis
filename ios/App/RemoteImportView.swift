@@ -13,28 +13,28 @@ struct RemoteImportView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("配置链接") {
+                Section("链接") {
                     TextField("https://example.com/config.yaml", text: $address)
                         .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
                         .accessibilityLabel("配置链接")
                         .disabled(importing)
                 }
-                Section("配置名称") {
-                    TextField("远程配置（可选）", text: $name).disabled(importing)
+                Section("名称") {
+                    TextField("可选", text: $name).disabled(importing)
                 }
                 Section {
-                    SecureField("密码（可选）", text: $password)
+                    SecureField("可选", text: $password)
                         .textInputAutocapitalization(.never).autocorrectionDisabled().disabled(importing)
-                } header: { Text("配置密码") }
-                footer: { Text("填写密码将先解密再导入；留空则按未加密配置导入。密码仅用于本次导入。") }
+                } header: { Text("解密密码") }
+                footer: { Text("仅用于加密配置，不会保存") }
                 if importing {
-                    Section { ProgressView("正在下载并校验…") }
+                    Section { ProgressView("正在导入…") }
                 }
                 if let errorMessage {
                     Section { Text(errorMessage).foregroundStyle(.red) }
                 }
             }
-            .navigationTitle("链接导入").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("从链接导入").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { password = ""; dismiss() }

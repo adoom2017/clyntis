@@ -39,6 +39,36 @@ struct Process {
     input: ChildStdin,
     output: protocol::FrameReader<ChildStdout>,
 }
+#[derive(Clone)]
+pub struct Controller {
+    address: std::net::SocketAddr,
+    secret: String,
+    client: reqwest::Client,
+}
+impl Controller {
+    pub async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &[&str],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut url = reqwest::Url::parse(&format!("http://{}/", self.address))?;
+        url.path_segments_mut().unwrap().clear().extend(path);
+        let mut request = self.client.request(method, url).bearer_auth(&self.secret);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.context("内核控制接口无法连接")?;
+        let status = response.status();
+        let value: serde_json::Value = response.json().await?;
+        ensure!(
+            status.is_success(),
+            "{}",
+            value["message"].as_str().unwrap_or("内核请求失败")
+        );
+        Ok(value)
+    }
+}
 pub struct Engine {
     process: Option<Process>,
     service: Option<Arc<tokio::sync::Mutex<Client>>>,
@@ -207,27 +237,21 @@ impl Engine {
         engine.stream(app.clone(), logs, "logs");
         Ok(engine)
     }
+    /// A detached handle to the controller API, usable without holding the operation lock.
+    pub fn controller(&self) -> Controller {
+        Controller {
+            address: self.address,
+            secret: self.secret.clone(),
+            client: self.client.clone(),
+        }
+    }
     pub async fn request(
         &self,
         method: reqwest::Method,
         path: &[&str],
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let mut url = reqwest::Url::parse(&format!("http://{}/", self.address))?;
-        url.path_segments_mut().unwrap().clear().extend(path);
-        let mut request = self.client.request(method, url).bearer_auth(&self.secret);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await.context("内核控制接口无法连接")?;
-        let status = response.status();
-        let value: serde_json::Value = response.json().await?;
-        ensure!(
-            status.is_success(),
-            "{}",
-            value["message"].as_str().unwrap_or("内核请求失败")
-        );
-        Ok(value)
+        self.controller().request(method, path, body).await
     }
     pub async fn health(&mut self) -> Result<()> {
         if let Some(process) = &mut self.process {

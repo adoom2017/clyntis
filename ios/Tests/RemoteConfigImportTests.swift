@@ -47,10 +47,11 @@ final class RemoteConfigImportTests: XCTestCase {
         }
     }
 
-    func testURLValidationAllowsHTTPAndHTTPSOnly() throws {
+    func testURLValidationRequiresHTTPSExceptLoopback() throws {
         XCTAssertEqual(try RemoteConfigImporter.url(from: " https://unit.invalid/config?token=abc \n").host, "unit.invalid")
         XCTAssertEqual(try RemoteConfigImporter.url(from: "http://127.0.0.1/config").scheme, "http")
-        for address in ["", "config.yaml", "file:///tmp/config.yaml", "ftp://unit.invalid/config", "https://user:secret@unit.invalid/config", "https://"] {
+        XCTAssertEqual(try RemoteConfigImporter.url(from: "http://localhost:8080/config").host, "localhost")
+        for address in ["http://unit.invalid/config", "http://192.168.1.2/config", "", "config.yaml", "file:///tmp/config.yaml", "ftp://unit.invalid/config", "https://user:secret@unit.invalid/config", "https://"] {
             XCTAssertThrowsError(try RemoteConfigImporter.url(from: address))
         }
     }

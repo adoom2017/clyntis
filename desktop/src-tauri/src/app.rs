@@ -505,13 +505,20 @@ pub async fn rollback_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<()> 
     state.apply(id, true).await.map_err(error)
 }
 
-#[tauri::command]
-pub async fn proxies(state: State<'_, Desktop>) -> Reply<Value> {
+// Read-only queries and delay probes release the operation lock before the
+// HTTP round trip, so a slow probe cannot block stop/restart or other commands.
+async fn controller(state: &Desktop) -> Reply<engine::Controller> {
     let op = state.operation.lock().await;
     op.engine
         .as_ref()
+        .map(Engine::controller)
         .context("内核未运行")
-        .map_err(error)?
+        .map_err(error)
+}
+#[tauri::command]
+pub async fn proxies(state: State<'_, Desktop>) -> Reply<Value> {
+    controller(&state)
+        .await?
         .request(reqwest::Method::GET, &["proxies"], None)
         .await
         .map_err(error)
@@ -534,22 +541,16 @@ pub async fn select_proxy(state: State<'_, Desktop>, group: String, name: String
 }
 #[tauri::command]
 pub async fn probe_proxy(state: State<'_, Desktop>, name: String) -> Reply<Value> {
-    let op = state.operation.lock().await;
-    op.engine
-        .as_ref()
-        .context("内核未运行")
-        .map_err(error)?
+    controller(&state)
+        .await?
         .request(reqwest::Method::GET, &["proxies", &name, "delay"], None)
         .await
         .map_err(error)
 }
 #[tauri::command]
 pub async fn connections(state: State<'_, Desktop>) -> Reply<Value> {
-    let op = state.operation.lock().await;
-    op.engine
-        .as_ref()
-        .context("内核未运行")
-        .map_err(error)?
+    controller(&state)
+        .await?
         .request(reqwest::Method::GET, &["connections"], None)
         .await
         .map_err(error)

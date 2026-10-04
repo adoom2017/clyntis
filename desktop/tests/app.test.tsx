@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -41,13 +42,13 @@ describe("desktop workflows", () => {
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("snapshot"));
     expect(screen.getByRole("button", { name: "启动连接" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "添加配置" }));
-    expect(screen.getByText("从一个配置开始")).toBeInTheDocument();
+    expect(screen.getByText("还没有配置")).toBeInTheDocument();
   });
   it("imports only after the native file dialog returns a selection", async () => {
     open.mockResolvedValue(null);
     render(<App />);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("snapshot"));
-    fireEvent.click(screen.getByRole("button", { name: "配置管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "配置" }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "导入文件" })).toBeEnabled(),
     );
@@ -96,14 +97,14 @@ describe("desktop workflows", () => {
       return structuredClone(initial);
     });
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "配置管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "配置" }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "导入文件" })).toBeEnabled(),
     );
     fireEvent.click(screen.getByRole("button", { name: "导入文件" }));
     expect(
-      await screen.findByRole("dialog", { name: "已导入兼容项" }),
-    ).toHaveTextContent("原文件和已有配置未被覆盖");
+      await screen.findByRole("dialog", { name: "导入完成" }),
+    ).toHaveTextContent("跳过 1 项不兼容内容");
     expect(screen.getByText("proxies[1]")).toBeInTheDocument();
     expect(screen.getByText("不支持的协议，已跳过")).toBeInTheDocument();
     expect(invoke).toHaveBeenCalledWith("import_profile", {
@@ -137,7 +138,7 @@ describe("desktop workflows", () => {
       return structuredClone(initial);
     });
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "配置管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "配置" }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "添加订阅" })).toBeEnabled(),
     );
@@ -148,16 +149,73 @@ describe("desktop workflows", () => {
     fireEvent.change(screen.getByLabelText("订阅 URL"), {
       target: { value: "https://example.com/sub" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "下载并校验" }));
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
     expect(
-      await screen.findByRole("dialog", { name: "已导入兼容项" }),
+      await screen.findByRole("dialog", { name: "导入完成" }),
     ).toHaveTextContent("日常订阅");
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "导入文件" })).toBeEnabled(),
     );
+    expect(screen.getByRole("dialog", { name: "导入完成" })).toHaveTextContent(
+      "unknown",
+    );
+  });
+  it("keeps unsaved settings when the backend pushes other changes", async () => {
+    const handlers: Record<string, (event: { payload: unknown }) => void> = {};
+    listen.mockImplementation(async (event: string, handler) => {
+      handlers[event] = handler;
+      return vi.fn();
+    });
+    render(<App />);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("snapshot"));
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.change(screen.getByDisplayValue("7890"), {
+      target: { value: "7891" },
+    });
+    act(() =>
+      handlers.state({
+        payload: {
+          ...structuredClone(initial),
+          settings: { ...initial.settings, capture: "tun" },
+        },
+      }),
+    );
+    expect(screen.getByDisplayValue("7891")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("TUN 模式")).toBeInTheDocument();
+  });
+  it("offers subscription refresh only for subscription profiles", async () => {
+    const profile = {
+      pending: false,
+      lastChecked: 0,
+      lastError: null,
+    };
+    invoke.mockResolvedValue({
+      ...structuredClone(initial),
+      profiles: [
+        {
+          ...profile,
+          id: "a",
+          name: "本地",
+          source: "本地文件",
+          subscription: false,
+        },
+        {
+          ...profile,
+          id: "b",
+          name: "订阅",
+          source: "sub.example.com",
+          subscription: true,
+        },
+      ],
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "配置" }));
     expect(
-      screen.getByRole("dialog", { name: "已导入兼容项" }),
-    ).toHaveTextContent("unknown");
+      await screen.findByRole("button", { name: "更新 订阅" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "更新 本地" }),
+    ).not.toBeInTheDocument();
   });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");

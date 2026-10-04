@@ -35,6 +35,7 @@ pub struct ProfileSummary {
     pub id: Uuid,
     pub name: String,
     pub source: String,
+    pub subscription: bool,
     pub pending: bool,
     pub last_checked: u64,
     pub last_error: Option<String>,
@@ -50,6 +51,7 @@ impl Profile {
                 .and_then(|s| reqwest::Url::parse(s).ok())
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .unwrap_or_else(|| "本地文件".into()),
+            subscription: self.url.is_some(),
             pending: self.pending.is_some(),
             last_checked: self.last_checked,
             last_error: self.last_error.clone(),

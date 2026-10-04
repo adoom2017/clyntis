@@ -22,6 +22,7 @@ export interface ProfileSummary {
   id: string;
   name: string;
   source: string;
+  subscription: boolean;
   pending: boolean;
   lastChecked: number;
   lastError: string | null;
@@ -30,7 +31,10 @@ export interface ImportResult {
   profile: ProfileSummary;
   warnings: { path: string; reason: string }[];
 }
-export interface Profile extends Omit<ProfileSummary, "pending" | "source"> {
+export interface Profile extends Omit<
+  ProfileSummary,
+  "pending" | "source" | "subscription"
+> {
   yaml: string;
   pending: string | null;
   previous: string | null;

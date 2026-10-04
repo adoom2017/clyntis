@@ -29,8 +29,7 @@ final class AppModel {
         case .connected: "已连接"
         case .connecting: "正在连接"
         case .disconnecting: "正在断开"
-        case .reasserting: "恢复连接中"
-        case .invalid: "尚未配置 VPN"
+        case .reasserting: "正在重连"
         default: "未连接"
         }
     }
@@ -78,10 +77,10 @@ final class AppModel {
         guard !busy, let store else { return }
         if active { manager?.connection.stopVPNTunnel(); return }
         #if targetEnvironment(simulator)
-        error = "模拟器可预览界面；VPN 连接需要具备 Network Extension 权限的真机签名。"
+        error = "模拟器不支持 VPN，请在已签名的真机上运行。"
         return
         #else
-        guard let selected else { error = "请先导入并选择一个配置。"; return }
+        guard let selected else { error = "请先导入配置。"; return }
         busy = true
         defer { busy = false }
         do {
@@ -141,7 +140,7 @@ final class AppModel {
     }
 
     func importRemote(address: String, password: String, name: String) async throws {
-        guard !busy, let store else { throw ClientError.message("配置正在处理中，请稍后重试。") }
+        guard !busy, let store else { throw ClientError.message("正在处理其他操作，请稍后再试。") }
         busy = true
         defer { busy = false }
         let url = try RemoteConfigImporter.url(from: address)
@@ -200,7 +199,7 @@ final class AppModel {
         return try await withCheckedThrowingContinuation { continuation in
             let reply = MessageReply(continuation)
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                reply.finish(.failure(ClientError.message("VPN 响应超时，请检查连接状态。")))
+                reply.finish(.failure(ClientError.message("VPN 无响应。")))
             }
             do {
                 try session.sendProviderMessage(payload) { data in

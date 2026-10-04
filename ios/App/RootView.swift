@@ -28,40 +28,43 @@ private struct ConnectionView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 24) {
-                    HStack(spacing: 12) {
-                        Image("Brand").resizable().frame(width: 48, height: 48)
-                            .clipShape(.rect(cornerRadius: 14)).accessibilityHidden(true)
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Clyntis").font(.title2.bold())
-                            Text("连接更自由").font(.subheadline).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                    }
-                    VStack(spacing: 18) {
-                        Label(model.statusText, systemImage: model.connected ? "checkmark.shield.fill" : "shield")
-                            .font(.headline).foregroundStyle(model.connected ? Color.green : Color.secondary)
+                VStack(spacing: 16) {
+                    VStack(spacing: 20) {
                         Button {
                             Task { await model.toggleConnection() }
                         } label: {
-                            Image(systemName: "power").font(.system(size: 44, weight: .medium))
-                                .frame(width: 112, height: 112).background(.tint.opacity(0.1), in: Circle())
+                            ZStack {
+                                Circle().fill(model.connected ? Color.brand : Color(.tertiarySystemFill))
+                                if model.busy || (model.active && !model.connected) {
+                                    ProgressView().controlSize(.large)
+                                        .tint(model.connected ? .white : .secondary)
+                                } else {
+                                    Image(systemName: "power").font(.system(size: 40, weight: .medium))
+                                        .foregroundStyle(model.connected ? Color.white : Color.secondary)
+                                }
+                            }
+                            .frame(width: 104, height: 104)
                         }
+                        .buttonStyle(.plain)
                         .disabled(model.busy || (!model.active && model.selected == nil))
                         .accessibilityLabel(model.active ? "断开 VPN" : "连接 VPN")
-                        Text(model.selected?.name ?? "先添加一个配置，开始连接")
-                            .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        if model.busy { ProgressView() }
+                        .sensoryFeedback(.impact, trigger: model.connected)
+                        VStack(spacing: 4) {
+                            Text(model.statusText).font(.title3.weight(.semibold))
+                                .foregroundStyle(model.connected ? Color.brand : Color.primary)
+                            Text(model.selected?.name ?? "未选择配置")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
                     }
-                    .frame(maxWidth: .infinity).padding(28)
-                    .background(.background, in: .rect(cornerRadius: 24))
-                    HStack {
-                        TrafficStat(title: "累计上传", value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)))
-                        TrafficStat(title: "累计下载", value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)))
-                        TrafficStat(title: "连接数", value: "\(model.connectionCount)")
+                    .frame(maxWidth: .infinity).padding(.vertical, 32)
+                    .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 20))
+                    HStack(spacing: 12) {
+                        TrafficStat(title: "上传", value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)))
+                        TrafficStat(title: "下载", value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)))
+                        TrafficStat(title: "连接", value: "\(model.connectionCount)")
                     }
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("路由模式").font(.headline)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("路由模式").font(.subheadline).foregroundStyle(.secondary)
                         Picker("路由模式", selection: Binding(get: { model.mode }, set: { value in
                             Task { await model.setMode(value) }
                         })) {
@@ -70,12 +73,11 @@ private struct ConnectionView: View {
                             Text("直连").tag("direct")
                         }.pickerStyle(.segmented).disabled(!model.connected || model.busy)
                     }
-                    Label("配置保存在本机，连接由系统 VPN 管理。", systemImage: "lock.shield")
-                        .font(.footnote).foregroundStyle(.secondary)
+                    .padding(.top, 4)
                 }
                 .padding(20).frame(maxWidth: 620).frame(maxWidth: .infinity)
             }
-            .background(Color(.systemGroupedBackground)).navigationTitle("连接")
+            .background(Color(.systemGroupedBackground)).navigationTitle("Clyntis")
         }
     }
 }
@@ -89,7 +91,7 @@ private struct TrafficStat: View {
             Text(value).font(.headline).monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14).background(.background, in: .rect(cornerRadius: 16))
+        .padding(14).background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 14))
     }
 }
 
@@ -101,8 +103,8 @@ private struct ProfilesView: View {
         NavigationStack {
             List {
                 if model.profiles.isEmpty {
-                    ContentUnavailableView("从一个配置开始", systemImage: "doc.badge.plus",
-                                           description: Text("导入兼容的 Clash YAML 配置。"))
+                    ContentUnavailableView("还没有配置", systemImage: "doc.badge.plus",
+                                           description: Text("点右上角 + 导入 Clash YAML 文件或链接"))
                 }
                 ForEach(model.profiles) { profile in
                     Button {
@@ -114,7 +116,7 @@ private struct ProfilesView: View {
                                 Text(profile.createdAt, style: .date).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Image(systemName: "checkmark.circle.fill").opacity(model.selectedID == profile.id ? 1 : 0)
+                            Image(systemName: "checkmark").foregroundStyle(.tint).opacity(model.selectedID == profile.id ? 1 : 0)
                         }
                     }
                     .disabled(model.active || model.busy)
@@ -122,9 +124,8 @@ private struct ProfilesView: View {
                         Button("删除", role: .destructive) { model.remove(profile) }.disabled(model.active || model.busy)
                     }
                 }
-                Section {
-                    Text("连接期间不能切换或删除配置。新的配置导入后不会自动重连。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                if model.active && !model.profiles.isEmpty {
+                    Section { } footer: { Text("断开后才能切换或删除配置") }
                 }
             }
             .navigationTitle("配置")
@@ -155,8 +156,8 @@ private struct NodesView: View {
         NavigationStack {
             List {
                 if model.groups.isEmpty {
-                    ContentUnavailableView("暂无可选节点", systemImage: "network",
-                        description: Text(model.connected ? "当前配置没有代理组。" : "连接后可查看代理组并选择节点。"))
+                    ContentUnavailableView(model.connected ? "没有代理组" : "未连接", systemImage: "network",
+                        description: Text(model.connected ? "当前配置未定义代理组" : "连接后可选择节点"))
                 }
                 ForEach(model.groups) { group in
                     Section(group.name) {
@@ -167,7 +168,7 @@ private struct NodesView: View {
                                 HStack {
                                     Text(node).foregroundStyle(.primary)
                                     Spacer()
-                                    Image(systemName: "checkmark").opacity(group.selected == node ? 1 : 0)
+                                    Image(systemName: "checkmark").foregroundStyle(.tint).opacity(group.selected == node ? 1 : 0)
                                 }
                             }.disabled(model.busy || !model.connected)
                         }
