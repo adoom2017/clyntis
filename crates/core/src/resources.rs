@@ -319,72 +319,112 @@ async fn asset(
         interval.is_some() && !url.is_empty(),
         "local routing resource is missing"
     );
-    let data = download(url, resolver, hooks)
-        .await
-        .context("routing resource download failed")?;
+    let data = download(url, resolver, hooks).await.with_context(|| {
+        format!(
+            "routing resource download failed ({})",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )
+    })?;
     pending.push((path.into(), data.clone()));
     Ok(data)
 }
+#[derive(Clone, Copy)]
+struct Timeouts {
+    /// Waiting for the server: DNS, TCP, TLS and response headers.
+    response: Duration,
+    /// A body that delivers no data for this long is treated as stalled.
+    idle: Duration,
+    /// Hard cap so a trickling server cannot hold startup forever.
+    total: Duration,
+}
+const TIMEOUTS: Timeouts = Timeouts {
+    response: Duration::from_secs(30),
+    idle: Duration::from_secs(30),
+    total: Duration::from_secs(300),
+};
+
+/// Large files (geoip.dat is ~16 MiB) may legitimately take minutes on a slow
+/// link, so only lack of progress fails a download, not its total duration.
 pub async fn download(
     url: &str,
     resolver: &crate::dns::Resolver,
     hooks: &meta_platform::Hooks,
 ) -> Result<Vec<u8>> {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        use http_body_util::{BodyExt, Empty, Limited};
+    download_with(url, resolver, hooks, TIMEOUTS).await
+}
+async fn download_with(
+    url: &str,
+    resolver: &crate::dns::Resolver,
+    hooks: &meta_platform::Hooks,
+    timeouts: Timeouts,
+) -> Result<Vec<u8>> {
+    tokio::time::timeout(timeouts.total, async {
+        use http_body_util::{BodyExt, Empty};
         let mut url = url.to_owned();
         for _ in 0..6 {
             let uri: http::Uri = url.parse().context("invalid resource URL")?;
-            let scheme = uri.scheme_str().unwrap_or("");
+            let scheme = uri.scheme_str().unwrap_or("").to_owned();
             ensure!(
                 scheme == "https" || scheme == "http",
                 "resource URL must use HTTP(S)"
             );
-            let target =
-                meta_protocol::Target::from_uri(&uri, if scheme == "https" { 443 } else { 80 })?;
-            let addresses = resolver.lookup(&target.host, target.port).await?;
-            let mut connected = None;
-            for addr in addresses {
-                if let Ok(Ok(s)) = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    meta_platform::tcp_connect(addr, &**hooks),
-                )
-                .await
-                {
-                    connected = Some(s);
-                    break;
-                }
-            }
-            let socket = connected.context("cannot connect to resource server")?;
-            let stream: meta_protocol::BoxStream = if scheme == "https" {
-                meta_protocol::tls::SecureConnector::new(resolver.clock())
-                    .connect(
-                        Box::new(socket),
-                        &meta_protocol::tls::TlsConnectConfig {
-                            server_name: target.host,
-                            alpn: vec!["http/1.1".into()],
-                            verify_cert: true,
-                            fingerprint: meta_protocol::tls::TlsFingerprint::Native,
-                            reality: None,
-                        },
+            let (response, driver) = tokio::time::timeout(timeouts.response, async {
+                let target = meta_protocol::Target::from_uri(
+                    &uri,
+                    if scheme == "https" { 443 } else { 80 },
+                )?;
+                let addresses = resolver.lookup(&target.host, target.port).await?;
+                let mut connected = None;
+                for addr in addresses {
+                    if let Ok(Ok(s)) = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        meta_platform::tcp_connect(addr, &**hooks),
                     )
-                    .await?
-            } else {
-                Box::new(socket)
-            };
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
-            let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
-            let request = http::Request::get(uri.path_and_query().map_or("/", |v| v.as_str()))
-                .header(
-                    http::header::HOST,
-                    uri.authority()
-                        .context("missing resource authority")?
-                        .as_str(),
+                    .await
+                    {
+                        connected = Some(s);
+                        break;
+                    }
+                }
+                let socket = connected.context("cannot connect to resource server")?;
+                let stream: meta_protocol::BoxStream = if scheme == "https" {
+                    meta_protocol::tls::SecureConnector::new(resolver.clock())
+                        .connect(
+                            Box::new(socket),
+                            &meta_protocol::tls::TlsConnectConfig {
+                                server_name: target.host,
+                                alpn: vec!["http/1.1".into()],
+                                verify_cert: true,
+                                fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                                reality: None,
+                            },
+                        )
+                        .await?
+                } else {
+                    Box::new(socket)
+                };
+                let (mut sender, connection) =
+                    hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                        .await?;
+                let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+                let request = http::Request::get(uri.path_and_query().map_or("/", |v| v.as_str()))
+                    .header(
+                        http::header::HOST,
+                        uri.authority()
+                            .context("missing resource authority")?
+                            .as_str(),
+                    )
+                    .header(http::header::USER_AGENT, "clyntis")
+                    .body(Empty::<bytes::Bytes>::new())?;
+                anyhow::Ok((sender.send_request(request).await?, driver))
+            })
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "resource server did not respond within {}s",
+                    timeouts.response.as_secs()
                 )
-                .header(http::header::USER_AGENT, "clyntis")
-                .body(Empty::<bytes::Bytes>::new())?;
-            let response = sender.send_request(request).await?;
+            })??;
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -406,16 +446,35 @@ pub async fn download(
                 response.status().is_success(),
                 "resource HTTP request failed"
             );
-            let body = Limited::new(response.into_body(), LIMIT)
-                .collect()
-                .await
-                .map_err(|_| anyhow::anyhow!("resource body failed or exceeded limit"))?
-                .to_bytes();
-            return Ok(body.to_vec());
+            let mut body = response.into_body();
+            let mut data = Vec::new();
+            loop {
+                let frame = tokio::time::timeout(timeouts.idle, body.frame())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "resource download stalled: no data for {:.0}s after {} bytes",
+                            timeouts.idle.as_secs_f32(),
+                            data.len()
+                        )
+                    })?;
+                let Some(frame) = frame else { break };
+                let frame = frame.map_err(|_| anyhow::anyhow!("resource body failed"))?;
+                if let Some(chunk) = frame.data_ref() {
+                    ensure!(
+                        data.len() + chunk.len() <= LIMIT,
+                        "resource exceeds size limit"
+                    );
+                    data.extend_from_slice(chunk);
+                }
+            }
+            drop(driver);
+            return Ok(data);
         }
         bail!("too many resource redirects")
     })
-    .await?
+    .await
+    .map_err(|_| anyhow::anyhow!("resource download exceeded {}s", timeouts.total.as_secs()))?
 }
 fn parse_payload(data: &[u8], format: &str) -> Result<Vec<String>> {
     match format {
@@ -536,6 +595,64 @@ struct Attribute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Serves a body in timed chunks: (delay before chunk, bytes).
+    async fn slow_server(chunks: Vec<(u64, &'static [u8])>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            let total: usize = chunks.iter().map(|(_, c)| c.len()).sum();
+            socket
+                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {total}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            for (delay, chunk) in chunks {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                if socket.write_all(chunk).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        format!("http://{address}/data")
+    }
+    fn short() -> Timeouts {
+        Timeouts {
+            response: Duration::from_secs(2),
+            idle: Duration::from_millis(500),
+            total: Duration::from_secs(10),
+        }
+    }
+    #[tokio::test]
+    async fn slow_but_steady_download_outlives_the_idle_timeout() {
+        let resolver =
+            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
+        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        // Takes ~1.5s in total, three times the idle limit, but never pauses for long.
+        let url = slow_server((0..6).map(|_| (250, &b"chunk"[..])).collect()).await;
+        let data = download_with(&url, &resolver, &hooks, short())
+            .await
+            .unwrap();
+        assert_eq!(data, b"chunk".repeat(6));
+    }
+    #[tokio::test]
+    async fn stalled_download_reports_progress_instead_of_a_bare_deadline() {
+        let resolver =
+            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
+        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        let url = slow_server(vec![(0, b"partial"), (3000, b"rest")]).await;
+        let error = download_with(&url, &resolver, &hooks, short())
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("stalled") && message.contains("after 7 bytes"),
+            "{message}"
+        );
+    }
     #[tokio::test]
     async fn geo_provider_and_atomic_failure() {
         let dir = std::env::temp_dir().join(format!("meta-geo-{}", uuid::Uuid::new_v4()));

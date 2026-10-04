@@ -2,8 +2,6 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, ValueEnum};
 use meta_config::{Config, ProxyKind, crypto};
-use meta_core::Core;
-use meta_platform::DefaultHooks;
 #[cfg(target_os = "macos")]
 use meta_runtime::{detect_macos_egress, public_egress_targets};
 use std::{
@@ -12,7 +10,6 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::PathBuf,
     process::ExitCode,
-    sync::Arc,
 };
 use zeroize::Zeroizing;
 
@@ -314,12 +311,8 @@ fn run(mut args: Args) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(async {
-            let core = Core::new(config, Arc::new(DefaultHooks))?;
-            core.prepare_resources(false).await?;
-            println!("Routing resource test successful");
-            Ok::<_, anyhow::Error>(())
-        })?;
+        runtime.block_on(meta_runtime::prefetch_resources(config))?;
+        println!("Routing resource test successful");
         return Ok(());
     }
     ensure!(

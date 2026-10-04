@@ -23,6 +23,16 @@ pub struct RuntimeReady {
     pub controller: Option<SocketAddr>,
 }
 
+/// Load routing resources into `config.directory`, downloading only missing files.
+/// Runs without TUN or listeners, so hosts can fetch resources over the ordinary
+/// network before a TUN session takes over routing.
+pub async fn prefetch_resources(mut config: Config) -> Result<()> {
+    config.tun.enable = false;
+    Core::new(config, Arc::new(DefaultHooks))?
+        .prepare_resources(false)
+        .await
+}
+
 pub fn recover(directory: &std::path::Path) -> Result<()> {
     // Attempt both journals even when one recovery fails.
     let routes = meta_platform::desktop::recover(directory);
@@ -505,5 +515,41 @@ mod dns_route_tests {
         assert_eq!(best_egress_index(&[1, 1], &[0, 2]), Some(1));
         assert_eq!(best_egress_index(&[0, 0], &[1, 1]), Some(0));
         assert_eq!(best_egress_index(&[0, 0], &[0, 0]), None);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn prefetch_downloads_missing_files_and_then_reuses_them() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Exactly one request: the second prefetch must use the local copy.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request).await;
+            let body = "payload:\n  - DOMAIN-SUFFIX,ads.example\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "mixed-port: 0\nrule-providers:\n  ads:\n    type: http\n    behavior: classical\n    format: yaml\n    url: http://{address}/ads.yaml\n    path: ./rule_provider/ads.yaml\n    interval: 600\nrules:\n  - RULE-SET,ads,REJECT\n  - MATCH,DIRECT\ntun:\n  enable: true\n"
+        );
+        let mut config = Config::parse(yaml.as_bytes()).unwrap();
+        config.directory = directory.path().into();
+        prefetch_resources(config.clone()).await.unwrap();
+        server.await.unwrap();
+        let saved =
+            std::fs::read_to_string(directory.path().join("rule_provider/ads.yaml")).unwrap();
+        assert!(saved.contains("ads.example"));
+        prefetch_resources(config).await.unwrap();
     }
 }

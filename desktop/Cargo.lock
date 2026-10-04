@@ -771,6 +771,7 @@ dependencies = [
  "clyntis-desktop-model",
  "clyntis-desktop-service",
  "futures-util",
+ "meta-runtime",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

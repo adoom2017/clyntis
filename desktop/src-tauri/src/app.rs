@@ -151,6 +151,21 @@ impl Desktop {
         settings: Settings,
     ) -> Result<()> {
         profiles::runtime_yaml(&profile, &settings, &"x".repeat(64))?;
+        // Fetch before stopping the current engine: the network still works
+        // normally, and the TUN session can then start from local files.
+        if settings.capture == Capture::Tun {
+            self.status("starting", None);
+            if let Err(error) = engine::prefetch(&self.store, &profile, &settings).await {
+                engine::log(
+                    &self.app,
+                    &self.logs,
+                    "warning",
+                    &clyntis_desktop_model::redact(&format!(
+                        "路由资源预下载失败，将由内核重试：{error:#}"
+                    )),
+                );
+            }
+        }
         let previous = operation.active.clone();
         if let Some(mut engine) = operation.engine.take() {
             self.status("stopping", None);
@@ -448,6 +463,14 @@ pub async fn add_subscription(
         .store
         .import_subscription(name, &source, url, password)
         .map_err(error)?;
+    if let Ok(profile) = state.store.get(result.profile.id) {
+        engine::spawn_prefetch(
+            state.app.clone(),
+            state.logs.clone(),
+            state.store.clone(),
+            profile,
+        );
+    }
     if state.store.selected().map_err(error)?.is_none() {
         state.store.select(Some(result.profile.id)).map_err(error)?;
     }

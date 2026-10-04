@@ -69,6 +69,39 @@ impl Controller {
         Ok(value)
     }
 }
+/// Download missing routing resources into the profile's runtime directory as
+/// the desktop user, over the ordinary network. TUN sessions upload these files
+/// to the service, so the core never has to fetch them while TUN routing is
+/// being brought up.
+pub async fn prefetch(store: &Store, profile: &Profile, settings: &Settings) -> Result<()> {
+    let yaml = runtime_yaml(profile, settings, &"x".repeat(64))?;
+    let mut config = validate(&yaml)?;
+    let directory = store.runtime_dir(profile.id);
+    clyntis_desktop_model::private_dir(&directory)?;
+    config.directory = directory;
+    meta_runtime::prefetch_resources(config).await
+}
+
+/// Background variant used after importing a subscription; failures are only logged.
+pub fn spawn_prefetch(app: tauri::AppHandle, logs: Logs, store: Store, profile: Profile) {
+    tokio::spawn(async move {
+        let result = match store.settings() {
+            Ok(settings) => prefetch(&store, &profile, &settings).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            log(
+                &app,
+                &logs,
+                "warning",
+                &clyntis_desktop_model::redact(&format!(
+                    "路由资源预下载失败，将在连接时重试：{error:#}"
+                )),
+            );
+        }
+    });
+}
+
 pub struct Engine {
     process: Option<Process>,
     service: Option<Arc<tokio::sync::Mutex<Client>>>,
