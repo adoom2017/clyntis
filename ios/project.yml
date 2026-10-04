@@ -1,0 +1,93 @@
+name: Clyntis
+options:
+  bundleIdPrefix: org.clyntis.ios
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    ARCHS: arm64
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    CLYNTIS_APP_GROUP: group.org.clyntis.ios
+    CLYNTIS_TUNNEL_ID: org.clyntis.ios.tunnel
+    HEADER_SEARCH_PATHS: "$(SRCROOT)/../crates/ffi/include"
+    SWIFT_OBJC_BRIDGING_HEADER: Core/Bridge.h
+    OTHER_LDFLAGS: "$(inherited) -lresolv -lc++"
+targets:
+  Clyntis:
+    type: application
+    platform: iOS
+    sources: [App, Shared, Assets.xcassets]
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Clyntis
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        "UISupportedInterfaceOrientations~ipad": [UIInterfaceOrientationPortrait, UIInterfaceOrientationPortraitUpsideDown, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        ClyntisAppGroup: "$(CLYNTIS_APP_GROUP)"
+        ClyntisTunnelIdentifier: "$(CLYNTIS_TUNNEL_ID)"
+    entitlements:
+      path: App/Clyntis.entitlements
+      properties:
+        com.apple.security.application-groups: ["$(CLYNTIS_APP_GROUP)"]
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.clyntis.ios
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: ClyntisTunnel
+      - framework: Frameworks/ClyntisCore.xcframework
+        embed: false
+      - sdk: NetworkExtension.framework
+  ClyntisTunnel:
+    type: app-extension
+    platform: iOS
+    sources: [Tunnel, Shared]
+    info:
+      path: Tunnel/Info.plist
+      properties:
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        ClyntisAppGroup: "$(CLYNTIS_APP_GROUP)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).PacketTunnelProvider"
+    entitlements:
+      path: Tunnel/ClyntisTunnel.entitlements
+      properties:
+        com.apple.security.application-groups: ["$(CLYNTIS_APP_GROUP)"]
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "$(CLYNTIS_TUNNEL_ID)"
+        APPLICATION_EXTENSION_API_ONLY: YES
+    dependencies:
+      - framework: Frameworks/ClyntisCore.xcframework
+        embed: false
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+  ClyntisTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+    dependencies:
+      - target: Clyntis
+schemes:
+  Clyntis:
+    build:
+      targets:
+        Clyntis: all
+    test:
+      targets: [ClyntisTests]

@@ -63,3 +63,10 @@ config-decrypt.yaml
 /desktop/src-tauri/gen/
 /desktop/*.tsbuildinfo
 .codex/
+
+# iOS generated native libraries and local Xcode output.
+/ios/Frameworks/
+/ios/build/
+/ios/*.xcodeproj/xcuserdata/
+/ios/*.xcodeproj/project.xcworkspace/xcuserdata/
+/ios/Signing.xcconfig

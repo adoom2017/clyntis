@@ -48,8 +48,11 @@ fn boundary(operation: impl FnOnce() -> Result<i32>) -> i32 {
     }
 }
 unsafe fn input<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
+    unsafe { input_with_limit(data, len, LIMIT) }
+}
+unsafe fn input_with_limit<'a>(data: *const u8, len: usize, limit: usize) -> Result<&'a [u8]> {
     ensure!(
-        len <= LIMIT && (len == 0 || !data.is_null()),
+        len <= limit && (len == 0 || !data.is_null()),
         "invalid input buffer"
     );
     if len == 0 {
@@ -87,6 +90,48 @@ pub extern "C" fn meta_abi_version_v1() -> u32 {
     1
 }
 
+/// Decrypt and validate the existing AES-CFB/Base64 configuration format.
+///
+/// # Safety
+/// Input buffers must be readable for their lengths. Output buffer and length
+/// must be writable, nonoverlapping, and must not overlap either input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_decrypt_config_v1(
+    data: *const u8,
+    len: usize,
+    password: *const u8,
+    password_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        ensure!(!length.is_null(), "output length is required");
+        unsafe { *length = 0 };
+        ensure!(capacity == 0 || !buffer.is_null(), "invalid output buffer");
+        let ciphertext = unsafe { input_with_limit(data, len, 24 * 1024 * 1024)? };
+        let password = std::str::from_utf8(unsafe { input(password, password_len)? })?;
+        // Remote text files may have a final newline or wrapped Base64 lines.
+        let ciphertext: Vec<u8> = ciphertext
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
+        let plaintext = meta_config::crypto::decrypt(&ciphertext, password).map_err(|_| {
+            anyhow::anyhow!("cannot decrypt configuration: check password and format")
+        })?;
+        ensure!(
+            !plaintext.is_empty() && plaintext.len() <= LIMIT,
+            "decrypted configuration is empty or exceeds 16 MiB"
+        );
+        // CFB has no authentication tag. Never expose unvalidated plaintext.
+        meta_config::Config::parse(&plaintext).map_err(|_| {
+            anyhow::anyhow!("cannot decrypt configuration: check password and format")
+        })?;
+        unsafe { output(&plaintext, buffer, capacity, length) }
+    })
+}
+
 /// # Safety
 /// Inputs and the hooks size field must be readable and aligned. If the size is
 /// supported, hooks must point to a complete valid MetaHooksV1. Callback context
@@ -98,13 +143,67 @@ pub unsafe extern "C" fn meta_create_v1(
     hooks: *const MetaHooksV1,
     out: *mut u64,
 ) -> i32 {
+    unsafe { create(data, len, hooks, out, None) }
+}
+
+/// Create a host-owned packet tunnel without opening desktop proxy listeners.
+///
+/// # Safety
+/// The same requirements as meta_create_v1 apply. directory must contain a
+/// readable UTF-8 absolute path to an existing host-owned resource directory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_create_packet_tunnel_v1(
+    data: *const u8,
+    len: usize,
+    directory: *const u8,
+    directory_len: usize,
+    hooks: *const MetaHooksV1,
+    out: *mut u64,
+) -> i32 {
+    // Parse the directory inside the boundary so invalid input remains a C error.
+    unsafe { create(data, len, hooks, out, Some((directory, directory_len))) }
+}
+
+unsafe fn create(
+    data: *const u8,
+    len: usize,
+    hooks: *const MetaHooksV1,
+    out: *mut u64,
+    directory: Option<(*const u8, usize)>,
+) -> i32 {
     boundary(|| {
         ensure!(!out.is_null(), "handle output is required");
         unsafe {
             *out = 0;
         }
         host::check_lifecycle()?;
-        let config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        if let Some((path, path_len)) = directory {
+            let path =
+                std::path::PathBuf::from(std::str::from_utf8(unsafe { input(path, path_len)? })?);
+            ensure!(
+                path.is_absolute() && path.is_dir(),
+                "host directory must exist and be absolute"
+            );
+            config.directory = path;
+            config.internal_host_packet_io = true;
+            config.port = 0;
+            config.socks_port = 0;
+            config.mixed_port = 0;
+            config.allow_lan = false;
+            config.external_controller = None;
+            config.external_ui.clear();
+            config.log.log_path.clear();
+            // Packet DNS interception uses the resolver without a local listener.
+            config.dns.enable = false;
+            config.tun.enable = true;
+            config.tun.auto_route = false;
+            config.tun.auto_dns = false;
+            config.tun.auto_detect_interface = false;
+            config.tun.interface = None;
+            config.tun.mtu = 1280;
+            config.tun.dns_hijack = vec!["any:53".into()];
+        }
         let hooks = if hooks.is_null() {
             HostHooks::default()
         } else {
@@ -203,7 +302,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
 ) -> i32 {
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "connections":handle.core.connections(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }

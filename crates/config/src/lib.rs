@@ -60,6 +60,9 @@ pub struct Config {
     pub directory: std::path::PathBuf,
     #[serde(skip)]
     pub internal_allow_native_profile: bool,
+    /// Packet-tunnel hosts provide networking rather than a native interface.
+    #[serde(skip)]
+    pub internal_host_packet_io: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -98,6 +101,7 @@ impl Default for Config {
             sniffer: Sniffer::default(),
             directory: ".".into(),
             internal_allow_native_profile: false,
+            internal_host_packet_io: false,
         }
     }
 }
@@ -701,7 +705,10 @@ impl Config {
             "tun.mtu must be 1280..9000"
         );
         ensure!(
-            !self.tun.enable || self.tun.auto_detect_interface || self.tun.interface.is_some(),
+            self.internal_host_packet_io
+                || !self.tun.enable
+                || self.tun.auto_detect_interface
+                || self.tun.interface.is_some(),
             "tun.interface is required when auto-detect-interface is disabled"
         );
         ensure!(
@@ -819,6 +826,19 @@ pub fn port_list(proxy: &Proxy) -> Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packet_host_interface_exemption_cannot_be_enabled_by_yaml() {
+        assert!(Config::parse(b"internal-host-packet-io: true\n").is_err());
+        assert!(Config::parse(b"tun: {enable: true, auto-detect-interface: false}\n").is_err());
+        let config = Config::parse(b"{}\n").unwrap();
+        assert!(!config.internal_host_packet_io);
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("internal-host-packet-io")
+                .is_none()
+        );
+    }
     #[test]
     fn defaults_and_logging() {
         let cfg = Config::parse(b"log:\n  log-level: debug\n  log-path: logs/meta.log\n").unwrap();

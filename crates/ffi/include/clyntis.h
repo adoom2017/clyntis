@@ -40,7 +40,24 @@ typedef struct {
  * routes/DNS and lifecycle. Packets have no Darwin address-family prefix.
  */
 uint32_t meta_abi_version_v1(void);
+/* Decrypt legacy AES-CFB/Base64 with a UTF-8 password, then validate YAML.
+ * Accepts ASCII whitespace in Base64. Ciphertext limit: 24 MiB; decrypted YAML:
+ * 16 MiB. Returns original plaintext bytes (including comments/credentials),
+ * not serialized/sanitized YAML. No handle or listener is created. Standard
+ * caller-buffer/size-query contract applies; on error length=0 and no plaintext
+ * is copied. Output must not overlap inputs. Password is consumed only here. */
+int32_t meta_decrypt_config_v1(const uint8_t *config, size_t length,
+    const uint8_t *password, size_t password_length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 int32_t meta_create_v1(const uint8_t *config, size_t length, const meta_hooks_v1 *hooks, meta_handle *out);
+/* Host-owned packet-tunnel variant (iOS Network Extension). Keeps credentials
+ * and routing policy from config; enables packet I/O, forces MTU=1280 and DNS
+ * interception, and disables local HTTP/SOCKS/DNS/controller listeners and
+ * native route/DNS/interface changes. directory is a UTF-8 absolute existing
+ * host resource/cache directory. The persisted source YAML is not modified. */
+int32_t meta_create_packet_tunnel_v1(const uint8_t *config, size_t length,
+    const uint8_t *directory, size_t directory_length,
+    const meta_hooks_v1 *hooks, meta_handle *out);
 int32_t meta_start_v1(meta_handle handle);
 int32_t meta_stop_v1(meta_handle handle);
 int32_t meta_destroy_v1(meta_handle handle);

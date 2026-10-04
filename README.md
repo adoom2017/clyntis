@@ -40,6 +40,10 @@ The optional Windows/macOS desktop application lives in the independent
 [`desktop/`](desktop/README.md) workspace. It uses Tauri 2 and React, with
 profile/subscription management, system proxy and TUN integration. See its
 README for development, privileged helper installation and desktop packaging.
+
+The native iOS/iPadOS client lives in [`ios/`](ios/README.md). It uses SwiftUI and
+a Network Extension packet tunnel with the Rust C API. See its README for
+Apple Silicon builds, simulator checks, device signing and current limitations.
 The commands below continue to build and test the CLI/core workspace only.
 
 From the repository root:

@@ -607,6 +607,9 @@ impl Core {
         config["rules"] = serde_json::to_value(&policy.raw_rules).unwrap();
         config
     }
+    pub fn selections(&self) -> HashMap<String, String> {
+        self.policy.read().unwrap().selection.clone()
+    }
     async fn raw_tcp(&self, target: &Target) -> Result<tokio::net::TcpStream> {
         let addresses = self.resolver.lookup(&target.host, target.port).await?;
         let stream = self.connect_addresses(addresses, false, "").await?;
