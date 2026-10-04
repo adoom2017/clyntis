@@ -18,12 +18,14 @@ import {
   CircleAlert,
   Download,
   FileCode2,
+  FileLock2,
   FolderOpen,
   Gauge,
   Globe2,
   Layers3,
   Link2,
   LoaderCircle,
+  Lock,
   Network,
   Pause,
   Play,
@@ -52,6 +54,7 @@ import {
   type ImportResult,
   type Mode,
   type Profile,
+  type ProfileSummary,
   type Proxy,
   type Settings,
   type Snapshot,
@@ -222,19 +225,80 @@ export default function App() {
   const importFile = async () => {
     const path = await open({
       multiple: false,
-      filters: [{ name: "YAML 配置", extensions: ["yaml", "yml"] }],
+      filters: [{ name: "配置文件", extensions: ["yaml", "yml", "txt"] }],
     });
-    if (typeof path === "string")
+    if (typeof path !== "string") return;
+    const { encrypted } = await invoke<{ encrypted: boolean }>(
+      "inspect_profile_file",
+      { path },
+    );
+    if (!encrypted) {
       showImportResult(await invoke<ImportResult>("import_profile", { path }));
+      return;
+    }
+    setModal(
+      <PasswordForm
+        title="导入加密配置"
+        text="此文件已加密，输入密码后导入。"
+        submitLabel="解密并导入"
+        onClose={() => setModal(null)}
+        onSubmit={async (password) => {
+          try {
+            const result = await invoke<ImportResult>("import_profile", {
+              path,
+              password,
+            });
+            await refresh();
+            showImportResult(result);
+            return null;
+          } catch (e) {
+            return String(e);
+          }
+        }}
+      />,
+    );
   };
+  const exportEncrypted = (profile: ProfileSummary) =>
+    setModal(
+      <PasswordForm
+        title={`加密导出「${profile.name}」`}
+        text="导出的文件需要此密码才能导入。导出的是当前生效的版本。"
+        submitLabel="选择位置并导出"
+        confirm
+        onClose={() => setModal(null)}
+        onSubmit={async (password) => {
+          try {
+            const path = await save({
+              defaultPath: `${profile.name}.txt`,
+              filters: [{ name: "加密配置", extensions: ["txt"] }],
+            });
+            if (!path) return "";
+            await invoke("export_encrypted", {
+              id: profile.id,
+              password,
+              path,
+            });
+            setModal(null);
+            setNotice("已加密导出");
+            return null;
+          } catch (e) {
+            return String(e);
+          }
+        }}
+      />,
+    );
   const addSubscription = () =>
     setModal(
       <SubscriptionForm
         onClose={() => setModal(null)}
-        onSubmit={async (name, url) => {
+        onSubmit={async (name, url, password) => {
           const ok = await perform(async () => {
             showImportResult(
-              await invoke<ImportResult>("add_subscription", { name, url }),
+              await invoke<ImportResult>("add_subscription", {
+                name,
+                url,
+                password: password || null,
+              }),
             );
           });
           return ok;
@@ -487,6 +551,13 @@ export default function App() {
                         <div>
                           <h3>{profile.name}</h3>
                           <p>
+                            {profile.encrypted && (
+                              <Lock
+                                size={11}
+                                className="inline-icon"
+                                aria-label="加密订阅"
+                              />
+                            )}
                             {profile.source} · 检查于{" "}
                             {new Date(
                               profile.lastChecked * 1000,
@@ -605,6 +676,15 @@ export default function App() {
                           }
                         >
                           <Undo2 size={16} />
+                        </button>
+                        <button
+                          className="icon-button"
+                          disabled={disabled}
+                          title="加密导出"
+                          aria-label={`加密导出 ${profile.name}`}
+                          onClick={() => exportEncrypted(profile)}
+                        >
+                          <FileLock2 size={16} />
                         </button>
                         <button
                           className="icon-button danger"
@@ -906,15 +986,95 @@ function Confirm({
     </Modal>
   );
 }
+function PasswordForm({
+  title,
+  text,
+  submitLabel,
+  confirm = false,
+  onClose,
+  onSubmit,
+}: {
+  title: string;
+  text: string;
+  submitLabel: string;
+  confirm?: boolean;
+  onClose: () => void;
+  /** Resolves to an error message, "" to stay open silently, or null on success. */
+  onSubmit: (password: string) => Promise<string | null>;
+}) {
+  const [password, setPassword] = useState("");
+  const [repeat, setRepeat] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  const mismatch = confirm && repeat !== "" && repeat !== password;
+  return (
+    <Modal title={title} onClose={onClose}>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          setSaving(true);
+          setFailure(null);
+          void onSubmit(password)
+            .then((message) => setFailure(message || null))
+            .finally(() => setSaving(false));
+        }}
+      >
+        <p className="small muted">{text}</p>
+        <label className="field">
+          密码
+          <input
+            autoFocus
+            required
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete={confirm ? "new-password" : "current-password"}
+          />
+        </label>
+        {confirm && (
+          <label className="field">
+            确认密码
+            <input
+              required
+              type="password"
+              value={repeat}
+              onChange={(e) => setRepeat(e.target.value)}
+              autoComplete="new-password"
+            />
+          </label>
+        )}
+        {mismatch && <p className="inline-error">两次输入的密码不一致</p>}
+        {failure && (
+          <p role="alert" className="inline-error">
+            {failure}
+          </p>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="button primary"
+            disabled={saving || !password || (confirm && repeat !== password)}
+          >
+            {saving && <LoaderCircle className="spin" size={16} />}
+            {submitLabel}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
 function SubscriptionForm({
   onClose,
   onSubmit,
 }: {
   onClose: () => void;
-  onSubmit: (name: string, url: string) => Promise<boolean>;
+  onSubmit: (name: string, url: string, password: string) => Promise<boolean>;
 }) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+  const [password, setPassword] = useState("");
   const [saving, setSaving] = useState(false);
   const [failed, setFailed] = useState(false);
   return (
@@ -923,7 +1083,7 @@ function SubscriptionForm({
         onSubmit={(event) => {
           event.preventDefault();
           setSaving(true);
-          void onSubmit(name, url)
+          void onSubmit(name, url, password)
             .then((ok) => setFailed(!ok))
             .finally(() => setSaving(false));
         }}
@@ -951,8 +1111,18 @@ function SubscriptionForm({
             spellCheck={false}
           />
         </label>
+        <label className="field">
+          解密密码（可选）
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="订阅内容未加密时留空"
+            autoComplete="off"
+          />
+        </label>
         <p className="small muted">
-          仅支持 HTTPS。链接通常含访问令牌，请勿外传。
+          仅支持 HTTPS。密码保存在本机，用于之后自动更新时解密。
         </p>
         {failed && (
           <p role="alert" className="inline-error">

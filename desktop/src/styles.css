@@ -740,6 +740,10 @@ textarea::placeholder {
   font-size: 12px;
   margin-top: 2px;
 }
+.inline-icon {
+  vertical-align: -1px;
+  margin-right: 4px;
+}
 .profile-actions {
   display: flex;
   align-items: center;
@@ -1105,6 +1109,9 @@ td:nth-child(4) {
   background: var(--surface);
   padding: 20px;
   box-shadow: 0 20px 60px #00000040;
+}
+.modal:focus {
+  outline: none;
 }
 .modal.wide {
   width: 800px;

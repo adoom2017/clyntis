@@ -106,6 +106,9 @@ final class AppModel {
         #endif
     }
 
+    /// An encrypted file waiting for its password; the UI prompts while this is set.
+    var pendingEncryptedImport: PendingImport?
+
     func importFile(_ url: URL) async {
         guard !busy, let store else { return }
         busy = true
@@ -114,20 +117,50 @@ final class AppModel {
         defer { if access { url.stopAccessingSecurityScopedResource() } }
         do {
             let name = url.deletingPathExtension().lastPathComponent
-            let profile = try await Task.detached {
+            let data = try await Task.detached {
+                // Base64 ciphertext is larger than the 16 MiB plaintext it decrypts to.
                 let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                guard size > 0, size <= ProfileStore.maximumBytes else {
-                    throw ClientError.message("配置为空或超过 16 MiB。")
+                guard size > 0, size <= 24 * 1024 * 1024 else {
+                    throw ClientError.message("配置为空或超过大小限制。")
                 }
-                let data = try Data(contentsOf: url)
-                return try store.add(name: name, configuration: data) { bytes, directory in
-                    let session = try CoreSession(configuration: bytes, directory: directory)
-                    session.close()
-                }
+                return try Data(contentsOf: url)
             }.value
-            profiles = try store.profiles()
-            if !active { selectedID = profile.id }
+            if ConfigCrypto.looksEncrypted(data) {
+                pendingEncryptedImport = PendingImport(name: name, data: data)
+                return
+            }
+            try await add(name: name, configuration: data, in: store)
         } catch { self.error = error.localizedDescription }
+    }
+
+    /// Throws so the password prompt can show the failure and let the user retry.
+    func importEncrypted(password: String) async throws {
+        guard !busy, let store, let pending = pendingEncryptedImport else { return }
+        busy = true
+        defer { busy = false }
+        let plaintext = try await Task.detached {
+            try ConfigCrypto.decrypt(pending.data, password: password)
+        }.value
+        try await add(name: pending.name, configuration: plaintext, in: store)
+        pendingEncryptedImport = nil
+    }
+
+    func exportEncrypted(_ profile: Profile, password: String) async throws -> Data {
+        guard let store else { throw ClientError.message("配置存储不可用。") }
+        return try await Task.detached {
+            try ConfigCrypto.encrypt(store.configuration(for: profile.id), password: password)
+        }.value
+    }
+
+    private func add(name: String, configuration: Data, in store: ProfileStore) async throws {
+        let profile = try await Task.detached {
+            try store.add(name: name, configuration: configuration) { bytes, directory in
+                let session = try CoreSession(configuration: bytes, directory: directory)
+                session.close()
+            }
+        }.value
+        profiles = try store.profiles()
+        if !active { selectedID = profile.id }
     }
 
     func remove(_ profile: Profile) {
@@ -228,6 +261,11 @@ final class AppModel {
             }
         }
     }
+}
+
+struct PendingImport {
+    let name: String
+    let data: Data
 }
 
 struct ProxyGroup: Identifiable {

@@ -444,10 +444,10 @@ rules:
         let path = dir.path().join("source.yaml");
         std::fs::write(&path, MIXED).unwrap();
         let store = crate::profiles::Store::new(dir.path().join("store")).unwrap();
-        let first = store.import_file(&path).unwrap();
+        let first = store.import_file(&path, None).unwrap();
         store.select(Some(first.profile.id)).unwrap();
         let before = std::fs::read(store.directory(first.profile.id).join("profile.json")).unwrap();
-        let second = store.import_file(&path).unwrap();
+        let second = store.import_file(&path, None).unwrap();
         assert_ne!(first.profile.id, second.profile.id);
         assert_eq!(store.list().unwrap().len(), 2);
         assert_eq!(store.selected().unwrap(), Some(first.profile.id));
@@ -492,7 +492,12 @@ proxies:
         let dir = tempfile::tempdir().unwrap();
         let store = crate::profiles::Store::new(dir.path().into()).unwrap();
         let result = store
-            .import_subscription("订阅".into(), source, "https://example.com/sub".into())
+            .import_subscription(
+                "订阅".into(),
+                source,
+                "https://example.com/sub".into(),
+                None,
+            )
             .unwrap();
         let profile = store.get(result.profile.id).unwrap();
         assert_eq!(profile.url.as_deref(), Some("https://example.com/sub"));

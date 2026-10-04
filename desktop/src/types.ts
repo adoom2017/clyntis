@@ -23,6 +23,7 @@ export interface ProfileSummary {
   name: string;
   source: string;
   subscription: boolean;
+  encrypted: boolean;
   pending: boolean;
   lastChecked: number;
   lastError: string | null;
@@ -33,7 +34,7 @@ export interface ImportResult {
 }
 export interface Profile extends Omit<
   ProfileSummary,
-  "pending" | "source" | "subscription"
+  "pending" | "source" | "subscription" | "encrypted"
 > {
   yaml: string;
   pending: string | null;

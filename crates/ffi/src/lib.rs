@@ -133,6 +133,32 @@ pub unsafe extern "C" fn meta_decrypt_config_v1(
 }
 
 /// # Safety
+/// Same pointer contract as `meta_decrypt_config_v1`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_encrypt_config_v1(
+    data: *const u8,
+    len: usize,
+    password: *const u8,
+    password_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        ensure!(!length.is_null(), "output length is required");
+        unsafe { *length = 0 };
+        ensure!(capacity == 0 || !buffer.is_null(), "invalid output buffer");
+        let plaintext = unsafe { input_with_limit(data, len, LIMIT)? };
+        let password = std::str::from_utf8(unsafe { input(password, password_len)? })?;
+        ensure!(!password.is_empty(), "password is required");
+        // Refuse to produce an export that could never be imported again.
+        meta_config::Config::parse(plaintext)?;
+        let encoded = meta_config::crypto::encrypt(plaintext, password)?;
+        unsafe { output(encoded.as_bytes(), buffer, capacity, length) }
+    })
+}
+
+/// # Safety
 /// Inputs and the hooks size field must be readable and aligned. If the size is
 /// supported, hooks must point to a complete valid MetaHooksV1. Callback context
 /// must stay live until stop/destroy returns. The handle output is writable.

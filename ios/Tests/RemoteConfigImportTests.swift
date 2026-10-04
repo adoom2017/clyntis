@@ -47,6 +47,17 @@ final class RemoteConfigImportTests: XCTestCase {
         }
     }
 
+    func testEncryptedExportRoundTripsAndIsDetected() throws {
+        let yaml = Data("mixed-port: 7890\nmode: rule\nrules: ['MATCH,DIRECT']\n".utf8)
+        let encrypted = try ConfigCrypto.encrypt(yaml, password: "导出密码")
+        XCTAssertTrue(ConfigCrypto.looksEncrypted(encrypted))
+        XCTAssertFalse(ConfigCrypto.looksEncrypted(yaml))
+        XCTAssertEqual(try ConfigCrypto.decrypt(encrypted, password: "导出密码"), yaml)
+        XCTAssertThrowsError(try ConfigCrypto.decrypt(encrypted, password: "wrong"))
+        XCTAssertThrowsError(try ConfigCrypto.encrypt(yaml, password: ""))
+        XCTAssertThrowsError(try ConfigCrypto.encrypt(Data("not: [valid".utf8), password: "p"))
+    }
+
     func testURLValidationRequiresHTTPSExceptLoopback() throws {
         XCTAssertEqual(try RemoteConfigImporter.url(from: " https://unit.invalid/config?token=abc \n").host, "unit.invalid")
         XCTAssertEqual(try RemoteConfigImporter.url(from: "http://127.0.0.1/config").scheme, "http")

@@ -102,6 +102,75 @@ fn decrypt_config_preserves_plaintext_and_caller_buffer_contract() {
 }
 
 #[test]
+fn encrypt_config_round_trips_through_decrypt() {
+    let plaintext = b"mixed-port: 7890\nmode: rule\nrules: ['MATCH,DIRECT']\n";
+    let password = "导出密码";
+    let mut length = 0;
+    assert_eq!(
+        unsafe {
+            meta_encrypt_config_v1(
+                plaintext.as_ptr(),
+                plaintext.len(),
+                password.as_ptr(),
+                password.len(),
+                std::ptr::null_mut(),
+                0,
+                &mut length,
+            )
+        },
+        BUFFER_TOO_SMALL
+    );
+    let mut encoded = vec![0; length];
+    assert_eq!(
+        unsafe {
+            meta_encrypt_config_v1(
+                plaintext.as_ptr(),
+                plaintext.len(),
+                password.as_ptr(),
+                password.len(),
+                encoded.as_mut_ptr(),
+                encoded.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    let mut decoded = [0; 256];
+    assert_eq!(
+        unsafe {
+            meta_decrypt_config_v1(
+                encoded.as_ptr(),
+                length,
+                password.as_ptr(),
+                password.len(),
+                decoded.as_mut_ptr(),
+                decoded.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    assert_eq!(&decoded[..length], plaintext);
+    for (config, password) in [(&b"not: [valid"[..], "p"), (&plaintext[..], "")] {
+        assert_ne!(
+            unsafe {
+                meta_encrypt_config_v1(
+                    config.as_ptr(),
+                    config.len(),
+                    password.as_ptr(),
+                    password.len(),
+                    encoded.as_mut_ptr(),
+                    encoded.len(),
+                    &mut length,
+                )
+            },
+            OK
+        );
+        assert_eq!(length, 0);
+    }
+}
+
+#[test]
 fn decrypt_config_rejects_bad_password_and_invalid_input_without_plaintext() {
     let valid = meta_config::crypto::encrypt(b"mode: direct\n", "correct").unwrap();
     let invalid =

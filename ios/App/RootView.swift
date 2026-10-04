@@ -99,6 +99,7 @@ private struct ProfilesView: View {
     @Bindable var model: AppModel
     @State private var importing = false
     @State private var importingLink = false
+    @State private var exporting: Profile?
     var body: some View {
         NavigationStack {
             List {
@@ -122,6 +123,10 @@ private struct ProfilesView: View {
                     .disabled(model.active || model.busy)
                     .swipeActions {
                         Button("删除", role: .destructive) { model.remove(profile) }.disabled(model.active || model.busy)
+                        Button("加密导出", systemImage: "lock.doc") { exporting = profile }.tint(.brand)
+                    }
+                    .contextMenu {
+                        Button("加密导出", systemImage: "lock.doc") { exporting = profile }
                     }
                 }
                 if model.active && !model.profiles.isEmpty {
@@ -146,6 +151,14 @@ private struct ProfilesView: View {
                 }
             }
             .sheet(isPresented: $importingLink) { RemoteImportView(model: model) }
+            .sheet(item: $exporting) { EncryptedExportView(model: model, profile: $0) }
+            .sheet(isPresented: Binding(get: { model.pendingEncryptedImport != nil },
+                                        set: { if !$0 { model.pendingEncryptedImport = nil } })) {
+                ConfigPasswordView(title: "导入加密配置", message: "此文件已加密，输入密码后导入。",
+                                   actionTitle: "导入") { password in
+                    try await model.importEncrypted(password: password)
+                }
+            }
         }
     }
 }

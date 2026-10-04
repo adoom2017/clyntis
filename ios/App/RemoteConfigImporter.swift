@@ -78,7 +78,10 @@ enum RemoteConfigImporter {
     static func store(_ source: Data, password: String, name: String, in store: ProfileStore) throws -> Profile {
         try Task.checkCancellation()
         let encrypted = !password.isEmpty
-        let plaintext = encrypted ? try decrypt(source, password: password) : source
+        if !encrypted && ConfigCrypto.looksEncrypted(source) {
+            throw ClientError.message("配置已加密，请填写密码。")
+        }
+        let plaintext = encrypted ? try ConfigCrypto.decrypt(source, password: password) : source
         try Task.checkCancellation()
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
@@ -96,31 +99,6 @@ enum RemoteConfigImporter {
         catch {
             if encrypted { throw ClientError.message("解密或配置校验失败，请检查密码和文件格式。") }
             throw error
-        }
-    }
-
-    private static func decrypt(_ source: Data, password: String) throws -> Data {
-        let password = Data(password.utf8)
-        return try source.withUnsafeBytes { source in
-            try password.withUnsafeBytes { password in
-                var length = 0
-                let result = meta_decrypt_config_v1(
-                    source.bindMemory(to: UInt8.self).baseAddress, source.count,
-                    password.bindMemory(to: UInt8.self).baseAddress, password.count, nil, 0, &length)
-                guard result == META_BUFFER_TOO_SMALL, length > 0, length <= ProfileStore.maximumBytes else {
-                    throw ClientError.message("解密或配置校验失败，请检查密码和文件格式。")
-                }
-                var plaintext = Data(count: length)
-                let status = plaintext.withUnsafeMutableBytes {
-                    meta_decrypt_config_v1(source.bindMemory(to: UInt8.self).baseAddress, source.count,
-                        password.bindMemory(to: UInt8.self).baseAddress, password.count,
-                        $0.bindMemory(to: UInt8.self).baseAddress, $0.count, &length)
-                }
-                guard status == META_OK else {
-                    throw ClientError.message("解密或配置校验失败，请检查密码和文件格式。")
-                }
-                return plaintext.prefix(length)
-            }
         }
     }
 }

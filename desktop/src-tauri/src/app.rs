@@ -317,7 +317,7 @@ impl Desktop {
         let profile = self.store.get(id)?;
         let url = profile.url.as_deref().context("该配置不是订阅")?;
         let before = (profile.yaml.clone(), profile.pending.clone());
-        let downloaded = profiles::download(url).await;
+        let downloaded = profiles::download(url, profile.password.as_deref()).await;
         // Re-read under the operation lock, so a concurrent edit/delete is never overwritten.
         let _op = self.operation.lock().await;
         let mut profile = self.store.get(id)?;
@@ -408,14 +408,25 @@ pub async fn save_settings(state: State<'_, Desktop>, settings: Settings) -> Rep
     state.settings(settings).await.map_err(error)
 }
 #[tauri::command]
+pub fn inspect_profile_file(path: String) -> Reply<Value> {
+    let source = clyntis_desktop_model::read_limited(
+        std::path::Path::new(&path),
+        clyntis_desktop_model::CONFIG_LIMIT,
+    )
+    .map_err(error)?;
+    let encrypted = std::str::from_utf8(&source).is_ok_and(profiles::looks_encrypted);
+    Ok(json!({ "encrypted": encrypted }))
+}
+#[tauri::command]
 pub async fn import_profile(
     state: State<'_, Desktop>,
     path: String,
+    password: Option<String>,
 ) -> Reply<profiles::ImportResult> {
     let _guard = state.operation.lock().await;
     let result = state
         .store
-        .import_file(std::path::Path::new(&path))
+        .import_file(std::path::Path::new(&path), password.as_deref())
         .map_err(error)?;
     if state.store.selected().map_err(error)?.is_none() {
         state.store.select(Some(result.profile.id)).map_err(error)?;
@@ -428,12 +439,14 @@ pub async fn add_subscription(
     state: State<'_, Desktop>,
     name: String,
     url: String,
+    password: Option<String>,
 ) -> Reply<profiles::ImportResult> {
-    let yaml = profiles::download_source(&url).await.map_err(error)?;
+    let password = password.filter(|p| !p.is_empty());
+    let source = profiles::download_source(&url).await.map_err(error)?;
     let _guard = state.operation.lock().await;
     let result = state
         .store
-        .import_subscription(name, &yaml, url)
+        .import_subscription(name, &source, url, password)
         .map_err(error)?;
     if state.store.selected().map_err(error)?.is_none() {
         state.store.select(Some(result.profile.id)).map_err(error)?;
@@ -443,7 +456,23 @@ pub async fn add_subscription(
 }
 #[tauri::command]
 pub fn read_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<Profile> {
-    state.store.get(id).map_err(error)
+    let mut profile = state.store.get(id).map_err(error)?;
+    // The stored subscription password never needs to reach the webview.
+    profile.password = None;
+    Ok(profile)
+}
+#[tauri::command]
+pub fn export_encrypted(
+    state: State<'_, Desktop>,
+    id: Uuid,
+    password: String,
+    path: String,
+) -> Reply<()> {
+    let profile = state.store.get(id).map_err(error)?;
+    let encrypted = profiles::encrypt_yaml(&profile.yaml, &password).map_err(error)?;
+    std::fs::write(&path, encrypted)
+        .context("无法写入导出文件")
+        .map_err(error)
 }
 #[tauri::command]
 pub async fn save_profile(state: State<'_, Desktop>, id: Uuid, yaml: String) -> Reply<()> {

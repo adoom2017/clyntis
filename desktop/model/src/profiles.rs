@@ -27,6 +27,9 @@ pub struct Profile {
     pub last_checked: u64,
     pub last_error: Option<String>,
     pub mode: String,
+    /// Password for encrypted subscriptions, kept so scheduled updates can decrypt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -36,6 +39,7 @@ pub struct ProfileSummary {
     pub name: String,
     pub source: String,
     pub subscription: bool,
+    pub encrypted: bool,
     pub pending: bool,
     pub last_checked: u64,
     pub last_error: Option<String>,
@@ -52,6 +56,7 @@ impl Profile {
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .unwrap_or_else(|| "本地文件".into()),
             subscription: self.url.is_some(),
+            encrypted: self.password.is_some(),
             pending: self.pending.is_some(),
             last_checked: self.last_checked,
             last_error: self.last_error.clone(),
@@ -98,7 +103,13 @@ impl Store {
             &serde_json::to_vec(profile)?,
         )
     }
-    pub fn create(&self, name: String, yaml: String, url: Option<String>) -> Result<Profile> {
+    pub fn create(
+        &self,
+        name: String,
+        yaml: String,
+        url: Option<String>,
+        password: Option<String>,
+    ) -> Result<Profile> {
         ensure!(
             !name.trim().is_empty() && name.len() <= 256,
             "配置名称不能为空且不能超过 256 字节"
@@ -120,6 +131,7 @@ impl Store {
                 .as_str()
                 .unwrap_or("rule")
                 .into(),
+            password,
         };
         self.save(&profile)?;
         private_dir(&self.runtime_dir(profile.id))?;
@@ -162,8 +174,16 @@ impl Store {
         }
         atomic_write(&self.root.join("selected.json"), &serde_json::to_vec(&id)?)
     }
-    pub fn import_file(&self, path: &Path) -> Result<ImportResult> {
-        let yaml = String::from_utf8(read_limited(path, CONFIG_LIMIT)?)?;
+    pub fn import_file(&self, path: &Path, password: Option<&str>) -> Result<ImportResult> {
+        let source =
+            String::from_utf8(read_limited(path, CONFIG_LIMIT)?).context("配置不是 UTF-8 文本")?;
+        let yaml = match password {
+            Some(password) => decrypt_source(&source, password)?,
+            None => {
+                ensure!(!looks_encrypted(&source), "配置已加密，需要密码");
+                source
+            }
+        };
         let (yaml, warnings) = crate::import::compatible_yaml(&yaml)?;
         let config = validate(&yaml)?;
         let source = path.parent().context("无法读取配置目录")?.canonicalize()?;
@@ -173,6 +193,7 @@ impl Store {
                 .to_string_lossy()
                 .into(),
             yaml,
+            None,
             None,
         )?;
         let result = (|| {
@@ -204,15 +225,64 @@ impl Store {
     pub fn import_subscription(
         &self,
         name: String,
-        yaml: &str,
+        source: &str,
         url: String,
+        password: Option<String>,
     ) -> Result<ImportResult> {
-        let (yaml, warnings) = crate::import::compatible_yaml(yaml)?;
-        let profile = self.create(name, yaml, Some(url))?;
+        let yaml = subscription_yaml(source, password.as_deref())?;
+        let (yaml, warnings) = crate::import::compatible_yaml(&yaml)?;
+        let profile = self.create(name, yaml, Some(url), password)?;
         Ok(ImportResult {
             profile: profile.summary(),
             warnings,
         })
+    }
+}
+
+/// Encrypted files are a single Base64 blob (optionally line-wrapped), which a
+/// valid YAML configuration can never be: it always contains `key: value` pairs.
+pub fn looks_encrypted(source: &str) -> bool {
+    let text = source.trim();
+    text.len() >= 16
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=') || b.is_ascii_whitespace()
+        })
+}
+
+/// CFB has no authentication tag, so a wrong password yields garbage rather
+/// than an error; anything that is not a UTF-8 YAML mapping is reported as such.
+pub fn decrypt_source(source: &str, password: &str) -> Result<String> {
+    ensure!(!password.is_empty(), "密码不能为空");
+    let compact: Vec<u8> = source
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let failed = || anyhow::anyhow!("解密失败，请检查密码");
+    let plaintext = meta_config::crypto::decrypt(&compact, password).map_err(|_| failed())?;
+    let yaml = String::from_utf8(plaintext.to_vec()).map_err(|_| failed())?;
+    ensure!(
+        matches!(serde_yaml::from_str::<Value>(&yaml), Ok(Value::Mapping(_))),
+        "解密失败，请检查密码"
+    );
+    Ok(yaml)
+}
+
+pub fn encrypt_yaml(yaml: &str, password: &str) -> Result<String> {
+    ensure!(!password.is_empty(), "密码不能为空");
+    meta_config::crypto::encrypt(yaml.as_bytes(), password)
+}
+
+/// Decrypts a downloaded subscription when it has a password.
+pub fn subscription_yaml(source: &str, password: Option<&str>) -> Result<String> {
+    match password {
+        Some(password) => decrypt_source(source, password),
+        None => {
+            ensure!(
+                !looks_encrypted(source),
+                "订阅内容已加密，请删除后重新添加并填写密码"
+            );
+            Ok(source.to_owned())
+        }
     }
 }
 
@@ -353,8 +423,8 @@ pub fn subscription_url(url: &str) -> Result<reqwest::Url> {
     Ok(url)
 }
 
-pub async fn download(url: &str) -> Result<String> {
-    let yaml = download_source(url).await?;
+pub async fn download(url: &str, password: Option<&str>) -> Result<String> {
+    let yaml = subscription_yaml(&download_source(url).await?, password)?;
     validate(&yaml)?;
     Ok(yaml)
 }
@@ -405,7 +475,9 @@ mod tests {
     fn credentials_survive_runtime_overrides_and_disk_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().into()).unwrap();
-        let profile = store.create("test".into(), YAML.into(), None).unwrap();
+        let profile = store
+            .create("test".into(), YAML.into(), None, None)
+            .unwrap();
         let saved = store.get(profile.id).unwrap();
         assert_eq!(saved.yaml, YAML);
         let yaml = runtime_yaml(&saved, &Settings::default(), "test-secret").unwrap();
@@ -416,10 +488,65 @@ mod tests {
         assert!(!config.tun.enable);
     }
     #[test]
+    fn encrypted_export_imports_with_password_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("store")).unwrap();
+        let encrypted = encrypt_yaml(YAML, "s3cret").unwrap();
+        assert!(looks_encrypted(&encrypted));
+        assert!(!looks_encrypted(YAML));
+        // Exported files may be line-wrapped by other tools.
+        let wrapped = encrypted
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let path = dir.path().join("exported.txt");
+        fs::write(&path, wrapped + "\n").unwrap();
+        let error = store.import_file(&path, None).err().unwrap();
+        assert!(error.to_string().contains("需要密码"));
+        let error = store.import_file(&path, Some("wrong")).err().unwrap();
+        assert!(error.to_string().contains("解密失败"));
+        let result = store.import_file(&path, Some("s3cret")).unwrap();
+        let profile = store.get(result.profile.id).unwrap();
+        assert!(
+            profile
+                .yaml
+                .contains("11111111-1111-4111-8111-111111111111")
+        );
+        // A decrypted local file is stored as plaintext; no password is retained.
+        assert!(profile.password.is_none());
+    }
+    #[test]
+    fn encrypted_subscription_keeps_password_for_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        let source = encrypt_yaml(YAML, "sub-pass").unwrap();
+        assert!(
+            store
+                .import_subscription("s".into(), &source, "https://example.com/s".into(), None)
+                .is_err()
+        );
+        let result = store
+            .import_subscription(
+                "s".into(),
+                &source,
+                "https://example.com/s".into(),
+                Some("sub-pass".into()),
+            )
+            .unwrap();
+        assert!(result.profile.encrypted);
+        let profile = store.get(result.profile.id).unwrap();
+        assert_eq!(profile.password.as_deref(), Some("sub-pass"));
+        assert!(subscription_yaml(&source, profile.password.as_deref()).is_ok());
+    }
+    #[test]
     fn invalid_save_preserves_previous_profile() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path().into()).unwrap();
-        let mut profile = store.create("test".into(), YAML.into(), None).unwrap();
+        let mut profile = store
+            .create("test".into(), YAML.into(), None, None)
+            .unwrap();
         profile.yaml = "unknown: value".into();
         assert!(store.save(&profile).is_err());
         assert_eq!(store.get(profile.id).unwrap().yaml, YAML);

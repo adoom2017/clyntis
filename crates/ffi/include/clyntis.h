@@ -49,6 +49,12 @@ uint32_t meta_abi_version_v1(void);
 int32_t meta_decrypt_config_v1(const uint8_t *config, size_t length,
     const uint8_t *password, size_t password_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Encrypt validated YAML (<= 16 MiB) into the same legacy AES-CFB/Base64
+ * format accepted by meta_decrypt_config_v1. Password must be non-empty UTF-8.
+ * Standard caller-buffer/size-query contract applies. */
+int32_t meta_encrypt_config_v1(const uint8_t *config, size_t length,
+    const uint8_t *password, size_t password_length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 int32_t meta_create_v1(const uint8_t *config, size_t length, const meta_hooks_v1 *hooks, meta_handle *out);
 /* Host-owned packet-tunnel variant (iOS Network Extension). Keeps credentials
  * and routing policy from config; enables packet I/O, forces MTU=1280 and DNS
