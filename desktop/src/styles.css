@@ -748,6 +748,31 @@ textarea::placeholder {
   font-size: 12px;
   margin-top: 2px;
 }
+.rule-form form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+}
+.rule-form input:not([type="checkbox"]) {
+  flex: 1;
+  min-width: 160px;
+}
+.rule-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.rule-table td:nth-child(3) {
+  white-space: nowrap;
+}
+.rule-actions {
+  text-align: right;
+  white-space: nowrap;
+}
 .inline-icon {
   vertical-align: -1px;
   margin-right: 4px;

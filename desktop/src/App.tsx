@@ -38,6 +38,10 @@ import {
   Terminal,
   Trash2,
   Undo2,
+  ListFilter,
+  ChevronUp,
+  ChevronDown,
+  PencilLine,
   X,
   Zap,
 } from "lucide-react";
@@ -57,6 +61,9 @@ import {
   type ProfileSummary,
   type Proxy,
   type Settings,
+  type CustomRules,
+  ruleTypes,
+  splitRule,
   type Snapshot,
   type Traffic,
 } from "./types";
@@ -65,6 +72,7 @@ type Page =
   | "overview"
   | "proxies"
   | "profiles"
+  | "rules"
   | "connections"
   | "logs"
   | "settings";
@@ -87,6 +95,11 @@ const pages: {
     id: "profiles",
     label: "配置",
     icon: Layers3,
+  },
+  {
+    id: "rules",
+    label: "规则",
+    icon: ListFilter,
   },
   {
     id: "connections",
@@ -724,6 +737,9 @@ export default function App() {
           )}
           {page === "proxies" && (
             <Proxies running={running} busy={disabled} perform={perform} />
+          )}
+          {page === "rules" && (
+            <RulesPage busy={disabled} running={running} confirm={setModal} />
           )}
           {page === "connections" && (
             <ConnectionPage running={running} perform={perform} />
@@ -1483,6 +1499,288 @@ function ConnectionPage({
       </div>
       <p className="small muted table-note">{items.length} 个连接</p>
     </>
+  );
+}
+function RulesPage({
+  busy,
+  running,
+  confirm,
+}: {
+  busy: boolean;
+  running: boolean;
+  confirm: (modal: ReactNode) => void;
+}) {
+  const [data, setData] = useState<CustomRules | null>(null);
+  const [type, setType] = useState(ruleTypes[0].type);
+  const [value, setValue] = useState("");
+  const [target, setTarget] = useState("");
+  const [noResolve, setNoResolve] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => {
+    void invoke<CustomRules>("custom_rules")
+      .then((next) => {
+        setData(next);
+        setTarget((current) => current || next.targets[0] || "DIRECT");
+      })
+      .catch((e) => setFailure(String(e)));
+  }, []);
+  const save = async (rules: string[]) => {
+    setSaving(true);
+    setFailure(null);
+    try {
+      setData(await invoke<CustomRules>("save_custom_rules", { rules }));
+      return true;
+    } catch (e) {
+      setFailure(String(e));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  };
+  if (!data) return failure ? <p className="inline-error">{failure}</p> : null;
+  const ip = type === "IP-CIDR" || type === "IP-CIDR6" || type === "GEOIP";
+  const placeholder = ruleTypes.find((t) => t.type === type)?.placeholder;
+  const add = async () => {
+    const rule = [
+      type,
+      value.trim(),
+      target,
+      ...(ip && noResolve ? ["no-resolve"] : []),
+    ].join(",");
+    if (await save([rule, ...data.rules])) setValue("");
+  };
+  const move = (index: number, delta: number) => {
+    const rules = [...data.rules];
+    const [rule] = rules.splice(index, 1);
+    rules.splice(index + delta, 0, rule);
+    void save(rules);
+  };
+  const skipped = new Map(data.skipped.map((s) => [s.rule, s.reason]));
+  const disabled = busy || saving;
+  return (
+    <>
+      <section className="panel settings-section rule-form">
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void add();
+          }}
+        >
+          <select
+            aria-label="规则类型"
+            value={type}
+            onChange={(e) => setType(e.target.value)}
+          >
+            {ruleTypes.map((t) => (
+              <option key={t.type} value={t.type}>
+                {t.label}
+              </option>
+            ))}
+          </select>
+          <input
+            aria-label="规则值"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder={placeholder}
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <select
+            aria-label="目标"
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+          >
+            {data.targets.map((t) => (
+              <option key={t}>{t}</option>
+            ))}
+          </select>
+          {ip && (
+            <label className="rule-check">
+              <input
+                type="checkbox"
+                checked={noResolve}
+                onChange={(e) => setNoResolve(e.target.checked)}
+              />
+              不解析域名
+            </label>
+          )}
+          <button
+            className="button primary"
+            disabled={disabled || !value.trim()}
+          >
+            {saving ? (
+              <LoaderCircle className="spin" size={16} />
+            ) : (
+              <Plus size={16} />
+            )}
+            添加
+          </button>
+        </form>
+      </section>
+      {failure && (
+        <p className="inline-error" role="alert">
+          {failure}
+        </p>
+      )}
+      <div className="toolbar">
+        <span className="muted small">
+          {data.rules.length} 条规则 · 优先于配置中的规则，按顺序匹配
+          {running ? " · 修改后立即生效" : ""}
+        </span>
+        <button
+          className="button secondary"
+          disabled={disabled}
+          onClick={() =>
+            confirm(
+              <BulkRules
+                rules={data.rules}
+                onClose={() => confirm(null)}
+                onSave={async (rules) => {
+                  const ok = await save(rules);
+                  if (ok) confirm(null);
+                  return ok;
+                }}
+              />,
+            )
+          }
+        >
+          <PencilLine size={16} />
+          批量编辑
+        </button>
+      </div>
+      {!data.rules.length ? (
+        <Empty
+          icon={<ListFilter />}
+          title="还没有自定义规则"
+          text="自定义规则对所有配置生效，并且优先于配置自带的规则。"
+        />
+      ) : (
+        <div className="panel table-wrap">
+          <table className="rule-table">
+            <thead>
+              <tr>
+                <th>类型</th>
+                <th>值</th>
+                <th>目标</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {data.rules.map((rule, index) => {
+                const parts = splitRule(rule);
+                const reason = skipped.get(rule);
+                return (
+                  <tr key={`${index}-${rule}`}>
+                    <td>
+                      <span className="tiny-tag">
+                        {ruleTypes.find((t) => t.type === parts.type)?.label ??
+                          parts.type}
+                      </span>
+                    </td>
+                    <td>
+                      <strong>{parts.value}</strong>
+                      {parts.noResolve && (
+                        <span className="chain">不解析域名</span>
+                      )}
+                      {reason && (
+                        <span className="chain danger">
+                          {reason}，当前配置下不生效
+                        </span>
+                      )}
+                    </td>
+                    <td>{parts.target}</td>
+                    <td className="rule-actions">
+                      <button
+                        className="icon-button"
+                        aria-label={`上移 ${rule}`}
+                        disabled={disabled || index === 0}
+                        onClick={() => move(index, -1)}
+                      >
+                        <ChevronUp size={15} />
+                      </button>
+                      <button
+                        className="icon-button"
+                        aria-label={`下移 ${rule}`}
+                        disabled={disabled || index === data.rules.length - 1}
+                        onClick={() => move(index, 1)}
+                      >
+                        <ChevronDown size={15} />
+                      </button>
+                      <button
+                        className="icon-button danger"
+                        aria-label={`删除 ${rule}`}
+                        disabled={disabled}
+                        onClick={() =>
+                          void save(data.rules.filter((_, i) => i !== index))
+                        }
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {data.profile && (
+        <p className="hint">
+          目标列表来自当前配置「{data.profile}
+          」；切换到没有该代理组的配置时，对应规则会被跳过。
+        </p>
+      )}
+    </>
+  );
+}
+function BulkRules({
+  rules,
+  onClose,
+  onSave,
+}: {
+  rules: string[];
+  onClose: () => void;
+  onSave: (rules: string[]) => Promise<boolean>;
+}) {
+  const [text, setText] = useState(rules.join("\n"));
+  const [saving, setSaving] = useState(false);
+  return (
+    <Modal title="批量编辑规则" onClose={onClose} wide>
+      <p className="small muted">
+        每行一条，格式为「类型,值,目标」，越靠前优先级越高。保存时会校验每一条。
+      </p>
+      <textarea
+        className="yaml-editor"
+        aria-label="自定义规则"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+        placeholder={
+          "DOMAIN-SUFFIX,example.com,DIRECT\nIP-CIDR,10.0.0.0/8,DIRECT,no-resolve"
+        }
+      />
+      <div className="modal-actions">
+        <button className="button secondary" onClick={onClose}>
+          取消
+        </button>
+        <button
+          className="button primary"
+          disabled={saving}
+          onClick={() => {
+            setSaving(true);
+            const lines = text
+              .split("\n")
+              .map((l) => l.trim())
+              .filter((l) => l && !l.startsWith("#"));
+            void onSave(lines).finally(() => setSaving(false));
+          }}
+        >
+          {saving && <LoaderCircle className="spin" size={16} />}
+          保存
+        </button>
+      </div>
+    </Modal>
   );
 }
 function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {

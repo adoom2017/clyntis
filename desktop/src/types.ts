@@ -77,6 +77,34 @@ export interface Connection {
   download: number;
   start: string;
 }
+export interface CustomRules {
+  rules: string[];
+  /** Targets the selected profile offers: DIRECT, REJECT, groups, proxies. */
+  targets: string[];
+  /** Rules the selected profile cannot use, with the reason. */
+  skipped: { rule: string; reason: string }[];
+  profile: string | null;
+}
+export const ruleTypes: { type: string; label: string; placeholder: string }[] =
+  [
+    { type: "DOMAIN-SUFFIX", label: "域名后缀", placeholder: "example.com" },
+    { type: "DOMAIN", label: "完整域名", placeholder: "www.example.com" },
+    { type: "DOMAIN-KEYWORD", label: "域名关键字", placeholder: "example" },
+    { type: "IP-CIDR", label: "IPv4 段", placeholder: "10.0.0.0/8" },
+    { type: "IP-CIDR6", label: "IPv6 段", placeholder: "2001:db8::/32" },
+    { type: "GEOSITE", label: "GeoSite", placeholder: "cn" },
+    { type: "GEOIP", label: "GeoIP", placeholder: "CN" },
+    { type: "DST-PORT", label: "目标端口", placeholder: "443 或 8000-9000" },
+  ];
+/** Splits `TYPE,VALUE,TARGET[,no-resolve]` for display; logical rules stay whole. */
+export function splitRule(rule: string) {
+  const fields = rule.split(",");
+  const noResolve = fields.at(-1)?.trim() === "no-resolve";
+  if (noResolve) fields.pop();
+  const type = fields[0]?.trim() ?? "";
+  const target = fields.length > 1 ? fields.pop()!.trim() : "";
+  return { type, value: fields.slice(1).join(","), target, noResolve };
+}
 export interface Connections {
   connections: Connection[];
   uploadTotal: number;

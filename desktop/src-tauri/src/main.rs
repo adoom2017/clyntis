@@ -45,6 +45,8 @@ fn main() {
             app::apply_pending,
             app::rollback_profile,
             app::save_settings,
+            app::custom_rules,
+            app::save_custom_rules,
             app::proxies,
             app::select_proxy,
             app::probe_proxy,

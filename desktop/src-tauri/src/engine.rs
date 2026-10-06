@@ -74,7 +74,7 @@ impl Controller {
 /// to the service, so the core never has to fetch them while TUN routing is
 /// being brought up.
 pub async fn prefetch(store: &Store, profile: &Profile, settings: &Settings) -> Result<()> {
-    let yaml = runtime_yaml(profile, settings, &"x".repeat(64))?;
+    let yaml = runtime_yaml(profile, settings, &"x".repeat(64), &store.custom_rules()?)?;
     let mut config = validate(&yaml)?;
     let directory = store.runtime_dir(profile.id);
     clyntis_desktop_model::private_dir(&directory)?;
@@ -122,7 +122,7 @@ impl Engine {
         settings: &Settings,
     ) -> Result<Self> {
         let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let yaml = runtime_yaml(profile, settings, &secret)?;
+        let yaml = runtime_yaml(profile, settings, &secret, &store.custom_rules()?)?;
         let request = Request::Start {
             version: VERSION,
             yaml: yaml.clone(),

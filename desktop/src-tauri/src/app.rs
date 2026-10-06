@@ -161,7 +161,12 @@ impl Desktop {
         profile: Profile,
         settings: Settings,
     ) -> Result<()> {
-        profiles::runtime_yaml(&profile, &settings, &"x".repeat(64))?;
+        profiles::runtime_yaml(
+            &profile,
+            &settings,
+            &"x".repeat(64),
+            &self.store.custom_rules()?,
+        )?;
         // Fetch before stopping the current engine: the network still works
         // normally, and the TUN session can then start from local files.
         if settings.capture == Capture::Tun {
@@ -338,6 +343,50 @@ impl Desktop {
         self.notify();
         result
     }
+    /// Saved rules plus, for the selected profile, its targets and the rules
+    /// it cannot use.
+    fn custom_rules_view(&self) -> Result<CustomRules> {
+        let rules = self.store.custom_rules()?;
+        let profile = match self.store.selected()? {
+            Some(id) => Some(self.store.get(id)?),
+            None => None,
+        };
+        let (targets, skipped) = match &profile {
+            Some(profile) => (
+                meta_config::custom::targets(&profile.yaml)?,
+                meta_config::custom::apply(&profile.yaml, &rules)?.skipped,
+            ),
+            None => (vec!["DIRECT".into(), "REJECT".into()], vec![]),
+        };
+        Ok(CustomRules {
+            rules,
+            targets,
+            skipped,
+            profile: profile.map(|p| p.name),
+        })
+    }
+    /// Saves the rules and restarts a running engine so they apply at once. A
+    /// start failure restores the previous rules and engine.
+    async fn save_custom_rules(&self, rules: Vec<String>) -> Result<CustomRules> {
+        let mut op = self.operation.lock().await;
+        let previous = self.store.custom_rules()?;
+        self.store.save_custom_rules(&rules)?;
+        if let Some((profile, settings)) = op.active.clone()
+            && let Err(error) = self
+                .replace(&mut op, profile.clone(), settings.clone())
+                .await
+        {
+            self.store.save_custom_rules(&previous)?;
+            if op.engine.is_none() {
+                let _ = self.replace(&mut op, profile, settings).await;
+            }
+            self.notify();
+            return Err(error.context("新规则无法启动，已恢复原来的规则"));
+        }
+        drop(op);
+        self.notify();
+        self.custom_rules_view()
+    }
     async fn update(&self, id: Uuid) -> Result<()> {
         let _guard = self.subscription_lock.lock().await;
         let profile = self.store.get(id)?;
@@ -428,6 +477,24 @@ pub async fn set_capture(state: State<'_, Desktop>, capture: Capture) -> Reply<(
 #[tauri::command]
 pub async fn set_mode(state: State<'_, Desktop>, mode: String) -> Reply<()> {
     state.mode(&mode).await.map_err(error)
+}
+#[derive(Serialize)]
+pub struct CustomRules {
+    rules: Vec<String>,
+    targets: Vec<String>,
+    skipped: Vec<meta_config::custom::Skipped>,
+    profile: Option<String>,
+}
+#[tauri::command]
+pub fn custom_rules(state: State<'_, Desktop>) -> Reply<CustomRules> {
+    state.custom_rules_view().map_err(error)
+}
+#[tauri::command]
+pub async fn save_custom_rules(
+    state: State<'_, Desktop>,
+    rules: Vec<String>,
+) -> Reply<CustomRules> {
+    state.save_custom_rules(rules).await.map_err(error)
 }
 #[tauri::command]
 pub async fn save_settings(state: State<'_, Desktop>, settings: Settings) -> Reply<()> {

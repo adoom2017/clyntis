@@ -159,6 +159,31 @@ impl Store {
             &serde_json::to_vec(settings)?,
         )
     }
+    /// Rules added in the app, applied before every profile's own rules.
+    pub fn custom_rules(&self) -> Result<Vec<String>> {
+        let path = self.root.join("custom-rules.json");
+        if !path.exists() {
+            return Ok(vec![]);
+        }
+        serde_json::from_slice(&read_limited(&path, 1024 * 1024)?)
+            .with_context(|| format!("自定义规则文件不是有效的 JSON：{}", path.display()))
+    }
+    pub fn save_custom_rules(&self, rules: &[String]) -> Result<()> {
+        ensure!(
+            rules.len() <= meta_config::custom::MAX_RULES,
+            "自定义规则不能超过 {} 条",
+            meta_config::custom::MAX_RULES
+        );
+        let rules: Vec<String> = rules.iter().map(|r| r.trim().to_owned()).collect();
+        for (i, rule) in rules.iter().enumerate() {
+            meta_config::custom::validate(rule)
+                .with_context(|| format!("第 {} 条规则「{rule}」", i + 1))?;
+        }
+        atomic_write(
+            &self.root.join("custom-rules.json"),
+            &serde_json::to_vec(&rules)?,
+        )
+    }
     pub fn selected(&self) -> Result<Option<Uuid>> {
         let path = self.root.join("selected.json");
         if !path.exists() {
@@ -358,10 +383,18 @@ pub fn validate(yaml: &str) -> Result<Config> {
 }
 
 /// Operate on the YAML document, never Serialize(Config): credentials are skip_serializing.
-pub fn runtime_yaml(profile: &Profile, settings: &Settings, secret: &str) -> Result<String> {
+/// `custom` rules (see [`Store::custom_rules`]) go before the profile's rules;
+/// those the profile cannot use are left out.
+pub fn runtime_yaml(
+    profile: &Profile,
+    settings: &Settings,
+    secret: &str,
+    custom: &[String],
+) -> Result<String> {
     validate(&profile.yaml)?;
     settings.validate()?;
-    let mut document: Value = serde_yaml::from_str(&profile.yaml)?;
+    let yaml = meta_config::custom::apply(&profile.yaml, custom)?.yaml;
+    let mut document: Value = serde_yaml::from_str(&yaml)?;
     let map = document.as_mapping_mut().context("配置必须是 YAML 对象")?;
     for (key, value) in [
         ("port", Value::from(0)),
@@ -480,7 +513,7 @@ mod tests {
             .unwrap();
         let saved = store.get(profile.id).unwrap();
         assert_eq!(saved.yaml, YAML);
-        let yaml = runtime_yaml(&saved, &Settings::default(), "test-secret").unwrap();
+        let yaml = runtime_yaml(&saved, &Settings::default(), "test-secret", &[]).unwrap();
         assert!(yaml.contains("11111111-1111-4111-8111-111111111111"));
         let config = validate(&yaml).unwrap();
         assert_eq!(config.secret, "test-secret");
@@ -539,6 +572,28 @@ mod tests {
         let profile = store.get(result.profile.id).unwrap();
         assert_eq!(profile.password.as_deref(), Some("sub-pass"));
         assert!(subscription_yaml(&source, profile.password.as_deref()).is_ok());
+    }
+    #[test]
+    fn custom_rules_persist_validate_and_lead_runtime_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        assert!(store.custom_rules().unwrap().is_empty());
+        assert!(store.save_custom_rules(&["MATCH,DIRECT".into()]).is_err());
+        assert!(store.save_custom_rules(&["BAD,x,DIRECT".into()]).is_err());
+        store
+            .save_custom_rules(&[
+                " DOMAIN,a.test,REJECT ".into(),
+                "DOMAIN,b.test,Missing".into(),
+            ])
+            .unwrap();
+        let rules = store.custom_rules().unwrap();
+        assert_eq!(rules, ["DOMAIN,a.test,REJECT", "DOMAIN,b.test,Missing"]);
+        let profile = store
+            .create("test".into(), YAML.into(), None, None)
+            .unwrap();
+        let yaml = runtime_yaml(&profile, &Settings::default(), &"s".repeat(32), &rules).unwrap();
+        let config = validate(&yaml).unwrap();
+        assert_eq!(config.rules, ["DOMAIN,a.test,REJECT", "MATCH,DIRECT"]);
     }
     #[test]
     fn invalid_save_preserves_previous_profile() {

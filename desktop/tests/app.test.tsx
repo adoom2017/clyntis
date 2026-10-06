@@ -324,6 +324,40 @@ describe("desktop workflows", () => {
       }),
     );
   });
+  it("adds custom rules ahead of existing ones and shows skipped reasons", async () => {
+    const view = {
+      rules: ["DOMAIN,old.test,Gone"],
+      targets: ["DIRECT", "REJECT", "Proxy"],
+      skipped: [
+        {
+          rule: "DOMAIN,old.test,Gone",
+          reason: "当前配置没有代理或代理组「Gone」",
+        },
+      ],
+      profile: "日常",
+    };
+    invoke.mockImplementation(async (command, args) => {
+      if (command === "custom_rules") return view;
+      if (command === "save_custom_rules")
+        return { ...view, rules: args.rules, skipped: [] };
+      return structuredClone(initial);
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "规则" }));
+    expect(await screen.findByText(/当前配置下不生效/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("规则值"), {
+      target: { value: "example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("目标"), {
+      target: { value: "Proxy" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("save_custom_rules", {
+        rules: ["DOMAIN-SUFFIX,example.com,Proxy", "DOMAIN,old.test,Gone"],
+      }),
+    );
+  });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");
     expect(bytes(1024)).toBe("1.0 KB");
