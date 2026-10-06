@@ -70,7 +70,7 @@ impl Resources {
         // which the ~50 MiB iOS tunnel extension cannot afford; there, the host
         // refreshes geo files before each start (meta_prefetch_resources_v1).
         let geo_refresh =
-            refresh && !(config.internal_host_packet_io && !previous.matchers.is_empty());
+            refresh && (!config.internal_host_packet_io || previous.matchers.is_empty());
         let mut refs = vec![];
         for rule in &config.rules {
             Rule::parse(rule)?.matcher.references(&mut refs);
