@@ -38,6 +38,10 @@ Xcode builds the app. It installs CMake and rustup when absent, selects the Rust
 version from `rust-toolchain.toml`, installs the device/simulator targets, fetches
 locked Cargo dependencies, and builds a Release `ClyntisCore.xcframework` with
 both arm64 slices. The framework stays ignored and is generated for each build.
+Dependency preparation uses `cargo fetch --locked` without a target filter so
+the subsequent offline builds have the full workspace dependency set on a fresh
+cloud worker. Filtering the fetch to iOS targets can leave dependencies missing
+and fail with `attempting to make an HTTP request, but --offline was specified`.
 
 Commit and push the hook, `scripts/build-ios.sh`, and the configured Xcode project
 to the branch used by the workflow. Select `ios/Clyntis.xcodeproj` and the

@@ -37,8 +37,11 @@ if [[ ! -f "$LIBCLANG_PATH/libclang.dylib" ]]; then
     exit 1
 fi
 
-printf 'Fetching locked Rust dependencies for iOS.\n'
-cargo fetch --locked --target aarch64-apple-ios --target aarch64-apple-ios-sim
+printf 'Fetching all locked Rust workspace dependencies.\n'
+# The offline build resolves workspace dependencies beyond the iOS target
+# graph. A target-filtered fetch leaves crates such as async-channel absent
+# on a fresh cloud worker, even though a warm local cache hides the problem.
+cargo fetch --locked
 printf 'Building Release ClyntisCore.xcframework for device and simulator.\n'
 # Build only the framework: regenerating the project would overwrite signing
 # and other settings saved in the committed Xcode project and Info.plists.
