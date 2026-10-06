@@ -211,12 +211,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func watchCore() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 5, repeating: 5)
+        var ticks = 0
         timer.setEventHandler { [weak self] in
             guard let self, let core = self.core else { return }
             do {
                 let state = try JSONSerialization.jsonObject(with: core.snapshot()) as? [String: Any]
                 if state?["stopped"] as? Bool == true {
                     self.fail(ClientError.message("代理内核已停止，请重新连接。"))
+                    return
+                }
+                // Memory against the ~50 MiB extension limit, with the load behind it.
+                ticks += 1
+                if ticks % 6 == 0 {
+                    let connections = (state?["connections"] as? [Any])?.count ?? 0
+                    log.info("running: memory=\(memory()) connections=\(connections)")
                 }
             } catch { self.fail(error) }
         }
