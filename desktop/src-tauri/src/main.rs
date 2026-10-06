@@ -3,6 +3,8 @@
 mod app;
 mod engine;
 mod platform;
+#[cfg(target_os = "macos")]
+mod tray;
 
 use app::Desktop;
 use tauri::{
@@ -67,8 +69,10 @@ fn main() {
                     &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
                 ],
             )?;
-            TrayIconBuilder::new()
-                .icon(tauri::image::Image::from_bytes(TRAY_ICON)?)
+            let tray_icon = tauri::image::Image::from_bytes(TRAY_ICON)?;
+            #[allow(unused_variables)] // Only the macOS icon is animated.
+            let tray = TrayIconBuilder::new()
+                .icon(tray_icon.clone())
                 .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Clyntis")
                 .menu(&menu)
@@ -102,6 +106,8 @@ fn main() {
                     });
                 })
                 .build(app)?;
+            #[cfg(target_os = "macos")]
+            tray::animate(tray, tray_icon, app.state::<Desktop>().running());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 app::background(handle).await;
