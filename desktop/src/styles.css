@@ -1,4 +1,6 @@
-/* Neutral greys; the brand green is the only chromatic accent. */
+/* Apple system palette: systemBlue accent, system greys, systemGreen only
+   for the connected state. Light values use Apple's accessible variants
+   where colour carries text on white. */
 :root {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC",
@@ -6,57 +8,63 @@
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  --bg: #f5f5f4;
+  --bg: #f2f2f7;
   --surface: #ffffff;
-  --sidebar: #efefee;
+  --sidebar: #e9e9ee;
   --hover: #0000000a;
-  --text: #1d1f1e;
-  --muted: #6e7371;
-  --border: #e4e5e3;
-  --border-strong: #c9cccb;
-  --accent: #10775a;
-  --accent-soft: #e5f1ec;
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --border: #e5e5ea;
+  --border-strong: #d1d1d6;
+  --accent: #007aff;
+  --accent-soft: #e5f0ff;
   --on-accent: #ffffff;
-  --upload: #5b6cc9;
-  --warning: #9a6400;
-  --danger: #c13f38;
+  --success: #248a3d;
+  --success-soft: #e3f5e8;
+  --upload: #af52de;
+  --warning: #c93400;
+  --danger: #d70015;
   --shadow: 0 1px 2px #0000000d;
   color-scheme: light;
 }
 :root[data-theme="dark"] {
-  --bg: #161817;
-  --surface: #1e2120;
-  --sidebar: #131514;
-  --hover: #ffffff0d;
-  --text: #e7e9e8;
-  --muted: #8f9693;
-  --border: #2b2f2d;
-  --border-strong: #3d4240;
-  --accent: #46c497;
-  --accent-soft: #1c372d;
-  --on-accent: #0b1d16;
-  --upload: #8e9df0;
-  --warning: #e0a83e;
-  --danger: #f07d75;
+  --bg: #1c1c1e;
+  --surface: #2c2c2e;
+  --sidebar: #232325;
+  --hover: #ffffff12;
+  --text: #f5f5f7;
+  --muted: #98989d;
+  --border: #38383a;
+  --border-strong: #48484a;
+  --accent: #0a84ff;
+  --accent-soft: #0a84ff2e;
+  --on-accent: #ffffff;
+  --success: #30d158;
+  --success-soft: #30d15826;
+  --upload: #bf5af2;
+  --warning: #ff9f0a;
+  --danger: #ff453a;
   --shadow: none;
   color-scheme: dark;
 }
 @media (prefers-color-scheme: dark) {
   :root[data-theme="system"] {
-    --bg: #161817;
-    --surface: #1e2120;
-    --sidebar: #131514;
-    --hover: #ffffff0d;
-    --text: #e7e9e8;
-    --muted: #8f9693;
-    --border: #2b2f2d;
-    --border-strong: #3d4240;
-    --accent: #46c497;
-    --accent-soft: #1c372d;
-    --on-accent: #0b1d16;
-    --upload: #8e9df0;
-    --warning: #e0a83e;
-    --danger: #f07d75;
+    --bg: #1c1c1e;
+    --surface: #2c2c2e;
+    --sidebar: #232325;
+    --hover: #ffffff12;
+    --text: #f5f5f7;
+    --muted: #98989d;
+    --border: #38383a;
+    --border-strong: #48484a;
+    --accent: #0a84ff;
+    --accent-soft: #0a84ff2e;
+    --on-accent: #ffffff;
+    --success: #30d158;
+    --success-soft: #30d15826;
+    --upload: #bf5af2;
+    --warning: #ff9f0a;
+    --danger: #ff453a;
     --shadow: none;
     color-scheme: dark;
   }
@@ -279,8 +287,8 @@ main {
   font-size: 12px;
 }
 .status-pill.connected {
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--success);
+  background: var(--success-soft);
 }
 .status-dot {
   display: inline-block;
@@ -291,7 +299,7 @@ main {
   flex-shrink: 0;
 }
 .status-dot.online {
-  background: var(--accent);
+  background: var(--success);
 }
 .content {
   width: 100%;
@@ -313,7 +321,7 @@ main {
   padding: 22px 24px;
 }
 .connect-card.is-running {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border));
 }
 .connection-copy h2 {
   margin-bottom: 6px;
@@ -843,7 +851,7 @@ textarea::placeholder {
   font-variant-numeric: tabular-nums;
 }
 .delay.fast {
-  color: var(--accent);
+  color: var(--success);
 }
 .delay.slow {
   color: var(--warning);

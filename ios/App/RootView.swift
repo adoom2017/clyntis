@@ -51,7 +51,7 @@ private struct ConnectionView: View {
                         .sensoryFeedback(.impact, trigger: model.connected)
                         VStack(spacing: 4) {
                             Text(model.statusText).font(.title3.weight(.semibold))
-                                .foregroundStyle(model.connected ? Color.brand : Color.primary)
+                                .foregroundStyle(model.connected ? Color.connected : Color.primary)
                             Text(model.selected?.name ?? "未选择配置")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }

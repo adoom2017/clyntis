@@ -14,10 +14,8 @@ struct ClyntisApp: App {
 }
 
 extension Color {
-    /// Brand green; lifted in dark mode so it keeps contrast on dark grouped backgrounds.
-    static let brand = Color(UIColor { traits in
-        traits.userInterfaceStyle == .dark
-            ? UIColor(red: 0.27, green: 0.77, blue: 0.59, alpha: 1)
-            : UIColor(red: 0.06, green: 0.47, blue: 0.35, alpha: 1)
-    })
+    /// Apple system colours adapt to light/dark mode and Increase Contrast automatically.
+    static let brand = Color(uiColor: .systemBlue)
+    /// Reserved for the connected state, matching Settings' VPN indicator.
+    static let connected = Color(uiColor: .systemGreen)
 }
