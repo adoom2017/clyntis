@@ -18,6 +18,8 @@ final class AppModel {
     var connectionCount = 0
     var mode = "rule"
     var groups: [ProxyGroup] = []
+    /// Rules matched before every profile's own (see CustomRules).
+    var customRules: [String] = []
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
     private var store: ProfileStore?
@@ -38,6 +40,7 @@ final class AppModel {
 
     func load() async {
         guard store == nil else { return }
+        customRules = CustomRules.load()
         do {
             let store = try ProfileStore.shared()
             self.store = store
@@ -102,7 +105,9 @@ final class AppModel {
         log.info("connect: begin profile=\(selected.id.uuidString) tunnel=\(self.tunnelIdentifier) existingManager=\(self.manager != nil)")
         var step = "read configuration"
         do {
-            let bytes = try store.configuration(for: selected.id)
+            // Validate and prefetch what the tunnel will run: the profile with custom rules.
+            let (bytes, skipped) = try CustomRules.applied(to: store.configuration(for: selected.id))
+            if !skipped.isEmpty { log.warning("connect: \(skipped.count) custom rule(s) skipped for this profile") }
             step = "validate configuration"
             log.info("connect: \(step) (\(bytes.count) bytes)")
             try await validate(bytes, directory: store.directory(for: selected.id))
@@ -236,6 +241,42 @@ final class AppModel {
         } onCancel: { worker.cancel() }
         profiles = try store.profiles()
         if !active { selectedID = profile.id }
+    }
+
+    // MARK: Custom rules
+
+    func saveCustomRules(_ rules: [String]) throws {
+        try CustomRules.save(rules)
+        customRules = CustomRules.load()
+        Diagnostics.app.info("custom rules saved (\(customRules.count))")
+    }
+
+    /// Targets offered by the selected profile; DIRECT and REJECT without one.
+    func customRuleTargets() -> [String] {
+        guard let store, let selected,
+              let configuration = try? store.configuration(for: selected.id),
+              let targets = try? CoreSession.ruleTargets(configuration: configuration) else {
+            return ["DIRECT", "REJECT"]
+        }
+        return targets
+    }
+
+    /// Custom rules the selected profile cannot use, keyed by rule.
+    func skippedCustomRules() -> [String: String] {
+        guard let store, let selected, !customRules.isEmpty,
+              let configuration = try? store.configuration(for: selected.id),
+              let (_, skipped) = try? CoreSession.applyRules(customRules, to: configuration) else { return [:] }
+        return Dictionary(skipped.map { ($0.rule, $0.reason) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// Stops the tunnel and starts it again so changed rules take effect.
+    func reconnect() async {
+        guard active else { return }
+        manager?.connection.stopVPNTunnel()
+        for _ in 0..<50 where status != .disconnected && status != .invalid {
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        await toggleConnection()
     }
 
     // MARK: Profile details

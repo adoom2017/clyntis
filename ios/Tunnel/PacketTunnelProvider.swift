@@ -37,8 +37,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     let provider = Unmanaged<PacketTunnelProvider>.fromOpaque(context).takeUnretainedValue()
                     provider.queue.async { provider.drainPackets() }
                 }
+                step = "apply custom rules"
+                let (configuration, skipped) = try CustomRules.applied(to: store.configuration(for: id))
+                if !skipped.isEmpty {
+                    log.warning("start: \(skipped.count) custom rule(s) not usable with this profile: "
+                                + skipped.map { "\($0.rule) (\($0.reason))" }.joined(separator: "; "))
+                }
                 step = "create core"
-                self.core = try CoreSession(configuration: store.configuration(for: id),
+                self.core = try CoreSession(configuration: configuration,
                                             directory: store.directory(for: id), hooks: &hooks)
                 log.info("start: core created memory=\(memory())")
                 self.collectLogs()

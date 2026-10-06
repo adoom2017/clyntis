@@ -105,6 +105,19 @@ private struct ProfilesView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    NavigationLink {
+                        RulesView(model: model)
+                    } label: {
+                        LabeledContent {
+                            Text("\(model.customRules.count)")
+                        } label: {
+                            Label("自定义规则", systemImage: "list.bullet.indent")
+                        }
+                    }
+                } footer: {
+                    Text("对所有配置生效，优先于配置自带的规则")
+                }
                 if model.profiles.isEmpty {
                     ContentUnavailableView("还没有配置", systemImage: "doc.badge.plus",
                                            description: Text("点右上角 + 导入 Clash YAML 文件或链接"))

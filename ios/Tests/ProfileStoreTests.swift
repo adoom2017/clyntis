@@ -60,6 +60,28 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertNil(loaded.sourceHost)
     }
 
+    func testCustomRulesValidateAndLeadTheProfile() throws {
+        let saved = CustomRules.load()
+        defer { try? CustomRules.save(saved) }
+        XCTAssertThrowsError(try CustomRules.save(["MATCH,DIRECT"]))
+        XCTAssertThrowsError(try CustomRules.save(["NOPE,x,DIRECT"]))
+        try CustomRules.save([" DOMAIN-SUFFIX,ads.test,REJECT ", "DOMAIN,x.test,Missing"])
+        XCTAssertEqual(CustomRules.load(), ["DOMAIN-SUFFIX,ads.test,REJECT", "DOMAIN,x.test,Missing"])
+        let profile = Data("proxy-groups:\n  - {name: Auto, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,Auto\n".utf8)
+        XCTAssertEqual(try CoreSession.ruleTargets(configuration: profile), ["DIRECT", "REJECT", "Auto"])
+        let (merged, skipped) = try CustomRules.applied(to: profile)
+        XCTAssertEqual(skipped.map(\.rule), ["DOMAIN,x.test,Missing"])
+        let text = String(decoding: merged, as: UTF8.self)
+        let ads = try XCTUnwrap(text.range(of: "DOMAIN-SUFFIX,ads.test,REJECT"))
+        let match = try XCTUnwrap(text.range(of: "MATCH,Auto"))
+        XCTAssertLessThan(ads.lowerBound, match.lowerBound)
+        // The merged profile is a valid tunnel configuration.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try CoreSession(configuration: merged, directory: root).close()
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()
