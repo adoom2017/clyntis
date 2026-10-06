@@ -55,6 +55,12 @@ int32_t meta_decrypt_config_v1(const uint8_t *config, size_t length,
 int32_t meta_encrypt_config_v1(const uint8_t *config, size_t length,
     const uint8_t *password, size_t password_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Drain buffered core logs (all cores in this process) as newline-separated
+ * JSON objects {"time":unix_seconds,"type":"info|warning|error|debug",
+ * "payload":"..."}. Lines are removed only when they fit; otherwise
+ * META_BUFFER_TOO_SMALL reports the required length. Up to 2000 lines are kept
+ * between drains; older lines are dropped. */
+int32_t meta_drain_logs_v1(uint8_t *buffer, size_t capacity, size_t *output_length);
 /* Download missing or expired routing resources referenced by config into
  * directory (UTF-8 absolute existing path) and validate them; an expired file
  * is kept when its update fails. Blocking; creates no handle or listener.

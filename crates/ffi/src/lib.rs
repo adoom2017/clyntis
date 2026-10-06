@@ -1,5 +1,6 @@
 //! Versioned caller-buffer C ABI. See include/clyntis.h for the host contract.
 mod host;
+mod logs;
 use anyhow::{Context, Result, ensure};
 use host::{Handle, HostHooks, MetaHooksV1};
 use std::{
@@ -190,6 +191,28 @@ pub unsafe extern "C" fn meta_create_packet_tunnel_v1(
     unsafe { create(data, len, hooks, out, Some((directory, directory_len))) }
 }
 
+/// Move buffered core log lines into `buffer` as newline-separated JSON objects
+/// (`time` in Unix seconds, `type` debug/info/warning/error, `payload`). Lines
+/// are removed only when they fit; otherwise `length` reports the size needed.
+///
+/// # Safety
+/// Buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_drain_logs_v1(
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let mut status = OK;
+        logs::drain(|bytes| {
+            status = unsafe { output(bytes, buffer, capacity, length)? };
+            Ok(status == OK)
+        })?;
+        Ok(status)
+    })
+}
+
 /// Download missing or expired routing resources (GeoIP/GeoSite, rule providers)
 /// referenced by `config` into `directory`, then validate them. Blocks until
 /// done. Hosts call this before starting a packet tunnel so the memory- and
@@ -239,6 +262,7 @@ unsafe fn create(
         }
         host::check_lifecycle()?;
         let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        logs::init(&config.log.log_level);
         if let Some((path, path_len)) = directory {
             let path =
                 std::path::PathBuf::from(std::str::from_utf8(unsafe { input(path, path_len)? })?);

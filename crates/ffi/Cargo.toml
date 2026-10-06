@@ -10,6 +10,8 @@ meta-core.workspace = true
 meta-config.workspace = true
 meta-platform.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
 serde_json.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

@@ -486,3 +486,39 @@ fn prefetch_downloads_rule_providers_into_the_host_directory() {
     assert_ne!(call("relative/dir"), OK);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn drain_logs_keeps_lines_until_they_fit() {
+    // Drain anything earlier tests logged, then add known lines.
+    let mut length = 0;
+    let mut scratch = vec![0u8; 1 << 20];
+    unsafe { meta_drain_logs_v1(scratch.as_mut_ptr(), scratch.len(), &mut length) };
+    logs::record_for_test(r#"{"type":"info","payload":"one"}"#);
+    logs::record_for_test(r#"{"type":"error","payload":"two"}"#);
+    let mut small = [0u8; 4];
+    assert_eq!(
+        unsafe { meta_drain_logs_v1(small.as_mut_ptr(), small.len(), &mut length) },
+        BUFFER_TOO_SMALL
+    );
+    let mut buffer = vec![0u8; length + 64];
+    assert_eq!(
+        unsafe { meta_drain_logs_v1(buffer.as_mut_ptr(), buffer.len(), &mut length) },
+        OK
+    );
+    let text = std::str::from_utf8(&buffer[..length]).unwrap();
+    assert!(
+        text.contains("\"one\"") && text.contains("\"two\""),
+        "{text}"
+    );
+    // Drained lines are gone (parallel tests may log other lines meanwhile).
+    let mut buffer = vec![0u8; 1 << 20];
+    assert_eq!(
+        unsafe { meta_drain_logs_v1(buffer.as_mut_ptr(), buffer.len(), &mut length) },
+        OK
+    );
+    let text = std::str::from_utf8(&buffer[..length]).unwrap();
+    assert!(
+        !text.contains("\"one\"") && !text.contains("\"two\""),
+        "{text}"
+    );
+}
