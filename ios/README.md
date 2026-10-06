@@ -31,6 +31,38 @@ copy. Use `bash scripts/build-ios.sh --release` to build optimized core librarie
 for device testing or distribution. Xcode's Release configuration alone does
 not rebuild the Rust core.
 
+### Xcode Cloud
+
+The executable hook `ios/ci_scripts/ci_post_clone.sh` prepares the core before
+Xcode builds the app. It installs CMake and rustup when absent, selects the Rust
+version from `rust-toolchain.toml`, installs the device/simulator targets, fetches
+locked Cargo dependencies, and builds a Release `ClyntisCore.xcframework` with
+both arm64 slices. The framework stays ignored and is generated for each build.
+
+Commit and push the hook, `scripts/build-ios.sh`, and the configured Xcode project
+to the branch used by the workflow. Select `ios/Clyntis.xcodeproj` and the
+`Clyntis` scheme in Xcode Cloud. No additional workflow environment variables or
+manual script step are required; Xcode Cloud automatically discovers the hook
+beside the project. Check the **Post-Clone** log for the Rust build and successful
+XCFramework creation. A fresh cloud build needs network access to Homebrew,
+Rust's distribution servers and Cargo dependencies, and takes longer than a
+cached local build.
+
+The hook uses `--skip-project-generation`, so cloud builds do not need XcodeGen
+and preserve the committed project, Info.plists and signing settings. Signing
+for both the app and tunnel must still be configured in Xcode/Xcode Cloud.
+To reproduce the dependency preparation locally on macOS:
+
+```sh
+bash ios/ci_scripts/ci_post_clone.sh
+```
+
+For a local core-only rebuild after dependencies have been fetched, use
+`bash scripts/build-ios.sh --release --skip-project-generation`.
+See Apple's [custom build script documentation](https://developer.apple.com/documentation/xcode/writing-custom-build-scripts).
+
+### Local verification
+
 Unsigned compile checks (these do not install a working VPN on a device):
 
 ```sh
