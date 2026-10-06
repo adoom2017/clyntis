@@ -10,6 +10,8 @@ final class AppModel {
     }
     var status: NEVPNStatus = .disconnected
     var busy = false
+    /// Shown under the status while a slow connect step runs.
+    var phase: String?
     var error: String?
     var upload: UInt64 = 0
     var download: UInt64 = 0
@@ -47,6 +49,7 @@ final class AppModel {
             manager = managers.first {
                 ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == tunnelIdentifier
             }
+            Diagnostics.app.info("load: \(managers.count) VPN configuration(s), ours=\(self.manager != nil)")
             if let manager {
                 status = manager.connection.status
                 if active, let rawID = (manager.protocolConfiguration as? NETunnelProviderProtocol)?
@@ -60,13 +63,25 @@ final class AppModel {
                         guard let self, let connection = notification.object as? NEVPNConnection,
                               connection === self.manager?.connection else { return }
                         self.status = connection.status
+                        Diagnostics.app.info("vpn status -> \(connection.status.rawValue)")
+                        if connection.status == .disconnected {
+                            // Ask the system why the tunnel stopped (start failure, provider error, ...).
+                            connection.fetchLastDisconnectError { error in
+                                if let error {
+                                    Diagnostics.app.error("vpn disconnected: \(Diagnostics.describe(error), privacy: .public)")
+                                }
+                            }
+                        }
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
                         }
                     }
                 }
             #endif
-        } catch { self.error = error.localizedDescription }
+        } catch {
+            Diagnostics.app.error("load: \(Diagnostics.describe(error), privacy: .public)")
+            self.error = error.localizedDescription
+        }
     }
 
     private var tunnelIdentifier: String {
@@ -82,10 +97,32 @@ final class AppModel {
         #else
         guard let selected else { error = "请先导入配置。"; return }
         busy = true
-        defer { busy = false }
+        defer { busy = false; phase = nil }
+        let log = Diagnostics.app
+        log.info("connect: begin profile=\(selected.id.uuidString, privacy: .public) tunnel=\(self.tunnelIdentifier, privacy: .public) existingManager=\(self.manager != nil)")
+        var step = "read configuration"
         do {
             let bytes = try store.configuration(for: selected.id)
+            step = "validate configuration"
+            log.info("connect: \(step, privacy: .public) (\(bytes.count) bytes)")
             try await validate(bytes, directory: store.directory(for: selected.id))
+            // Fetch GeoIP/GeoSite and rule providers here, where neither the tunnel's
+            // ~50 MiB memory limit nor its start timeout applies.
+            step = "prefetch resources"
+            log.info("connect: \(step, privacy: .public)")
+            phase = "正在准备路由资源…"
+            let directory = store.directory(for: selected.id)
+            let started = Date()
+            do {
+                try await Task.detached {
+                    try CoreSession.prefetchResources(configuration: bytes, directory: directory)
+                }.value
+                log.info("connect: resources ready in \(Date().timeIntervalSince(started), format: .fixed(precision: 1))s")
+            } catch {
+                // Not fatal: the tunnel can still fetch what is missing itself.
+                log.error("connect: prefetch failed: \(Diagnostics.describe(error), privacy: .public)")
+            }
+            phase = nil
             let manager = self.manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = tunnelIdentifier
@@ -97,12 +134,22 @@ final class AppModel {
             manager.localizedDescription = "Clyntis"
             manager.isEnabled = true
             manager.isOnDemandEnabled = false
+            step = "save preferences"
+            log.info("connect: \(step, privacy: .public)")
             try await manager.saveToPreferences()
+            step = "reload preferences"
+            log.info("connect: \(step, privacy: .public)")
             try await manager.loadFromPreferences()
             self.manager = manager
+            step = "start tunnel"
+            log.info("connect: \(step, privacy: .public) enabled=\(manager.isEnabled) status=\(manager.connection.status.rawValue)")
             try manager.connection.startVPNTunnel()
             status = manager.connection.status
-        } catch { self.error = error.localizedDescription }
+            log.info("connect: start requested, status=\(self.status.rawValue)")
+        } catch {
+            log.error("connect: failed at \(step, privacy: .public): \(Diagnostics.describe(error), privacy: .public)")
+            self.error = error.localizedDescription
+        }
         #endif
     }
 
@@ -204,6 +251,7 @@ final class AppModel {
             let data = try await send(TunnelMessage(command: "snapshot"))
             try applySnapshot(data)
         } catch {
+            Diagnostics.app.error("snapshot: \(Diagnostics.describe(error), privacy: .public)")
             if connected { self.error = error.localizedDescription }
         }
     }

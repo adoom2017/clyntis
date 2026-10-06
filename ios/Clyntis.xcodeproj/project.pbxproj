@@ -13,6 +13,7 @@
 		2D8481EB52250EB33070F77B /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16E5C6B7DCB40C68F7211D86 /* AppModel.swift */; };
 		32AD2774235232663A36C194 /* TunnelMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B4B2639FDBCD0D9EC6D5121 /* TunnelMessage.swift */; };
 		361C94D98870D17B5A4B8246 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = FD817C6A169F8DFC4183D3B4 /* Assets.xcassets */; };
+		3ADFC46836317B25A2D7E9F3 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08C48B38E9CA87387BC36EAC /* Diagnostics.swift */; };
 		450BD701860BB3F96BAD666A /* ClyntisTunnel.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7D33B6B66F8B436DE4160641 /* ClyntisTunnel.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		47EE4B47F567953035197D7F /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4CD9F227C5DB6EE5B5BA41C5 /* Network.framework */; };
 		4E60E59A3023616B29B393CB /* ProfileStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3831CDBEE61FA4DB359AB263 /* ProfileStoreTests.swift */; };
@@ -23,6 +24,7 @@
 		82F9DA0BAAE9E54C95C4298A /* ClyntisCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7EBCE9855260D3674DF1C422 /* ClyntisCore.xcframework */; };
 		88087D6A84402E55DC933636 /* ClyntisCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7EBCE9855260D3674DF1C422 /* ClyntisCore.xcframework */; };
 		89B71378DBDB49CFFE4463E6 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51B7F9DA68DB1DC03B419874 /* NetworkExtension.framework */; };
+		9D907A2DF84666270D23F778 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08C48B38E9CA87387BC36EAC /* Diagnostics.swift */; };
 		A18CA02320179DF84B5FF279 /* RemoteConfigImportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F7EAB0C1D2E264CCDE904DD /* RemoteConfigImportTests.swift */; };
 		A57149F844CCAFC2559BE2B7 /* ProfileStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 780FEACDBDC48C7EA90A5065 /* ProfileStore.swift */; };
 		A75F93E0C7BA4D03A76A0E87 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D05A537A88901961F3530892 /* RootView.swift */; };
@@ -64,6 +66,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		08C48B38E9CA87387BC36EAC /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		16E5C6B7DCB40C68F7211D86 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		238BD3B82B99BE112B4D3D83 /* ConfigPasswordView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigPasswordView.swift; sourceTree = "<group>"; };
 		3831CDBEE61FA4DB359AB263 /* ProfileStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStoreTests.swift; sourceTree = "<group>"; };
@@ -165,6 +168,7 @@
 			isa = PBXGroup;
 			children = (
 				85C0453CF264DA14FB00CEC0 /* CoreSession.swift */,
+				08C48B38E9CA87387BC36EAC /* Diagnostics.swift */,
 				780FEACDBDC48C7EA90A5065 /* ProfileStore.swift */,
 				4B4B2639FDBCD0D9EC6D5121 /* TunnelMessage.swift */,
 			);
@@ -309,6 +313,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				257A1AA8013F7B9FCA085EDC /* CoreSession.swift in Sources */,
+				9D907A2DF84666270D23F778 /* Diagnostics.swift in Sources */,
 				D20BFB9B6D5AE28CF35011C7 /* PacketTunnelProvider.swift in Sources */,
 				A57149F844CCAFC2559BE2B7 /* ProfileStore.swift in Sources */,
 				6F3758ECF7571F9668C938E4 /* TunnelMessage.swift in Sources */,
@@ -324,6 +329,7 @@
 				08B50211ED35EA3A230E46A4 /* ConfigCrypto.swift in Sources */,
 				E2CAD0490779F962B383B8A9 /* ConfigPasswordView.swift in Sources */,
 				62FE4B2352CD402A466015B3 /* CoreSession.swift in Sources */,
+				3ADFC46836317B25A2D7E9F3 /* Diagnostics.swift in Sources */,
 				61CF5ABEE28DB1C9D2079717 /* ProfileStore.swift in Sources */,
 				6595D1D8F7B59AEBBCFAA8D8 /* RemoteConfigImporter.swift in Sources */,
 				E06208BA706DCD951ED3081E /* RemoteImportView.swift in Sources */,

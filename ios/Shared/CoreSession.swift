@@ -26,6 +26,19 @@ final class CoreSession {
         handle = 0
     }
 
+    /// Downloads missing/expired routing resources into `directory`. Blocking; run
+    /// it in the app before starting the tunnel, whose process is memory-limited.
+    static func prefetchResources(configuration: Data, directory: URL) throws {
+        let path = Data(directory.path.utf8)
+        let result = configuration.withUnsafeBytes { config in
+            path.withUnsafeBytes { path in
+                meta_prefetch_resources_v1(config.bindMemory(to: UInt8.self).baseAddress, config.count,
+                                           path.bindMemory(to: UInt8.self).baseAddress, path.count)
+            }
+        }
+        try check(result)
+    }
+
     func snapshot() throws -> Data {
         try Self.read { meta_snapshot_v1(handle, $0, $1, $2) }
     }

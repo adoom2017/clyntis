@@ -52,7 +52,7 @@ private struct ConnectionView: View {
                         VStack(spacing: 4) {
                             Text(model.statusText).font(.title3.weight(.semibold))
                                 .foregroundStyle(model.connected ? Color.connected : Color.primary)
-                            Text(model.selected?.name ?? "未选择配置")
+                            Text(model.phase ?? model.selected?.name ?? "未选择配置")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }
