@@ -250,7 +250,14 @@ pub enum ProxyKind {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Reality {
     pub public_key: String,
+    /// Optional, as in mihomo; empty means an all-zero short ID.
+    #[serde(default)]
     pub short_id: String,
+    /// mihomo's switch for the X25519MLKEM768 key share. Absent keeps the
+    /// browser profile's shares (the patched BoringSSL reuses the X25519 secret
+    /// so old and new servers authenticate); `false` removes the hybrid share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_x25519mlkem768: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -328,6 +335,10 @@ pub struct Tun {
     pub mtu: u16,
     pub route_exclude_address: Vec<ipnet::IpNet>,
     pub dns_hijack: Vec<String>,
+    /// TCP congestion control for TUN connections: cubic, reno, bbr or bbr3.
+    /// cubic/reno apply to the smoltcp stack; bbr/bbr3 are accepted for mihomo
+    /// compatibility but have no smoltcp implementation. Absent: none.
+    pub congestion_controller: Option<String>,
 }
 impl Default for Tun {
     fn default() -> Self {
@@ -342,6 +353,7 @@ impl Default for Tun {
             mtu: 1500,
             route_exclude_address: vec![],
             dns_hijack: vec!["any:53".into()],
+            congestion_controller: None,
         }
     }
 }
@@ -659,10 +671,18 @@ impl Config {
             ["strict", "always", "off"].contains(&self.find_process_mode.as_str()),
             "invalid find-process-mode"
         );
+        // Labels only: every stack name runs the native smoltcp stack. mihomo
+        // 1.19.32 made `mips` its default.
         ensure!(
-            ["gvisor", "system", "mixed"].contains(&self.tun.stack.as_str()),
+            ["gvisor", "system", "mixed", "mips"].contains(&self.tun.stack.as_str()),
             "invalid tun.stack"
         );
+        if let Some(controller) = &self.tun.congestion_controller {
+            ensure!(
+                ["cubic", "reno", "bbr", "bbr3"].contains(&controller.as_str()),
+                "invalid tun.congestion-controller (cubic, reno, bbr or bbr3)"
+            );
+        }
         ensure!(
             self.ntp.interval > 0 && self.ntp.port > 0,
             "invalid NTP interval/port"
@@ -825,6 +845,35 @@ pub fn port_list(proxy: &Proxy) -> Result<Vec<u16>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepts_mihomo_1_19_31_and_1_19_32_options() {
+        let yaml = br#"
+tun:
+  stack: mips
+  congestion-controller: cubic
+proxies:
+  - name: r
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: tcp
+    tls: true
+    servername: example.com
+    reality-opts:
+      public-key: e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM
+      support-x25519mlkem768: false
+rules: ['MATCH,DIRECT']
+"#;
+        let config = Config::parse(yaml).unwrap();
+        assert_eq!(config.tun.congestion_controller.as_deref(), Some("cubic"));
+        let reality = config.proxies[0].reality_opts.as_ref().unwrap();
+        assert_eq!(reality.short_id, "");
+        assert_eq!(reality.support_x25519mlkem768, Some(false));
+        let bad = String::from_utf8_lossy(yaml).replace("cubic", "vegas");
+        assert!(Config::parse(bad.as_bytes()).is_err());
+    }
+
     use super::*;
     #[test]
     fn packet_host_interface_exemption_cannot_be_enabled_by_yaml() {

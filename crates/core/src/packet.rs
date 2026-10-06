@@ -31,11 +31,59 @@ use tokio::{
 };
 use tokio_util::{sync::PollSender, task::AbortOnDropHandle};
 
-const MAX_TCP: usize = 512;
-const MAX_UDP: usize = 512;
-const MAX_PORTS: usize = 256;
-const BUFFER: usize = 32768;
 const CHUNK: usize = 8192;
+
+/// Per-flow limits. Hosted packet tunnels (the iOS Network Extension) are
+/// killed above ~50 MiB, and an app opening many QUIC/DNS destinations at once
+/// used to exhaust that with 128 KiB of UDP buffers per destination; there the
+/// tunnel keeps smaller buffers and fewer flows, dropping new flows at the cap
+/// (clients retry) rather than being terminated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Budget {
+    max_tcp: usize,
+    max_udp: usize,
+    max_ports: usize,
+    /// smoltcp receive and send buffer, each, per TCP flow.
+    tcp_buffer: usize,
+    /// smoltcp receive and send payload storage, each, per UDP destination.
+    udp_buffer: usize,
+    udp_idle: Duration,
+    /// Chunks of up to CHUNK bytes queued per direction for each TCP flow.
+    tcp_queue: usize,
+}
+impl Budget {
+    const DESKTOP: Self = Self {
+        max_tcp: 512,
+        max_udp: 512,
+        max_ports: 256,
+        tcp_buffer: 32 * 1024,
+        udp_buffer: 65535,
+        udp_idle: Duration::from_secs(120),
+        tcp_queue: 4,
+    };
+    /// Holds DNS answers (EDNS, 4 KiB) and bursts of QUIC datagrams at MTU 1280.
+    const HOSTED: Self = Self {
+        max_tcp: 256,
+        max_udp: 256,
+        max_ports: 128,
+        tcp_buffer: 16 * 1024,
+        udp_buffer: 16 * 1024,
+        udp_idle: Duration::from_secs(60),
+        tcp_queue: 2,
+    };
+    /// DNS clients use a fresh source port per query and retry within seconds,
+    /// so a hijacked DNS flow needs no long idle period.
+    fn dns_idle(self) -> Duration {
+        self.udp_idle.min(Duration::from_secs(15))
+    }
+    fn for_config(config: &meta_config::Config) -> Self {
+        if config.internal_host_packet_io {
+            Self::HOSTED
+        } else {
+            Self::DESKTOP
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct Flow {
@@ -281,11 +329,11 @@ async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> 
             }
             Ok(())
         };
-        return tokio::time::timeout(Duration::from_secs(120), serve).await?;
+        return tokio::time::timeout(Budget::for_config(&core.config).udp_idle, serve).await?;
     }
     let target = Target::new(flow.target.addr.to_string(), flow.target.port)?;
     let source = flow.source.to_string();
-    if core.should_sniff(&core.restore_target(&target)) {
+    if core.wants_sniff(&core.restore_target(&target)) {
         let (route, destination, prefix) = core.sniff_target(&mut stream, &target).await?;
         let (mut outbound, name) = core.dial_sniffed(&route, &destination, &source).await?;
         outbound.write_all(&prefix).await?;
@@ -302,7 +350,7 @@ async fn udp_session(
 ) -> Result<()> {
     if hijack_dns(&core, flow.target, false) {
         while let Some(packet) =
-            tokio::time::timeout(Duration::from_secs(120), input.recv()).await?
+            tokio::time::timeout(Budget::for_config(&core.config).dns_idle(), input.recv()).await?
         {
             match tokio::time::timeout(Duration::from_secs(10), core.resolver.answer(&packet)).await
             {
@@ -329,7 +377,7 @@ async fn udp_session(
     // resume safely if a partially read frame is cancelled for every upload.
     let send = async {
         while let Some(packet) =
-            tokio::time::timeout(Duration::from_secs(120), input.recv()).await?
+            tokio::time::timeout(Budget::for_config(&core.config).udp_idle, input.recv()).await?
         {
             session.send(&target, &packet).await?;
         }
@@ -351,7 +399,26 @@ async fn udp_session(
     }
 }
 
+/// Maps `tun.congestion-controller` onto smoltcp. Enabling the cubic/reno
+/// features makes smoltcp default to Cubic, so "not configured" is set to None
+/// explicitly to keep the previous behaviour.
+fn congestion_control(name: Option<&str>) -> tcp::CongestionControl {
+    match name {
+        Some("cubic") => tcp::CongestionControl::Cubic,
+        Some("reno") => tcp::CongestionControl::Reno,
+        _ => tcp::CongestionControl::None,
+    }
+}
+
 pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
+    let budget = Budget::for_config(&core.config);
+    let congestion = congestion_control(core.config.tun.congestion_controller.as_deref());
+    if let Some(name @ ("bbr" | "bbr3")) = core.config.tun.congestion_controller.as_deref() {
+        tracing::warn!(
+            controller = name,
+            "TUN congestion controller is not available in the smoltcp stack; using none"
+        );
+    }
     ensure!(
         (1280..=9000).contains(&core.config.tun.mtu),
         "invalid TUN MTU"
@@ -427,20 +494,21 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) else { continue; };
                 if let Some((flow, syn)) = sniff(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }
-                    if flow.tcp && syn && !tcp_flows.contains_key(&flow) && tcp_flows.len() < MAX_TCP {
-                        let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; BUFFER]), tcp::SocketBuffer::new(vec![0; BUFFER]));
+                    if flow.tcp && syn && !tcp_flows.contains_key(&flow) && tcp_flows.len() < budget.max_tcp {
+                        let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]), tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]));
                         socket.set_timeout(Some(NetDuration::from_secs(300)));
                         socket.set_keep_alive(Some(NetDuration::from_secs(30)));
+                        socket.set_congestion_control(congestion);
                         socket.listen(flow.target)?;
                         let handle = sockets.add(socket);
-                        let (input, receiver) = mpsc::channel(4);
-                        let (sender, output) = mpsc::channel(4);
+                        let (input, receiver) = mpsc::channel(budget.tcp_queue);
+                        let (sender, output) = mpsc::channel(budget.tcp_queue);
                         let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)) };
                         let core = core.clone();
                         let task = tasks.spawn(async move { (flow, tcp_session(core, flow, stream).await) });
                         tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
-                    } else if !flow.tcp && !ports.contains_key(&flow.target) && ports.len() < MAX_PORTS {
-                        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; 65535]);
+                    } else if !flow.tcp && !ports.contains_key(&flow.target) && ports.len() < budget.max_ports {
+                        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; budget.udp_buffer]);
                         let mut socket = udp::Socket::new(buffer(), buffer());
                         socket.bind(flow.target)?;
                         ports.insert(flow.target, UdpPort { handle: sockets.add(socket), last: Instant::now() });
@@ -543,7 +611,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     target: *endpoint,
                     tcp: false,
                 };
-                if !udp_flows.contains_key(&flow) && udp_flows.len() < MAX_UDP {
+                if !udp_flows.contains_key(&flow) && udp_flows.len() < budget.max_udp {
                     let (input, receiver) = mpsc::channel(16);
                     let core = core.clone();
                     let replies = replies.clone();
@@ -568,7 +636,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             }
         }
         ports.retain(|endpoint, port| {
-            if port.last.elapsed() <= Duration::from_secs(120) {
+            if port.last.elapsed() <= budget.udp_idle {
                 return true;
             }
             udp_flows.retain(|flow, state| {
@@ -594,3 +662,51 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
 #[cfg(test)]
 #[path = "packet_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod congestion_tests {
+    use super::*;
+
+    #[test]
+    fn congestion_controller_names_map_to_smoltcp() {
+        assert_eq!(
+            congestion_control(Some("cubic")),
+            tcp::CongestionControl::Cubic
+        );
+        assert_eq!(
+            congestion_control(Some("reno")),
+            tcp::CongestionControl::Reno
+        );
+        // Not configured keeps the pre-feature behaviour; bbr has no smoltcp port.
+        for name in [None, Some("bbr"), Some("bbr3")] {
+            assert_eq!(congestion_control(name), tcp::CongestionControl::None);
+        }
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 64]),
+            tcp::SocketBuffer::new(vec![0; 64]),
+        );
+        socket.set_congestion_control(congestion_control(Some("reno")));
+        assert_eq!(socket.congestion_control(), tcp::CongestionControl::Reno);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_tunnels_use_the_compact_budget() {
+        let mut config = meta_config::Config::default();
+        assert_eq!(Budget::for_config(&config), Budget::DESKTOP);
+        config.internal_host_packet_io = true;
+        let hosted = Budget::for_config(&config);
+        assert_eq!(hosted, Budget::HOSTED);
+        // Worst case for TUN buffers stays well inside the 50 MiB extension limit.
+        let worst = hosted.max_tcp * (2 * hosted.tcp_buffer + 2 * hosted.tcp_queue * CHUNK)
+            + hosted.max_ports * 2 * hosted.udp_buffer;
+        assert!(worst <= 20 * 1024 * 1024, "{worst}");
+        // Hijacked DNS flows end quickly in both modes.
+        assert_eq!(hosted.dns_idle(), Duration::from_secs(15));
+        assert_eq!(Budget::DESKTOP.dns_idle(), Duration::from_secs(15));
+    }
+}

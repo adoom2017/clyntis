@@ -177,6 +177,9 @@ const CHROMIUM_CIPHERS: &str = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TL
 const FIREFOX_CIPHERS: &str = "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
 const CHROMIUM_SIGALGS: &str = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
 const FIREFOX_SIGALGS: &str = "ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:ecdsa_secp521r1_sha512:rsa_pss_rsae_sha256:rsa_pss_rsae_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha256:rsa_pkcs1_sha384:rsa_pkcs1_sha512:ecdsa_sha1:rsa_pkcs1_sha1";
+/// TLS group code points used in key-share lists.
+const X25519_MLKEM768: u16 = 0x11ec;
+const X25519: u16 = 29;
 const KEY_SHARES_CHROME: &[u16] = &[0x11ec, 29];
 const KEY_SHARES_FIREFOX: &[u16] = &[0x11ec, 29, 23];
 const KEY_SHARES_CLASSIC: &[u16] = &[29, 23];
@@ -632,14 +635,52 @@ fn configure_ssl(
     if let Some(now) = clock.unix_seconds() {
         ssl.verify_param_mut().set_time(now as _);
     }
+    // mihomo's `support-x25519mlkem768: false` asks REALITY not to offer the
+    // hybrid group at all; absent keeps the profile (see meta_config::Reality).
+    let without_mlkem = config
+        .reality
+        .as_ref()
+        .is_some_and(|r| r.support_x25519mlkem768 == Some(false));
+    let key_shares = if without_mlkem {
+        let shares: Vec<u16> = profile
+            .tls
+            .key_shares
+            .iter()
+            .copied()
+            .filter(|&group| group != X25519_MLKEM768)
+            .collect();
+        if shares.is_empty() {
+            vec![X25519]
+        } else {
+            shares
+        }
+    } else {
+        profile.tls.key_shares.to_vec()
+    };
+    if without_mlkem {
+        let groups = std::ffi::CString::new(
+            profile
+                .tls
+                .curves
+                .split(':')
+                .filter(|group| *group != "X25519MLKEM768")
+                .collect::<Vec<_>>()
+                .join(":"),
+        )?;
+        // SAFETY: ssl is valid and `groups` is a NUL-terminated string.
+        ensure!(
+            unsafe { boring_sys::SSL_set1_curves_list(ssl.as_ptr(), groups.as_ptr()) } == 1,
+            "cannot configure TLS groups"
+        );
+    }
     // Keep the supported-groups list and emitted key_share entries separate.
     // SAFETY: ssl is valid and the slice lives for the duration of the call.
     unsafe {
         ensure!(
             boring_sys::SSL_set1_client_key_shares(
                 ssl.as_ptr(),
-                profile.tls.key_shares.as_ptr(),
-                profile.tls.key_shares.len()
+                key_shares.as_ptr(),
+                key_shares.len()
             ) == 1,
             "cannot configure TLS key shares"
         );
@@ -915,12 +956,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reality_mlkem_switch_follows_mihomo_only_when_explicit() {
+        let key_share_groups = |hello: &WireHello| {
+            let shares = hello.extension(51);
+            let (mut offset, mut groups) = (2, vec![]);
+            while offset + 4 <= shares.len() {
+                groups.push(u16::from_be_bytes([shares[offset], shares[offset + 1]]));
+                offset += 4 + u16::from_be_bytes([shares[offset + 2], shares[offset + 3]]) as usize;
+            }
+            groups
+        };
+        for (switch, offered) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let hello = capture_with_reality(
+                TlsFingerprint::Chrome,
+                Some(meta_config::Reality {
+                    public_key: "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM".into(),
+                    short_id: String::new(),
+                    support_x25519mlkem768: switch,
+                }),
+            )
+            .await;
+            // supported_groups (10) and key_share (51) agree on the hybrid group.
+            let supported = u16s(&hello.extension(10)[2..]);
+            assert_eq!(supported.contains(&0x11ec), offered, "{switch:?}");
+            let shares = key_share_groups(&hello);
+            assert_eq!(shares.contains(&0x11ec), offered, "{switch:?}");
+            assert!(shares.contains(&29), "{switch:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn reality_reuses_x25519_without_changing_profile_sigalgs() {
         let hello = capture_with_reality(
             TlsFingerprint::Chrome,
             Some(meta_config::Reality {
                 public_key: "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM".into(),
                 short_id: "01020304".into(),
+                support_x25519mlkem768: None,
             }),
         )
         .await;

@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use meta_config::{
     Config, RuleProvider,
-    rule::{DomainSet, IpMatcher, IpSet, Matcher, Rule},
+    rule::{DomainSetBuilder, IpMatcher, IpSet, Matcher, Rule},
 };
 use prost::Message;
 use std::{
@@ -65,7 +65,14 @@ impl Resources {
         hooks: &meta_platform::Hooks,
         refresh: bool,
         previous: &Resources,
+        via: Option<&crate::Core>,
     ) -> Result<Self> {
+        let proxy = via.and_then(|core| core.resource_proxy().map(|name| (core, name)));
+        let fetch = Fetch {
+            resolver,
+            hooks,
+            proxy: proxy.as_ref().map(|(core, name)| (*core, name.as_str())),
+        };
         // Rebuilding geo data while the old snapshot is alive doubles its memory,
         // which the ~50 MiB iOS tunnel extension cannot afford; there, the host
         // refreshes geo files before each start (meta_prefetch_resources_v1).
@@ -108,8 +115,7 @@ impl Resources {
                         None
                     },
                     refresh,
-                    resolver,
-                    hooks,
+                    &fetch,
                     &mut pending,
                 )
                 .await?;
@@ -135,8 +141,7 @@ impl Resources {
                     &config.geox_url.geoip,
                     geo_interval(config),
                     geo_refresh,
-                    resolver,
-                    hooks,
+                    &fetch,
                     &mut pending,
                 )
                 .await?;
@@ -193,8 +198,7 @@ impl Resources {
                     &config.geox_url.mmdb,
                     geo_interval(config),
                     geo_refresh,
-                    resolver,
-                    hooks,
+                    &fetch,
                     &mut pending,
                 )
                 .await?;
@@ -248,8 +252,7 @@ impl Resources {
                 &config.geox_url.geosite,
                 geo_interval(config),
                 geo_refresh,
-                resolver,
-                hooks,
+                &fetch,
                 &mut pending,
             )
             .await?;
@@ -264,25 +267,32 @@ impl Resources {
                 // categories (cn, geolocation-!cn) would otherwise exist twice, as
                 // decoded structs and as the resulting domain set.
                 let mut entries = HashMap::new();
-                let raw =
+                for bytes in
                     wire::read_entries(&data, |code| wanted.contains(&code.to_ascii_lowercase()))
-                        .context("invalid geosite.dat")?;
-                for bytes in &raw {
-                    let bytes = bytes.as_slice();
+                        .context("invalid geosite.dat")?
+                {
                     let mut code = String::new();
-                    wire::each_field(bytes, 1, |value| {
+                    wire::each_field(&bytes, 1, |value| {
                         code = std::str::from_utf8(value)?.to_ascii_lowercase();
                         Ok(())
                     })
                     .context("invalid geosite.dat")?;
                     entries.insert(code, bytes);
                 }
+                // Release each category's raw bytes once its last tag is built,
+                // so large categories do not all stay in memory until the end.
+                let mut remaining: HashMap<String, usize> = HashMap::new();
+                for tag in &site_refs {
+                    let code = tag.split('@').next().unwrap_or("").to_ascii_lowercase();
+                    *remaining.entry(code).or_default() += 1;
+                }
                 for tag in site_refs {
                     let parts: Vec<_> = tag.split('@').collect();
-                    let entry = *entries
-                        .get(&parts[0].to_ascii_lowercase())
+                    let code = parts[0].to_ascii_lowercase();
+                    let entry = entries
+                        .get(&code)
                         .context("GEOSITE category missing from data")?;
-                    let mut set = DomainSet::default();
+                    let mut set = DomainSetBuilder::default();
                     wire::each_field(entry, 2, |bytes| {
                         let d = Domain::decode(bytes).context("invalid geosite.dat")?;
                         if !parts[1..].iter().all(|attr| {
@@ -292,24 +302,25 @@ impl Resources {
                         }) {
                             return Ok(());
                         }
-                        let value = d.value.trim_end_matches('.').to_ascii_lowercase();
                         match d.kind {
-                            0 => set.keywords.push(value),
-                            1 => set.regex.push(meta_config::rule::compile_regex(&d.value)?),
-                            2 => {
-                                set.suffix.insert(value);
-                            }
-                            3 => {
-                                set.exact.insert(value);
-                            }
+                            0 => set.keyword(&d.value),
+                            1 => set.regex(&d.value)?,
+                            2 => set.suffix(&d.value),
+                            3 => set.exact(&d.value),
                             _ => bail!("invalid geosite domain type"),
                         }
                         Ok(())
                     })?;
-                    set.exact.shrink_to_fit();
-                    set.suffix.shrink_to_fit();
-                    out.matchers
-                        .insert(("geosite".into(), tag), Matcher::Domains(Arc::new(set)));
+                    if let Some(count) = remaining.get_mut(&code) {
+                        *count -= 1;
+                        if *count == 0 {
+                            entries.remove(&code);
+                        }
+                    }
+                    out.matchers.insert(
+                        ("geosite".into(), tag),
+                        Matcher::Domains(Arc::new(set.build())),
+                    );
                 }
             }
         }
@@ -365,8 +376,7 @@ async fn asset(
     url: &str,
     interval: Option<u64>,
     refresh: bool,
-    resolver: &crate::dns::Resolver,
-    hooks: &meta_platform::Hooks,
+    fetch: &Fetch<'_>,
     pending: &mut Staged,
 ) -> Result<PathBuf> {
     let meta = std::fs::metadata(path).ok();
@@ -388,15 +398,33 @@ async fn asset(
         "local routing resource is missing"
     );
     let (temp, mut file) = pending.create(path)?;
-    let result = download(url, resolver, hooks, &mut file)
-        .await
-        .and_then(|_| Ok(file.sync_all()?))
-        .with_context(|| {
-            format!(
-                "routing resource download failed ({})",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            )
-        });
+    let mut result = download(url, fetch.resolver, fetch.hooks, None, &mut file).await;
+    if let (Err(error), Some((core, name))) = (&result, fetch.proxy) {
+        // Resource hosts (jsDelivr, GitHub) are often unreachable directly from
+        // the networks that need the proxy in the first place.
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            proxy = name,
+            "direct routing resource download failed; retrying through the proxy"
+        );
+        use std::io::Seek;
+        file.set_len(0)?;
+        file.rewind()?;
+        result = download(
+            url,
+            fetch.resolver,
+            fetch.hooks,
+            Some((core, name)),
+            &mut file,
+        )
+        .await;
+    }
+    let result = result.and_then(|_| Ok(file.sync_all()?)).with_context(|| {
+        format!(
+            "routing resource download failed ({})",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        )
+    });
     match result {
         Ok(()) => Ok(temp),
         // An expired file is still usable: stay on it rather than fail.
@@ -407,6 +435,13 @@ async fn asset(
         }
         Err(error) => Err(error),
     }
+}
+
+/// How routing resources are fetched: direct first, then through `proxy`.
+struct Fetch<'a> {
+    resolver: &'a crate::dns::Resolver,
+    hooks: &'a meta_platform::Hooks,
+    proxy: Option<(&'a crate::Core, &'a str)>,
 }
 
 fn read_limited(path: &Path) -> Result<Vec<u8>> {
@@ -607,18 +642,21 @@ const TIMEOUTS: Timeouts = Timeouts {
 /// Large files (geoip.dat is ~16 MiB) may legitimately take minutes on a slow
 /// link, so only lack of progress fails a download, not its total duration.
 /// Writes the body to `sink` as it arrives and returns its length.
+/// Connects directly, or through the named proxy or group when `via` is set.
 pub async fn download(
     url: &str,
     resolver: &crate::dns::Resolver,
     hooks: &meta_platform::Hooks,
+    via: Option<(&crate::Core, &str)>,
     sink: &mut (dyn std::io::Write + Send),
 ) -> Result<usize> {
-    download_with(url, resolver, hooks, TIMEOUTS, sink).await
+    download_with(url, resolver, hooks, via, TIMEOUTS, sink).await
 }
 async fn download_with(
     url: &str,
     resolver: &crate::dns::Resolver,
     hooks: &meta_platform::Hooks,
+    via: Option<(&crate::Core, &str)>,
     timeouts: Timeouts,
     sink: &mut (dyn std::io::Write + Send),
 ) -> Result<usize> {
@@ -637,53 +675,73 @@ async fn download_with(
                     &uri,
                     if scheme == "https" { 443 } else { 80 },
                 )?;
-                let addresses = resolver.lookup(&target.host, target.port).await?;
-                // CDNs return several addresses and one can accept TCP yet stall
-                // the TLS handshake on a lossy route; bound each address and move on.
-                let (mut stream, mut failure) = (None, None);
-                for addr in addresses {
-                    let attempt = tokio::time::timeout(PER_ADDRESS_TIMEOUT, async {
-                        let socket = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            meta_platform::tcp_connect(addr, &**hooks),
-                        )
-                        .await
-                        .map_err(|_| anyhow::anyhow!("TCP connect to {addr} timed out"))??;
-                        let stream: meta_protocol::BoxStream = if scheme == "https" {
-                            meta_protocol::tls::SecureConnector::new(resolver.clock())
-                                .connect(
-                                    Box::new(socket),
-                                    &meta_protocol::tls::TlsConnectConfig {
-                                        server_name: target.host.clone(),
-                                        alpn: vec!["http/1.1".into()],
-                                        verify_cert: true,
-                                        fingerprint: meta_protocol::tls::TlsFingerprint::Native,
-                                        reality: None,
-                                    },
-                                )
-                                .await?
-                        } else {
-                            Box::new(socket)
-                        };
-                        anyhow::Ok(stream)
-                    })
-                    .await;
-                    match attempt {
-                        Ok(Ok(connected)) => {
-                            stream = Some(connected);
-                            break;
-                        }
-                        Ok(Err(error)) => failure = Some(error),
-                        Err(_) => {
-                            failure = Some(anyhow::anyhow!("handshake with {addr} timed out"))
+                let stream: meta_protocol::BoxStream = if let Some((core, name)) = via {
+                    let (tunnel, _) = core.dial(&target, Some(name)).await?;
+                    if scheme == "https" {
+                        meta_protocol::tls::SecureConnector::new(resolver.clock())
+                            .connect(
+                                tunnel,
+                                &meta_protocol::tls::TlsConnectConfig {
+                                    server_name: target.host.clone(),
+                                    alpn: vec!["http/1.1".into()],
+                                    verify_cert: true,
+                                    fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                                    reality: None,
+                                },
+                            )
+                            .await?
+                    } else {
+                        tunnel
+                    }
+                } else {
+                    let addresses = resolver.lookup(&target.host, target.port).await?;
+                    // CDNs return several addresses and one can accept TCP yet stall
+                    // the TLS handshake on a lossy route; bound each address and move on.
+                    let (mut stream, mut failure) = (None, None);
+                    for addr in addresses {
+                        let attempt = tokio::time::timeout(PER_ADDRESS_TIMEOUT, async {
+                            let socket = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                meta_platform::tcp_connect(addr, &**hooks),
+                            )
+                            .await
+                            .map_err(|_| anyhow::anyhow!("TCP connect to {addr} timed out"))??;
+                            let stream: meta_protocol::BoxStream = if scheme == "https" {
+                                meta_protocol::tls::SecureConnector::new(resolver.clock())
+                                    .connect(
+                                        Box::new(socket),
+                                        &meta_protocol::tls::TlsConnectConfig {
+                                            server_name: target.host.clone(),
+                                            alpn: vec!["http/1.1".into()],
+                                            verify_cert: true,
+                                            fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                                            reality: None,
+                                        },
+                                    )
+                                    .await?
+                            } else {
+                                Box::new(socket)
+                            };
+                            anyhow::Ok(stream)
+                        })
+                        .await;
+                        match attempt {
+                            Ok(Ok(connected)) => {
+                                stream = Some(connected);
+                                break;
+                            }
+                            Ok(Err(error)) => failure = Some(error),
+                            Err(_) => {
+                                failure = Some(anyhow::anyhow!("handshake with {addr} timed out"))
+                            }
                         }
                     }
-                }
-                let stream = match stream {
-                    Some(stream) => stream,
-                    None => {
-                        let error = failure.unwrap_or_else(|| anyhow::anyhow!("no address"));
-                        return Err(error.context("cannot connect to resource server"));
+                    match stream {
+                        Some(stream) => stream,
+                        None => {
+                            let error = failure.unwrap_or_else(|| anyhow::anyhow!("no address"));
+                            return Err(error.context("cannot connect to resource server"));
+                        }
                     }
                 };
                 let (mut sender, connection) =
@@ -779,23 +837,42 @@ fn parse_payload(data: &[u8], format: &str) -> Result<Vec<String>> {
         _ => bail!("unsupported rule provider format"),
     }
 }
+/// Domain conditions (all of a `domain` provider, and DOMAIN/DOMAIN-SUFFIX/
+/// DOMAIN-KEYWORD/DOMAIN-REGEX lines of a `classical` one) go into one compact
+/// [`DomainSet`] and CIDRs into one [`IpSet`], instead of one matcher per line
+/// scanned in order. A provider matches when any entry does, so grouping keeps
+/// the result.
 fn provider_matcher(p: &RuleProvider, payload: &[String]) -> Result<Matcher> {
     ensure!(payload.len() <= 2_000_000, "too many provider rules");
+    let mut domains = DomainSetBuilder::default();
+    let mut nets = vec![];
     let mut nodes = vec![];
     for value in payload {
-        let m = match p.behavior.as_str() {
-            "domain" => meta_config::rule::domain_pattern(value)?,
-            "ipcidr" => Matcher::Net(value.parse()?),
-            "classical" => Matcher::parse_condition(value)?,
+        match p.behavior.as_str() {
+            "domain" => domains.pattern(value)?,
+            "ipcidr" => nets.push(value.parse()?),
+            "classical" => {
+                let m = Matcher::parse_condition(value)?;
+                let mut refs = vec![];
+                m.references(&mut refs);
+                ensure!(
+                    !refs.iter().any(|r| r.0 == "rule-set"),
+                    "nested RULE-SET is not permitted in classical providers"
+                );
+                match m {
+                    Matcher::Net(net) => nets.push(net),
+                    m => nodes.extend(domains.absorb(m)),
+                }
+            }
             _ => bail!("unsupported provider behavior"),
-        };
-        let mut refs = vec![];
-        m.references(&mut refs);
-        ensure!(
-            !refs.iter().any(|r| r.0 == "rule-set"),
-            "nested RULE-SET is not permitted in classical providers"
-        );
-        nodes.push(m);
+        }
+    }
+    let domains = domains.build();
+    if !domains.is_empty() {
+        nodes.insert(0, Matcher::Domains(Arc::new(domains)));
+    }
+    if !nets.is_empty() {
+        nodes.insert(0, Matcher::Nets(Arc::new(IpSet::new(nets, false))));
     }
     Ok(Matcher::Or(nodes.into()))
 }
@@ -914,6 +991,60 @@ mod tests {
         }
     }
     #[test]
+    fn providers_group_domains_and_cidrs_without_changing_matches() {
+        let provider = |behavior: &str| RuleProvider {
+            behavior: behavior.into(),
+            ..RuleProvider::default()
+        };
+        let payload = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let domain = provider_matcher(
+            &provider("domain"),
+            &payload(&["+.ads.test", ".sub.test", "exact.test", "*.wild.test"]),
+        )
+        .unwrap();
+        let eval = |m: &Matcher, host: &str, ip: Option<IpAddr>, port: u16| {
+            m.evaluate(host, ip, port, "tcp", false)
+        };
+        for (host, expected) in [
+            ("ads.test", true),
+            ("x.ads.test", true),
+            ("sub.test", false),
+            ("x.sub.test", true),
+            ("exact.test", true),
+            ("a.wild.test", true),
+            ("other.test", false),
+        ] {
+            assert_eq!(eval(&domain, host, None, 443), Some(expected), "{host}");
+        }
+        let classical = provider_matcher(
+            &provider("classical"),
+            &payload(&[
+                "DOMAIN-SUFFIX,ads.test",
+                "DOMAIN,exact.test",
+                "IP-CIDR,10.0.0.0/8",
+                "DST-PORT,8443",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(eval(&classical, "x.ads.test", None, 443), Some(true));
+        assert_eq!(eval(&classical, "exact.test", None, 443), Some(true));
+        assert_eq!(
+            eval(&classical, "n.test", Some("10.1.2.3".parse().unwrap()), 443),
+            Some(true)
+        );
+        assert_eq!(eval(&classical, "n.test", None, 8443), Some(true));
+        assert_eq!(
+            eval(&classical, "n.test", Some("8.8.8.8".parse().unwrap()), 443),
+            Some(false)
+        );
+        let ipcidr = provider_matcher(&provider("ipcidr"), &payload(&["192.168.0.0/16"])).unwrap();
+        assert_eq!(
+            eval(&ipcidr, "h", Some("192.168.1.1".parse().unwrap()), 1),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn read_entries_streams_only_the_wanted_categories() {
         let site = |code: &str, domains: usize| GeoSite {
             country_code: code.into(),
@@ -988,7 +1119,7 @@ mod tests {
         config.geox_url.geosite = format!("http://{address}/geosite.dat");
         (config, attempts)
     }
-    fn domains(resources: &Resources) -> Arc<DomainSet> {
+    fn domains(resources: &Resources) -> Arc<meta_config::rule::DomainSet> {
         match resources.matchers.get(&("geosite".into(), "test".into())) {
             Some(Matcher::Domains(set)) => set.clone(),
             _ => panic!("geosite matcher missing"),
@@ -1001,13 +1132,13 @@ mod tests {
         let dns =
             crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
         let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
-        let first = Resources::load(&config, &dns, &hooks, false, &Resources::default())
+        let first = Resources::load(&config, &dns, &hooks, false, &Resources::default(), None)
             .await
             .unwrap();
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
         // Desktop refresh tries the expired file, fails, and keeps the local copy;
         // the unchanged file means the old matcher is reused, not rebuilt.
-        let second = Resources::load(&config, &dns, &hooks, true, &first)
+        let second = Resources::load(&config, &dns, &hooks, true, &first, None)
             .await
             .unwrap();
         assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) > 0);
@@ -1023,18 +1154,67 @@ mod tests {
             crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
         let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
         // Start: no previous snapshot, so the expired file is checked (and kept on failure).
-        let first = Resources::load(&config, &dns, &hooks, true, &Resources::default())
+        let first = Resources::load(&config, &dns, &hooks, true, &Resources::default(), None)
             .await
             .unwrap();
         let at_start = attempts.load(std::sync::atomic::Ordering::SeqCst);
         assert!(at_start > 0);
         // While running: no download, the matcher is carried over.
-        let second = Resources::load(&config, &dns, &hooks, true, &first)
+        let second = Resources::load(&config, &dns, &hooks, true, &first, None)
             .await
             .unwrap();
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), at_start);
         assert!(Arc::ptr_eq(&domains(&first), &domains(&second)));
         std::fs::remove_dir_all(&config.directory).unwrap();
+    }
+
+    fn proxy_core(rules: &str, groups: &str) -> Arc<crate::Core> {
+        let yaml = format!(
+            "proxies:\n  - {{name: node, type: vless, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111, network: tcp}}\nproxy-groups:\n{groups}rules:\n{rules}"
+        );
+        let config = Config::parse(yaml.as_bytes()).unwrap();
+        crate::Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap()
+    }
+
+    #[test]
+    fn resource_proxy_follows_match_then_first_group_and_never_direct() {
+        let groups = "  - {name: Proxy, type: select, proxies: [node, DIRECT]}\n  - {name: Home, type: select, proxies: [DIRECT]}\n";
+        let core = proxy_core("  - DOMAIN,x.test,Home\n  - MATCH,Proxy\n", groups);
+        assert_eq!(core.resource_proxy().as_deref(), Some("Proxy"));
+        // MATCH to DIRECT: fall back to the first group.
+        let core = proxy_core("  - MATCH,DIRECT\n", groups);
+        assert_eq!(core.resource_proxy().as_deref(), Some("Proxy"));
+        // Every candidate resolves to DIRECT: no proxy fallback.
+        let core = proxy_core(
+            "  - MATCH,Home\n",
+            "  - {name: Home, type: select, proxies: [DIRECT]}\n",
+        );
+        assert_eq!(core.resource_proxy(), None);
+    }
+
+    #[tokio::test]
+    async fn download_can_route_through_a_core_outbound() {
+        let core = proxy_core(
+            "  - MATCH,DIRECT\n",
+            "  - {name: Proxy, type: select, proxies: [node]}\n",
+        );
+        let url = slow_server(vec![(0, &b"through-core"[..])]).await;
+        let resolver =
+            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
+        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        let mut data = Vec::new();
+        // DIRECT stands in for a proxy here: the request goes through Core::dial.
+        download_with(
+            &url,
+            &resolver,
+            &hooks,
+            Some((&core, "DIRECT")),
+            short(),
+            &mut data,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data, b"through-core");
     }
 
     #[tokio::test]
@@ -1045,7 +1225,7 @@ mod tests {
         // Takes ~1.5s in total, three times the idle limit, but never pauses for long.
         let url = slow_server((0..6).map(|_| (250, &b"chunk"[..])).collect()).await;
         let mut data = Vec::new();
-        let received = download_with(&url, &resolver, &hooks, short(), &mut data)
+        let received = download_with(&url, &resolver, &hooks, None, short(), &mut data)
             .await
             .unwrap();
         assert_eq!(data, b"chunk".repeat(6));
@@ -1057,7 +1237,7 @@ mod tests {
             crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
         let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
         let url = slow_server(vec![(0, b"partial"), (3000, b"rest")]).await;
-        let error = download_with(&url, &resolver, &hooks, short(), &mut Vec::new())
+        let error = download_with(&url, &resolver, &hooks, None, short(), &mut Vec::new())
             .await
             .unwrap_err();
         let message = format!("{error:#}");
@@ -1123,7 +1303,7 @@ mod tests {
         );
         let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
         let dns = crate::dns::Resolver::new(c.dns.clone(), hooks.clone());
-        let resources = Resources::load(&c, &dns, &hooks, false, &Resources::default())
+        let resources = Resources::load(&c, &dns, &hooks, false, &Resources::default(), None)
             .await
             .unwrap();
         let rules = resources.rules(&c.rules).unwrap();
@@ -1159,7 +1339,7 @@ mod tests {
         );
         std::fs::write(dir.join("geosite.dat"), [255]).unwrap();
         assert!(
-            Resources::load(&c, &dns, &hooks, false, &Resources::default())
+            Resources::load(&c, &dns, &hooks, false, &Resources::default(), None)
                 .await
                 .is_err()
         );

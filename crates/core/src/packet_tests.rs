@@ -81,8 +81,8 @@ async fn client_stream(
     let mut sockets = SocketSet::new(vec![]);
     let handle = if tcp {
         let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; BUFFER]),
-            tcp::SocketBuffer::new(vec![0; BUFFER]),
+            tcp::SocketBuffer::new(vec![0; Budget::DESKTOP.tcp_buffer]),
+            tcp::SocketBuffer::new(vec![0; Budget::DESKTOP.tcp_buffer]),
         );
         socket.connect(iface.context(), remote, local).unwrap();
         sockets.add(socket)

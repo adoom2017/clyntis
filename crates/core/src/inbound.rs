@@ -137,7 +137,7 @@ async fn socks_connection(core: Arc<Core>, mut stream: TcpStream, peer: SocketAd
         Ok::<_, anyhow::Error>((cmd, target))
     };
     let (cmd, target) = tokio::time::timeout(Duration::from_secs(10), handshake).await??;
-    if cmd == 1 && core.should_sniff(&core.restore_target(&target)) {
+    if cmd == 1 && core.wants_sniff(&core.restore_target(&target)) {
         stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         let (route, destination, prefix) = core.sniff_target(&mut stream, &target).await?;
         let (mut outbound, name) = core
@@ -275,7 +275,7 @@ async fn http_connection(core: Arc<Core>, stream: &mut TcpStream, peer: SocketAd
         );
         Target::from_uri(&uri, 80)?
     };
-    if method == "CONNECT" && core.should_sniff(&core.restore_target(&target)) {
+    if method == "CONNECT" && core.wants_sniff(&core.restore_target(&target)) {
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;

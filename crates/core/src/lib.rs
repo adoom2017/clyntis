@@ -443,6 +443,44 @@ impl Core {
             controller_address,
         })
     }
+    /// Proxy for routing-resource downloads when a direct download fails: the
+    /// MATCH rule's target, else the first group, else the first proxy. Only a
+    /// name that resolves to a real proxy (not DIRECT/REJECT) qualifies. Rules
+    /// cannot decide this: they may depend on the resources being fetched.
+    pub(crate) fn resource_proxy(&self) -> Option<String> {
+        let from_match = self
+            .policy
+            .read()
+            .unwrap()
+            .raw_rules
+            .iter()
+            .rev()
+            .find_map(|rule| {
+                let mut fields = rule.split(',').map(str::trim);
+                if fields.next()?.eq_ignore_ascii_case("MATCH") {
+                    fields.next().map(str::to_owned)
+                } else {
+                    None
+                }
+            });
+        let candidate = from_match
+            .filter(|name| name != "DIRECT" && name != "REJECT")
+            .or_else(|| self.config.proxy_groups.first().map(|g| g.name.clone()))
+            .or_else(|| self.config.proxies.first().map(|p| p.name.clone()))?;
+        let leaf = self.leaf(&candidate).ok()?;
+        (leaf != "DIRECT" && leaf != "REJECT").then_some(candidate)
+    }
+    /// Fails at once for a fake-IP address with no domain: dialing it would only
+    /// time out, while a refusal makes the client resolve the name again.
+    fn refuse_stale_fake(&self, target: &Target) -> Result<()> {
+        if self.stale_fake(target) {
+            bail!(
+                "fake-IP {} has no domain (cached by the client across a restart); refusing it so the client re-resolves",
+                target.host
+            );
+        }
+        Ok(())
+    }
     pub fn restore_target(&self, target: &Target) -> Target {
         if let Some(name) = target.ip().and_then(|ip| self.resolver.original(ip)) {
             Target {
@@ -458,8 +496,15 @@ impl Core {
         config.rules = self.policy.read().unwrap().raw_rules.clone();
         let previous = self.resources.read().unwrap().clone();
         let next = Arc::new(
-            resources::Resources::load(&config, &self.resolver, &self.hooks, refresh, &previous)
-                .await?,
+            resources::Resources::load(
+                &config,
+                &self.resolver,
+                &self.hooks,
+                refresh,
+                &previous,
+                Some(self),
+            )
+            .await?,
         );
         drop(previous);
         let mut resources = self.resources.write().unwrap();
@@ -824,6 +869,7 @@ impl Core {
         network: &str,
     ) -> Result<(BoxStream, RouteDecision)> {
         let target = self.restore_target(target);
+        self.refuse_stale_fake(&target)?;
         let decision = match selected {
             Some(n) => RouteDecision {
                 node: self.leaf(n)?,
@@ -880,6 +926,7 @@ impl Core {
         source: Option<&str>,
     ) -> Result<Arc<dyn Datagram>> {
         let target = self.restore_target(target);
+        self.refuse_stale_fake(&target)?;
         tokio::select! {
             biased;
             _=self.stop.cancelled()=>bail!("core stopped"),
@@ -1094,9 +1141,17 @@ impl Datagram for DirectUdp {
         Ok(())
     }
     async fn recv(&self) -> Result<(Target, Vec<u8>)> {
-        let mut bytes = vec![0; 65535];
-        let n = self.socket.recv(&mut bytes).await?;
-        bytes.truncate(n);
-        Ok((self.target.clone(), bytes))
+        // Copy out exactly the datagram: a truncated 64 KiB Vec keeps its full
+        // capacity while queued for the TUN, which multiplied memory under
+        // QUIC-heavy direct traffic. The scratch buffer exists only per read.
+        loop {
+            self.socket.readable().await?;
+            let mut scratch = vec![0; 65535];
+            match self.socket.try_recv(&mut scratch) {
+                Ok(n) => return Ok((self.target.clone(), scratch[..n].to_vec())),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 }

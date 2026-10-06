@@ -172,6 +172,16 @@ impl Resolver {
     pub fn original(&self, ip: IpAddr) -> Option<String> {
         self.fake.lock().unwrap().by_ip.get(&ip).cloned()
     }
+    /// An address from the fake-IP pool with no domain behind it, e.g. one a
+    /// client cached before the core restarted. Dialing it can only time out.
+    pub fn is_unmapped_fake(&self, ip: IpAddr) -> bool {
+        self.config.enhanced_mode == "fake-ip"
+            && match ip {
+                IpAddr::V4(ip) => self.config.fake_ip_range.contains(&ip),
+                IpAddr::V6(ip) => self.config.fake_ip_range6.contains(&ip),
+            }
+            && self.original(ip).is_none()
+    }
     pub fn export_fake(&self) -> Vec<(String, IpAddr)> {
         self.fake
             .lock()
@@ -720,7 +730,7 @@ impl Resolver {
         }
         Ok(response.to_vec()?)
     }
-    fn fake_address(&self, host: &str, v6: bool) -> Result<IpAddr> {
+    pub(crate) fn fake_address(&self, host: &str, v6: bool) -> Result<IpAddr> {
         absolute_name(host).context("unsupported fake-IP hostname")?;
         let mut map = self.fake.lock().unwrap();
         let key = (host.into(), v6);

@@ -92,6 +92,17 @@ fn http(data: &[u8]) -> Option<String> {
     valid_host(&host).then_some(host)
 }
 impl crate::Core {
+    /// `target` (already restored) is a fake-IP address without a mapping.
+    pub(crate) fn stale_fake(&self, target: &Target) -> bool {
+        target
+            .ip()
+            .is_some_and(|ip| self.resolver.is_unmapped_fake(ip))
+    }
+    /// Sniff configured traffic, and always try to recover the domain of a
+    /// stale fake-IP connection, which cannot be dialed by address.
+    pub(crate) fn wants_sniff(&self, target: &Target) -> bool {
+        self.should_sniff(target) || self.stale_fake(target)
+    }
     pub(crate) fn should_sniff(&self, target: &Target) -> bool {
         let s = &self.config.sniffer;
         if !s.enable {
@@ -113,7 +124,8 @@ impl crate::Core {
         let mut prefix = vec![];
         let mut route = self.restore_target(target);
         let mut destination = route.clone();
-        if !self.should_sniff(&route) {
+        let stale = self.stale_fake(&route);
+        if !stale && !self.should_sniff(&route) {
             return Ok((route, destination, prefix));
         }
         let s = &self.config.sniffer;
@@ -125,6 +137,19 @@ impl crate::Core {
                     break;
                 }
                 prefix.extend_from_slice(&buffer[..n]);
+                if stale {
+                    // The fake IP is meaningless: take any TLS/HTTP host and
+                    // dial it, whatever the sniffer's ports or override setting.
+                    if let Some(host) = tls(&prefix).or_else(|| http(&prefix)) {
+                        route.host = host;
+                        destination = route.clone();
+                        return Ok::<_, std::io::Error>(());
+                    }
+                    if prefix.len() >= 32768 {
+                        break;
+                    }
+                    continue;
+                }
                 for (kind, settings) in &s.sniff {
                     if !settings.ports.iter().any(|p| p.contains(target.port)) {
                         continue;
@@ -151,6 +176,12 @@ impl crate::Core {
             Ok(())
         })
         .await;
+        if stale && destination.ip().is_some() {
+            anyhow::bail!(
+                "fake-IP {} has no domain (cached by the client across a restart); refusing it so the client re-resolves",
+                destination.host
+            );
+        }
         Ok((route, destination, prefix))
     }
     pub(crate) async fn dial_sniffed(
@@ -180,5 +211,58 @@ mod tests {
         );
         assert!(tls(&[22, 3, 3, 255, 255]).is_none());
         assert!(http(b"GET / HTTP/1.1\r\nHost: bad/name\r\n\r\n").is_none());
+    }
+
+    fn fake_ip_core() -> std::sync::Arc<crate::Core> {
+        let mut config = meta_config::Config::default();
+        config.dns.enhanced_mode = "fake-ip".into();
+        config.sniffer.enable = false; // recovery must not depend on the sniffer
+        crate::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_fake_ip_is_refused_at_once_but_mapped_ones_restore() {
+        let core = fake_ip_core();
+        let mapped = core.resolver.fake_address("known.test", false).unwrap();
+        let known = Target::new(mapped.to_string(), 443).unwrap();
+        assert!(!core.stale_fake(&core.restore_target(&known)));
+        assert_eq!(core.restore_target(&known).host, "known.test");
+        let stale = Target::new("198.18.200.7", 443).unwrap();
+        assert!(core.stale_fake(&stale));
+        // Outside the pool is a real address, never treated as stale.
+        assert!(!core.stale_fake(&Target::new("203.0.113.9", 443).unwrap()));
+        let started = std::time::Instant::now();
+        let error = core
+            .dial(&stale, None)
+            .await
+            .err()
+            .expect("stale fake-IP must not dial");
+        assert!(format!("{error:#}").contains("has no domain"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn stale_fake_ip_recovers_the_sniffed_domain() {
+        let core = fake_ip_core();
+        let stale = Target::new("198.18.200.8", 80).unwrap();
+        assert!(core.wants_sniff(&stale));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(
+            &mut client,
+            b"GET / HTTP/1.1\r\nHost: real.test\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let (route, destination, prefix) = core.sniff_target(&mut server, &stale).await.unwrap();
+        assert_eq!(route.host, "real.test");
+        assert_eq!(destination.host, "real.test");
+        assert!(!prefix.is_empty());
+        // Nothing recognisable: refused instead of dialing the fake address.
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"\x00\x01binary")
+            .await
+            .unwrap();
+        drop(client);
+        assert!(core.sniff_target(&mut server, &stale).await.is_err());
     }
 }
