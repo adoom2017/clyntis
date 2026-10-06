@@ -12,9 +12,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var monitor: NWPathMonitor?
     private var receivedInitialPath = false
     private var healthTimer: DispatchSourceTimer?
+    private var logTimer: DispatchSourceTimer?
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        log.info("start: begin memory=\(memory(), privacy: .public)")
+        log.info("start: begin memory=\(memory())")
         queue.async {
             var step = "read profile"
             do {
@@ -24,7 +25,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                       let id = UUID(uuidString: rawID) else {
                     throw ClientError.message("缺少有效的 VPN 配置。")
                 }
-                log.info("start: profile=\(id.uuidString, privacy: .public)")
+                log.info("start: profile=\(id.uuidString)")
                 step = "open profile store"
                 let store = try ProfileStore.shared()
                 var hooks = meta_hooks_v1()
@@ -39,11 +40,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 step = "create core"
                 self.core = try CoreSession(configuration: store.configuration(for: id),
                                             directory: store.directory(for: id), hooks: &hooks)
-                log.info("start: core created memory=\(memory(), privacy: .public)")
+                log.info("start: core created memory=\(memory())")
+                self.collectLogs()
                 // Loads routing resources (geoip/geosite/rule providers) and may download them.
                 step = "start core"
                 try self.core?.start()
-                log.info("start: core started memory=\(memory(), privacy: .public)")
+                log.info("start: core started memory=\(memory())")
                 let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "198.18.0.1")
                 settings.mtu = 1280
                 let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.252"])
@@ -65,7 +67,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             return
                         }
                         if let error {
-                            log.error("start: network settings failed: \(Diagnostics.describe(error), privacy: .public)")
+                            log.error("start: network settings failed: \(Diagnostics.describe(error))")
                             self.shutdown()
                             completionHandler(error)
                             return
@@ -74,12 +76,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         self.drainPackets()
                         self.watchNetwork()
                         self.watchCore()
-                        log.info("start: tunnel up memory=\(memory(), privacy: .public)")
+                        log.info("start: tunnel up memory=\(memory())")
                         completionHandler(nil)
                     }
                 }
             } catch {
-                log.error("start: failed at \(step, privacy: .public): \(Diagnostics.describe(error), privacy: .public) memory=\(memory(), privacy: .public)")
+                log.error("start: failed at \(step): \(Diagnostics.describe(error)) memory=\(memory())")
                 self.shutdown()
                 completionHandler(error)
             }
@@ -87,14 +89,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
-        log.info("stop: reason=\(reason.rawValue) memory=\(memory(), privacy: .public)")
+        log.info("stop: reason=\(reason.rawValue) memory=\(memory())")
         queue.async {
             self.shutdown()
             completionHandler()
         }
     }
 
+    /// Moves core logs into the shared log file every second while a core exists.
+    private func collectLogs() {
+        logTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { Diagnostics.collectCoreLogs() }
+        logTimer = timer
+        timer.resume()
+    }
+
     private func shutdown() {
+        Diagnostics.collectCoreLogs()
+        logTimer?.cancel()
+        logTimer = nil
         epoch = UUID()
         monitor?.cancel()
         monitor = nil
@@ -188,7 +203,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func fail(_ error: Error) {
-        log.error("fail: \(Diagnostics.describe(error), privacy: .public) memory=\(memory(), privacy: .public)")
+        log.error("fail: \(Diagnostics.describe(error)) memory=\(memory())")
         shutdown()
         cancelTunnelWithError(error)
     }

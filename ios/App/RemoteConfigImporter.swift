@@ -75,17 +75,25 @@ enum RemoteConfigImporter {
         return data
     }
 
-    static func store(_ source: Data, password: String, name: String, in store: ProfileStore) throws -> Profile {
-        try Task.checkCancellation()
+    /// The downloaded body as YAML: decrypted when a password is given.
+    static func plaintext(_ source: Data, password: String) throws -> Data {
         let encrypted = !password.isEmpty
         if !encrypted && ConfigCrypto.looksEncrypted(source) {
             throw ClientError.message("配置已加密，请填写密码。")
         }
-        let plaintext = encrypted ? try ConfigCrypto.decrypt(source, password: password) : source
+        return encrypted ? try ConfigCrypto.decrypt(source, password: password) : source
+    }
+
+    static func store(_ source: Data, password: String, name: String, link: URL? = nil,
+                      in store: ProfileStore) throws -> Profile {
+        try Task.checkCancellation()
+        let encrypted = !password.isEmpty
+        let plaintext = try plaintext(source, password: password)
         try Task.checkCancellation()
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let profile = try store.add(name: name.isEmpty ? "远程配置" : name, configuration: plaintext) { bytes, directory in
+            let profile = try store.add(name: name.isEmpty ? "远程配置" : name, configuration: plaintext,
+                                        source: link?.absoluteString, encrypted: encrypted) { bytes, directory in
                 let core = try CoreSession(configuration: bytes, directory: directory)
                 core.close()
                 try Task.checkCancellation()

@@ -15,6 +15,13 @@ final class RemoteConfigImportTests: XCTestCase {
         }.value
         XCTAssertEqual(try store.configuration(for: profile.id), source)
         XCTAssertEqual(profile.name, "Plain")
+        XCTAssertNil(profile.source)
+        let linked = try await Task.detached {
+            try RemoteConfigImporter.store(Self.encrypted, password: "test-password", name: "L",
+                                           link: URL(string: "https://unit.invalid/c?t=1"), in: store)
+        }.value
+        XCTAssertEqual(linked.source, "https://unit.invalid/c?t=1")
+        XCTAssertEqual(linked.encrypted, true)
     }
 
     func testEncryptedGoldenVectorImportsAndDoesNotPersistPassword() async throws {

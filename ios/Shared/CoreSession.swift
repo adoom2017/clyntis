@@ -39,6 +39,11 @@ final class CoreSession {
         try check(result)
     }
 
+    /// Buffered core log lines of this process (newline-separated JSON), removed once read.
+    static func drainLogs() throws -> Data {
+        try read { meta_drain_logs_v1($0, $1, $2) }
+    }
+
     func snapshot() throws -> Data {
         try Self.read { meta_snapshot_v1(handle, $0, $1, $2) }
     }

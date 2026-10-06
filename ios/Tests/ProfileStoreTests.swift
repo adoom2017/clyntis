@@ -22,6 +22,58 @@ final class ProfileStoreTests: XCTestCase {
         try store.remove(profile)
         XCTAssertTrue(try store.profiles().isEmpty)
     }
+    func testEditingValidatesAndKeepsTheOldConfigurationOnFailure() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try ProfileStore(root: root)
+        let original = Data("mode: rule\nrules: ['MATCH,DIRECT']\n".utf8)
+        let profile = try store.add(name: "Edit", configuration: original, source: "https://example.com/c?token=x",
+                                    encrypted: true) { _, _ in }
+        XCTAssertEqual(profile.sourceHost, "example.com")
+        XCTAssertEqual(profile.encrypted, true)
+        let validate: (Data, URL) throws -> Void = { bytes, directory in
+            try CoreSession(configuration: bytes, directory: directory).close()
+        }
+        XCTAssertThrowsError(try store.replaceConfiguration(profile.id, with: Data("proxies: [{name: bad, type: socks5}]\n".utf8),
+                                                            validate: validate))
+        XCTAssertEqual(try store.configuration(for: profile.id), original)
+        let edited = Data("mode: global\nrules: ['MATCH,DIRECT']\n".utf8)
+        let updated = try store.replaceConfiguration(profile.id, with: edited, validate: validate)
+        XCTAssertEqual(try store.configuration(for: profile.id), edited)
+        XCTAssertNotNil(updated.updatedAt)
+        XCTAssertEqual(try store.rename(profile.id, to: "  Renamed ").name, "Renamed")
+        XCTAssertThrowsError(try store.rename(profile.id, to: "   "))
+        XCTAssertEqual(try store.profiles().first?.name, "Renamed")
+        XCTAssertEqual(try store.profiles().first?.source, "https://example.com/c?token=x")
+    }
+
+    func testProfilesWrittenBeforeSourceTrackingStillLoad() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try ProfileStore(root: root)
+        let profile = try store.add(name: "Old", configuration: Data("mode: rule\n".utf8)) { _, _ in }
+        let legacy = #"{"id":"\#(profile.id.uuidString)","name":"Old","createdAt":700000000}"#
+        try Data(legacy.utf8).write(to: store.directory(for: profile.id).appendingPathComponent("profile.json"))
+        let loaded = try XCTUnwrap(try store.profiles().first)
+        XCTAssertEqual(loaded.name, "Old")
+        XCTAssertNil(loaded.source)
+        XCTAssertNil(loaded.sourceHost)
+    }
+
+    func testLogFileRedactsCredentialsAndRoundTrips() throws {
+        let log = LogFile.shared
+        log.clear()
+        defer { log.clear() }
+        log.append(level: "warning", source: "test",
+                   message: "user 11111111-2222-4333-8444-555555555555 fetched https://sub.example/x?token=abc\nnext")
+        let entry = try XCTUnwrap(log.entries().last)
+        XCTAssertEqual(entry.level, "warning")
+        XCTAssertEqual(entry.source, "test")
+        XCTAssertEqual(entry.message, "user <uuid> fetched https://sub.example/x?… next")
+        log.clear()
+        XCTAssertTrue(log.entries().isEmpty)
+    }
+
     func testPacketTunnelConfigRejectsUnsupportedProtocols() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

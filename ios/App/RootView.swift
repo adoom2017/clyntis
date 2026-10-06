@@ -9,6 +9,7 @@ struct RootView: View {
             ConnectionView(model: model).tabItem { Label("连接", systemImage: "network") }
             ProfilesView(model: model).tabItem { Label("配置", systemImage: "square.stack.3d.up") }
             NodesView(model: model).tabItem { Label("节点", systemImage: "point.3.connected.trianglepath.dotted") }
+            LogView().tabItem { Label("日志", systemImage: "doc.text.magnifyingglass") }
         }
         .alert("Clyntis", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button("知道了") { model.error = nil }
@@ -100,6 +101,7 @@ private struct ProfilesView: View {
     @State private var importing = false
     @State private var importingLink = false
     @State private var exporting: Profile?
+    @State private var detail: Profile?
     var body: some View {
         NavigationStack {
             List {
@@ -108,19 +110,31 @@ private struct ProfilesView: View {
                                            description: Text("点右上角 + 导入 Clash YAML 文件或链接"))
                 }
                 ForEach(model.profiles) { profile in
-                    Button {
-                        model.selectedID = profile.id
-                    } label: {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(profile.name).foregroundStyle(.primary)
-                                Text(profile.createdAt, style: .date).font(.caption).foregroundStyle(.secondary)
+                    HStack(spacing: 12) {
+                        Button {
+                            model.selectedID = profile.id
+                        } label: {
+                            HStack {
+                                Image(systemName: "checkmark").foregroundStyle(.tint)
+                                    .opacity(model.selectedID == profile.id ? 1 : 0)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(profile.name).foregroundStyle(.primary)
+                                    Text("\(profile.sourceHost ?? "本地文件") · \(profile.createdAt.formatted(date: .abbreviated, time: .omitted))")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
                             }
-                            Spacer()
-                            Image(systemName: "checkmark").foregroundStyle(.tint).opacity(model.selectedID == profile.id ? 1 : 0)
+                            .contentShape(.rect)
                         }
+                        .buttonStyle(.plain)
+                        .disabled(model.active || model.busy)
+                        // Viewing details stays available while connected.
+                        Button { detail = profile } label: {
+                            Image(systemName: "info.circle").imageScale(.large)
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("\(profile.name) 详情")
                     }
-                    .disabled(model.active || model.busy)
                     .swipeActions {
                         Button("删除", role: .destructive) { model.remove(profile) }.disabled(model.active || model.busy)
                         Button("加密导出", systemImage: "lock.doc") { exporting = profile }.tint(.brand)
@@ -134,6 +148,7 @@ private struct ProfilesView: View {
                 }
             }
             .navigationTitle("配置")
+            .navigationDestination(item: $detail) { ProfileDetailView(model: model, id: $0.id) }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu("导入", systemImage: "plus") {

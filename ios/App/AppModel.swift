@@ -68,7 +68,7 @@ final class AppModel {
                             // Ask the system why the tunnel stopped (start failure, provider error, ...).
                             connection.fetchLastDisconnectError { error in
                                 if let error {
-                                    Diagnostics.app.error("vpn disconnected: \(Diagnostics.describe(error), privacy: .public)")
+                                    Diagnostics.app.error("vpn disconnected: \(Diagnostics.describe(error))")
                                 }
                             }
                         }
@@ -79,7 +79,7 @@ final class AppModel {
                 }
             #endif
         } catch {
-            Diagnostics.app.error("load: \(Diagnostics.describe(error), privacy: .public)")
+            Diagnostics.app.error("load: \(Diagnostics.describe(error))")
             self.error = error.localizedDescription
         }
     }
@@ -99,17 +99,17 @@ final class AppModel {
         busy = true
         defer { busy = false; phase = nil }
         let log = Diagnostics.app
-        log.info("connect: begin profile=\(selected.id.uuidString, privacy: .public) tunnel=\(self.tunnelIdentifier, privacy: .public) existingManager=\(self.manager != nil)")
+        log.info("connect: begin profile=\(selected.id.uuidString) tunnel=\(self.tunnelIdentifier) existingManager=\(self.manager != nil)")
         var step = "read configuration"
         do {
             let bytes = try store.configuration(for: selected.id)
             step = "validate configuration"
-            log.info("connect: \(step, privacy: .public) (\(bytes.count) bytes)")
+            log.info("connect: \(step) (\(bytes.count) bytes)")
             try await validate(bytes, directory: store.directory(for: selected.id))
             // Fetch GeoIP/GeoSite and rule providers here, where neither the tunnel's
             // ~50 MiB memory limit nor its start timeout applies.
             step = "prefetch resources"
-            log.info("connect: \(step, privacy: .public)")
+            log.info("connect: \(step)")
             phase = "正在准备路由资源…"
             let directory = store.directory(for: selected.id)
             let started = Date()
@@ -117,12 +117,14 @@ final class AppModel {
                 try await Task.detached {
                     try CoreSession.prefetchResources(configuration: bytes, directory: directory)
                 }.value
-                log.info("connect: resources ready in \(Date().timeIntervalSince(started), format: .fixed(precision: 1))s")
+                log.info("connect: resources ready in \(String(format: "%.1f", Date().timeIntervalSince(started)))s")
             } catch {
                 // Not fatal: the tunnel can still fetch what is missing itself.
-                log.error("connect: prefetch failed: \(Diagnostics.describe(error), privacy: .public)")
+                log.warning("connect: prefetch failed: \(Diagnostics.describe(error))")
             }
             phase = nil
+            // Validation and prefetch ran a core in this process; keep its logs.
+            Diagnostics.collectCoreLogs()
             let manager = self.manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
             proto.providerBundleIdentifier = tunnelIdentifier
@@ -135,19 +137,19 @@ final class AppModel {
             manager.isEnabled = true
             manager.isOnDemandEnabled = false
             step = "save preferences"
-            log.info("connect: \(step, privacy: .public)")
+            log.info("connect: \(step)")
             try await manager.saveToPreferences()
             step = "reload preferences"
-            log.info("connect: \(step, privacy: .public)")
+            log.info("connect: \(step)")
             try await manager.loadFromPreferences()
             self.manager = manager
             step = "start tunnel"
-            log.info("connect: \(step, privacy: .public) enabled=\(manager.isEnabled) status=\(manager.connection.status.rawValue)")
+            log.info("connect: \(step) enabled=\(manager.isEnabled) status=\(manager.connection.status.rawValue)")
             try manager.connection.startVPNTunnel()
             status = manager.connection.status
             log.info("connect: start requested, status=\(self.status.rawValue)")
         } catch {
-            log.error("connect: failed at \(step, privacy: .public): \(Diagnostics.describe(error), privacy: .public)")
+            log.error("connect: failed at \(step): \(Diagnostics.describe(error))")
             self.error = error.localizedDescription
         }
         #endif
@@ -227,13 +229,54 @@ final class AppModel {
         let source = try await RemoteConfigImporter.download(from: url, encrypted: !password.isEmpty)
         try Task.checkCancellation()
         let worker = Task.detached {
-            try RemoteConfigImporter.store(source, password: password, name: name, in: store)
+            try RemoteConfigImporter.store(source, password: password, name: name, link: url, in: store)
         }
         let profile = try await withTaskCancellationHandler {
             try await worker.value
         } onCancel: { worker.cancel() }
         profiles = try store.profiles()
         if !active { selectedID = profile.id }
+    }
+
+    // MARK: Profile details
+
+    func configurationText(for profile: Profile) throws -> String {
+        guard let store else { throw ClientError.message("配置存储不可用。") }
+        return String(decoding: try store.configuration(for: profile.id), as: UTF8.self)
+    }
+
+    /// Validates and saves edited YAML. A running tunnel keeps its loaded copy until reconnected.
+    func saveConfiguration(_ text: String, for profile: Profile) async throws {
+        guard let store else { throw ClientError.message("配置存储不可用。") }
+        let data = Data(text.utf8)
+        try await Task.detached {
+            _ = try store.replaceConfiguration(profile.id, with: data) { bytes, directory in
+                try CoreSession(configuration: bytes, directory: directory).close()
+            }
+        }.value
+        Diagnostics.app.info("profile \(profile.id.uuidString): configuration edited (\(data.count) bytes)")
+        profiles = try store.profiles()
+    }
+
+    func rename(_ profile: Profile, to name: String) throws {
+        guard let store else { throw ClientError.message("配置存储不可用。") }
+        _ = try store.rename(profile.id, to: name)
+        profiles = try store.profiles()
+    }
+
+    /// Downloads the profile's link again and replaces its configuration.
+    func updateFromSource(_ profile: Profile, password: String = "") async throws {
+        guard let store, let source = profile.source else { throw ClientError.message("此配置不是从链接导入的。") }
+        let url = try RemoteConfigImporter.url(from: source)
+        let body = try await RemoteConfigImporter.download(from: url, encrypted: !password.isEmpty)
+        try await Task.detached {
+            let plaintext = try RemoteConfigImporter.plaintext(body, password: password)
+            _ = try store.replaceConfiguration(profile.id, with: plaintext) { bytes, directory in
+                try CoreSession(configuration: bytes, directory: directory).close()
+            }
+        }.value
+        Diagnostics.app.info("profile \(profile.id.uuidString): updated from \(url.host ?? "link") (\(body.count) bytes)")
+        profiles = try store.profiles()
     }
 
     private func validate(_ data: Data, directory: URL) async throws {
@@ -251,7 +294,7 @@ final class AppModel {
             let data = try await send(TunnelMessage(command: "snapshot"))
             try applySnapshot(data)
         } catch {
-            Diagnostics.app.error("snapshot: \(Diagnostics.describe(error), privacy: .public)")
+            Diagnostics.app.error("snapshot: \(Diagnostics.describe(error))")
             if connected { self.error = error.localizedDescription }
         }
     }

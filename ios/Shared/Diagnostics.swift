@@ -1,12 +1,25 @@
 import Foundation
 import os
 
-/// Unified-log diagnostics, readable with Console.app or
-/// `log show --predicate 'subsystem == "org.clyntis.ios"' --info`.
+/// Diagnostics go to the unified log (Console.app, or
+/// `log show --predicate 'subsystem == "org.clyntis.ios"' --info`) and to the
+/// shared log file shown on the app's log page.
 /// Never log configuration contents, server addresses or passwords.
 enum Diagnostics {
-    static let app = Logger(subsystem: "org.clyntis.ios", category: "app")
-    static let tunnel = Logger(subsystem: "org.clyntis.ios", category: "tunnel")
+    static let app = DiagnosticLog(category: "app")
+    static let tunnel = DiagnosticLog(category: "tunnel")
+
+    /// Moves buffered core log lines into the shared log file.
+    static func collectCoreLogs() {
+        guard let data = try? CoreSession.drainLogs(), !data.isEmpty else { return }
+        for line in data.split(separator: UInt8(ascii: "\n")) {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let message = object["payload"] as? String else { continue }
+            let date = (object["time"] as? Double).map(Date.init(timeIntervalSince1970:)) ?? Date()
+            LogFile.shared.append(level: object["type"] as? String ?? "info", source: "core",
+                                  message: message, date: date)
+        }
+    }
 
     /// Localized text plus NSError domain/code, which identify system failures
     /// (for example NEVPNErrorDomain codes) that the message alone hides.
@@ -30,5 +43,23 @@ enum Diagnostics {
             }
         }
         return result == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+    }
+}
+
+struct DiagnosticLog {
+    let category: String
+    private var logger: Logger { Logger(subsystem: "org.clyntis.ios", category: category) }
+
+    func info(_ message: String) {
+        logger.info("\(message, privacy: .public)")
+        LogFile.shared.append(level: "info", source: category, message: message)
+    }
+    func warning(_ message: String) {
+        logger.warning("\(message, privacy: .public)")
+        LogFile.shared.append(level: "warning", source: category, message: message)
+    }
+    func error(_ message: String) {
+        logger.error("\(message, privacy: .public)")
+        LogFile.shared.append(level: "error", source: category, message: message)
     }
 }
