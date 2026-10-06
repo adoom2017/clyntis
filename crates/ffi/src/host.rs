@@ -227,7 +227,9 @@ impl Handle {
         })
     }
     pub(crate) fn start(&self) -> Result<()> {
-        self.command(Command::Start)
+        // Start may still fetch missing routing resources; their downloads are
+        // bounded by progress timeouts, so allow far more than other commands.
+        self.command_within(Command::Start, Duration::from_secs(120))
     }
     pub(crate) fn check_packet_queue(&self) -> Result<()> {
         ensure!(
@@ -247,13 +249,20 @@ impl Handle {
         &self,
         make: impl FnOnce(std::sync::mpsc::SyncSender<Result<(), String>>) -> Command,
     ) -> Result<()> {
+        self.command_within(make, Duration::from_secs(30))
+    }
+    fn command_within(
+        &self,
+        make: impl FnOnce(std::sync::mpsc::SyncSender<Result<(), String>>) -> Command,
+        timeout: Duration,
+    ) -> Result<()> {
         check_lifecycle()?;
         ensure!(!self.core.stop.is_cancelled(), "core is stopped");
         let (reply, result) = std::sync::mpsc::sync_channel(1);
         self.commands
             .try_send(make(reply))
             .context("core command queue closed or full")?;
-        match result.recv_timeout(Duration::from_secs(30)) {
+        match result.recv_timeout(timeout) {
             Ok(result) => result.map_err(anyhow::Error::msg),
             Err(error) => {
                 self.core.stop.cancel();

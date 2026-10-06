@@ -190,6 +190,41 @@ pub unsafe extern "C" fn meta_create_packet_tunnel_v1(
     unsafe { create(data, len, hooks, out, Some((directory, directory_len))) }
 }
 
+/// Download missing or expired routing resources (GeoIP/GeoSite, rule providers)
+/// referenced by `config` into `directory`, then validate them. Blocks until
+/// done. Hosts call this before starting a packet tunnel so the memory- and
+/// time-constrained tunnel process starts from local files.
+///
+/// # Safety
+/// `data` and `directory` must be readable for their lengths; `directory` is
+/// a UTF-8 absolute path to an existing directory.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_prefetch_resources_v1(
+    data: *const u8,
+    len: usize,
+    directory: *const u8,
+    directory_len: usize,
+) -> i32 {
+    boundary(|| {
+        let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        let path = std::path::PathBuf::from(std::str::from_utf8(unsafe {
+            input(directory, directory_len)?
+        })?);
+        ensure!(
+            path.is_absolute() && path.is_dir(),
+            "resource directory must exist and be absolute"
+        );
+        config.directory = path;
+        config.tun.enable = false;
+        let core = meta_core::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks))?;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(core.prepare_resources(true))?;
+        Ok(OK)
+    })
+}
+
 unsafe fn create(
     data: *const u8,
     len: usize,

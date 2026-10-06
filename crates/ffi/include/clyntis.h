@@ -55,6 +55,13 @@ int32_t meta_decrypt_config_v1(const uint8_t *config, size_t length,
 int32_t meta_encrypt_config_v1(const uint8_t *config, size_t length,
     const uint8_t *password, size_t password_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Download missing or expired routing resources referenced by config into
+ * directory (UTF-8 absolute existing path) and validate them; an expired file
+ * is kept when its update fails. Blocking; creates no handle or listener.
+ * Call before meta_create_packet_tunnel_v1 so the tunnel starts from local
+ * files instead of downloading inside the constrained tunnel process. */
+int32_t meta_prefetch_resources_v1(const uint8_t *config, size_t length,
+    const uint8_t *directory, size_t directory_length);
 int32_t meta_create_v1(const uint8_t *config, size_t length, const meta_hooks_v1 *hooks, meta_handle *out);
 /* Host-owned packet-tunnel variant (iOS Network Extension). Keeps credentials
  * and routing policy from config; enables packet I/O, forces MTU=1280 and DNS

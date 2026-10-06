@@ -277,6 +277,8 @@ impl Core {
         packets: Option<Arc<dyn meta_platform::PacketIo>>,
         system_dns: Option<SocketAddr>,
     ) -> Result<Running> {
+        // Hosted packet tunnels get their files from the host's prefetch (see
+        // meta_prefetch_resources_v1); start only downloads what is missing.
         self.prepare_resources(false)
             .await
             .context("cannot prepare routing resources")?;
@@ -454,9 +456,12 @@ impl Core {
     pub async fn prepare_resources(&self, refresh: bool) -> Result<()> {
         let mut config = self.config.clone();
         config.rules = self.policy.read().unwrap().raw_rules.clone();
+        let previous = self.resources.read().unwrap().clone();
         let next = Arc::new(
-            resources::Resources::load(&config, &self.resolver, &self.hooks, refresh).await?,
+            resources::Resources::load(&config, &self.resolver, &self.hooks, refresh, &previous)
+                .await?,
         );
+        drop(previous);
         let mut resources = self.resources.write().unwrap();
         let mut policy = self.policy.write().unwrap();
         let rules = next.rules(&policy.raw_rules)?;

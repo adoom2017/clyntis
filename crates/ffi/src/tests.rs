@@ -450,3 +450,39 @@ fn packet_buffers_notifications_and_shutdown_ownership() {
     std::thread::sleep(Duration::from_millis(10));
     assert_eq!(context.notifications.load(Ordering::Relaxed), notifications);
 }
+
+#[test]
+fn prefetch_downloads_rule_providers_into_the_host_directory() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        let _ = socket.read(&mut request);
+        let body = "payload:\n  - DOMAIN-SUFFIX,ads.example\n";
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let directory = std::env::temp_dir().join(format!("meta-prefetch-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let config = format!(
+        "rule-providers:\n  ads:\n    type: http\n    behavior: classical\n    format: yaml\n    url: http://{address}/ads.yaml\n    path: ./rules/ads.yaml\n    interval: 600\nrules:\n  - RULE-SET,ads,REJECT\n  - MATCH,DIRECT\n"
+    );
+    let path = directory.to_str().unwrap();
+    let call = |path: &str| unsafe {
+        meta_prefetch_resources_v1(config.as_ptr(), config.len(), path.as_ptr(), path.len())
+    };
+    assert_eq!(call(path), OK);
+    server.join().unwrap();
+    let saved = std::fs::read_to_string(directory.join("rules/ads.yaml")).unwrap();
+    assert!(saved.contains("ads.example"));
+    // Present and fresh: no second download (the server is gone).
+    assert_eq!(call(path), OK);
+    assert_ne!(call("relative/dir"), OK);
+    std::fs::remove_dir_all(directory).unwrap();
+}
