@@ -55,6 +55,19 @@ int32_t meta_decrypt_config_v1(const uint8_t *config, size_t length,
 int32_t meta_encrypt_config_v1(const uint8_t *config, size_t length,
     const uint8_t *password, size_t password_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Custom rules: user rules outside any profile, matched before its own.
+ * validate: syntax of one UTF-8 rule line (MATCH refused).
+ * targets: JSON array of names usable as a rule target in config.
+ * apply: rules is a JSON array of strings; writes JSON
+ *   {"yaml":"...","skipped":[{"rule":"...","reason":"..."}]} with the usable
+ *   rules prepended; rules whose target/provider the profile lacks are skipped.
+ * targets/apply follow the caller-buffer/size-query contract. */
+int32_t meta_custom_rule_validate_v1(const uint8_t *rule, size_t length);
+int32_t meta_custom_rule_targets_v1(const uint8_t *config, size_t length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
+int32_t meta_custom_rules_apply_v1(const uint8_t *config, size_t length,
+    const uint8_t *rules, size_t rules_length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 /* Drain buffered core logs (all cores in this process) as newline-separated
  * JSON objects {"time":unix_seconds,"type":"info|warning|error|debug",
  * "payload":"..."}. Lines are removed only when they fit; otherwise

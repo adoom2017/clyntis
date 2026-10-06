@@ -522,3 +522,53 @@ fn drain_logs_keeps_lines_until_they_fit() {
         "{text}"
     );
 }
+
+#[test]
+fn custom_rules_validate_list_targets_and_apply() {
+    let rule = b"DOMAIN,example.com,DIRECT";
+    assert_eq!(
+        unsafe { meta_custom_rule_validate_v1(rule.as_ptr(), rule.len()) },
+        OK
+    );
+    let bad = b"MATCH,DIRECT";
+    assert_eq!(
+        unsafe { meta_custom_rule_validate_v1(bad.as_ptr(), bad.len()) },
+        ERROR
+    );
+    let config = b"proxy-groups:\n  - {name: Auto, type: select, proxies: [DIRECT]}\nrules:\n  - MATCH,Auto\n";
+    let mut buffer = vec![0u8; 4096];
+    let mut length = 0;
+    assert_eq!(
+        unsafe {
+            meta_custom_rule_targets_v1(
+                config.as_ptr(),
+                config.len(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    let targets: Vec<String> = serde_json::from_slice(&buffer[..length]).unwrap();
+    assert_eq!(targets, ["DIRECT", "REJECT", "Auto"]);
+    let rules = br#"["DOMAIN,ads.test,REJECT","DOMAIN,x.test,Gone"]"#;
+    assert_eq!(
+        unsafe {
+            meta_custom_rules_apply_v1(
+                config.as_ptr(),
+                config.len(),
+                rules.as_ptr(),
+                rules.len(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    let applied: serde_json::Value = serde_json::from_slice(&buffer[..length]).unwrap();
+    let merged = meta_config::Config::parse(applied["yaml"].as_str().unwrap().as_bytes()).unwrap();
+    assert_eq!(merged.rules, ["DOMAIN,ads.test,REJECT", "MATCH,Auto"]);
+    assert_eq!(applied["skipped"][0]["rule"], "DOMAIN,x.test,Gone");
+}

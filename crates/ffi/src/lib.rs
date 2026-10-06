@@ -191,6 +191,64 @@ pub unsafe extern "C" fn meta_create_packet_tunnel_v1(
     unsafe { create(data, len, hooks, out, Some((directory, directory_len))) }
 }
 
+/// Check the syntax of one custom rule (UTF-8 `TYPE,VALUE,TARGET[,no-resolve]`).
+/// MATCH is refused. Whether the target exists is checked when applying.
+///
+/// # Safety
+/// `rule` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_custom_rule_validate_v1(rule: *const u8, len: usize) -> i32 {
+    boundary(|| {
+        meta_config::custom::validate(std::str::from_utf8(unsafe { input(rule, len)? })?)?;
+        Ok(OK)
+    })
+}
+
+/// Write the rule targets offered by `config` as a JSON array of strings:
+/// DIRECT, REJECT, then proxy groups and proxies.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_custom_rule_targets_v1(
+    config: *const u8,
+    len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let targets = meta_config::custom::targets(yaml)?;
+        unsafe { output(&serde_json::to_vec(&targets)?, buffer, capacity, length) }
+    })
+}
+
+/// Prepend custom rules (`rules`: JSON array of strings) to `config`. Writes
+/// JSON `{"yaml": "...", "skipped": [{"rule": "...", "reason": "..."}]}`;
+/// rules the profile cannot use are skipped rather than failing it.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_custom_rules_apply_v1(
+    config: *const u8,
+    len: usize,
+    rules: *const u8,
+    rules_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let rules: Vec<String> = serde_json::from_slice(unsafe { input(rules, rules_len)? })?;
+        let applied = meta_config::custom::apply(yaml, &rules)?;
+        let value = serde_json::json!({"yaml": applied.yaml, "skipped": applied.skipped});
+        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
+
 /// Move buffered core log lines into `buffer` as newline-separated JSON objects
 /// (`time` in Unix seconds, `type` debug/info/warning/error, `payload`). Lines
 /// are removed only when they fit; otherwise `length` reports the size needed.
