@@ -29,7 +29,7 @@ impl Default for Settings {
             capture: Capture::Manual,
             mixed_port: 7890,
             allow_lan: false,
-            auto_dns: false,
+            auto_dns: true,
             tun_interface: None,
             theme: "system".into(),
             launch_at_login: false,
@@ -56,5 +56,19 @@ impl Settings {
             "无效网络接口"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tun_takes_over_system_dns_unless_turned_off() {
+        assert!(Settings::default().auto_dns);
+        let saved: Settings = serde_json::from_str(r#"{"capture":"tun"}"#).unwrap();
+        assert!(saved.auto_dns);
+        let off: Settings = serde_json::from_str(r#"{"autoDns":false}"#).unwrap();
+        assert!(!off.auto_dns);
     }
 }

@@ -122,7 +122,7 @@ export const initial: Snapshot = {
     capture: "manual",
     mixedPort: 7890,
     allowLan: false,
-    autoDns: false,
+    autoDns: true,
     tunInterface: null,
     theme: "system",
     launchAtLogin: false,
