@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use meta_platform::PacketIo;
 use meta_protocol::Target;
 use smoltcp::{
-    iface::{Config, Interface, SocketHandle, SocketSet},
+    iface::{Config, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp, udp},
     time::{Duration as NetDuration, Instant as NetInstant},
@@ -25,7 +25,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    sync::mpsc,
+    sync::{Notify, mpsc},
     task::JoinSet,
     time::Instant,
 };
@@ -155,10 +155,14 @@ impl TxToken for Transmit {
     }
 }
 
+/// A TCP flow as seen by its proxy session. Every queue change wakes the
+/// packet loop, so data queued between packets is forwarded at once instead
+/// of waiting for the next packet or the 2 ms tick.
 struct ChannelStream {
     input: mpsc::Receiver<Vec<u8>>,
     pending: Option<(Vec<u8>, usize)>,
     output: Option<PollSender<Vec<u8>>>,
+    wake: Arc<Notify>,
 }
 impl AsyncRead for ChannelStream {
     fn poll_read(
@@ -174,7 +178,10 @@ impl AsyncRead for ChannelStream {
             match this.input.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Ready(Some(bytes)) => this.pending = Some((bytes, 0)),
+                Poll::Ready(Some(bytes)) => {
+                    this.pending = Some((bytes, 0));
+                    this.wake.notify_one();
+                }
             }
         }
         let (bytes, offset) = this.pending.as_mut().unwrap();
@@ -193,7 +200,8 @@ impl AsyncWrite for ChannelStream {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let Some(output) = self.get_mut().output.as_mut() else {
+        let this = self.get_mut();
+        let Some(output) = this.output.as_mut() else {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         };
         if bytes.is_empty() {
@@ -204,12 +212,12 @@ impl AsyncWrite for ChannelStream {
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             Poll::Ready(Ok(())) => {
                 let n = bytes.len().min(CHUNK);
-                Poll::Ready(
-                    output
-                        .send_item(bytes[..n].to_vec())
-                        .map(|()| n)
-                        .map_err(|_| io::ErrorKind::BrokenPipe.into()),
-                )
+                let sent = output
+                    .send_item(bytes[..n].to_vec())
+                    .map(|()| n)
+                    .map_err(|_| io::ErrorKind::BrokenPipe.into());
+                this.wake.notify_one();
+                Poll::Ready(sent)
             }
         }
     }
@@ -217,7 +225,9 @@ impl AsyncWrite for ChannelStream {
         Poll::Ready(Ok(()))
     }
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().output.take();
+        let this = self.get_mut();
+        this.output.take();
+        this.wake.notify_one();
         Poll::Ready(Ok(()))
     }
 }
@@ -410,6 +420,25 @@ fn congestion_control(name: Option<&str>) -> tcp::CongestionControl {
     }
 }
 
+/// smoltcp emits at most one segment per socket per egress pass, so a single
+/// poll per wakeup sends one or two segments per received packet. That only
+/// keeps up while the host ACKs every segment; macOS ACKs every few segments,
+/// which capped a download near 10 MB/s. Keep transmitting until the sockets
+/// have nothing left to send or the device queue is full.
+fn poll(
+    iface: &mut Interface,
+    now: NetInstant,
+    device: &mut PacketDevice,
+    sockets: &mut SocketSet<'_>,
+) {
+    iface.poll(now, device, sockets);
+    for _ in 0..256 {
+        if iface.poll_egress(now, device, sockets) == PollResult::None {
+            break;
+        }
+    }
+}
+
 pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let budget = Budget::for_config(&core.config);
     let congestion = congestion_control(core.config.tun.congestion_controller.as_deref());
@@ -476,6 +505,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut ports: HashMap<IpEndpoint, UdpPort> = HashMap::new();
     let mut tasks = JoinSet::new();
     let (replies, mut incoming_replies) = mpsc::channel::<Reply>(256);
+    let wake = Arc::new(Notify::new());
     let mut tick = tokio::time::interval(Duration::from_millis(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut packet = vec![0; 65535];
@@ -510,11 +540,16 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                         socket.set_timeout(Some(NetDuration::from_secs(300)));
                         socket.set_keep_alive(Some(NetDuration::from_secs(30)));
                         socket.set_congestion_control(congestion);
+                        // Upstream reads arrive a segment at a time (1448 bytes behind
+                        // TCP timestamps), just under the TUN MSS. With Nagle each one
+                        // waits for every byte in flight to be ACKed, and macOS ACKs
+                        // only every few segments or on its delayed-ACK timer.
+                        socket.set_nagle_enabled(false);
                         socket.listen(flow.target)?;
                         let handle = sockets.add(socket);
                         let (input, receiver) = mpsc::channel(budget.tcp_queue);
                         let (sender, output) = mpsc::channel(budget.tcp_queue);
-                        let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)) };
+                        let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
                         let core = core.clone();
                         let task = tasks.spawn(async move { (flow, tcp_session(core, flow, stream).await) });
                         tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
@@ -527,13 +562,14 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 }
                 device.incoming.push_back(packet.into_owned());
             },
+            _ = wake.notified() => {},
             _ = tick.tick() => {},
         }
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
             fragments.expire(last_expiry.into());
         }
-        iface.poll(now(), &mut device, &mut sockets);
+        poll(&mut iface, now(), &mut device, &mut sockets);
         while let Some(result) = tasks.try_join_next() {
             if let Ok((flow, result)) = result {
                 if flow.tcp {
@@ -660,7 +696,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             sockets.remove(port.handle);
             false
         });
-        iface.poll(now(), &mut device, &mut sockets);
+        poll(&mut iface, now(), &mut device, &mut sockets);
         for handle in retired {
             sockets.remove(handle);
         }

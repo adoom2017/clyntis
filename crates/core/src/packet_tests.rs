@@ -364,3 +364,114 @@ async fn tun_sse_resumes_after_six_minutes_with_tcp_keepalive() {
     assert_eq!(server.read(&mut [0]).await.unwrap(), 0);
     running.shutdown().await;
 }
+
+/// macOS ACKs every few segments, not each one. smoltcp sends one segment per
+/// socket per egress pass, so the loop must keep transmitting after each
+/// wakeup; sending one or two segments per ACK capped downloads near 10 MB/s
+/// (this test took ~10 s). Run in release with `--nocapture` for MB/s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tun_download_keeps_up_with_sparse_host_acks() {
+    const TOTAL: usize = 16 * 1024 * 1024;
+    const ACK_EVERY: u64 = 8;
+    let (device, host_io) = pair();
+    let mut config = CoreConfig::default();
+    config.tun.enable = true;
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let running = core.start_with_packets(Some(device)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // One segment per write, as an upstream socket is read from a NIC.
+        let segment = [7u8; 1448];
+        let mut sent = 0;
+        while sent < TOTAL {
+            let n = segment.len().min(TOTAL - sent);
+            stream.write_all(&segment[..n]).await.unwrap();
+            sent += n;
+            tokio::task::yield_now().await;
+        }
+        stream.shutdown().await.unwrap();
+    });
+    let started = Instant::now();
+    let now = || NetInstant::from_millis(started.elapsed().as_millis() as i64);
+    let (outgoing, mut output) = mpsc::channel(1024);
+    let mut device = PacketDevice {
+        incoming: VecDeque::new(),
+        outgoing,
+        mtu: 1500,
+    };
+    let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now());
+    let source: IpAddress = "10.0.0.2".parse().unwrap();
+    iface.update_ip_addrs(|a| a.push(IpCidr::new(source, 0)).unwrap());
+    let mut sockets = SocketSet::new(vec![]);
+    // A host kernel's autotuned receive window.
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 4 << 20]),
+        tcp::SocketBuffer::new(vec![0; 64 * 1024]),
+    );
+    socket
+        .connect(
+            iface.context(),
+            IpEndpoint::new(target.ip().into(), target.port()),
+            IpEndpoint::new(source, 54321),
+        )
+        .unwrap();
+    let handle = sockets.add(socket);
+    let mut packet = vec![0; 65535];
+    let mut received = 0;
+    let mut acks = 0u64;
+    // A withheld ACK goes out on a delayed-ACK timer, like the host's.
+    let mut held: Option<(Vec<u8>, Instant)> = None;
+    while received < TOTAL {
+        iface.poll(now(), &mut device, &mut sockets);
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        while socket.can_recv() {
+            received += socket.recv(|b| (b.len(), b.len())).unwrap();
+        }
+        iface.poll(now(), &mut device, &mut sockets);
+        while let Ok(packet) = output.try_recv() {
+            let pure_ack = Ipv4Packet::new_checked(&packet[..])
+                .ok()
+                .and_then(|ip| {
+                    TcpPacket::new_checked(ip.payload())
+                        .ok()
+                        .map(|tcp| tcp.payload().is_empty() && !tcp.syn() && !tcp.fin())
+                })
+                .unwrap_or(false);
+            if pure_ack {
+                acks += 1;
+                if !acks.is_multiple_of(ACK_EVERY) {
+                    held = Some((packet, Instant::now()));
+                    continue;
+                }
+            }
+            held = None;
+            host_io.send(&packet).await.unwrap();
+        }
+        if let Some((packet, at)) = &held
+            && at.elapsed() >= Duration::from_millis(40)
+        {
+            host_io.send(packet).await.unwrap();
+            held = None;
+        }
+        let wait = iface
+            .poll_delay(now(), &sockets)
+            .map_or(Duration::from_millis(5), |d| {
+                Duration::from_micros(d.total_micros())
+            })
+            .min(Duration::from_millis(5));
+        if let Ok(n) = tokio::time::timeout(wait, host_io.recv(&mut packet)).await {
+            device.incoming.push_back(packet[..n.unwrap()].to_vec());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "TUN download stalled at {received} of {TOTAL} bytes"
+        );
+    }
+    println!(
+        "TUN download with sparse ACKs: {:.1} MB/s",
+        TOTAL as f64 / started.elapsed().as_secs_f64() / 1e6
+    );
+    running.shutdown().await;
+}
