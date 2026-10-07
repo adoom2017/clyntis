@@ -85,6 +85,13 @@ final class CoreSession {
         try read { meta_drain_logs_v1($0, $1, $2) }
     }
 
+    /// Top-level `ipv6` of the running configuration; the tunnel routes IPv6
+    /// only when it is enabled.
+    func enablesIPv6() throws -> Bool {
+        let state = try JSONSerialization.jsonObject(with: snapshot()) as? [String: Any]
+        return (state?["config"] as? [String: Any])?["ipv6"] as? Bool ?? false
+    }
+
     func snapshot() throws -> Data {
         try Self.read { meta_snapshot_v1(handle, $0, $1, $2) }
     }

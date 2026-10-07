@@ -479,6 +479,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(2));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut packet = vec![0; 65535];
+    let mut ipv6_dropped: u64 = 0;
     let mut fragments = ipv6::Reassembly::default();
     let mut last_expiry = Instant::now();
     loop {
@@ -490,7 +491,17 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 let n = result?;
                 ensure!(n <= packet.len(), "PacketIo returned invalid length");
                 if n == 0 { continue; }
-                if !core.config.ipv6 && packet[0] >> 4 == 6 { continue; }
+                if !core.config.ipv6 && packet[0] >> 4 == 6 {
+                    // Hosts should keep IPv6 out of the TUN when it is disabled;
+                    // make a misrouted host visible instead of silently stalling.
+                    ipv6_dropped += 1;
+                    if ipv6_dropped == 1 {
+                        tracing::warn!("TUN received IPv6 although ipv6 is disabled; dropping IPv6 packets");
+                    } else if ipv6_dropped.is_multiple_of(1000) {
+                        tracing::debug!(dropped = ipv6_dropped, "IPv6 packets dropped because ipv6 is disabled");
+                    }
+                    continue;
+                }
                 let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) else { continue; };
                 if let Some((flow, syn)) = sniff(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }

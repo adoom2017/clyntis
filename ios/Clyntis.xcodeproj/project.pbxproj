@@ -87,13 +87,13 @@
 		62DC05775423F8BC051EDCE0 /* Clyntis.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Clyntis.entitlements; sourceTree = "<group>"; };
 		6B6DD8AA26D8E3F4058D9D9C /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		780FEACDBDC48C7EA90A5065 /* ProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStore.swift; sourceTree = "<group>"; };
-		7D33B6B66F8B436DE4160641 /* ClyntisTunnel.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = ClyntisTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		7D33B6B66F8B436DE4160641 /* ClyntisTunnel.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ClyntisTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		7EBCE9855260D3674DF1C422 /* ClyntisCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ClyntisCore.xcframework; path = Frameworks/ClyntisCore.xcframework; sourceTree = "<group>"; };
 		84CCE7ADE5FA50EA87FA1026 /* ClyntisTunnel.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = ClyntisTunnel.entitlements; sourceTree = "<group>"; };
 		85C0453CF264DA14FB00CEC0 /* CoreSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreSession.swift; sourceTree = "<group>"; };
-		8D31DF756998FEC1803E949D /* Clyntis.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Clyntis.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8D31DF756998FEC1803E949D /* Clyntis.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Clyntis.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9F7EAB0C1D2E264CCDE904DD /* RemoteConfigImportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteConfigImportTests.swift; sourceTree = "<group>"; };
-		A3C93BDC3E86AFC65E2F3654 /* ClyntisTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = ClyntisTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A3C93BDC3E86AFC65E2F3654 /* ClyntisTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ClyntisTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A4CFA8CA230BCAFD5DF0AA60 /* LogFile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogFile.swift; sourceTree = "<group>"; };
 		B8B80015583796068121DB40 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		B9B50CF2014E240A4478F055 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -279,7 +279,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1430;
+				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					028D7EE9B2FA6F82413E5B94 = {
 						DevelopmentTeam = YH6JCRN97J;
@@ -433,7 +433,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
-				ARCHS = arm64;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -471,6 +470,7 @@
 				DEVELOPMENT_TEAM = YH6JCRN97J;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -490,9 +490,14 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
-				OTHER_LDFLAGS = "$(inherited) -lresolv -lc++";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lresolv",
+					"-lc++",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OBJC_BRIDGING_HEADER = Core/Bridge.h;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -586,7 +591,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
-				ARCHS = arm64;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -624,6 +628,7 @@
 				DEVELOPMENT_TEAM = YH6JCRN97J;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -636,9 +641,14 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
-				OTHER_LDFLAGS = "$(inherited) -lresolv -lc++";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lresolv",
+					"-lc++",
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OBJC_BRIDGING_HEADER = Core/Bridge.h;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";

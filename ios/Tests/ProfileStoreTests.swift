@@ -82,6 +82,18 @@ final class ProfileStoreTests: XCTestCase {
         try CoreSession(configuration: merged, directory: root).close()
     }
 
+    func testTunnelReadsWhetherTheProfileEnablesIPv6() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        // Absent means the core default (enabled), as in mihomo.
+        for (yaml, expected) in [("ipv6: true\n", true), ("ipv6: false\n", false), ("mode: rule\n", true)] {
+            let session = try CoreSession(configuration: Data((yaml + "rules: ['MATCH,DIRECT']\n").utf8), directory: root)
+            defer { session.close() }
+            XCTAssertEqual(try session.enablesIPv6(), expected, yaml)
+        }
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()

@@ -57,9 +57,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.252"])
                 ipv4.includedRoutes = [.default()]
                 settings.ipv4Settings = ipv4
-                let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::2"], networkPrefixLengths: [126])
-                ipv6.includedRoutes = [.default()]
-                settings.ipv6Settings = ipv6
+                // Like mihomo, claim IPv6 only when the profile enables it. With
+                // `ipv6: false` the core drops IPv6 packets, so routing them here
+                // silently stalls apps that dial IPv6 literals (WeChat's HTTPDNS
+                // avatars); left outside the tunnel they use the device network.
+                if let core = self.core, try core.enablesIPv6() {
+                    let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::2"], networkPrefixLengths: [126])
+                    ipv6.includedRoutes = [.default()]
+                    settings.ipv6Settings = ipv6
+                    log.info("start: IPv6 routed through the tunnel")
+                } else {
+                    log.info("start: profile disables IPv6; IPv6 stays on the device network")
+                }
                 let dns = NEDNSSettings(servers: ["198.18.0.1"])
                 dns.matchDomains = [""]
                 settings.dnsSettings = dns
