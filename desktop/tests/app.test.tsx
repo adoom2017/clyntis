@@ -184,40 +184,65 @@ describe("desktop workflows", () => {
     expect(screen.getByDisplayValue("7891")).toBeInTheDocument();
     expect(screen.getByDisplayValue("TUN 模式")).toBeInTheDocument();
   });
-  it("offers subscription refresh only for subscription profiles", async () => {
-    const profile = {
-      pending: false,
-      lastChecked: 0,
-      lastError: null,
-    };
-    invoke.mockResolvedValue({
-      ...structuredClone(initial),
-      profiles: [
-        {
-          ...profile,
-          id: "a",
-          name: "本地",
-          source: "本地文件",
-          subscription: false,
-        },
-        {
-          ...profile,
-          id: "b",
-          name: "订阅",
-          source: "sub.example.com",
-          subscription: true,
-        },
-      ],
-    });
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "配置" }));
-    expect(
-      await screen.findByRole("button", { name: "更新 订阅" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "更新 本地" }),
-    ).not.toBeInTheDocument();
-  });
+  it.each(["before navigation", "after navigation"])(
+    "offers subscription refresh only for subscription profiles (snapshot %s)",
+    async (arrival) => {
+      const profile = {
+        pending: false,
+        lastChecked: 0,
+        lastError: null,
+      };
+      const snapshot = {
+        ...structuredClone(initial),
+        profiles: [
+          {
+            ...profile,
+            id: "a",
+            name: "本地",
+            source: "本地文件",
+            subscription: false,
+          },
+          {
+            ...profile,
+            id: "b",
+            name: "订阅",
+            source: "sub.example.com",
+            subscription: true,
+          },
+        ],
+      };
+      let resolveSnapshot!: (value: typeof snapshot) => void;
+      const snapshotRequest = new Promise<typeof snapshot>((resolve) => {
+        resolveSnapshot = resolve;
+      });
+      invoke.mockImplementation(async (command) =>
+        command === "snapshot" ? snapshotRequest : null,
+      );
+      // Settle listener registration and control snapshot delivery explicitly so
+      // this assertion does not race startup through findByRole's timer polling.
+      await act(async () => {
+        render(<App />);
+      });
+      expect(invoke).toHaveBeenCalledWith("snapshot");
+      const deliverSnapshot = () =>
+        act(async () => {
+          resolveSnapshot(snapshot);
+        });
+      if (arrival === "before navigation") await deliverSnapshot();
+      fireEvent.click(screen.getByRole("button", { name: "配置" }));
+      if (arrival === "after navigation") await deliverSnapshot();
+
+      const refresh = screen.getByRole("button", { name: "更新 订阅" });
+      expect(refresh).toBeEnabled();
+      expect(
+        screen.queryByRole("button", { name: "更新 本地" }),
+      ).not.toBeInTheDocument();
+      await act(async () => {
+        fireEvent.click(refresh);
+      });
+      expect(invoke).toHaveBeenCalledWith("update_subscription", { id: "b" });
+    },
+  );
   it("asks for a password before importing an encrypted file", async () => {
     open.mockResolvedValue("/tmp/secret.txt");
     invoke.mockImplementation(async (command, args) => {
