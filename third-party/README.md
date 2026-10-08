@@ -2,8 +2,13 @@
 
 Production protocol implementations are repository-owned. Cargo dependencies
 provide runtimes, serialization, standard cryptography, BoringSSL TLS, HTTP,
-DNS wire types, TCP/IP and operating-system interfaces. No external proxy kernel
-or protocol implementation is linked, loaded or launched by the product.
+DNS wire types, TCP/IP (smoltcp) and operating-system interfaces. The one
+exception is WireGuard for the Tailscale outbound: it uses Cloudflare's
+`boringtun` crate (its `noise` module only, without the device/TUN features).
+Tailscale's own protocols — the ts2021 control transport, DERP relaying, disco
+path discovery and STUN — are implemented in `crates/tailscale`, and NaCl boxes
+use the `crypto_box` crate. No external proxy kernel, Tailscale daemon or Go
+`tsnet` is linked, loaded or launched by the product.
 
 Local foundation patches:
 

@@ -1,9 +1,27 @@
 # Clyntis for iOS
 
-Native SwiftUI client for iOS/iPadOS 17 or later, with the same emerald icon as
-the desktop client. The app imports local or remote Clash-style YAML profiles, controls
-a system VPN, displays traffic and connections, and switches routing mode and
-proxy-group selections while connected.
+Native SwiftUI client for iOS/iPadOS 17 or later, with the same icon and Apple
+system-blue palette as the desktop client. The app imports local or remote
+Clash-style YAML profiles, controls a system VPN, displays traffic and
+connections, and switches routing mode and proxy-group selections while
+connected. It also provides:
+
+- **Profiles:** view and edit a profile's YAML (validated before saving), update
+  a remote profile from its link, encrypted export, rename and delete.
+- **Custom rules** (配置 → 自定义规则): matched before every profile's own rules;
+  add one at a time, reorder or edit in bulk. Rules a profile cannot use (missing
+  proxy, group or rule set) are skipped with the reason shown.
+- **Profile overrides** (配置 → 覆盖配置文件): log level, IPv6 and domain
+  sniffing replace the profile's values; "跟随配置文件" keeps them. The core
+  performs the merge, the same as on the desktop.
+- **Node status** (节点): each node shows a status line and a detail page. VLESS:
+  server, transport, TLS/REALITY, the last delay test or its error, and open
+  connections, with per-node and all-node delay tests. Tailscale: login state,
+  this device's tailnet name and addresses, home DERP region, UDP candidates and
+  every peer's online state and path (direct with RTT, or relayed). Proxies
+  outside every group appear under "其他节点".
+- **Logs** (日志): app, tunnel and core logs from the shared App Group file, with
+  share and clear actions; credentials are redacted.
 
 The VPN is a separate `NEPacketTunnelProvider` extension. It exchanges raw IPv4
 and IPv6 packets with the Rust core through the versioned C API; it does not
@@ -82,7 +100,9 @@ Run the `ClyntisTests` scheme action on an installed iOS simulator. For example,
 use `xcodebuild test` with `-destination 'platform=iOS Simulator,id=SIMULATOR_UUID'`.
 Tests cover credential-preserving storage, failed-import cleanup, strict protocol
 validation, remote download limits/errors/cancellation, encrypted import using
-the existing Alpha golden vector, and the actual Swift-to-Rust session/policy bridge. Simulator builds
+the existing Alpha golden vector, custom rules and profile overrides applied by
+the core, the tunnel's IPv6 decision, node-status decoding from the core
+snapshot, log redaction, and the actual Swift-to-Rust session/policy bridge. Simulator builds
 can preview all tabs and import profiles; the connection action explains that
 VPN operation needs a signed device.
 
@@ -128,21 +148,40 @@ even if Content-Length is missing. Request/resource timeouts are 30/60 seconds.
 The form displays download/validation progress and allows cancellation or
 retry after an error. Invalid imports are removed.
 
-The password is used locally, never sent in the request or saved. Source URLs
-are also not saved; this is a one-time import rather than an automatically
-updated subscription. Decrypted original YAML is saved using the existing
+The password is used locally, never sent in the request or saved. The source
+URL is kept with the profile so its detail page can update it from the link
+(asking for the password again when the profile is encrypted); there is no
+automatic subscription refresh. Decrypted original YAML is saved using the existing
 protected App Group profile store. Requests use an ephemeral URLSession without
 disk caches, cookie storage or stored credentials. The app target permits HTTP
 imports through ATS configuration; HTTPS server certificate validation remains
 enabled. See Apple's [URLSession documentation](https://developer.apple.com/documentation/foundation/urlsession)
 and [ATS configuration](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity).
 
-At runtime the host sets MTU 1280, installs IPv4/IPv6 default VPN routes and DNS
-`198.18.0.1`, and intercepts port 53 in the packet core. HTTP/SOCKS/mixed, DNS
+Before connecting, the app checks the profile's routing resources (GeoIP,
+GeoSite, rule providers) without parsing them. Missing files are downloaded
+first; expired ones are used as they are and refreshed in the background (the
+tunnel refreshes rule providers itself, new geo files apply on the next
+connect); current ones skip the step. The tunnel process never has to download
+or parse them twice within its ~50 MiB memory limit, and logs its memory and
+connection count every 30 seconds.
+
+At runtime the host sets MTU 1280, installs the IPv4 default VPN route and DNS
+`198.18.0.1`, and intercepts port 53 in the packet core. IPv6 is routed through
+the tunnel only when the profile (or the IPv6 override) enables it **and** the
+device network supports IPv6; otherwise apps would dial IPv6 literals that fail.
+The decision is re-evaluated when the network changes. HTTP/SOCKS/mixed, DNS
 listener and controller ports from the source profile are disabled in memory.
-The source profile remains unchanged. Network-path changes notify the core so
-old sessions are closed; shutdown joins Rust workers before releasing callback
-context. If the core stops, the extension cancels the system tunnel.
+The source profile remains unchanged. Network-path changes on physical
+interfaces notify the core so old sessions are closed; shutdown joins Rust
+workers before releasing callback context. If the core stops, the extension
+cancels the system tunnel.
+
+Tailscale nodes (`type: tailscale`) run inside the tunnel as a Rust userspace
+node, so the tailnet is usable together with the proxy without the Tailscale
+app (iOS allows only one VPN at a time). Its control, DERP and direct UDP
+connections leave through the device network. Fields and limits are described
+in the root README.
 
 ## Current scope
 
@@ -151,15 +190,16 @@ device/simulator compilation and simulator tests do not establish real-device
 VPN routing, provider socket egress, memory-budget compliance or battery usage.
 Those require a provisioned device and working server details.
 
-- Local and remote YAML import; automatic subscription refresh, configuration editing and resource-file
-  import (such as local GeoIP/GeoSite or rule-provider files) are not implemented.
-  Keep initial profiles self-contained; remote resource loading follows core
-  behavior and must also be checked on a device.
-- Protocol/configuration support is the same focused subset as the Rust core.
-  Unknown fields fail validation. Trojan/Hysteria2 outbounds remain unimplemented;
-  use supported VLESS nodes or DIRECT for initial testing.
+- Automatic subscription refresh and resource-file import (such as local
+  GeoIP/GeoSite or rule-provider files) are not implemented; routing resources
+  are downloaded from the profile's configured sources.
+- Protocol/configuration support is the same focused subset as the Rust core:
+  VLESS and Tailscale outbounds. Unknown fields fail validation;
+  Trojan/Hysteria2 outbounds remain unimplemented. UDP through Tailscale is not
+  supported yet.
 - No on-demand connection, reconnect-on-launch, desktop system proxy, tray, or
-  local HTTP controller. Node groups/statistics are available after connection.
+  local HTTP controller. Node groups, status and statistics are available after
+  connection.
 - Intel simulator slices, distribution signing and App Store packaging are not
   included in the build script.
 
