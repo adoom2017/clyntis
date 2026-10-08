@@ -78,27 +78,7 @@ impl Resources {
         // refreshes geo files before each start (meta_prefetch_resources_v1).
         let geo_refresh =
             refresh && (!config.internal_host_packet_io || previous.matchers.is_empty());
-        let mut refs = vec![];
-        for rule in &config.rules {
-            Rule::parse(rule)?.matcher.references(&mut refs);
-        }
-        for key in config
-            .dns
-            .nameserver_policy
-            .keys()
-            .chain(config.dns.fake_ip_filter.iter())
-        {
-            if let Some(tags) = key.strip_prefix("geosite:") {
-                for tag in tags.split(',') {
-                    refs.push(("geosite".into(), tag.to_ascii_lowercase()));
-                }
-            }
-            if let Some(tags) = key.strip_prefix("rule-set:") {
-                for tag in tags.split(',') {
-                    refs.push(("rule-set".into(), tag.into()));
-                }
-            }
-        }
+        let mut refs = references(config)?;
         let mut pending = Staged::default();
         let mut providers = HashMap::new();
         for (name, p) in &config.rule_providers {
@@ -334,6 +314,92 @@ impl Resources {
         Ok(out)
     }
 }
+/// Past its update interval (`interval` seconds, 0 or `None` never expires).
+fn expired(meta: Option<&std::fs::Metadata>, interval: Option<u64>) -> bool {
+    interval.is_some_and(|v| v > 0)
+        && meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .is_none_or(|age| age >= Duration::from_secs(interval.unwrap_or(0)))
+}
+
+/// Resources referenced by rules and DNS policy, before rule providers add theirs.
+fn references(config: &Config) -> Result<Vec<(String, String)>> {
+    let mut refs = vec![];
+    for rule in &config.rules {
+        Rule::parse(rule)?.matcher.references(&mut refs);
+    }
+    for key in config
+        .dns
+        .nameserver_policy
+        .keys()
+        .chain(config.dns.fake_ip_filter.iter())
+    {
+        if let Some(tags) = key.strip_prefix("geosite:") {
+            for tag in tags.split(',') {
+                refs.push(("geosite".into(), tag.to_ascii_lowercase()));
+            }
+        }
+        if let Some(tags) = key.strip_prefix("rule-set:") {
+            for tag in tags.split(',') {
+                refs.push(("rule-set".into(), tag.into()));
+            }
+        }
+    }
+    Ok(refs)
+}
+
+/// State of the files a profile references, worst first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Freshness {
+    Current,
+    /// Present but past an update interval: usable until replaced.
+    Expired,
+    /// Some file does not exist; the core cannot start without it.
+    Missing,
+}
+
+/// The state of every referenced file. Cheap: no geo data is parsed, only
+/// rule-provider payloads (which can reference geo data themselves).
+pub fn freshness(config: &Config) -> Result<Freshness> {
+    let mut refs = references(config)?;
+    let mut state = Freshness::Current;
+    let mut check = |path: &Path, interval: Option<u64>| {
+        let found = match std::fs::metadata(path) {
+            Err(_) => Freshness::Missing,
+            Ok(meta) if expired(Some(&meta), interval) => Freshness::Expired,
+            Ok(_) => Freshness::Current,
+        };
+        state = state.max(found);
+        found
+    };
+    for p in config.rule_providers.values() {
+        let payload = if p.kind == "inline" {
+            p.payload.clone()
+        } else {
+            let path = asset_path(&config.directory, &p.path)?;
+            if check(&path, (p.kind == "http").then_some(p.interval)) == Freshness::Missing {
+                continue;
+            }
+            parse_payload(&read_limited(&path)?, &p.format)?
+        };
+        provider_matcher(p, &payload)?.references(&mut refs);
+    }
+    let interval = geo_interval(config);
+    if refs.iter().any(|r| r.0 == "geoip") {
+        let file = if config.geodata_mode {
+            "geoip.dat"
+        } else {
+            "Country.mmdb"
+        };
+        check(&config.directory.join(file), interval);
+    }
+    if refs.iter().any(|r| r.0 == "geosite") {
+        check(&config.directory.join("geosite.dat"), interval);
+    }
+    Ok(state)
+}
+
 fn geo_interval(c: &Config) -> Option<u64> {
     Some(if c.geo_auto_update {
         c.geo_update_interval.saturating_mul(3600)
@@ -380,13 +446,7 @@ async fn asset(
     pending: &mut Staged,
 ) -> Result<PathBuf> {
     let meta = std::fs::metadata(path).ok();
-    let expired = refresh
-        && interval.is_some_and(|v| v > 0)
-        && meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .is_none_or(|age| age >= Duration::from_secs(interval.unwrap_or(0)));
+    let expired = refresh && expired(meta.as_ref(), interval);
     if let Some(meta) = &meta
         && !expired
     {
@@ -426,7 +486,15 @@ async fn asset(
         )
     });
     match result {
-        Ok(()) => Ok(temp),
+        Ok(()) => {
+            tracing::info!(
+                file = %path.file_name().unwrap_or_default().to_string_lossy(),
+                bytes = file.metadata().map(|m| m.len()).unwrap_or(0),
+                replaced = meta.is_some(),
+                "routing resource downloaded"
+            );
+            Ok(temp)
+        }
         // An expired file is still usable: stay on it rather than fail.
         Err(error) if meta.is_some() => {
             pending.discard(&temp);
@@ -1147,6 +1215,34 @@ mod tests {
         std::fs::remove_dir_all(&config.directory).unwrap();
     }
 
+    #[test]
+    fn freshness_reports_missing_then_expired_files() {
+        let dir = std::env::temp_dir().join(format!("meta-fresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::parse(
+            b"geo-auto-update: true\ngeo-update-interval: 24\nrule-providers:\n  ads: {type: http, url: 'https://example.com/ads.txt', path: ads.txt, interval: 3600, behavior: domain, format: text}\nrules: ['GEOSITE,cn,DIRECT', 'RULE-SET,ads,REJECT', 'MATCH,DIRECT']\n",
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        assert_eq!(freshness(&config).unwrap(), Freshness::Missing);
+        std::fs::write(dir.join("ads.txt"), "ads.test\n").unwrap();
+        // geosite.dat is still missing.
+        assert_eq!(freshness(&config).unwrap(), Freshness::Missing);
+        std::fs::write(dir.join("geosite.dat"), b"").unwrap();
+        assert_eq!(freshness(&config).unwrap(), Freshness::Current);
+        // A provider past its interval is usable but due for a refresh.
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("ads.txt"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(freshness(&config).unwrap(), Freshness::Expired);
+        // geoip.dat is not referenced, so its absence does not matter.
+        assert!(!dir.join("geoip.dat").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[tokio::test]
     async fn hosted_tunnels_refresh_geo_data_only_at_start() {
         let (config, attempts) = expired_geosite(true).await;

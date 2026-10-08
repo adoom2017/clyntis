@@ -6,6 +6,7 @@ mod ntp;
 mod packet;
 mod profile;
 mod resources;
+pub use resources::Freshness;
 mod sniff;
 #[cfg(test)]
 mod tests;
@@ -490,6 +491,12 @@ impl Core {
         } else {
             target.clone()
         }
+    }
+    /// Whether the referenced routing files are present and current.
+    pub fn resource_freshness(&self) -> Result<Freshness> {
+        let mut config = self.config.clone();
+        config.rules = self.policy.read().unwrap().raw_rules.clone();
+        resources::freshness(&config)
     }
     pub async fn prepare_resources(&self, refresh: bool) -> Result<()> {
         let mut config = self.config.clone();

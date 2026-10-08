@@ -297,8 +297,9 @@ pub unsafe extern "C" fn meta_drain_logs_v1(
 }
 
 /// Download missing or expired routing resources (GeoIP/GeoSite, rule providers)
-/// referenced by `config` into `directory`, then validate them. Blocks until
-/// done. Hosts call this before starting a packet tunnel so the memory- and
+/// referenced by `config` into `directory`, then validate them. Returns at once
+/// when every referenced file is present and current. Blocks until done. Hosts
+/// call this before starting a packet tunnel so the memory- and
 /// time-constrained tunnel process starts from local files.
 ///
 /// # Safety
@@ -323,10 +324,49 @@ pub unsafe extern "C" fn meta_prefetch_resources_v1(
         config.directory = path;
         config.tun.enable = false;
         let core = meta_core::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks))?;
+        // Current files were validated when they were downloaded, and the
+        // tunnel parses them again anyway; parsing ~20 MB of geo data here
+        // only delayed every connect.
+        if core.resource_freshness()? == meta_core::Freshness::Current {
+            return Ok(OK);
+        }
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(core.prepare_resources(true))?;
+        Ok(OK)
+    })
+}
+
+/// Report whether the routing files `config` references exist in `directory`
+/// and are within their update intervals: `state` receives 0 (current),
+/// 1 (present but expired: usable, refresh when convenient) or 2 (missing:
+/// prefetch before starting). Cheap; parses no geo data.
+///
+/// # Safety
+/// `data` and `directory` must be readable for their lengths; `state` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_resources_state_v1(
+    data: *const u8,
+    len: usize,
+    directory: *const u8,
+    directory_len: usize,
+    state: *mut u32,
+) -> i32 {
+    boundary(|| {
+        ensure!(!state.is_null(), "state output is required");
+        let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        config.directory = std::path::PathBuf::from(std::str::from_utf8(unsafe {
+            input(directory, directory_len)?
+        })?);
+        config.tun.enable = false;
+        let core = meta_core::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks))?;
+        let value = match core.resource_freshness()? {
+            meta_core::Freshness::Current => 0,
+            meta_core::Freshness::Expired => 1,
+            meta_core::Freshness::Missing => 2,
+        };
+        unsafe { state.write(value) };
         Ok(OK)
     })
 }

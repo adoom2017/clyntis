@@ -612,3 +612,30 @@ fn overrides_replace_profile_settings() {
         OK
     );
 }
+
+#[test]
+fn resource_state_reports_missing_files_without_parsing_them() {
+    let dir = std::env::temp_dir().join(format!("meta-ffi-state-{}", uuid_for_test()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = b"geo-auto-update: true\nrules: ['GEOSITE,cn,DIRECT', 'MATCH,DIRECT']\n";
+    let path = dir.to_str().unwrap().as_bytes();
+    let state = || {
+        let mut state = u32::MAX;
+        let result = unsafe {
+            meta_resources_state_v1(
+                config.as_ptr(),
+                config.len(),
+                path.as_ptr(),
+                path.len(),
+                &mut state,
+            )
+        };
+        assert_eq!(result, OK);
+        state
+    };
+    assert_eq!(state(), 2);
+    // An empty (unparseable) file still counts as present and current.
+    std::fs::write(dir.join("geosite.dat"), b"").unwrap();
+    assert_eq!(state(), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -39,6 +39,29 @@ final class CoreSession {
         try check(result)
     }
 
+    enum ResourceState: UInt32 {
+        case current = 0
+        /// Present but past an update interval: usable, refresh when convenient.
+        case expired = 1
+        /// The core cannot start without fetching first.
+        case missing = 2
+    }
+
+    /// Whether the routing files `configuration` references are in `directory`
+    /// and current. Cheap: no geo data is parsed.
+    static func resourceState(configuration: Data, directory: URL) throws -> ResourceState {
+        let path = Data(directory.path.utf8)
+        var state: UInt32 = 0
+        let result = configuration.withUnsafeBytes { config in
+            path.withUnsafeBytes { path in
+                meta_resources_state_v1(config.bindMemory(to: UInt8.self).baseAddress, config.count,
+                                        path.bindMemory(to: UInt8.self).baseAddress, path.count, &state)
+            }
+        }
+        try check(result)
+        return ResourceState(rawValue: state) ?? .missing
+    }
+
     /// Throws with the core's reason when `rule` is not a valid custom rule.
     static func validateRule(_ rule: String) throws {
         let bytes = Data(rule.utf8)
