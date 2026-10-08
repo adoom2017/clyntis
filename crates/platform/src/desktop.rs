@@ -181,6 +181,14 @@ pub fn discover(interface: Option<&str>, excluded_index: Option<u32>) -> Result<
 }
 
 #[cfg(target_os = "macos")]
+/// Whether the interface is wired (Ethernet, including USB and Thunderbolt
+/// adapters) rather than Wi-Fi or another link type.
+pub fn is_wired(index: u32) -> bool {
+    netdev::get_interfaces()
+        .into_iter()
+        .find(|device| device.index == index)
+        .is_some_and(|device| device.if_type == netdev::prelude::InterfaceType::Ethernet)
+}
 pub fn ipv4_egress_candidates() -> Result<Vec<ExitInterface>> {
     let interfaces = netdev::get_interfaces();
     let mut candidates = Vec::new();

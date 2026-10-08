@@ -83,16 +83,33 @@ fn physical_dns_upstreams(dns: &meta_config::Dns) -> Vec<IpAddr> {
 }
 
 #[cfg(target_os = "macos")]
-fn best_egress_index(public_scores: &[usize], proxy_scores: &[usize]) -> Option<usize> {
-    public_scores
-        .iter()
-        .zip(proxy_scores)
-        .enumerate()
-        .max_by_key(|(index, (public, proxy))| {
-            (**public > 0, **proxy, **public, std::cmp::Reverse(*index))
-        })
-        .filter(|(_, (public, proxy))| **public > 0 || **proxy > 0)
-        .map(|(index, _)| index)
+/// The best reachable egress: internet access first, then proxies reached,
+/// then a wired link over Wi-Fi. `current` is kept unless another candidate
+/// ranks higher on those: one lost public probe must not switch interfaces,
+/// since every switch closes all sessions and the next probe would usually
+/// switch straight back.
+fn best_egress_index(
+    public_scores: &[usize],
+    proxy_scores: &[usize],
+    wired: &[bool],
+    current: Option<usize>,
+) -> Option<usize> {
+    let rank = |index: usize| {
+        (
+            public_scores[index] > 0,
+            proxy_scores[index],
+            wired.get(index).copied().unwrap_or(false),
+        )
+    };
+    let best = (0..public_scores.len())
+        .filter(|&index| public_scores[index] > 0 || proxy_scores[index] > 0)
+        .max_by_key(|&index| (rank(index), public_scores[index], std::cmp::Reverse(index)))?;
+    match current {
+        Some(current) if current < public_scores.len() && rank(current) >= rank(best) => {
+            Some(current)
+        }
+        _ => Some(best),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -149,6 +166,7 @@ pub async fn detect_macos_egress(
     config: &Config,
     public_targets: &[SocketAddr],
     phase: &str,
+    current: Option<&str>,
 ) -> Result<Option<String>> {
     use meta_platform::desktop::{EgressHooks, Network, ipv4_egress_candidates};
     use std::time::Duration;
@@ -230,7 +248,12 @@ pub async fn detect_macos_egress(
             proxy_targets.len()
         );
     }
-    let selected = best_egress_index(&public_scores, &proxy_scores);
+    let current = current.and_then(|name| candidates.iter().position(|c| c.name == name));
+    let wired: Vec<bool> = candidates
+        .iter()
+        .map(|candidate| meta_platform::desktop::is_wired(candidate.index))
+        .collect();
+    let selected = best_egress_index(&public_scores, &proxy_scores, &wired, current);
     if let Some(index) = selected {
         eprintln!(
             "macOS physical egress selected ({phase}): {} (public: {}/{}, proxy: {}/{})",
@@ -276,7 +299,7 @@ pub async fn run(
     };
     #[cfg(target_os = "macos")]
     let detected_interface = if config.tun.enable {
-        detect_macos_egress(&config, &public_targets, "before TUN").await?
+        detect_macos_egress(&config, &public_targets, "before TUN", None).await?
     } else {
         None
     };
@@ -307,7 +330,7 @@ pub async fn run(
     };
     #[cfg(target_os = "macos")]
     if config.tun.enable && config.tun.auto_detect_interface && config.tun.interface.is_none() {
-        let after = detect_macos_egress(&config, &public_targets, "after TUN")
+        let after = detect_macos_egress(&config, &public_targets, "after TUN", None)
             .await?
             .context(
                 "no physical egress reachable after TUN routing; set tun.interface explicitly",
@@ -322,7 +345,8 @@ pub async fn run(
             drop(previous);
             desktop = Some(open_tun(Some(&after))?);
             let verified =
-                detect_macos_egress(&config, &public_targets, "after TUN reselection").await?;
+                detect_macos_egress(&config, &public_targets, "after TUN reselection", None)
+                    .await?;
             ensure!(
                 verified.as_deref() == Some(after.as_str()),
                 "physical egress changed during TUN setup; set tun.interface explicitly"
@@ -421,6 +445,8 @@ pub async fn run(
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(3));
     #[cfg(target_os = "macos")]
     let mut next_egress_probe = tokio::time::Instant::now();
+    #[cfg(target_os = "macos")]
+    let (mut dns_pending, mut dns_waiting) = (false, false);
     let result: Result<()> = async { loop {
             tokio::select! {
                 _ = stop.cancelled() => break Ok(()),
@@ -429,7 +455,8 @@ pub async fn run(
                     #[cfg(target_os = "macos")]
                     let selected = if tokio::time::Instant::now() >= next_egress_probe {
                         next_egress_probe = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-                        match detect_macos_egress(&core.config, &public_targets, "network refresh").await {
+                        let current = desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).map(|exit| exit.name);
+                        match detect_macos_egress(&core.config, &public_targets, "network refresh", current.as_deref()).await {
                             Ok(selected) => selected,
                             Err(error) => { tracing::warn!(%error, "physical egress detection failed; retrying"); None }
                         }
@@ -444,21 +471,43 @@ pub async fn run(
                     match changed {
                         Ok(true) => {
                             #[cfg(target_os = "macos")]
-                            if let Some(dns) = &mut system_dns {
-                                let interface = desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).context("automatic DNS lost its IPv4 physical exit")?;
-                                let address = meta_platform::desktop::local_ipv4_address(&interface)?;
-                                if Some(address) != system_dns_address {
-                                    running.rebind_system_dns(std::net::SocketAddr::new(address.into(), 53)).await?;
-                                    system_dns_address = Some(address);
-                                }
-                                dns.refresh(&interface.name, address)?;
-                                tracing::debug!(interface = %interface.name, "macOS system DNS checked after network change");
+                            if system_dns.is_some() {
+                                dns_pending = true;
                             }
                             core.network_changed().await;
                             tracing::info!(network = ?desktop.as_ref().unwrap().hooks.network(), "physical egress changed; sessions closed for reconnect");
                         },
                         Ok(false) => {},
                         Err(error) => break Err(error.context("cannot update TUN routing")),
+                    }
+                    // Sleep, Wi-Fi roaming and DHCP renewals briefly leave no IPv4
+                    // exit or address. Keep the TUN running and retry every tick
+                    // instead of stopping the core; the system DNS keeps pointing
+                    // at the previous listener until the network is back.
+                    #[cfg(target_os = "macos")]
+                    if dns_pending && let Some(dns) = &mut system_dns {
+                        let synced = async {
+                            let interface = desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).context("no IPv4 physical exit")?;
+                            let address = meta_platform::desktop::local_ipv4_address(&interface)?;
+                            if Some(address) != system_dns_address {
+                                running.rebind_system_dns(std::net::SocketAddr::new(address.into(), 53)).await?;
+                                system_dns_address = Some(address);
+                            }
+                            dns.refresh(&interface.name, address)?;
+                            Ok::<_, anyhow::Error>(interface.name)
+                        }.await;
+                        match synced {
+                            Ok(interface) => {
+                                dns_pending = false;
+                                dns_waiting = false;
+                                tracing::info!(%interface, "macOS system DNS updated after network change");
+                            }
+                            Err(error) if !dns_waiting => {
+                                dns_waiting = true;
+                                tracing::warn!(error = %format!("{error:#}"), "automatic DNS waits for the network; retrying");
+                            }
+                            Err(error) => tracing::debug!(error = %format!("{error:#}"), "automatic DNS still waiting for the network"),
+                        }
                     }
                 },
             }
@@ -511,10 +560,61 @@ mod dns_route_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn reachable_public_egress_beats_proxy_only_interface() {
-        assert_eq!(best_egress_index(&[0, 1], &[2, 1]), Some(1));
-        assert_eq!(best_egress_index(&[1, 1], &[0, 2]), Some(1));
-        assert_eq!(best_egress_index(&[0, 0], &[1, 1]), Some(0));
-        assert_eq!(best_egress_index(&[0, 0], &[0, 0]), None);
+        let wifi = [false, false];
+        assert_eq!(best_egress_index(&[0, 1], &[2, 1], &wifi, None), Some(1));
+        assert_eq!(best_egress_index(&[1, 1], &[0, 2], &wifi, None), Some(1));
+        assert_eq!(best_egress_index(&[0, 0], &[1, 1], &wifi, None), Some(0));
+        assert_eq!(best_egress_index(&[0, 0], &[0, 0], &wifi, None), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wired_egress_wins_when_equally_reachable() {
+        // Wi-Fi (index 0) listed before Ethernet (index 1).
+        let kinds = [false, true];
+        assert_eq!(best_egress_index(&[2, 2], &[1, 1], &kinds, None), Some(1));
+        // Plugging in a working cable moves off Wi-Fi.
+        assert_eq!(
+            best_egress_index(&[2, 2], &[1, 1], &kinds, Some(0)),
+            Some(1)
+        );
+        // One lost public probe on the cable does not.
+        assert_eq!(
+            best_egress_index(&[2, 1], &[1, 1], &kinds, Some(1)),
+            Some(1)
+        );
+        // A cable without internet or proxy access loses to Wi-Fi.
+        assert_eq!(best_egress_index(&[2, 0], &[1, 1], &kinds, None), Some(0));
+        assert_eq!(
+            best_egress_index(&[2, 2], &[1, 0], &kinds, Some(1)),
+            Some(0)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_egress_survives_a_lost_public_probe() {
+        // en7 (current) lost one of two public probes; en0 reached both.
+        assert_eq!(
+            best_egress_index(&[1, 2], &[1, 1], &[true, true], Some(0)),
+            Some(0)
+        );
+        // Ties keep the current interface rather than the first one.
+        assert_eq!(
+            best_egress_index(&[2, 2], &[1, 1], &[true, true], Some(1)),
+            Some(1)
+        );
+        // Switch when the current one loses the internet or a proxy.
+        assert_eq!(
+            best_egress_index(&[0, 2], &[1, 1], &[true, true], Some(0)),
+            Some(1)
+        );
+        assert_eq!(
+            best_egress_index(&[2, 2], &[0, 1], &[true, true], Some(0)),
+            Some(1)
+        );
+        // A vanished current interface falls back to the best candidate.
+        assert_eq!(best_egress_index(&[2], &[1], &[false], Some(3)), Some(0));
     }
 }
 

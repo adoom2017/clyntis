@@ -285,7 +285,7 @@ fn run(mut args: Args) -> Result<()> {
             .build()?;
         let interface = runtime.block_on(async {
             let targets = public_egress_targets().await;
-            detect_macos_egress(&config, &targets, "without TUN").await
+            detect_macos_egress(&config, &targets, "without TUN", None).await
         })?;
         let interface = config.tun.interface.as_deref().or(interface.as_deref());
         let interface = interface.context("no reachable physical egress found")?;
