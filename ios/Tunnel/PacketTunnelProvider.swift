@@ -11,6 +11,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var epoch = UUID()
     private var monitor: NWPathMonitor?
     private var receivedInitialPath = false
+    /// Whether the profile enables IPv6, and whether the applied settings route it.
+    private var profileIPv6 = false
+    private var routesIPv6: Bool?
     private var healthTimer: DispatchSourceTimer?
     private var logTimer: DispatchSourceTimer?
 
@@ -59,31 +62,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 step = "start core"
                 try self.core?.start()
                 log.info("start: core started memory=\(memory())")
-                let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "198.18.0.1")
-                settings.mtu = 1280
-                let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.252"])
-                ipv4.includedRoutes = [.default()]
-                settings.ipv4Settings = ipv4
-                // Like mihomo, claim IPv6 only when the profile enables it. With
-                // `ipv6: false` the core drops IPv6 packets, so routing them here
-                // silently stalls apps that dial IPv6 literals (WeChat's HTTPDNS
-                // avatars); left outside the tunnel they use the device network.
-                if let core = self.core, try core.enablesIPv6() {
-                    let ipv6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::2"], networkPrefixLengths: [126])
-                    ipv6.includedRoutes = [.default()]
-                    settings.ipv6Settings = ipv6
-                    log.info("start: IPv6 routed through the tunnel")
-                } else {
-                    log.info("start: profile disables IPv6; IPv6 stays on the device network")
-                }
-                let dns = NEDNSSettings(servers: ["198.18.0.1"])
-                dns.matchDomains = [""]
-                settings.dnsSettings = dns
+                // Like mihomo, claim IPv6 only when the profile enables it, and only
+                // while the device network can route it. Claiming it otherwise makes
+                // apps believe IPv6 works: they dial IPv6 literals (WeChat avatars,
+                // Meituan's HTTPDNS) that fail with "no route" before falling back.
+                self.profileIPv6 = try self.core?.enablesIPv6() ?? false
                 let epoch = self.epoch
-                step = "apply network settings"
-                log.info("start: applying network settings")
-                self.setTunnelNetworkSettings(settings) { error in
-                    self.queue.async {
+                step = "wait for network"
+                log.info("start: waiting for the device network")
+                self.watchNetwork { path in
+                    let ipv6 = self.profileIPv6 && path.supportsIPv6
+                    log.info("start: applying network settings ipv6=\(ipv6) (profile=\(self.profileIPv6) network=\(path.supportsIPv6))")
+                    self.applySettings(ipv6: ipv6) { error in
                         guard self.epoch == epoch, self.core != nil else {
                             completionHandler(ClientError.message("VPN 启动已取消。"))
                             return
@@ -96,7 +86,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                         self.readPackets(epoch: epoch)
                         self.drainPackets()
-                        self.watchNetwork()
                         self.watchCore()
                         log.info("start: tunnel up memory=\(memory())")
                         completionHandler(nil)
@@ -136,6 +125,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         monitor?.cancel()
         monitor = nil
         receivedInitialPath = false
+        routesIPv6 = nil
         healthTimer?.cancel()
         healthTimer = nil
         core?.close()
@@ -206,19 +196,57 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if packets.count == 64 { queue.async { self.drainPackets() } }
     }
 
-    private func watchNetwork() {
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] _ in
+    /// Routes for the tunnel; IPv6 only when `ipv6`. Completes on `queue`.
+    private func applySettings(ipv6: Bool, completion: @escaping (Error?) -> Void) {
+        let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "198.18.0.1")
+        settings.mtu = 1280
+        let ipv4 = NEIPv4Settings(addresses: ["198.18.0.2"], subnetMasks: ["255.255.255.252"])
+        ipv4.includedRoutes = [.default()]
+        settings.ipv4Settings = ipv4
+        if ipv6 {
+            let v6 = NEIPv6Settings(addresses: ["fdfe:dcba:9876::2"], networkPrefixLengths: [126])
+            v6.includedRoutes = [.default()]
+            settings.ipv6Settings = v6
+        }
+        let dns = NEDNSSettings(servers: ["198.18.0.1"])
+        dns.matchDomains = [""]
+        settings.dnsSettings = dns
+        setTunnelNetworkSettings(settings) { error in
+            self.queue.async {
+                if error == nil { self.routesIPv6 = ipv6 }
+                completion(error)
+            }
+        }
+    }
+
+    /// Calls `ready` with the first device path, then reacts to changes. Only
+    /// physical interfaces count: this tunnel and other VPNs are `.other`, and
+    /// our own IPv6 route must not look like IPv6 connectivity.
+    private func watchNetwork(ready: @escaping (Network.NWPath) -> Void) {
+        let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other])
+        monitor.pathUpdateHandler = { [weak self] path in
             guard let self, let core = self.core else { return }
+            guard self.receivedInitialPath else {
+                self.receivedInitialPath = true
+                ready(path)
+                return
+            }
             // Even an address change on the same interface invalidates old sockets.
             // NWPathMonitor already emits changes; an interface-name comparison
             // would miss transitions between Wi-Fi and cellular with both present.
-            guard self.receivedInitialPath else {
-                self.receivedInitialPath = true
-                return
+            log.info("network path changed ipv6=\(path.supportsIPv6)")
+            do { try core.networkChanged() } catch { self.fail(error); return }
+            let ipv6 = self.profileIPv6 && path.supportsIPv6
+            guard let routed = self.routesIPv6, routed != ipv6 else { return }
+            let epoch = self.epoch
+            self.applySettings(ipv6: ipv6) { error in
+                guard self.epoch == epoch, self.core != nil else { return }
+                if let error {
+                    log.error("network settings update failed: \(Diagnostics.describe(error))")
+                } else {
+                    log.info("IPv6 \(ipv6 ? "now routed through the tunnel" : "left on the device network") after network change")
+                }
             }
-            log.info("network path changed")
-            do { try core.networkChanged() } catch { self.fail(error) }
         }
         monitor.start(queue: queue)
         self.monitor = monitor

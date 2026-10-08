@@ -627,7 +627,10 @@ impl DesktopTun {
         }
         let network = self.hooks.network();
         let mut routes = vec![];
-        for prefix in tun_capture_prefixes(self.ipv6)? {
+        // Capture IPv6 only while a physical interface can route it; otherwise
+        // apps take the TUN's IPv6 route as connectivity and dial IPv6 literals
+        // that the core cannot reach. Network refreshes recompute this.
+        for prefix in tun_capture_prefixes(self.ipv6 && network.ipv6.is_some())? {
             routes.push(RouteSpec {
                 network: prefix,
                 interface: self.tunnel.clone(),
