@@ -1102,6 +1102,9 @@ impl Core {
         outbound: BoxStream,
         node: String,
     ) -> Result<()> {
+        // Record the domain behind a fake IP: paths that did not sniff still
+        // carry the fake address here, although the dial already restored it.
+        let target = self.restore_target(&target);
         let tracker = traffic::Tracker::new(self.clone(), target, node, "tcp")?;
         let cancel = tracker.cancel();
         let mut outbound = traffic::Stream {

@@ -761,3 +761,29 @@ fn url_test_switches_when_the_current_member_fails() {
         None
     );
 }
+
+#[tokio::test]
+async fn connections_show_the_domain_behind_a_fake_ip() {
+    let mut config = Config::default();
+    config.dns.enhanced_mode = "fake-ip".into();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let fake = core.resolver.fake_address("example.com", false).unwrap();
+    let target = Target::new(fake.to_string(), 443).unwrap();
+    let (inbound, _client) = tokio::io::duplex(64);
+    let (outbound, _server) = tokio::io::duplex(64);
+    let relay = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.relay_io(inbound, target, Box::new(outbound), "DIRECT".into())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let hosts: Vec<String> = core
+        .connections()
+        .into_iter()
+        .map(|c| c.metadata.host)
+        .collect();
+    assert_eq!(hosts, ["example.com"]);
+    relay.abort();
+}
