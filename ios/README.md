@@ -20,6 +20,9 @@ connected. It also provides:
   this device's tailnet name and addresses, home DERP region, UDP candidates and
   every peer's online state and path (direct with RTT, or relayed). Proxies
   outside every group appear under "其他节点".
+- **Connections** (概览 → 连接): open connections with target (the domain
+  behind a fake IP), protocol, proxy chain, traffic and age; search, swipe to
+  close one, or close all.
 - **Logs** (日志): app, tunnel and core logs from the shared App Group file, with
   share and clear actions; credentials are redacted.
 

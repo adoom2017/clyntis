@@ -555,6 +555,23 @@ pub unsafe extern "C" fn meta_select_v1(
         Ok(OK)
     })
 }
+/// Close the connection `id` from the snapshot's `connections`; unknown or
+/// finished ids are ignored. `meta_close_connections_v1` closes all of them.
+///
+/// # Safety
+/// `id` must be readable UTF-8 for `id_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_close_connection_v1(
+    handle_id: u64,
+    id: *const u8,
+    id_len: usize,
+) -> i32 {
+    boundary(|| {
+        let id = std::str::from_utf8(unsafe { input(id, id_len)? })?;
+        handle(handle_id)?.core.close_connection(id);
+        Ok(OK)
+    })
+}
 /// Measures the delay through proxy `name` (an HTTPS request to
 /// gstatic generate_204), waiting at most `timeout_ms`; writes milliseconds to
 /// `delay_ms`. Blocks: call it off the packet path. The result also appears in

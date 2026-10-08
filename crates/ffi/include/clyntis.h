@@ -116,6 +116,9 @@ int32_t meta_error_v1(uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_snapshot_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_update_v1(meta_handle handle, const uint8_t *json, size_t length);
 int32_t meta_select_v1(meta_handle handle, const uint8_t *group, size_t group_length, const uint8_t *node, size_t node_length);
+/* Close connection `id` from meta_snapshot_v1's "connections" (unknown or
+ * finished ids are ignored); meta_close_connections_v1 closes them all. */
+int32_t meta_close_connection_v1(meta_handle handle, const uint8_t *id, size_t id_length);
 /* Delay through proxy `name` (HTTPS to gstatic generate_204, at most
  * timeout_ms); writes milliseconds. Blocks the caller: never call it on the
  * packet path. The outcome also appears in meta_snapshot_v1's "proxies". */

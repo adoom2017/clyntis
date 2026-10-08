@@ -143,6 +143,18 @@ final class CoreSession {
         return delay
     }
 
+    /// Closes connection `id`, or every connection when `id` is nil.
+    func closeConnection(_ id: String?) throws {
+        guard let id else {
+            try Self.check(meta_close_connections_v1(handle))
+            return
+        }
+        let bytes = Data(id.utf8)
+        try Self.check(bytes.withUnsafeBytes {
+            meta_close_connection_v1(handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+        })
+    }
+
     func updateMode(_ mode: String) throws {
         guard ["rule", "global", "direct"].contains(mode) else { throw ClientError.message("无效的代理模式。") }
         let data = try JSONSerialization.data(withJSONObject: ["mode": mode])

@@ -639,3 +639,20 @@ fn resource_state_reports_missing_files_without_parsing_them() {
     assert_eq!(state(), 0);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn closing_connections_accepts_one_id_or_all() {
+    let config = b"mode: rule\n";
+    let mut id = 0;
+    assert_eq!(
+        unsafe { meta_create_v1(config.as_ptr(), config.len(), std::ptr::null(), &mut id) },
+        OK
+    );
+    assert_eq!(meta_close_connections_v1(id), OK);
+    let unknown = b"no-such-connection";
+    assert_eq!(
+        unsafe { meta_close_connection_v1(id, unknown.as_ptr(), unknown.len()) },
+        OK
+    );
+    assert_eq!(meta_destroy_v1(id), OK);
+}

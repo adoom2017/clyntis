@@ -21,6 +21,8 @@ final class AppModel {
     /// Proxies outside every group (for example a Tailscale node used only by rules).
     var ungrouped: [String] = []
     var nodeStatus: [String: NodeStatus] = [:]
+    /// Open connections from the core snapshot, newest first.
+    var connections: [ConnectionInfo] = []
     var probing: Set<String> = []
     /// Rules matched before every profile's own (see CustomRules).
     var customRules: [String] = []
@@ -84,7 +86,7 @@ final class AppModel {
                         }
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
-                            self.ungrouped = []; self.nodeStatus = [:]
+                            self.ungrouped = []; self.nodeStatus = [:]; self.connections = []
                         }
                     }
                 }
@@ -396,6 +398,13 @@ final class AppModel {
         catch { self.error = error.localizedDescription }
     }
 
+    /// Closes one connection, or all of them when `id` is nil.
+    func closeConnection(_ id: String?) async {
+        guard connected else { return }
+        do { try applySnapshot(await send(TunnelMessage(command: "close", id: id))) }
+        catch { self.error = error.localizedDescription }
+    }
+
     /// Tests the delay through `node`; the result lands in `nodeStatus`.
     func probe(_ node: String) async {
         guard connected, nodeStatus[node]?.type == "VLESS", !probing.contains(node) else { return }
@@ -450,6 +459,7 @@ final class AppModel {
         upload = (object["upload"] as? NSNumber)?.uint64Value ?? 0
         download = (object["download"] as? NSNumber)?.uint64Value ?? 0
         connectionCount = (object["connections"] as? [Any])?.count ?? 0
+        connections = ConnectionInfo.decode(object["connections"])
         if let config = object["config"] as? [String: Any] {
             mode = config["mode"] as? String ?? "rule"
             let selections = object["selections"] as? [String: String] ?? [:]

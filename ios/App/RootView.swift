@@ -62,7 +62,10 @@ private struct ConnectionView: View {
                     HStack(spacing: 12) {
                         TrafficStat(title: "上传", value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)))
                         TrafficStat(title: "下载", value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)))
-                        TrafficStat(title: "连接", value: "\(model.connectionCount)")
+                        NavigationLink { ConnectionsView(model: model) } label: {
+                            TrafficStat(title: "连接", value: "\(model.connectionCount)", disclosure: true)
+                        }
+                        .buttonStyle(.plain)
                     }
                     VStack(alignment: .leading, spacing: 10) {
                         Text("路由模式").font(.subheadline).foregroundStyle(.secondary)
@@ -86,9 +89,14 @@ private struct ConnectionView: View {
 private struct TrafficStat: View {
     let title: String
     let value: String
+    var disclosure = false
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 2) {
+                Text(title)
+                if disclosure { Image(systemName: "chevron.right").imageScale(.small) }
+            }
+            .font(.caption).foregroundStyle(.secondary)
             Text(value).font(.headline).monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)

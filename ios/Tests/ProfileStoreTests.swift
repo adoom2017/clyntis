@@ -134,6 +134,21 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertEqual(NodeStatus.decode(tailscale)["ts"]?.summary, "已连接 · 1 台在线 · 1 直连")
     }
 
+    func testConnectionsDecodeFromTheCoreSnapshotNewestFirst() throws {
+        let snapshot: [[String: Any]] = [
+            ["id": "a", "metadata": ["host": "www.google.com", "port": 443], "network": "tcp",
+             "chains": ["vless-vision"], "upload": 10, "download": 2048, "start": "100"],
+            ["id": "b", "metadata": ["host": "2001:db8::1", "port": 53], "network": "udp",
+             "chains": ["DIRECT"], "upload": 1, "download": 1, "start": "200"],
+        ]
+        let list = ConnectionInfo.decode(snapshot)
+        XCTAssertEqual(list.map(\.id), ["b", "a"])
+        XCTAssertEqual(list[1].target, "www.google.com:443")
+        XCTAssertEqual(list[0].target, "[2001:db8::1]:53")
+        XCTAssertEqual(list[0].started, Date(timeIntervalSince1970: 200))
+        XCTAssertTrue(ConnectionInfo.decode(nil).isEmpty)
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()

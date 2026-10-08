@@ -5,4 +5,6 @@ struct TunnelMessage: Codable {
     var mode: String?
     var group: String?
     var node: String?
+    /// A connection id for "close"; nil closes all.
+    var id: String?
 }
