@@ -79,6 +79,9 @@ impl NetMap {
                 if patch.online.is_some() {
                     peer.online = patch.online;
                 }
+                if let Some(endpoints) = patch.endpoints {
+                    peer.endpoints = endpoints;
+                }
             }
         }
         for (id, online) in map.online_change {
@@ -116,6 +119,12 @@ impl NetMap {
             let peer = Peer {
                 key: node.key,
                 region: node.derp_region(),
+                disco: node.disco_key,
+                endpoints: node
+                    .endpoints
+                    .iter()
+                    .filter_map(|e| e.parse().ok())
+                    .collect(),
             };
             peers.insert(node.key, peer.clone());
             for net in node.allowed() {
@@ -144,6 +153,8 @@ struct Inner {
     routes: watch::Sender<Routes>,
     ready: watch::Sender<Option<String>>,
     stack: netstack::Handle,
+    disco: Private,
+    endpoints: watch::Receiver<magic::Endpoints>,
 }
 
 /// A running Tailscale node. Dropping the last handle does not stop it;
@@ -172,12 +183,17 @@ impl Node {
             to_router,
             stop.clone(),
         ));
+        // One disco key for the node's lifetime: peers learn it from the map.
+        let disco = Private::generate();
+        let (endpoints, endpoints_rx) = watch::channel(Vec::new());
         tokio::spawn(magic::run(
             state.node.clone(),
+            disco.clone(),
             dialer.clone(),
             routes_rx,
             from_stack,
             to_stack,
+            endpoints,
             stop.clone(),
         ));
         let node = Self {
@@ -188,6 +204,8 @@ impl Node {
                 routes,
                 ready,
                 stack: netstack::Handle { commands },
+                disco,
+                endpoints: endpoints_rx,
             }),
         };
         let inner = node.inner.clone();
@@ -347,9 +365,9 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
         state.save(&options.state_path)?;
         tracing::info!(proxy = %options.name, "Tailscale node registered");
     }
-    // One disco key per session; peers see it but we never answer disco.
-    let disco = Private::generate().public().disco();
-    let request = |home: u32, stream: bool| MapRequest {
+    let disco = inner.disco.public().disco();
+    let mut endpoints = inner.endpoints.clone();
+    let request = |home: u32, stream: bool, endpoints: &magic::Endpoints| MapRequest {
         version: CAPABILITY_VERSION,
         compress: "zstd",
         keep_alive: true,
@@ -358,10 +376,12 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
         stream,
         hostinfo: hostinfo(options, home),
         omit_peers: !stream,
-        endpoints: vec![],
+        endpoints: endpoints.iter().map(|(addr, _)| addr.to_string()).collect(),
+        endpoint_types: endpoints.iter().map(|(_, kind)| *kind).collect(),
     };
     let mut home = state.home_derp;
-    let mut stream = match control.map(&request(home, true)).await {
+    let current = endpoints.borrow_and_update().clone();
+    let mut stream = match control.map(&request(home, true, &current)).await {
         Ok(stream) => stream,
         // The node key is unknown or expired (an ephemeral node removed while
         // offline, a key expiry): log in again with the auth key.
@@ -373,7 +393,22 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
         Err(error) => return Err(error),
     };
     let mut announced = false;
-    while let Some(map) = stream.next().await? {
+    loop {
+        let map = tokio::select! {
+            map = stream.next() => match map? {
+                Some(map) => map,
+                None => break,
+            },
+            // New UDP candidates: tell control so peers can try direct paths.
+            changed = endpoints.changed() => {
+                if changed.is_ok() {
+                    let current = endpoints.borrow_and_update().clone();
+                    let mut update = control.map(&request(home, false, &current)).await?;
+                    let _ = tokio::time::timeout(Duration::from_secs(10), update.next()).await;
+                }
+                continue;
+            }
+        };
         if map.keep_alive
             && map.node.is_none()
             && map.peers.is_none()
@@ -406,7 +441,8 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
                 state.home_derp = chosen;
                 let _ = state.save(&options.state_path);
             }
-            let mut update = control.map(&request(home, false)).await?;
+            let current = endpoints.borrow().clone();
+            let mut update = control.map(&request(home, false, &current)).await?;
             let _ = tokio::time::timeout(Duration::from_secs(10), update.next()).await;
         }
         let routes = Routes { home, ..routes };

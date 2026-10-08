@@ -13,8 +13,10 @@ replacement for every protocol or configuration option.
 - **Tailscale outbound** (`type: tailscale`, mihomo's fields plus
   `dialer-proxy`): a userspace Tailscale node in Rust that joins a tailnet with
   an auth key and reaches peers, accepted subnet routes or an exit node over
-  WireGuard. TCP only, relayed through DERP (no direct NAT traversal yet);
-  MagicDNS names resolve to tailnet addresses. Example:
+  WireGuard. TCP only. Direct UDP paths are found with disco pings and STUN
+  (LAN and public candidates, call-me-maybe hole punching) and kept alive by
+  heartbeats; without one, packets are relayed through DERP. MagicDNS names
+  resolve to tailnet addresses. Example:
 
   ```yaml
   proxies:

@@ -77,9 +77,14 @@ pub struct MapRequest {
     pub stream: bool,
     pub hostinfo: Hostinfo,
     pub omit_peers: bool,
-    /// Without direct paths there are no endpoints; peers reach us through DERP.
+    /// Our UDP candidates ("ip:port") for direct paths, with their kinds.
     pub endpoints: Vec<String>,
+    pub endpoint_types: Vec<u8>,
 }
+
+/// tailcfg.EndpointType values for the candidates we report.
+pub const ENDPOINT_LOCAL: u8 = 1;
+pub const ENDPOINT_STUN: u8 = 2;
 
 #[derive(Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "PascalCase", default)]
@@ -94,6 +99,8 @@ pub struct Node {
     #[serde(rename = "AllowedIPs")]
     pub allowed_ips: Option<Vec<ipnet::IpNet>>,
     pub primary_routes: Vec<ipnet::IpNet>,
+    /// UDP candidates for direct paths.
+    pub endpoints: Vec<String>,
     #[serde(rename = "HomeDERP")]
     pub home_derp: u32,
     /// Legacy home DERP as "127.3.3.40:<region>".
@@ -135,6 +142,7 @@ pub struct PeerChange {
     pub key: Option<Public>,
     pub disco_key: Option<Public>,
     pub online: Option<bool>,
+    pub endpoints: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -163,6 +171,9 @@ pub struct DerpNode {
     pub ipv4: String,
     #[serde(rename = "DERPPort")]
     pub derp_port: u16,
+    /// 0 means 3478; negative disables STUN on this node.
+    #[serde(rename = "STUNPort")]
+    pub stun_port: i32,
     #[serde(rename = "STUNOnly")]
     pub stun_only: bool,
 }

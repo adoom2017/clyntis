@@ -35,6 +35,12 @@ impl Dialer for Plain {
             )
             .await
     }
+    async fn bind_udp(&self) -> anyhow::Result<tokio::net::UdpSocket> {
+        Ok(tokio::net::UdpSocket::bind("0.0.0.0:0").await?)
+    }
+    async fn local_ipv4(&self) -> Option<std::net::IpAddr> {
+        None
+    }
     async fn resolve(&self, host: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
         Ok(tokio::net::lookup_host((host, 0))
             .await?

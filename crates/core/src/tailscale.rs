@@ -14,6 +14,9 @@ use std::{
     sync::{Arc, Weak},
 };
 
+/// Any public address: only used to pick the egress, never contacted.
+const PROBE: &str = "1.1.1.1:3478";
+
 struct CoreDialer {
     core: Weak<Core>,
     via: Option<String>,
@@ -49,6 +52,25 @@ impl meta_tailscale::Dialer for CoreDialer {
                 },
             )
             .await
+    }
+    async fn bind_udp(&self) -> Result<tokio::net::UdpSocket> {
+        let core = self.core.upgrade().context("proxy core stopped")?;
+        // Bound like the core's own UDP: outside the TUN, on the physical exit.
+        meta_platform::udp_bind_for("0.0.0.0:0".parse()?, Some(PROBE.parse()?), &*core.hooks)
+    }
+    async fn local_ipv4(&self) -> Option<IpAddr> {
+        let core = self.core.upgrade()?;
+        let socket = meta_platform::udp_bind_for(
+            "0.0.0.0:0".parse().ok()?,
+            PROBE.parse().ok(),
+            &*core.hooks,
+        )
+        .ok()?;
+        // Connecting a UDP socket sends nothing; it only selects the source.
+        socket.connect(PROBE).await.ok()?;
+        let ip = socket.local_addr().ok()?.ip();
+        let tun = "198.18.0.0/15".parse::<ipnet::IpNet>().ok()?;
+        (!ip.is_loopback() && !ip.is_unspecified() && !tun.contains(&ip)).then_some(ip)
     }
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
         let core = self.core.upgrade().context("proxy core stopped")?;

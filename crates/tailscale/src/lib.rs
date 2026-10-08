@@ -3,6 +3,7 @@
 //! No NAT traversal yet: every peer is reached through its home DERP region.
 pub mod control;
 pub mod derp;
+pub mod disco;
 mod http1;
 pub mod key;
 mod magic;
@@ -28,4 +29,9 @@ pub trait Dialer: Send + Sync + 'static {
     async fn connect_tls(&self, host: &str, port: u16) -> Result<BoxStream>;
     /// Addresses for a destination sent through an exit node.
     async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>>;
+    /// An IPv4 UDP socket on the physical egress, for direct peer paths.
+    async fn bind_udp(&self) -> Result<tokio::net::UdpSocket>;
+    /// This device's LAN address, advertised so peers on the same network
+    /// connect locally.
+    async fn local_ipv4(&self) -> Option<IpAddr>;
 }
