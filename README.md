@@ -8,27 +8,21 @@ replacement for every protocol or configuration option.
 
 - **Inbound:** HTTP/CONNECT, SOCKS5 and mixed proxy listeners; optional DNS
   listener and desktop TUN. HTTP/SOCKS authentication is supported.
-- **Outbound:** DIRECT, REJECT and VLESS over TCP, WebSocket or gRPC, including
-  TLS, REALITY, XTLS Vision and UDP/XUDP. BoringSSL is the TLS backend.
-- **Tailscale outbound** (`type: tailscale`, mihomo's fields plus
-  `dialer-proxy`): a userspace Tailscale node in Rust that joins a tailnet with
-  an auth key and reaches peers, accepted subnet routes or an exit node over
-  WireGuard. TCP only. Direct UDP paths are found with disco pings and STUN
-  (LAN and public candidates, call-me-maybe hole punching) and kept alive by
-  heartbeats; without one, packets are relayed through DERP. MagicDNS names
-  resolve to tailnet addresses. Example:
-
-  ```yaml
-  proxies:
-    - {name: Tailscale, type: tailscale, auth-key: tskey-auth-..., hostname: my-mac}
-  rules:
-    - IP-CIDR,100.64.0.0/10,Tailscale,no-resolve
-    - DOMAIN-SUFFIX,ts.net,Tailscale
-  ```
+- **Outbound:** DIRECT, REJECT, VLESS and Tailscale. VLESS runs over TCP,
+  WebSocket or gRPC, including TLS, REALITY, XTLS Vision and UDP/XUDP.
+  BoringSSL is the TLS backend. Tailscale is described [below](#tailscale-outbound).
 - **Routing:** rule/global/direct modes, select and url-test groups, domain/IP
-  rules, GeoIP/GeoSite and rule providers.
+  rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
+  profile (see `meta_config::custom`); a rule whose target or rule provider the
+  profile lacks is skipped with a reason instead of failing the profile.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
-  redir-host modes.
+  redir-host modes. Real lookups also resolve Tailscale MagicDNS names; fake-IP
+  answers keep the domain so domain rules still apply.
+- **Status:** per-proxy status for the apps and the controller (`/proxies`
+  carries a `status` object): VLESS server, transport and security; the last
+  delay test with its error and time; open connections; and, for Tailscale, the
+  login state, this node's name and addresses, the home DERP region, UDP
+  candidates and each peer's online state and path (direct with RTT, or DERP).
 - **Desktop and host integration:** Windows Wintun, macOS utun and Linux TUN;
   route recovery after an interrupted session; a reduced local controller with
   configuration, proxy selection, connections, traffic and logs; and a C ABI for
@@ -37,8 +31,51 @@ replacement for every protocol or configuration option.
 Trojan and Hysteria2 entries can be parsed for configuration compatibility, but
 their outbound protocols are **not implemented**: selecting one fails instead of
 silently using another proxy. Unknown or unsupported configuration fields fail
-validation. `--vless-only` removes unavailable outbounds and replaces dangling
-references with REJECT, not DIRECT.
+validation. `--vless-only` keeps the implemented outbounds (VLESS and Tailscale),
+removes the others and replaces dangling references with REJECT, not DIRECT.
+
+### Tailscale outbound
+
+A `type: tailscale` proxy runs a userspace Tailscale node written in Rust (no Go
+`tsnet`): it joins a tailnet through the control server and carries TCP
+connections to peers over WireGuard. Rules route to it like any proxy:
+
+```yaml
+proxies:
+  - name: Tailscale
+    type: tailscale
+    auth-key: tskey-auth-...      # required for the first login
+    hostname: my-mac              # optional; default clyntis-<os>
+    ephemeral: false              # optional
+    accept-routes: true           # optional: use peers' advertised subnet routes
+    exit-node: us-exit            # optional: node name or 100.x address
+    control-url: https://...      # optional: Headscale or another control server
+    state-dir: tailscale/home     # optional: relative to the configuration directory
+    dialer-proxy: Proxy           # optional: carry control and DERP through this proxy/group
+rules:
+  - IP-CIDR,100.64.0.0/10,Tailscale,no-resolve
+  - DOMAIN-SUFFIX,ts.net,Tailscale
+```
+
+- Fields follow mihomo's; `exit-node-allow-lan-access` is accepted for
+  compatibility and has no effect in a proxy. `dialer-proxy` is an addition.
+- Control: the ts2021 Noise transport (HTTP upgrade, then HTTP/2) registers the
+  node with the auth key and streams the network map. Machine and node keys
+  persist in `state-dir` (default `tailscale/<proxy name>/state.json`, mode
+  0600), so later starts do not log in again. `state-dir` must stay inside the
+  configuration directory.
+- Paths: disco pings and STUN (with Tailscale's required attributes) find direct
+  UDP paths using LAN and public candidates and call-me-maybe hole punching; a
+  path is trusted for 6.5 s after a pong and kept alive by 3 s heartbeats while
+  in use. Without one, WireGuard is relayed through each peer's home DERP region.
+  The home region is the fastest by TLS handshake. On the desktop the UDP socket
+  is bound to the physical egress, outside the TUN.
+- Destinations: peers' tailnet addresses, MagicDNS names (full or short), subnet
+  routes with `accept-routes`, and anything else through `exit-node`.
+- Limits: TCP only (UDP through Tailscale is not supported yet); login with an
+  auth key only (an interactive login URL is logged but not awaited); node-key
+  expiry is not renewed automatically; no peer relays, port mapping or
+  Tailscale SSH/Funnel/Serve.
 
 ## Requirements
 
@@ -59,7 +96,13 @@ README for development, privileged helper installation and desktop packaging.
 The native iOS/iPadOS client lives in [`ios/`](ios/README.md). It uses SwiftUI and
 a Network Extension packet tunnel with the Rust C API. See its README for
 Apple Silicon builds, simulator checks, device signing and current limitations.
-The commands below continue to build and test the CLI/core workspace only.
+
+Both apps share the core's merge logic for two layers over the selected
+profile: custom rules, matched before the profile's own, and settings that
+override the profile (log level, IPv6 and domain sniffing; unset values follow
+the profile). Both show the per-node status described above, with delay tests
+for VLESS nodes. The commands below continue to build and test the CLI/core
+workspace only.
 
 From the repository root:
 
@@ -144,11 +187,18 @@ physical exits against `example.com:443` and configured proxy endpoints before
 and after installing routes, including when there is only one candidate,
 and reopens the TUN on a different exit when
 needed. Use `--test-egress` to run only the probe without TUN, or set
-`tun.auto-detect-interface` to keep probing exits every 15 seconds while running;
-an exit change updates routes and socket bindings, closes old sessions, and
-rebinds automatic DNS when the local IPv4 address changes. Use
-`tun.interface` to select an interface explicitly. `tun.auto-dns` defaults to `false`,
-preserving the system's existing DNS services. Literal public DNS upstreams
+`tun.auto-detect-interface` to keep probing exits every 15 seconds while running.
+Exits are ranked by internet reachability, then proxies reached, then a wired
+link over Wi-Fi; the current exit is kept unless another ranks higher, so one
+lost probe does not switch interfaces. An exit change updates routes and socket
+bindings, closes old sessions, and rebinds automatic DNS when the local IPv4
+address changes; a brief loss of the IPv4 exit (sleep, Wi-Fi roaming) keeps the
+TUN running and retries DNS until the network returns. Use `tun.interface` to
+select an interface explicitly. With `ipv6: true`, IPv6 is captured only while a
+physical interface has an IPv6 exit, so apps do not dial IPv6 the core cannot
+reach. `tun.auto-dns` defaults to `false` in the core, preserving the system's
+existing DNS services; the desktop app turns it on in TUN mode unless disabled
+in its settings. Literal public DNS upstreams
 receive physical host routes so the proxy's own DNS queries avoid the TUN.
 Setting `tun.auto-dns: true` when TUN, auto-route and the DNS listener are
 enabled, or passing `--auto-dns` on macOS for a single run, listens on port 53
@@ -228,7 +278,14 @@ repository.
 On Windows, run `cargo fetch --locked` followed by
 `pwsh -File scripts/package-release.ps1`. These scripts do not publish artifacts.
 The package contains the CLI, examples, licenses, C libraries and
-`crates/ffi/include/clyntis.h`. For a separate host-library build, use
+`crates/ffi/include/clyntis.h`. Besides creating, starting and driving a core
+(`meta_create_v1`, `meta_create_packet_tunnel_v1`, `meta_snapshot_v1`,
+`meta_select_v1`, `meta_probe_v1`, packet I/O), the C API validates and merges
+custom rules (`meta_custom_rule_*`, `meta_custom_rules_apply_v1`), applies app
+settings (`meta_overrides_apply_v1`), checks and prefetches routing resources
+(`meta_resources_state_v1`, `meta_prefetch_resources_v1`) and drains logs
+(`meta_drain_logs_v1`); every function documents its buffer contract in the
+header. For a separate host-library build, use
 `cargo build -p meta-ffi --release --locked`; mobile target builds use the
 `scripts/check-mobile.sh` or `scripts/check-mobile.ps1` helpers with the relevant
 SDK/NDK installed.
