@@ -396,6 +396,7 @@ pub fn runtime_yaml(
     let yaml = meta_config::custom::apply(&profile.yaml, custom)?.yaml;
     let mut document: Value = serde_yaml::from_str(&yaml)?;
     let map = document.as_mapping_mut().context("配置必须是 YAML 对象")?;
+    settings.overrides.apply_to(map)?;
     for (key, value) in [
         ("port", Value::from(0)),
         ("socks-port", Value::from(0)),
@@ -594,6 +595,26 @@ mod tests {
         let yaml = runtime_yaml(&profile, &Settings::default(), &"s".repeat(32), &rules).unwrap();
         let config = validate(&yaml).unwrap();
         assert_eq!(config.rules, ["DOMAIN,a.test,REJECT", "MATCH,DIRECT"]);
+    }
+    #[test]
+    fn app_settings_override_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        let mut profile = store
+            .create("test".into(), YAML.into(), None, None)
+            .unwrap();
+        profile.yaml = format!("log-level: debug\nipv6: false\n{YAML}");
+        let mut settings = Settings::default();
+        let follow = runtime_yaml(&profile, &settings, &"s".repeat(32), &[]).unwrap();
+        assert_eq!(validate(&follow).unwrap().log.log_level, "debug");
+        settings.overrides.log_level = Some("info".into());
+        settings.overrides.ipv6 = Some(true);
+        let config =
+            validate(&runtime_yaml(&profile, &settings, &"s".repeat(32), &[]).unwrap()).unwrap();
+        assert_eq!(config.log.log_level, "info");
+        assert!(config.ipv6 && config.dns.ipv6);
+        settings.overrides.log_level = Some("loud".into());
+        assert!(settings.validate().is_err());
     }
     #[test]
     fn invalid_save_preserves_previous_profile() {

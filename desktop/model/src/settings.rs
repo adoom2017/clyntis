@@ -22,6 +22,8 @@ pub struct Settings {
     pub launch_at_login: bool,
     pub auto_connect: bool,
     pub subscription_interval_hours: u16,
+    /// Values chosen here replace the profile's own (log level, IPv6, sniffing).
+    pub overrides: meta_config::overrides::Overrides,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -35,6 +37,7 @@ impl Default for Settings {
             launch_at_login: false,
             auto_connect: false,
             subscription_interval_hours: 24,
+            overrides: Default::default(),
         }
     }
 }
@@ -55,7 +58,7 @@ impl Settings {
                 .is_none_or(|s| s.len() <= 64 && !s.contains('\0')),
             "无效网络接口"
         );
-        Ok(())
+        self.overrides.validate()
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod compat;
 pub mod crypto;
 pub mod custom;
+pub mod overrides;
 pub use compat::*;
 pub mod rule;
 

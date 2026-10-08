@@ -572,3 +572,43 @@ fn custom_rules_validate_list_targets_and_apply() {
     assert_eq!(merged.rules, ["DOMAIN,ads.test,REJECT", "MATCH,Auto"]);
     assert_eq!(applied["skipped"][0]["rule"], "DOMAIN,x.test,Gone");
 }
+
+#[test]
+fn overrides_replace_profile_settings() {
+    let config = b"log-level: debug\nipv6: false\nmode: rule\n";
+    let overrides = br#"{"logLevel":"error","ipv6":true}"#;
+    let mut buffer = vec![0u8; 4096];
+    let mut length = 0;
+    assert_eq!(
+        unsafe {
+            meta_overrides_apply_v1(
+                config.as_ptr(),
+                config.len(),
+                overrides.as_ptr(),
+                overrides.len(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    let merged = meta_config::Config::parse(&buffer[..length]).unwrap();
+    assert_eq!(merged.log.log_level, "error");
+    assert!(merged.ipv6);
+    let invalid = br#"{"logLevel":"loud"}"#;
+    assert_ne!(
+        unsafe {
+            meta_overrides_apply_v1(
+                config.as_ptr(),
+                config.len(),
+                invalid.as_ptr(),
+                invalid.len(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+}

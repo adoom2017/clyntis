@@ -17,6 +17,14 @@ export interface Settings {
   launchAtLogin: boolean;
   autoConnect: boolean;
   subscriptionIntervalHours: number;
+  overrides: Overrides;
+}
+export type LogLevel = "debug" | "info" | "warning" | "error" | "silent";
+/** Replaces the profile's value when set; absent keeps the profile's own. */
+export interface Overrides {
+  logLevel?: LogLevel | null;
+  ipv6?: boolean | null;
+  sniffing?: boolean | null;
 }
 export interface ProfileSummary {
   id: string;
@@ -128,6 +136,7 @@ export const initial: Snapshot = {
     launchAtLogin: false,
     autoConnect: false,
     subscriptionIntervalHours: 24,
+    overrides: {},
   },
 };
 export const statusText: Record<Status, string> = {

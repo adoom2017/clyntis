@@ -23,6 +23,7 @@
 		6595D1D8F7B59AEBBCFAA8D8 /* RemoteConfigImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EF5B7AE790C96FE38085975 /* RemoteConfigImporter.swift */; };
 		6F3758ECF7571F9668C938E4 /* TunnelMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B4B2639FDBCD0D9EC6D5121 /* TunnelMessage.swift */; };
 		8110D1AB67EEF33506E470AC /* CustomRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = 600592D7EE14E85760521851 /* CustomRules.swift */; };
+		BEFCD00D1ED2EB6A8E73AC4A /* AppOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8F48AFF9553F17B1FAD40F0 /* AppOverrides.swift */; };
 		82F9DA0BAAE9E54C95C4298A /* ClyntisCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7EBCE9855260D3674DF1C422 /* ClyntisCore.xcframework */; };
 		88087D6A84402E55DC933636 /* ClyntisCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7EBCE9855260D3674DF1C422 /* ClyntisCore.xcframework */; };
 		89B71378DBDB49CFFE4463E6 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51B7F9DA68DB1DC03B419874 /* NetworkExtension.framework */; };
@@ -33,7 +34,9 @@
 		ABA428DDF3F711DFCD4A60A8 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51B7F9DA68DB1DC03B419874 /* NetworkExtension.framework */; };
 		AFB0F6E8A4EE802DA97A373A /* LogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D53C30959E430B69A3A758F0 /* LogView.swift */; };
 		CC0E434388291FE1403E20ED /* CustomRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = 600592D7EE14E85760521851 /* CustomRules.swift */; };
+		56F4EE5EBD6258D362F3BCEE /* AppOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8F48AFF9553F17B1FAD40F0 /* AppOverrides.swift */; };
 		CE39C2445F5237173DD003B0 /* RulesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAD28DC61A12504BD9B81416 /* RulesView.swift */; };
+		E3641EBCBCFFE018A2219B6D /* OverridesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24DC4166967C5B62BCC03C91 /* OverridesView.swift */; };
 		D20BFB9B6D5AE28CF35011C7 /* PacketTunnelProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B6DD8AA26D8E3F4058D9D9C /* PacketTunnelProvider.swift */; };
 		E06208BA706DCD951ED3081E /* RemoteImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4409D215D0A78072B9C08F80 /* RemoteImportView.swift */; };
 		E1AFE22AD51DE44F16F2FBFB /* LogFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4CFA8CA230BCAFD5DF0AA60 /* LogFile.swift */; };
@@ -84,6 +87,7 @@
 		51B7F9DA68DB1DC03B419874 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		52D3D68422415E8BCBCE97E2 /* ClyntisApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClyntisApp.swift; sourceTree = "<group>"; };
 		600592D7EE14E85760521851 /* CustomRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomRules.swift; sourceTree = "<group>"; };
+		C8F48AFF9553F17B1FAD40F0 /* AppOverrides.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppOverrides.swift; sourceTree = "<group>"; };
 		62DC05775423F8BC051EDCE0 /* Clyntis.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Clyntis.entitlements; sourceTree = "<group>"; };
 		6B6DD8AA26D8E3F4058D9D9C /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		780FEACDBDC48C7EA90A5065 /* ProfileStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileStore.swift; sourceTree = "<group>"; };
@@ -98,6 +102,7 @@
 		B8B80015583796068121DB40 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		B9B50CF2014E240A4478F055 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		CAD28DC61A12504BD9B81416 /* RulesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RulesView.swift; sourceTree = "<group>"; };
+		24DC4166967C5B62BCC03C91 /* OverridesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverridesView.swift; sourceTree = "<group>"; };
 		D05A537A88901961F3530892 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		D53C30959E430B69A3A758F0 /* LogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogView.swift; sourceTree = "<group>"; };
 		DC3C90397AC4E4D034C0E577 /* ProfileDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDetailView.swift; sourceTree = "<group>"; };
@@ -153,6 +158,7 @@
 				4409D215D0A78072B9C08F80 /* RemoteImportView.swift */,
 				D05A537A88901961F3530892 /* RootView.swift */,
 				CAD28DC61A12504BD9B81416 /* RulesView.swift */,
+				24DC4166967C5B62BCC03C91 /* OverridesView.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -184,6 +190,7 @@
 			children = (
 				85C0453CF264DA14FB00CEC0 /* CoreSession.swift */,
 				600592D7EE14E85760521851 /* CustomRules.swift */,
+				C8F48AFF9553F17B1FAD40F0 /* AppOverrides.swift */,
 				08C48B38E9CA87387BC36EAC /* Diagnostics.swift */,
 				A4CFA8CA230BCAFD5DF0AA60 /* LogFile.swift */,
 				780FEACDBDC48C7EA90A5065 /* ProfileStore.swift */,
@@ -334,6 +341,7 @@
 			files = (
 				257A1AA8013F7B9FCA085EDC /* CoreSession.swift in Sources */,
 				CC0E434388291FE1403E20ED /* CustomRules.swift in Sources */,
+				56F4EE5EBD6258D362F3BCEE /* AppOverrides.swift in Sources */,
 				9D907A2DF84666270D23F778 /* Diagnostics.swift in Sources */,
 				E1AFE22AD51DE44F16F2FBFB /* LogFile.swift in Sources */,
 				D20BFB9B6D5AE28CF35011C7 /* PacketTunnelProvider.swift in Sources */,
@@ -352,6 +360,7 @@
 				E2CAD0490779F962B383B8A9 /* ConfigPasswordView.swift in Sources */,
 				62FE4B2352CD402A466015B3 /* CoreSession.swift in Sources */,
 				8110D1AB67EEF33506E470AC /* CustomRules.swift in Sources */,
+				BEFCD00D1ED2EB6A8E73AC4A /* AppOverrides.swift in Sources */,
 				3ADFC46836317B25A2D7E9F3 /* Diagnostics.swift in Sources */,
 				08F02BD4E7230F4A8BB2B37A /* LogFile.swift in Sources */,
 				AFB0F6E8A4EE802DA97A373A /* LogView.swift in Sources */,
@@ -361,6 +370,7 @@
 				E06208BA706DCD951ED3081E /* RemoteImportView.swift in Sources */,
 				A75F93E0C7BA4D03A76A0E87 /* RootView.swift in Sources */,
 				CE39C2445F5237173DD003B0 /* RulesView.swift in Sources */,
+				E3641EBCBCFFE018A2219B6D /* OverridesView.swift in Sources */,
 				32AD2774235232663A36C194 /* TunnelMessage.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

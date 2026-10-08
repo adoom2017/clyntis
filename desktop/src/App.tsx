@@ -61,6 +61,8 @@ import {
   type ProfileSummary,
   type Proxy,
   type Settings,
+  type LogLevel,
+  type Overrides,
   type CustomRules,
   ruleTypes,
   splitRule,
@@ -1870,6 +1872,27 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
     </>
   );
 }
+function OverrideSwitch({
+  value,
+  onChange,
+}: {
+  value: boolean | null | undefined;
+  onChange: (value: boolean | null) => void;
+}) {
+  return (
+    <select
+      value={value == null ? "" : String(value)}
+      onChange={(e) =>
+        onChange(e.target.value === "" ? null : e.target.value === "true")
+      }
+    >
+      <option value="">跟随配置文件</option>
+      <option value="true">开启</option>
+      <option value="false">关闭</option>
+    </select>
+  );
+}
+
 function SettingsPage({
   state,
   busy,
@@ -1893,13 +1916,15 @@ function SettingsPage({
     setSettings((local) => {
       const merged = { ...local };
       for (const key of Object.keys(next) as (keyof Settings)[])
-        if (local[key] === previous[key])
+        if (JSON.stringify(local[key]) === JSON.stringify(previous[key]))
           (merged as Record<keyof Settings, unknown>)[key] = next[key];
       return merged;
     });
   }, [persistedSettings]);
   const update = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setSettings((s) => ({ ...s, [key]: value }));
+  const override = <K extends keyof Overrides>(key: K, value: Overrides[K]) =>
+    setSettings((s) => ({ ...s, overrides: { ...s.overrides, [key]: value } }));
   const dirty = JSON.stringify(settings) !== JSON.stringify(state.settings);
   return (
     <>
@@ -1945,6 +1970,38 @@ function SettingsPage({
             value={settings.tunInterface ?? ""}
             placeholder="自动"
             onChange={(e) => update("tunInterface", e.target.value || null)}
+          />
+        </Setting>
+      </section>
+      <h3 className="settings-heading">覆盖配置文件</h3>
+      <section className="panel settings-section">
+        <Setting label="日志级别" text="debug 日志多，平时用 info">
+          <select
+            value={settings.overrides.logLevel ?? ""}
+            onChange={(e) =>
+              override("logLevel", (e.target.value || null) as LogLevel | null)
+            }
+          >
+            <option value="">跟随配置文件</option>
+            {(["debug", "info", "warning", "error", "silent"] as const).map(
+              (level) => (
+                <option key={level} value={level}>
+                  {level}
+                </option>
+              ),
+            )}
+          </select>
+        </Setting>
+        <Setting label="IPv6">
+          <OverrideSwitch
+            value={settings.overrides.ipv6}
+            onChange={(v) => override("ipv6", v)}
+          />
+        </Setting>
+        <Setting label="域名嗅探" text="从 TLS / HTTP 识别域名">
+          <OverrideSwitch
+            value={settings.overrides.sniffing}
+            onChange={(v) => override("sniffing", v)}
           />
         </Setting>
       </section>

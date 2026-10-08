@@ -68,6 +68,13 @@ int32_t meta_custom_rule_targets_v1(const uint8_t *config, size_t length,
 int32_t meta_custom_rules_apply_v1(const uint8_t *config, size_t length,
     const uint8_t *rules, size_t rules_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* App settings over a profile. overrides is JSON {"logLevel":"debug|info|
+ * warning|error|silent","ipv6":bool,"sniffing":bool}, every key optional;
+ * absent keys keep the profile's value. Writes the resulting YAML; follows the
+ * caller-buffer/size-query contract. */
+int32_t meta_overrides_apply_v1(const uint8_t *config, size_t length,
+    const uint8_t *overrides, size_t overrides_length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 /* Drain buffered core logs (all cores in this process) as newline-separated
  * JSON objects {"time":unix_seconds,"type":"info|warning|error|debug",
  * "payload":"..."}. Lines are removed only when they fit; otherwise

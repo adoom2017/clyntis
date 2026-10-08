@@ -20,6 +20,8 @@ final class AppModel {
     var groups: [ProxyGroup] = []
     /// Rules matched before every profile's own (see CustomRules).
     var customRules: [String] = []
+    /// App settings that replace the profile's values (see AppOverrides).
+    var overrides = AppOverrides()
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
     private var store: ProfileStore?
@@ -41,6 +43,7 @@ final class AppModel {
     func load() async {
         guard store == nil else { return }
         customRules = CustomRules.load()
+        overrides = AppOverrides.load()
         do {
             let store = try ProfileStore.shared()
             self.store = store
@@ -105,8 +108,10 @@ final class AppModel {
         log.info("connect: begin profile=\(selected.id.uuidString) tunnel=\(self.tunnelIdentifier) existingManager=\(self.manager != nil)")
         var step = "read configuration"
         do {
-            // Validate and prefetch what the tunnel will run: the profile with custom rules.
-            let (bytes, skipped) = try CustomRules.applied(to: store.configuration(for: selected.id))
+            // Validate and prefetch what the tunnel will run: the profile with
+            // custom rules and app settings.
+            let (withRules, skipped) = try CustomRules.applied(to: store.configuration(for: selected.id))
+            let bytes = try overrides.applied(to: withRules)
             if !skipped.isEmpty { log.warning("connect: \(skipped.count) custom rule(s) skipped for this profile") }
             step = "validate configuration"
             log.info("connect: \(step) (\(bytes.count) bytes)")
@@ -249,6 +254,12 @@ final class AppModel {
         try CustomRules.save(rules)
         customRules = CustomRules.load()
         Diagnostics.app.info("custom rules saved (\(customRules.count))")
+    }
+
+    func saveOverrides(_ value: AppOverrides) throws {
+        try value.save()
+        overrides = AppOverrides.load()
+        Diagnostics.app.info("app settings saved")
     }
 
     /// Targets offered by the selected profile; DIRECT and REJECT without one.

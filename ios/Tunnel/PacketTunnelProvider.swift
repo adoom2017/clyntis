@@ -38,10 +38,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     provider.queue.async { provider.drainPackets() }
                 }
                 step = "apply custom rules"
-                let (configuration, skipped) = try CustomRules.applied(to: store.configuration(for: id))
+                let (withRules, skipped) = try CustomRules.applied(to: store.configuration(for: id))
                 if !skipped.isEmpty {
                     log.warning("start: \(skipped.count) custom rule(s) not usable with this profile: "
                                 + skipped.map { "\($0.rule) (\($0.reason))" }.joined(separator: "; "))
+                }
+                step = "apply app settings"
+                let overrides = AppOverrides.load()
+                let configuration = try overrides.applied(to: withRules)
+                if !overrides.isEmpty {
+                    log.info("start: app settings override the profile: log=\(overrides.logLevel ?? "profile") "
+                             + "ipv6=\(overrides.ipv6.map(String.init) ?? "profile") sniffing=\(overrides.sniffing.map(String.init) ?? "profile")")
                 }
                 step = "create core"
                 self.core = try CoreSession(configuration: configuration,

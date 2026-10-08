@@ -249,6 +249,31 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
     })
 }
 
+/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing"}`, each
+/// optional) over `config`. Writes the resulting YAML; unset values keep the
+/// profile's own.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_overrides_apply_v1(
+    config: *const u8,
+    len: usize,
+    overrides: *const u8,
+    overrides_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let overrides: meta_config::overrides::Overrides =
+            serde_json::from_slice(unsafe { input(overrides, overrides_len)? })?;
+        let yaml = overrides.apply(yaml)?;
+        unsafe { output(yaml.as_bytes(), buffer, capacity, length) }
+    })
+}
+
 /// Move buffered core log lines into `buffer` as newline-separated JSON objects
 /// (`time` in Unix seconds, `type` debug/info/warning/error, `payload`). Lines
 /// are removed only when they fit; otherwise `length` reports the size needed.

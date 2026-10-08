@@ -94,6 +94,21 @@ final class ProfileStoreTests: XCTestCase {
         }
     }
 
+    func testAppSettingsOverrideTheProfileInTheTunnel() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let profile = Data("ipv6: false\nlog-level: debug\nrules: ['MATCH,DIRECT']\n".utf8)
+        XCTAssertEqual(try AppOverrides().applied(to: profile), profile)
+        let overrides = AppOverrides(logLevel: "warning", ipv6: true, sniffing: nil)
+        let session = try CoreSession(configuration: try overrides.applied(to: profile), directory: root)
+        defer { session.close() }
+        XCTAssertTrue(try session.enablesIPv6())
+        let state = try JSONSerialization.jsonObject(with: session.snapshot()) as? [String: Any]
+        XCTAssertEqual((state?["config"] as? [String: Any])?["log-level"] as? String, "warning")
+        XCTAssertThrowsError(try AppOverrides(logLevel: "loud").applied(to: profile))
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()

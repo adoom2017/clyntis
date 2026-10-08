@@ -115,8 +115,17 @@ private struct ProfilesView: View {
                             Label("自定义规则", systemImage: "list.bullet.indent")
                         }
                     }
+                    NavigationLink {
+                        OverridesView(model: model)
+                    } label: {
+                        LabeledContent {
+                            Text(model.overrides.isEmpty ? "跟随配置" : "已修改")
+                        } label: {
+                            Label("覆盖配置文件", systemImage: "slider.horizontal.3")
+                        }
+                    }
                 } footer: {
-                    Text("对所有配置生效，优先于配置自带的规则")
+                    Text("对所有配置生效，优先于配置文件自身的规则和设置")
                 }
                 if model.profiles.isEmpty {
                     ContentUnavailableView("还没有配置", systemImage: "doc.badge.plus",

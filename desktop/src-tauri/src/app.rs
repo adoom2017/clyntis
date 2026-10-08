@@ -324,7 +324,8 @@ impl Desktop {
             || settings.mixed_port != previous.mixed_port
             || settings.allow_lan != previous.allow_lan
             || settings.auto_dns != previous.auto_dns
-            || settings.tun_interface != previous.tun_interface;
+            || settings.tun_interface != previous.tun_interface
+            || settings.overrides != previous.overrides;
         if settings.launch_at_login != previous.launch_at_login {
             platform::autostart(&self.app, settings.launch_at_login)?;
         }

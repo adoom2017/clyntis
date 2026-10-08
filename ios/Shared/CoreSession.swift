@@ -80,6 +80,18 @@ final class CoreSession {
         return (Data(applied.yaml.utf8), applied.skipped)
     }
 
+    /// The configuration with app settings (`AppOverrides` JSON) applied.
+    static func applyOverrides(_ overrides: Data, to configuration: Data) throws -> Data {
+        try configuration.withUnsafeBytes { config in
+            try overrides.withUnsafeBytes { overrides in
+                try read(limit: 24 * 1024 * 1024) {
+                    meta_overrides_apply_v1(config.bindMemory(to: UInt8.self).baseAddress, config.count,
+                                            overrides.bindMemory(to: UInt8.self).baseAddress, overrides.count, $0, $1, $2)
+                }
+            }
+        }
+    }
+
     /// Buffered core log lines of this process (newline-separated JSON), removed once read.
     static func drainLogs() throws -> Data {
         try read { meta_drain_logs_v1($0, $1, $2) }
