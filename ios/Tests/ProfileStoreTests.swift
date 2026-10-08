@@ -109,6 +109,31 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertThrowsError(try AppOverrides(logLevel: "loud").applied(to: profile))
     }
 
+    func testSnapshotCarriesNodeStatusForVLESSAndTailscale() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let yaml = "proxies:\n  - {name: node, type: vless, server: 127.0.0.1, port: 9, uuid: 11111111-1111-4111-8111-111111111111, tls: true}\nrules: ['MATCH,node']\n"
+        let session = try CoreSession(configuration: Data(yaml.utf8), directory: root)
+        defer { session.close() }
+        let object = try JSONSerialization.jsonObject(with: session.snapshot()) as? [String: Any]
+        let status = try XCTUnwrap(NodeStatus.decode(object?["proxies"])["node"])
+        XCTAssertEqual(status.type, "VLESS")
+        XCTAssertEqual(status.server, "127.0.0.1:9")
+        XCTAssertEqual(status.security, "tls")
+        XCTAssertNil(status.delay)
+        XCTAssertEqual(status.summary, "VLESS")
+        // Tailscale status as the core serializes it (snake_case keys).
+        let tailscale: [String: Any] = ["ts": ["type": "Tailscale", "connections": 0, "tailscale": [
+            "state": "running", "name": "me.tail.ts.net", "addresses": ["100.64.0.1"], "home_derp": "sfo", "endpoints": [],
+            "peers": [["name": "pi5", "address": "100.104.16.87", "online": true, "path": "direct", "direct": "1.2.3.4:41641",
+                       "rtt_ms": 9, "derp": "sfo", "exit_node": false]]]]]
+        let ts = try XCTUnwrap(NodeStatus.decode(tailscale)["ts"]?.tailscale)
+        XCTAssertEqual(ts.homeDerp, "sfo")
+        XCTAssertEqual(ts.peers.first?.pathText, "直连 9 ms")
+        XCTAssertEqual(NodeStatus.decode(tailscale)["ts"]?.summary, "已连接 · 1 台在线 · 1 直连")
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()

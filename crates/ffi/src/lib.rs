@@ -510,7 +510,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
 ) -> i32 {
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }
@@ -552,6 +552,29 @@ pub unsafe extern "C" fn meta_select_v1(
             std::str::from_utf8(unsafe { input(group, group_len)? })?,
             std::str::from_utf8(unsafe { input(node, node_len)? })?,
         )?;
+        Ok(OK)
+    })
+}
+/// Measures the delay through proxy `name` (an HTTPS request to
+/// gstatic generate_204), waiting at most `timeout_ms`; writes milliseconds to
+/// `delay_ms`. Blocks: call it off the packet path. The result also appears in
+/// the snapshot's `proxies` status.
+///
+/// # Safety
+/// `name` must be readable UTF-8 for `name_len` bytes; `delay_ms` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_probe_v1(
+    id: u64,
+    name: *const u8,
+    name_len: usize,
+    timeout_ms: u32,
+    delay_ms: *mut u32,
+) -> i32 {
+    boundary(|| {
+        ensure!(!delay_ms.is_null(), "delay output is required");
+        let name = std::str::from_utf8(unsafe { input(name, name_len)? })?;
+        let delay = handle(id)?.probe(name, u64::from(timeout_ms.clamp(100, 30_000)))?;
+        unsafe { delay_ms.write(delay.min(u64::from(u32::MAX)) as u32) };
         Ok(OK)
     })
 }

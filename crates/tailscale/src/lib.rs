@@ -12,7 +12,7 @@ mod node;
 pub mod noise;
 pub mod tailcfg;
 
-pub use node::{Node, Options};
+pub use node::{Node, Options, PeerStatus, Status};
 
 use anyhow::Result;
 use meta_protocol::BoxStream;

@@ -297,6 +297,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 case "select":
                     guard let group = message.group, let node = message.node else { throw ClientError.message("缺少节点。") }
                     try core.select(group: group, node: node)
+                case "probe":
+                    guard let node = message.node else { throw ClientError.message("缺少节点。") }
+                    // Seconds of network I/O: off the packet queue. A failed probe is
+                    // a result too; the snapshot carries it in the node's status.
+                    DispatchQueue.global(qos: .utility).async {
+                        _ = try? core.probe(node)
+                        self.queue.async {
+                            let reply = try? self.core?.snapshot()
+                            completionHandler?(reply ?? (try? JSONSerialization.data(withJSONObject: ["error": "VPN 未连接。"])))
+                        }
+                    }
+                    return
                 default: throw ClientError.message("不支持的内核命令。")
                 }
                 completionHandler?(try core.snapshot())

@@ -75,6 +75,67 @@ export interface Proxy {
   all?: string[];
   now?: string;
   history: { delay: number }[];
+  status?: NodeStatus;
+}
+/** Per-proxy status from the core: the last delay test and kind details. */
+export interface NodeStatus {
+  type: string;
+  connections: number;
+  delay: number | null;
+  error: string | null;
+  checked: number | null;
+  server?: string;
+  network?: string;
+  security?: string;
+  flow?: string | null;
+  udp?: boolean;
+  tailscale?: TailscaleStatus;
+}
+export interface TailscaleStatus {
+  state: "connecting" | "running" | "error";
+  error: string | null;
+  name: string | null;
+  addresses: string[];
+  home_derp: string | null;
+  endpoints: string[];
+  peers: TailscalePeer[];
+}
+export interface TailscalePeer {
+  name: string;
+  address: string | null;
+  os: string | null;
+  online: boolean | null;
+  path: "direct" | "derp" | "idle";
+  direct: string | null;
+  rtt_ms: number | null;
+  derp: string | null;
+  exit_node: boolean;
+}
+export const tailscaleStateText: Record<TailscaleStatus["state"], string> = {
+  connecting: "连接中",
+  running: "已连接",
+  error: "连接失败",
+};
+export function peerPathText(peer: TailscalePeer): string {
+  if (peer.path === "direct")
+    return peer.rtt_ms == null ? "直连" : `直连 ${peer.rtt_ms} ms`;
+  if (peer.path === "derp") return peer.derp ? `中继 ${peer.derp}` : "中继";
+  return peer.online ? "空闲" : "离线";
+}
+/** One line for node cards: what matters most for this kind of node. */
+export function nodeSummary(status: NodeStatus | undefined, type?: string) {
+  if (!status) return type ?? "—";
+  const ts = status.tailscale;
+  if (ts) {
+    if (ts.state !== "running") return tailscaleStateText[ts.state];
+    const online = ts.peers.filter((p) => p.online).length;
+    const direct = ts.peers.filter((p) => p.path === "direct").length;
+    return `已连接 · ${online} 台在线${direct ? ` · ${direct} 直连` : ""}`;
+  }
+  const parts = [status.type];
+  if (status.server) parts.push(status.server);
+  if (status.connections) parts.push(`${status.connections} 连接`);
+  return parts.join(" · ");
 }
 export interface Connection {
   id: string;

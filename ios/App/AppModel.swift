@@ -18,6 +18,10 @@ final class AppModel {
     var connectionCount = 0
     var mode = "rule"
     var groups: [ProxyGroup] = []
+    /// Proxies outside every group (for example a Tailscale node used only by rules).
+    var ungrouped: [String] = []
+    var nodeStatus: [String: NodeStatus] = [:]
+    var probing: Set<String> = []
     /// Rules matched before every profile's own (see CustomRules).
     var customRules: [String] = []
     /// App settings that replace the profile's values (see AppOverrides).
@@ -80,6 +84,7 @@ final class AppModel {
                         }
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
+                            self.ungrouped = []; self.nodeStatus = [:]
                         }
                     }
                 }
@@ -391,14 +396,40 @@ final class AppModel {
         catch { self.error = error.localizedDescription }
     }
 
-    private func send(_ message: TunnelMessage) async throws -> Data {
+    /// Tests the delay through `node`; the result lands in `nodeStatus`.
+    func probe(_ node: String) async {
+        guard connected, nodeStatus[node]?.type == "VLESS", !probing.contains(node) else { return }
+        probing.insert(node)
+        defer { probing.remove(node) }
+        do { try applySnapshot(await send(TunnelMessage(command: "probe", node: node), timeout: 15)) }
+        catch { Diagnostics.app.warning("probe \(node): \(Diagnostics.describe(error))") }
+    }
+
+    /// Tests every VLESS node, two at a time (the core accepts a few at once).
+    func probeAll() async {
+        var queue = nodeStatus.filter { $0.value.type == "VLESS" }.map(\.key).sorted()
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<2 {
+                guard !queue.isEmpty else { break }
+                let first = queue.removeFirst()
+                group.addTask { await self.probe(first) }
+            }
+            while await group.next() != nil {
+                guard !queue.isEmpty else { continue }
+                let next = queue.removeFirst()
+                group.addTask { await self.probe(next) }
+            }
+        }
+    }
+
+    private func send(_ message: TunnelMessage, timeout: Double = 5) async throws -> Data {
         guard let session = manager?.connection as? NETunnelProviderSession else {
             throw ClientError.message("VPN 会话不可用。")
         }
         let payload = try JSONEncoder().encode(message)
         return try await withCheckedThrowingContinuation { continuation in
             let reply = MessageReply(continuation)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
                 reply.finish(.failure(ClientError.message("VPN 无响应。")))
             }
             do {
@@ -426,7 +457,12 @@ final class AppModel {
                 guard let name = group["name"] as? String, let nodes = group["proxies"] as? [String] else { return nil }
                 return ProxyGroup(name: name, nodes: nodes, selected: selections[name])
             }
+            let grouped = Set(groups.flatMap(\.nodes))
+            ungrouped = (config["proxies"] as? [[String: Any]] ?? [])
+                .compactMap { $0["name"] as? String }
+                .filter { !grouped.contains($0) }
         }
+        nodeStatus = NodeStatus.decode(object["proxies"])
     }
 }
 

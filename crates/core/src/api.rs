@@ -151,6 +151,13 @@ fn proxy_map(core: &Core) -> serde_json::Map<String, Value> {
     for g in &core.config.proxy_groups {
         output.insert(g.name.clone(),json!({"name":g.name,"type":if g.kind==meta_config::GroupKind::Select{"Selector"}else{"URLTest"},"all":g.proxies,"now":policy.selection.get(&g.name),"history":[]}));
     }
+    drop(policy);
+    // After releasing the policy lock: proxy_status takes it again.
+    for (name, status) in core.proxy_status() {
+        if let Some(Value::Object(entry)) = output.get_mut(&name) {
+            entry.insert("status".into(), status);
+        }
+    }
     output
 }
 async fn proxies(State(core): State<Arc<Core>>) -> Json<Value> {

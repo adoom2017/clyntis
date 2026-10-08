@@ -124,6 +124,11 @@ pub(crate) struct PacketsOut {
 }
 enum Command {
     Start(std::sync::mpsc::SyncSender<Result<(), String>>),
+    Probe(
+        String,
+        u64,
+        std::sync::mpsc::SyncSender<Result<u64, String>>,
+    ),
     NetworkChanged(std::sync::mpsc::SyncSender<Result<(), String>>),
     #[cfg(target_os = "android")]
     SetFd(
@@ -185,6 +190,18 @@ impl Handle {
                                 };
                                 let _ = reply.send(result);
                             },
+                            // Probes run concurrently; the worker keeps serving commands.
+                            Some(Command::Probe(name, timeout, reply)) => {
+                                let core = owner.clone();
+                                tokio::spawn(async move {
+                                    let url = "https://www.gstatic.com/generate_204";
+                                    let result = core
+                                        .probe(&name, url, Duration::from_millis(timeout))
+                                        .await
+                                        .map_err(|e| format!("{e:#}"));
+                                    let _ = reply.send(result);
+                                });
+                            },
                             Some(Command::NetworkChanged(reply)) => {
                                 owner.network_changed().await;
                                 let _ = reply.send(Ok(()));
@@ -237,6 +254,17 @@ impl Handle {
             "host packet queue unavailable: TUN is disabled or uses an Android fd"
         );
         Ok(())
+    }
+    /// Measures `name` like the desktop's delay test; blocks the caller.
+    pub(crate) fn probe(&self, name: &str, timeout_ms: u64) -> Result<u64> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .try_send(Command::Probe(name.to_owned(), timeout_ms, reply))
+            .map_err(|_| anyhow::anyhow!("core worker is busy or stopped"))?;
+        result
+            .recv_timeout(Duration::from_millis(timeout_ms + 5_000))
+            .map_err(|_| anyhow::anyhow!("core worker did not answer"))?
+            .map_err(|e| anyhow::anyhow!(e))
     }
     pub(crate) fn network_changed(&self) -> Result<()> {
         self.command(Command::NetworkChanged)

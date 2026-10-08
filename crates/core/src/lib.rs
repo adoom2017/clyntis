@@ -53,6 +53,8 @@ struct Policy {
     raw_rules: Vec<String>,
     selection: HashMap<String, String>,
     delay: HashMap<String, u64>,
+    /// The last probe of each proxy: delay or error, and when (Unix seconds).
+    probes: HashMap<String, (Option<u64>, Option<String>, u64)>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct RouteDecision {
@@ -219,6 +221,7 @@ impl Core {
             rules,
             selection,
             delay: HashMap::new(),
+            probes: HashMap::new(),
         };
         let (events, _) = tokio::sync::broadcast::channel(256);
         let mut xudp_key = [0; 32];
@@ -1075,6 +1078,58 @@ impl Core {
         }
         Ok(())
     }
+    /// Per-proxy status for the apps: kind-specific details, the last probe
+    /// and the number of open connections through it.
+    pub fn proxy_status(&self) -> serde_json::Map<String, serde_json::Value> {
+        use serde_json::json;
+        let mut open: HashMap<String, usize> = HashMap::new();
+        for connection in self.connections() {
+            for name in &connection.chains {
+                *open.entry(name.clone()).or_default() += 1;
+            }
+        }
+        let probes = self.policy.read().unwrap().probes.clone();
+        let nodes = self.tailscale.lock().unwrap().clone();
+        let mut out = serde_json::Map::new();
+        for p in &self.config.proxies {
+            let (delay, error, checked) = probes.get(&p.name).cloned().unwrap_or_default();
+            let mut status = json!({
+                "type": match p.kind {
+                    ProxyKind::Vless => "VLESS",
+                    ProxyKind::Tailscale => "Tailscale",
+                    ProxyKind::Hysteria2 => "Hysteria2",
+                    ProxyKind::Trojan => "Trojan",
+                },
+                "connections": open.get(&p.name).copied().unwrap_or(0),
+                "delay": delay,
+                "error": error,
+                "checked": (checked != 0).then_some(checked),
+            });
+            match p.kind {
+                ProxyKind::Vless => {
+                    status["server"] = json!(format!("{}:{}", p.server, p.port));
+                    status["network"] = json!(p.network);
+                    status["security"] = json!(if p.reality_opts.is_some() {
+                        "reality"
+                    } else if p.tls {
+                        "tls"
+                    } else {
+                        "none"
+                    });
+                    status["flow"] = json!((!p.flow.is_empty()).then_some(&p.flow));
+                    status["udp"] = json!(p.udp);
+                }
+                ProxyKind::Tailscale => {
+                    if let Some(node) = nodes.get(&p.name) {
+                        status["tailscale"] = json!(node.status());
+                    }
+                }
+                _ => {}
+            }
+            out.insert(p.name.clone(), status);
+        }
+        out
+    }
     pub fn connections(&self) -> Vec<Connection> {
         self.connections
             .lock()
@@ -1095,6 +1150,22 @@ impl Core {
         self.resolver.clear_cache();
     }
     pub async fn probe(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
+        let result = self.probe_once(name, url, timeout).await;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let entry = match &result {
+            Ok(delay) => (Some(*delay), None, at),
+            Err(error) => (None, Some(format!("{error:#}")), at),
+        };
+        self.policy
+            .write()
+            .unwrap()
+            .probes
+            .insert(name.into(), entry);
+        result
+    }
+    async fn probe_once(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
         let start = Instant::now();
         let mut measured = start;
         let operation = async {

@@ -116,6 +116,11 @@ int32_t meta_error_v1(uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_snapshot_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_update_v1(meta_handle handle, const uint8_t *json, size_t length);
 int32_t meta_select_v1(meta_handle handle, const uint8_t *group, size_t group_length, const uint8_t *node, size_t node_length);
+/* Delay through proxy `name` (HTTPS to gstatic generate_204, at most
+ * timeout_ms); writes milliseconds. Blocks the caller: never call it on the
+ * packet path. The outcome also appears in meta_snapshot_v1's "proxies". */
+int32_t meta_probe_v1(meta_handle handle, const uint8_t *name, size_t name_length,
+    uint32_t timeout_ms, uint32_t *delay_ms);
 int32_t meta_write_packet_v1(meta_handle handle, const uint8_t *packet, size_t length);
 int32_t meta_read_packet_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 #ifdef __cplusplus

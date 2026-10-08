@@ -155,6 +155,36 @@ struct Inner {
     stack: netstack::Handle,
     disco: Private,
     endpoints: watch::Receiver<magic::Endpoints>,
+    paths: magic::Paths,
+    /// "connecting", "running" or "error", with the last error.
+    lifecycle: Mutex<(&'static str, Option<String>)>,
+}
+
+/// A snapshot for status displays.
+#[derive(serde::Serialize, Debug)]
+pub struct Status {
+    pub state: &'static str,
+    pub error: Option<String>,
+    /// This node's MagicDNS name and tailnet addresses.
+    pub name: Option<String>,
+    pub addresses: Vec<String>,
+    pub home_derp: Option<String>,
+    /// Our UDP candidates for direct paths.
+    pub endpoints: Vec<String>,
+    pub peers: Vec<PeerStatus>,
+}
+#[derive(serde::Serialize, Debug)]
+pub struct PeerStatus {
+    pub name: String,
+    pub address: Option<String>,
+    pub os: Option<String>,
+    pub online: Option<bool>,
+    /// "direct", "derp" (relayed) or "idle" (no recent traffic).
+    pub path: &'static str,
+    pub direct: Option<String>,
+    pub rtt_ms: Option<u64>,
+    pub derp: Option<String>,
+    pub exit_node: bool,
 }
 
 /// A running Tailscale node. Dropping the last handle does not stop it;
@@ -186,6 +216,7 @@ impl Node {
         // One disco key for the node's lifetime: peers learn it from the map.
         let disco = Private::generate();
         let (endpoints, endpoints_rx) = watch::channel(Vec::new());
+        let paths = magic::Paths::default();
         tokio::spawn(magic::run(
             state.node.clone(),
             disco.clone(),
@@ -194,6 +225,7 @@ impl Node {
             from_stack,
             to_stack,
             endpoints,
+            paths.clone(),
             stop.clone(),
         ));
         let node = Self {
@@ -206,6 +238,8 @@ impl Node {
                 stack: netstack::Handle { commands },
                 disco,
                 endpoints: endpoints_rx,
+                paths,
+                lifecycle: Mutex::new(("connecting", None)),
             }),
         };
         let inner = node.inner.clone();
@@ -218,7 +252,9 @@ impl Node {
                     result = session(&inner, &mut state) => result,
                 };
                 if let Err(error) = result {
-                    tracing::warn!(proxy = %inner.options.name, error = %format!("{error:#}"), "Tailscale control session failed; retrying");
+                    let text = format!("{error:#}");
+                    tracing::warn!(proxy = %inner.options.name, error = %text, "Tailscale control session failed; retrying");
+                    *inner.lifecycle.lock().unwrap() = ("error", Some(text));
                 }
                 tokio::select! {
                     _ = stop.cancelled() => return,
@@ -237,6 +273,81 @@ impl Node {
             .await
             .context("Tailscale is not connected to its tailnet yet")??;
         Ok(())
+    }
+
+    pub fn status(&self) -> Status {
+        let inner = &self.inner;
+        let (state, error) = inner.lifecycle.lock().unwrap().clone();
+        let netmap = inner.netmap.lock().unwrap();
+        let paths = inner.paths.lock().unwrap();
+        let routes = inner.routes.borrow();
+        let region = |id: u32| {
+            (id != 0).then(|| {
+                netmap
+                    .derp
+                    .regions
+                    .values()
+                    .find(|r| r.region_id == id)
+                    .map_or_else(|| id.to_string(), |r| r.region_code.clone())
+            })
+        };
+        let exit = routes
+            .table
+            .iter()
+            .find(|(net, _)| net.prefix_len() == 0)
+            .map(|(_, peer)| peer.key);
+        let mut peers: Vec<PeerStatus> = netmap
+            .peers
+            .values()
+            .map(|peer| {
+                let path = paths.get(&peer.key);
+                let direct = path.and_then(|p| p.direct);
+                PeerStatus {
+                    name: peer.fqdn().split('.').next().unwrap_or_default().to_owned(),
+                    address: peer
+                        .addresses
+                        .iter()
+                        .map(|a| a.addr())
+                        .find(IpAddr::is_ipv4)
+                        .map(|ip| ip.to_string()),
+                    os: peer
+                        .hostinfo
+                        .as_ref()
+                        .and_then(|h| h.get("OS"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned),
+                    online: peer.online,
+                    path: match (direct, path.is_some_and(|p| p.active)) {
+                        (Some(_), _) => "direct",
+                        (None, true) => "derp",
+                        (None, false) => "idle",
+                    },
+                    direct: direct.map(|a| a.to_string()),
+                    rtt_ms: path.and_then(|p| p.rtt_ms),
+                    derp: region(peer.derp_region()),
+                    exit_node: exit == Some(peer.key),
+                }
+            })
+            .collect();
+        peers.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.name.cmp(&b.name)));
+        Status {
+            state,
+            error,
+            name: netmap.me.as_ref().map(|me| me.fqdn().to_owned()),
+            addresses: netmap
+                .me
+                .iter()
+                .flat_map(|me| me.addresses.iter().map(|a| a.addr().to_string()))
+                .collect(),
+            home_derp: region(routes.home),
+            endpoints: inner
+                .endpoints
+                .borrow()
+                .iter()
+                .map(|(a, _)| a.to_string())
+                .collect(),
+            peers,
+        }
     }
 
     /// The tailnet address for a peer's MagicDNS name (full or short).
@@ -465,6 +576,7 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
                 );
             }
             inner.ready.send_replace(Some(me.fqdn().to_owned()));
+            *inner.lifecycle.lock().unwrap() = ("running", None);
         }
     }
     bail!("Tailscale network map stream ended")

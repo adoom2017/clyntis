@@ -131,6 +131,18 @@ final class CoreSession {
         try Self.read { meta_snapshot_v1(handle, $0, $1, $2) }
     }
 
+    /// Delay through `name` in milliseconds; blocks, so never call it on the
+    /// packet queue. The outcome also lands in the snapshot's `proxies`.
+    func probe(_ name: String, timeoutMs: UInt32 = 8000) throws -> UInt32 {
+        let bytes = Data(name.utf8)
+        var delay: UInt32 = 0
+        let result = bytes.withUnsafeBytes {
+            meta_probe_v1(handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count, timeoutMs, &delay)
+        }
+        try Self.check(result)
+        return delay
+    }
+
     func updateMode(_ mode: String) throws {
         guard ["rule", "global", "direct"].contains(mode) else { throw ClientError.message("无效的代理模式。") }
         let data = try JSONSerialization.data(withJSONObject: ["mode": mode])

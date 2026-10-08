@@ -701,3 +701,27 @@ async fn tcp_relay_survives_six_minutes_without_application_data() {
     relay.await.unwrap().unwrap();
     assert!(core.connections().is_empty());
 }
+
+#[tokio::test]
+async fn proxy_status_reports_details_and_the_last_probe() {
+    let config = meta_config::Config::parse(
+        b"proxies:\n  - {name: node, type: vless, server: 127.0.0.1, port: 9, uuid: 11111111-1111-4111-8111-111111111111, tls: true, flow: xtls-rprx-vision}\nrules: ['MATCH,node']\n",
+    )
+    .unwrap();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let status = &core.proxy_status()["node"];
+    assert_eq!(status["type"], "VLESS");
+    assert_eq!(status["server"], "127.0.0.1:9");
+    assert_eq!(status["security"], "tls");
+    assert_eq!(status["flow"], "xtls-rprx-vision");
+    assert!(status["delay"].is_null() && status["checked"].is_null());
+    // Port 9 refuses: the failure is kept with its time.
+    let result = core
+        .probe("node", "http://example.com/", Duration::from_secs(2))
+        .await;
+    assert!(result.is_err());
+    let status = &core.proxy_status()["node"];
+    assert!(status["delay"].is_null());
+    assert!(status["error"].as_str().is_some_and(|e| !e.is_empty()));
+    assert!(status["checked"].as_u64().is_some());
+}

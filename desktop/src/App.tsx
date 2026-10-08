@@ -22,6 +22,7 @@ import {
   FolderOpen,
   Gauge,
   Globe2,
+  Info,
   Layers3,
   Link2,
   LoaderCircle,
@@ -61,6 +62,10 @@ import {
   type ProfileSummary,
   type Proxy,
   type Settings,
+  type NodeStatus,
+  nodeSummary,
+  peerPathText,
+  tailscaleStateText,
   type LogLevel,
   type Overrides,
   type CustomRules,
@@ -733,7 +738,8 @@ export default function App() {
                 </div>
               )}
               <p className="hint">
-                支持 VLESS 和 Tailscale 节点，导入时会跳过不兼容的项，不会改动原文件。
+                支持 VLESS 和 Tailscale
+                节点，导入时会跳过不兼容的项，不会改动原文件。
               </p>
             </>
           )}
@@ -1231,12 +1237,20 @@ function Proxies({
   const [query, setQuery] = useState("");
   const [probing, setProbing] = useState<string[]>([]);
   const [delays, setDelays] = useState<Record<string, number | null>>({});
+  const [detail, setDetail] = useState<string | null>(null);
   const refresh = useCallback(async () => {
     const data = await invoke<{ proxies: Record<string, Proxy> }>("proxies");
     setNodes(data.proxies);
   }, []);
+  // Status (connections, Tailscale paths) changes on its own: poll while shown.
   useEffect(() => {
-    if (running) void refresh().catch(() => {});
+    if (!running) return;
+    void refresh().catch(() => {});
+    const timer = window.setInterval(
+      () => void refresh().catch(() => {}),
+      3000,
+    );
+    return () => window.clearInterval(timer);
   }, [running, refresh]);
   const probe = async (name: string) => {
     setProbing((p) => (p.includes(name) ? p : [...p, name]));
@@ -1348,39 +1362,165 @@ function Proxies({
                       </span>
                       <span>
                         <strong>{name}</strong>
-                        <small>{nodes[name]?.type ?? "—"}</small>
+                        <small
+                          className={
+                            nodes[name]?.status?.tailscale?.state === "error"
+                              ? "danger-text"
+                              : ""
+                          }
+                        >
+                          {nodeSummary(nodes[name]?.status, nodes[name]?.type)}
+                        </small>
                       </span>
                       {group.now === name && (
                         <Check size={16} className="accent" />
                       )}
                     </button>
-                    <button
-                      className={`delay ${delayTone(delay)}`}
-                      aria-label={`测试 ${name} 延迟`}
-                      disabled={
-                        busy ||
-                        probing.includes(name) ||
-                        ["DIRECT", "REJECT"].includes(name)
-                      }
-                      onClick={() => void probe(name)}
-                    >
-                      {probing.includes(name) ? (
-                        <LoaderCircle className="spin" size={13} />
-                      ) : delay === null ? (
-                        "超时"
-                      ) : delay === undefined ? (
-                        "测速"
-                      ) : (
-                        `${delay} ms`
-                      )}
-                    </button>
+                    {nodes[name]?.status && (
+                      <button
+                        className="node-info"
+                        aria-label={`${name} 状态`}
+                        onClick={() => setDetail(name)}
+                      >
+                        <Info size={15} />
+                      </button>
+                    )}
+                    {nodes[name]?.type === "Tailscale" ? null : (
+                      <button
+                        className={`delay ${delayTone(delay)}`}
+                        aria-label={`测试 ${name} 延迟`}
+                        disabled={
+                          busy ||
+                          probing.includes(name) ||
+                          ["DIRECT", "REJECT"].includes(name)
+                        }
+                        onClick={() => void probe(name)}
+                      >
+                        {probing.includes(name) ? (
+                          <LoaderCircle className="spin" size={13} />
+                        ) : delay === null ? (
+                          "超时"
+                        ) : delay === undefined ? (
+                          "测速"
+                        ) : (
+                          `${delay} ms`
+                        )}
+                      </button>
+                    )}
                   </div>
                 );
               })}
           </div>
         </section>
       ))}
+      {detail && nodes[detail]?.status && (
+        <Modal title={detail} onClose={() => setDetail(null)} wide>
+          <NodeDetail
+            status={nodes[detail].status!}
+            probing={probing.includes(detail)}
+            onProbe={() => void probe(detail).then(refresh)}
+          />
+        </Modal>
+      )}
     </>
+  );
+}
+function NodeDetail({
+  status,
+  probing,
+  onProbe,
+}: {
+  status: NodeStatus;
+  probing: boolean;
+  onProbe: () => void;
+}) {
+  const ts = status.tailscale;
+  const rows: [string, string][] = [
+    ["类型", status.type],
+    ["当前连接", String(status.connections)],
+  ];
+  if (status.server) rows.push(["服务器", status.server]);
+  if (status.network) rows.push(["传输", status.network]);
+  if (status.security) rows.push(["安全", status.security.toUpperCase()]);
+  if (status.flow) rows.push(["Flow", status.flow]);
+  if (status.udp !== undefined)
+    rows.push(["UDP", status.udp ? "开启" : "关闭"]);
+  if (ts) {
+    rows.push(["状态", tailscaleStateText[ts.state]]);
+    if (ts.name) rows.push(["本机名称", ts.name]);
+    if (ts.addresses.length) rows.push(["地址", ts.addresses.join("、")]);
+    if (ts.home_derp) rows.push(["DERP 主区域", ts.home_derp]);
+    rows.push(["公网候选", ts.endpoints.join("、") || "无"]);
+  }
+  return (
+    <div className="node-detail">
+      <dl className="detail-list">
+        {rows.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+      {ts?.error && <p className="danger-text small">{ts.error}</p>}
+      {status.type === "VLESS" && (
+        <div className="detail-probe">
+          <span
+            className={
+              status.error && status.delay == null ? "danger-text" : ""
+            }
+          >
+            {status.delay != null
+              ? `最近一次 ${status.delay} ms`
+              : status.error
+                ? `测速失败：${status.error}`
+                : "尚未测速"}
+            {status.checked
+              ? ` · ${new Date(status.checked * 1000).toLocaleTimeString()}`
+              : ""}
+          </span>
+          <button
+            className="button secondary"
+            disabled={probing}
+            onClick={onProbe}
+          >
+            {probing ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <Zap size={14} />
+            )}
+            测速
+          </button>
+        </div>
+      )}
+      {ts && (
+        <>
+          <h4 className="detail-heading">
+            节点（{ts.peers.filter((p) => p.online).length}/{ts.peers.length}{" "}
+            在线）
+          </h4>
+          <div className="peer-list">
+            {ts.peers.map((peer) => (
+              <div className="peer-row" key={`${peer.name}-${peer.address}`}>
+                <span className={`peer-dot ${peer.online ? "online" : ""}`} />
+                <span className="peer-name">
+                  <strong>{peer.name}</strong>
+                  {peer.exit_node && <span className="tiny-tag">出口</span>}
+                  <small>
+                    {[peer.address, peer.os, peer.direct]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </small>
+                </span>
+                <span className={`peer-path ${peer.path}`}>
+                  {peerPathText(peer)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 function ConnectionPage({

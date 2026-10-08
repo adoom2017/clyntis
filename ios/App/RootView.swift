@@ -205,27 +205,147 @@ private struct NodesView: View {
     var body: some View {
         NavigationStack {
             List {
-                if model.groups.isEmpty {
-                    ContentUnavailableView(model.connected ? "没有代理组" : "未连接", systemImage: "network",
-                        description: Text(model.connected ? "当前配置未定义代理组" : "连接后可选择节点"))
+                if model.groups.isEmpty && model.ungrouped.isEmpty {
+                    ContentUnavailableView(model.connected ? "没有节点" : "未连接", systemImage: "network",
+                        description: Text(model.connected ? "当前配置未定义节点" : "连接后可选择节点"))
                 }
                 ForEach(model.groups) { group in
                     Section(group.name) {
                         ForEach(group.nodes, id: \.self) { node in
-                            Button {
+                            NodeRow(model: model, name: node, selected: group.selected == node) {
                                 Task { await model.select(group: group.name, node: node) }
-                            } label: {
-                                HStack {
-                                    Text(node).foregroundStyle(.primary)
-                                    Spacer()
-                                    Image(systemName: "checkmark").foregroundStyle(.tint).opacity(group.selected == node ? 1 : 0)
-                                }
-                            }.disabled(model.busy || !model.connected)
+                            }
                         }
                     }
                 }
+                if !model.ungrouped.isEmpty {
+                    Section {
+                        ForEach(model.ungrouped, id: \.self) { node in
+                            NodeRow(model: model, name: node, selected: false, select: nil)
+                        }
+                    } header: { Text("其他节点") } footer: { Text("未放入代理组，由规则直接使用") }
+                }
             }
             .navigationTitle("节点")
+            .toolbar {
+                if model.connected && model.nodeStatus.values.contains(where: { $0.type == "VLESS" }) {
+                    Button("测速", systemImage: "bolt") { Task { await model.probeAll() } }
+                        .disabled(!model.probing.isEmpty)
+                }
+            }
+            .navigationDestination(for: String.self) { NodeDetailView(model: model, name: $0) }
+        }
+    }
+}
+
+private struct NodeRow: View {
+    @Bindable var model: AppModel
+    let name: String
+    let selected: Bool
+    let select: (() -> Void)?
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                select?()
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(name).foregroundStyle(.primary)
+                        if let status = model.nodeStatus[name] {
+                            Text(status.summary).font(.caption).foregroundStyle(tone(status))
+                        }
+                    }
+                    Spacer()
+                    if model.probing.contains(name) { ProgressView().controlSize(.small) }
+                    Image(systemName: "checkmark").foregroundStyle(.tint).opacity(selected ? 1 : 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .disabled(select == nil || model.busy || !model.connected)
+            if model.nodeStatus[name] != nil {
+                NavigationLink(value: name) {
+                    Image(systemName: "info.circle").foregroundStyle(.tint)
+                }
+                .fixedSize()
+                .accessibilityLabel("\(name) 状态")
+            }
+        }
+    }
+    private func tone(_ status: NodeStatus) -> Color {
+        if let tailscale = status.tailscale { return tailscale.state == "error" ? .red : .secondary }
+        if status.delay == nil && status.error != nil { return .red }
+        return .secondary
+    }
+}
+
+private struct NodeDetailView: View {
+    @Bindable var model: AppModel
+    let name: String
+    var body: some View {
+        List {
+            if let status = model.nodeStatus[name] {
+                Section {
+                    LabeledContent("类型", value: status.type)
+                    LabeledContent("当前连接", value: "\(status.connections)")
+                    if let server = status.server { LabeledContent("服务器", value: server) }
+                    if let network = status.network { LabeledContent("传输", value: network) }
+                    if let security = status.security { LabeledContent("安全", value: security.uppercased()) }
+                    if let flow = status.flow { LabeledContent("Flow", value: flow) }
+                    if let udp = status.udp { LabeledContent("UDP", value: udp ? "开启" : "关闭") }
+                }
+                if status.type == "VLESS" {
+                    Section("延迟") {
+                        if let delay = status.delay {
+                            LabeledContent("最近一次", value: "\(delay) ms")
+                        } else if let error = status.error {
+                            Text(error).font(.footnote).foregroundStyle(.red)
+                        } else {
+                            Text("尚未测速").foregroundStyle(.secondary)
+                        }
+                        if let checked = status.checkedAt {
+                            LabeledContent("测试时间", value: checked.formatted(date: .omitted, time: .standard))
+                        }
+                        Button(model.probing.contains(name) ? "测速中…" : "测速") { Task { await model.probe(name) } }
+                            .disabled(model.probing.contains(name) || !model.connected)
+                    }
+                }
+                if let tailscale = status.tailscale { TailscaleSections(status: tailscale) }
+            } else {
+                ContentUnavailableView("没有状态", systemImage: "questionmark.circle", description: Text("连接后显示节点状态"))
+            }
+        }
+        .navigationTitle(name)
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await model.refreshSnapshot() }
+    }
+}
+
+private struct TailscaleSections: View {
+    let status: TailscaleStatus
+    var body: some View {
+        Section("Tailscale") {
+            LabeledContent("状态", value: status.stateText)
+            if let error = status.error { Text(error).font(.footnote).foregroundStyle(.red) }
+            if let name = status.name { LabeledContent("本机名称", value: name) }
+            ForEach(status.addresses, id: \.self) { LabeledContent("地址", value: $0) }
+            if let derp = status.homeDerp { LabeledContent("DERP 主区域", value: derp) }
+            LabeledContent("公网候选", value: status.endpoints.isEmpty ? "无" : status.endpoints.joined(separator: "\n"))
+        }
+        Section("节点（\(status.onlinePeers)/\(status.peers.count) 在线）") {
+            ForEach(status.peers) { peer in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Circle().fill(peer.online == true ? Color.connected : Color.secondary.opacity(0.4)).frame(width: 8, height: 8)
+                        Text(peer.name)
+                        if peer.exitNode { Text("出口").font(.caption2).padding(.horizontal, 5).background(.tint.opacity(0.15), in: .capsule) }
+                        Spacer()
+                        Text(peer.pathText).font(.caption).foregroundStyle(peer.path == "direct" ? Color.connected : .secondary)
+                    }
+                    Text([peer.address, peer.os, peer.direct].compactMap { $0 }.joined(separator: " · "))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
     }
 }

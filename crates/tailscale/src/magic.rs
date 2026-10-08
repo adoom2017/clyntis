@@ -66,6 +66,17 @@ impl Routes {
 /// Our UDP candidates for peers, with their tailcfg endpoint types.
 pub type Endpoints = Vec<(SocketAddr, u8)>;
 
+/// How a peer is currently reached, for status displays.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct PathStatus {
+    /// The trusted direct UDP path, if any.
+    pub direct: Option<SocketAddr>,
+    pub rtt_ms: Option<u64>,
+    /// Traffic in the last 45 s.
+    pub active: bool,
+}
+pub type Paths = Arc<std::sync::Mutex<HashMap<Public, PathStatus>>>;
+
 enum Region {
     Connecting(VecDeque<(Public, Vec<u8>)>),
     Up(derp::Link),
@@ -124,6 +135,8 @@ struct Router {
     stun_addrs: Vec<SocketAddr>,
     stun_round: Vec<SocketAddr>,
     endpoints: watch::Sender<Endpoints>,
+    paths: Paths,
+    ticks: u32,
     buf: Vec<u8>,
 }
 
@@ -521,6 +534,25 @@ impl Router {
         for key in rediscover {
             self.discover(&key, false);
         }
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks.is_multiple_of(4) {
+            let snapshot = self
+                .states
+                .iter()
+                .map(|(key, state)| {
+                    let trusted = state.trusted(now);
+                    let status = PathStatus {
+                        direct: trusted,
+                        rtt_ms: trusted
+                            .and(state.best.as_ref())
+                            .map(|p| p.rtt.as_millis() as u64),
+                        active: state.last_send.is_some_and(|t| now - t < ACTIVE),
+                    };
+                    (*key, status)
+                })
+                .collect();
+            *self.paths.lock().unwrap() = snapshot;
+        }
     }
 
     /// Asks a few DERP nodes' STUN servers for our public UDP address.
@@ -633,6 +665,7 @@ pub async fn run(
     mut from_stack: mpsc::Receiver<Vec<u8>>,
     to_stack: mpsc::Sender<Vec<u8>>,
     endpoints: watch::Sender<Endpoints>,
+    paths: Paths,
     stop: CancellationToken,
 ) {
     let (derp_in, mut derp_rx) = mpsc::channel(1024);
@@ -687,6 +720,8 @@ pub async fn run(
         stun_addrs: Vec::new(),
         stun_round: Vec::new(),
         endpoints,
+        paths,
+        ticks: 0,
         buf: vec![0; BUFFER],
     };
     router.publish();
@@ -825,6 +860,7 @@ mod tests {
             from_stack,
             to_stack,
             endpoints,
+            Default::default(),
             stop.clone(),
         ));
         let packet = ip_packet(b"direct");
