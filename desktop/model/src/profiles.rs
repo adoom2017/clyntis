@@ -366,12 +366,12 @@ pub fn validate(yaml: &str) -> Result<Config> {
     let unsupported: Vec<_> = config
         .proxies
         .iter()
-        .filter(|p| p.kind != ProxyKind::Vless)
+        .filter(|p| !matches!(p.kind, ProxyKind::Vless | ProxyKind::Tailscale))
         .map(|p| p.name.as_str())
         .collect();
     ensure!(
         unsupported.is_empty(),
-        "当前仅支持 VLESS，以下节点协议未实现：{}",
+        "当前支持 VLESS 和 Tailscale，以下节点协议未实现：{}",
         unsupported.join("、")
     );
     for provider in config.rule_providers.values() {

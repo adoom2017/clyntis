@@ -1,0 +1,33 @@
+[package]
+name = "meta-tailscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meta-protocol.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+rand.workspace = true
+blake2.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+zstd.workspace = true
+ipnet.workspace = true
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+crypto_box = { version = "0.9", features = ["salsa20"] }
+boringtun = { version = "0.7.1", default-features = false }
+h2 = "0.4"
+http = "1"
+httparse = "1"
+hex = "0.4"
+smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic"] }
+
+[dev-dependencies]

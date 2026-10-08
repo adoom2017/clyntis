@@ -146,7 +146,7 @@ fn proxy_map(core: &Core) -> serde_json::Map<String, Value> {
         );
     }
     for p in &core.config.proxies {
-        output.insert(p.name.clone(),json!({"name":p.name,"type":match p.kind{meta_config::ProxyKind::Vless=>"VLESS",meta_config::ProxyKind::Hysteria2=>"Hysteria2",meta_config::ProxyKind::Trojan=>"Unsupported"},"udp":p.udp,"history":policy.delay.get(&p.name).map(|d|vec![json!({"delay":d})]).unwrap_or_default()}));
+        output.insert(p.name.clone(),json!({"name":p.name,"type":match p.kind{meta_config::ProxyKind::Vless=>"VLESS",meta_config::ProxyKind::Hysteria2=>"Hysteria2",meta_config::ProxyKind::Trojan=>"Unsupported",meta_config::ProxyKind::Tailscale=>"Tailscale"},"udp":p.udp,"history":policy.delay.get(&p.name).map(|d|vec![json!({"delay":d})]).unwrap_or_default()}));
     }
     for g in &core.config.proxy_groups {
         output.insert(g.name.clone(),json!({"name":g.name,"type":if g.kind==meta_config::GroupKind::Select{"Selector"}else{"URLTest"},"all":g.proxies,"now":policy.selection.get(&g.name),"history":[]}));

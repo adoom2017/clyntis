@@ -733,7 +733,7 @@ export default function App() {
                 </div>
               )}
               <p className="hint">
-                仅支持 VLESS 节点，导入时会跳过不兼容的项，不会改动原文件。
+                支持 VLESS 和 Tailscale 节点，导入时会跳过不兼容的项，不会改动原文件。
               </p>
             </>
           )}

@@ -10,6 +10,19 @@ replacement for every protocol or configuration option.
   listener and desktop TUN. HTTP/SOCKS authentication is supported.
 - **Outbound:** DIRECT, REJECT and VLESS over TCP, WebSocket or gRPC, including
   TLS, REALITY, XTLS Vision and UDP/XUDP. BoringSSL is the TLS backend.
+- **Tailscale outbound** (`type: tailscale`, mihomo's fields plus
+  `dialer-proxy`): a userspace Tailscale node in Rust that joins a tailnet with
+  an auth key and reaches peers, accepted subnet routes or an exit node over
+  WireGuard. TCP only, relayed through DERP (no direct NAT traversal yet);
+  MagicDNS names resolve to tailnet addresses. Example:
+
+  ```yaml
+  proxies:
+    - {name: Tailscale, type: tailscale, auth-key: tskey-auth-..., hostname: my-mac}
+  rules:
+    - IP-CIDR,100.64.0.0/10,Tailscale,no-resolve
+    - DOMAIN-SUFFIX,ts.net,Tailscale
+  ```
 - **Routing:** rule/global/direct modes, select and url-test groups, domain/IP
   rules, GeoIP/GeoSite and rule providers.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and

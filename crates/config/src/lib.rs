@@ -137,7 +137,10 @@ pub struct Proxy {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: ProxyKind,
+    /// Required except for `tailscale`, which finds peers through its tailnet.
+    #[serde(default)]
     pub server: String,
+    #[serde(default)]
     pub port: u16,
     #[serde(default, skip_serializing, deserialize_with = "relaxed_uuid")]
     pub uuid: Option<uuid::Uuid>,
@@ -199,6 +202,34 @@ pub struct Proxy {
     pub disable_mtu_discovery: bool,
     #[serde(default)]
     pub fast_open: bool,
+    /// Another proxy (or group) that carries this proxy's own connections;
+    /// for `tailscale`, its control-server and DERP connections.
+    #[serde(default)]
+    pub dialer_proxy: Option<String>,
+    #[serde(flatten)]
+    pub tailscale: TailscaleOptions,
+}
+/// mihomo's `type: tailscale` fields.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct TailscaleOptions {
+    #[serde(default, skip_serializing)]
+    pub auth_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_url: Option<String>,
+    /// Relative to the configuration directory; default `tailscale/<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_routes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node_allow_lan_access: Option<bool>,
 }
 impl std::fmt::Debug for Proxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -247,6 +278,7 @@ pub enum ProxyKind {
     #[serde(alias = "hy2")]
     Hysteria2,
     Trojan,
+    Tailscale,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -361,14 +393,16 @@ impl Default for Tun {
 }
 
 impl Config {
+    /// Keeps the implemented outbounds (VLESS and Tailscale).
     pub fn retain_vless(&mut self) -> Result<()> {
+        let supported = |p: &Proxy| matches!(p.kind, ProxyKind::Vless | ProxyKind::Tailscale);
         let removed: HashSet<_> = self
             .proxies
             .iter()
-            .filter(|p| p.kind != ProxyKind::Vless)
+            .filter(|p| !supported(p))
             .map(|p| p.name.clone())
             .collect();
-        self.proxies.retain(|p| p.kind == ProxyKind::Vless);
+        self.proxies.retain(supported);
         for group in &mut self.proxy_groups {
             group.proxies.retain(|p| !removed.contains(p));
             if group.proxies.is_empty() {
@@ -455,8 +489,13 @@ impl Config {
                 p.name
             );
             ensure!(
-                !p.server.is_empty() && p.port != 0,
+                p.kind == ProxyKind::Tailscale || (!p.server.is_empty() && p.port != 0),
                 "proxy {}: server/port required",
+                p.name
+            );
+            ensure!(
+                p.kind == ProxyKind::Tailscale || p.tailscale == TailscaleOptions::default(),
+                "proxy {}: tailscale options require type: tailscale",
                 p.name
             );
             ensure!(
@@ -587,6 +626,40 @@ impl Config {
                     }
                 }
                 ProxyKind::Trojan => {}
+                ProxyKind::Tailscale => {
+                    let t = &p.tailscale;
+                    if let Some(url) = &t.control_url {
+                        ensure!(
+                            url.starts_with("https://") || url.starts_with("http://"),
+                            "proxy {}: control-url must be http(s)",
+                            p.name
+                        );
+                    }
+                    if let Some(dir) = &t.state_dir {
+                        // Downloaded profiles run as root in TUN mode: keep the
+                        // node state inside the configuration directory.
+                        ensure!(
+                            !dir.is_empty()
+                                && !std::path::Path::new(dir).is_absolute()
+                                && !dir.starts_with(['/', '\\', '~'])
+                                && !dir.contains(':')
+                                && !dir.split(['/', '\\']).any(|part| part == ".."),
+                            "proxy {}: state-dir must be a relative path inside the configuration directory",
+                            p.name
+                        );
+                    }
+                    if let Some(hostname) = &t.hostname {
+                        ensure!(
+                            !hostname.is_empty()
+                                && hostname.len() <= 63
+                                && hostname
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                            "proxy {}: hostname must be a DNS label",
+                            p.name
+                        );
+                    }
+                }
             }
         }
         for g in &self.proxy_groups {
@@ -597,6 +670,15 @@ impl Config {
             );
             ensure!(!g.proxies.is_empty(), "empty group {}", g.name);
             ensure!(g.interval > 0, "group interval must be positive");
+        }
+        for p in &self.proxies {
+            if let Some(via) = &p.dialer_proxy {
+                ensure!(
+                    via != &p.name && via != "GLOBAL" && names.contains(via.as_str()),
+                    "proxy {}: unknown dialer-proxy {via}",
+                    p.name
+                );
+            }
         }
         let groups: HashMap<&str, &Group> = self
             .proxy_groups
@@ -956,5 +1038,46 @@ rules: ['MATCH,DIRECT']
             "feb54431-301b-52bb-a6dd-e1e93e81bb9e"
         );
         assert!(Config::parse(b"proxies:\n- name: test\n  type: vless\n  server: localhost\n  port: 443\n  uuid: ''\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tailscale_tests {
+    use super::*;
+
+    #[test]
+    fn parses_mihomo_tailscale_proxies() {
+        let config = Config::parse(
+            b"proxies:\n  - {name: ts, type: tailscale, auth-key: tskey-auth-x, hostname: clyntis-mac, exit-node: us-exit, accept-routes: true, ephemeral: true}\n  - {name: node, type: vless, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111}\n  - {name: ts2, type: tailscale, dialer-proxy: node, control-url: 'https://headscale.example'}\nrules: ['IP-CIDR,100.64.0.0/10,ts,no-resolve', 'DOMAIN-SUFFIX,ts.net,ts', 'MATCH,DIRECT']\n",
+        )
+        .unwrap();
+        let ts = &config.proxies[0];
+        assert_eq!(ts.kind, ProxyKind::Tailscale);
+        assert_eq!(ts.tailscale.auth_key.as_deref(), Some("tskey-auth-x"));
+        assert_eq!(ts.tailscale.exit_node.as_deref(), Some("us-exit"));
+        assert!(ts.tailscale.ephemeral);
+        assert_eq!(config.proxies[2].dialer_proxy.as_deref(), Some("node"));
+        // Unknown keys are still rejected, and tailscale keys need the type.
+        assert!(Config::parse(b"proxies:\n  - {name: ts, type: tailscale, bogus: 1}\n").is_err());
+        assert!(Config::parse(b"proxies:\n  - {name: v, type: vless, server: a.b, port: 1, uuid: 11111111-1111-4111-8111-111111111111, auth-key: x}\n").is_err());
+        assert!(Config::parse(b"proxies:\n  - {name: v, type: vless, uuid: 11111111-1111-4111-8111-111111111111}\n").is_err());
+        assert!(
+            Config::parse(b"proxies:\n  - {name: ts, type: tailscale, dialer-proxy: missing}\n")
+                .is_err()
+        );
+        assert!(
+            Config::parse(b"proxies:\n  - {name: ts, type: tailscale, dialer-proxy: ts}\n")
+                .is_err()
+        );
+        for dir in ["/etc/x", "../x", "a/../../x", "~/x", "C:\\\\x"] {
+            let yaml = format!("proxies:\n  - {{name: ts, type: tailscale, state-dir: '{dir}'}}\n");
+            assert!(Config::parse(yaml.as_bytes()).is_err(), "{dir}");
+        }
+        assert!(
+            Config::parse(b"proxies:\n  - {name: ts, type: tailscale, state-dir: nodes/home}\n")
+                .is_ok()
+        );
+        // The auth key never leaves through serialization.
+        assert!(!serde_json::to_string(&config).unwrap().contains("tskey"));
     }
 }

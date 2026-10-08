@@ -44,7 +44,10 @@ pub struct Resolver {
     cache: Mutex<Cache>,
     fake: Mutex<FakeMap>,
     policy: RwLock<DnsPolicy>,
+    tailnet: RwLock<Option<TailnetNames>>,
 }
+/// MagicDNS names of the running Tailscale proxies.
+pub type TailnetNames = std::sync::Arc<dyn Fn(&str) -> Option<IpAddr> + Send + Sync>;
 #[derive(Clone, Default)]
 struct DnsPolicy {
     hosts: std::collections::BTreeMap<String, meta_config::Strings>,
@@ -69,6 +72,7 @@ impl Resolver {
             hooks,
             clock,
             policy: RwLock::new(DnsPolicy::default()),
+            tailnet: RwLock::new(None),
             cache: Mutex::new(Cache::default()),
             fake: Mutex::new(FakeMap {
                 by_name: HashMap::new(),
@@ -137,6 +141,11 @@ impl Resolver {
         };
         self.clear_cache();
         Ok(())
+    }
+    /// Real lookups (DIRECT dials, non-fake-ip answers) resolve tailnet names
+    /// to their 100.x addresses; fake-ip answers keep the domain for rules.
+    pub fn set_tailnet_names(&self, names: Option<TailnetNames>) {
+        *self.tailnet.write().unwrap() = names;
     }
     pub fn set_hosts(&self, hosts: &std::collections::BTreeMap<String, meta_config::Strings>) {
         self.policy.write().unwrap().hosts = hosts.clone();
@@ -251,6 +260,10 @@ impl Resolver {
     }
     pub async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         let mut host = host.trim_end_matches('.').to_ascii_lowercase();
+        let tailnet = self.tailnet.read().unwrap().clone();
+        if let Some(ip) = tailnet.and_then(|names| names(&host)) {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
         for depth in 0..16 {
             let Some(values) = self.host_values(&host) else {
                 break;

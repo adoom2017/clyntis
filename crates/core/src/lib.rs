@@ -8,6 +8,7 @@ mod profile;
 mod resources;
 pub use resources::Freshness;
 mod sniff;
+mod tailscale;
 #[cfg(test)]
 mod tests;
 mod traffic;
@@ -44,6 +45,7 @@ pub struct Core {
     clock: Arc<meta_protocol::tls::Clock>,
     xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<meta_protocol::xudp::Multiplexer>>>,
     xudp_key: [u8; 32],
+    tailscale: Mutex<HashMap<String, meta_tailscale::Node>>,
 }
 struct Policy {
     mode: Mode,
@@ -238,6 +240,7 @@ impl Core {
             clock,
             xudp_pool: Default::default(),
             xudp_key,
+            tailscale: Default::default(),
         }))
     }
     pub async fn start(self: &Arc<Self>) -> Result<Running> {
@@ -284,6 +287,7 @@ impl Core {
             .await
             .context("cannot prepare routing resources")?;
         self.load_profile().context("cannot load saved profile")?;
+        *self.tailscale.lock().unwrap() = tailscale::start(self)?;
         let mut tasks = JoinSet::new();
         let mut system_dns_tasks = JoinSet::new();
         let mut addresses = vec![];
@@ -901,6 +905,16 @@ impl Core {
                 .context("proxy not found")?;
             match p.kind {
                 ProxyKind::Vless => self.vless_stream(p, &target, 1).await,
+                ProxyKind::Tailscale => {
+                    let node = self
+                        .tailscale
+                        .lock()
+                        .unwrap()
+                        .get(name.as_str())
+                        .cloned()
+                        .context("Tailscale proxy is not running")?;
+                    node.dial(&target.host, target.port).await
+                }
                 ProxyKind::Hysteria2 | ProxyKind::Trojan => {
                     bail!("configured outbound protocol is unavailable in this build")
                 }
@@ -1022,6 +1036,7 @@ impl Core {
                     )))
                 }
             }
+            ProxyKind::Tailscale => bail!("UDP through Tailscale is not supported yet"),
             ProxyKind::Hysteria2 | ProxyKind::Trojan => {
                 bail!("configured outbound protocol is unavailable in this build")
             }

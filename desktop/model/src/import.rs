@@ -199,14 +199,14 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
         };
         let mut trial = base.clone();
         trial.proxies = vec![proxy.clone()];
-        if proxy.kind != ProxyKind::Vless
+        if !matches!(proxy.kind, ProxyKind::Vless | ProxyKind::Tailscale)
             || trial.validate().is_err()
             || !names.insert(proxy.name.clone())
         {
             warn(
                 &mut warnings,
                 path,
-                "仅支持有效且名称唯一的 VLESS 节点，已跳过",
+                "仅支持有效且名称唯一的 VLESS 或 Tailscale 节点，已跳过",
             );
             continue;
         }

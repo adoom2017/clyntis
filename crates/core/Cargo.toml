@@ -7,6 +7,7 @@ license.workspace = true
 meta-config.workspace = true
 meta-protocol.workspace = true
 meta-platform.workspace = true
+meta-tailscale.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

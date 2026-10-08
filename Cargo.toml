@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/config", "crates/protocol", "crates/platform", "crates/core", "crates/cli", "crates/ffi", "crates/runtime"]
+members = ["crates/config", "crates/protocol", "crates/platform", "crates/core", "crates/cli", "crates/ffi", "crates/runtime", "crates/tailscale"]
 resolver = "2"
 exclude = ["fuzz", "desktop"]
 
@@ -43,6 +43,7 @@ meta-protocol = { path = "crates/protocol" }
 meta-platform = { path = "crates/platform" }
 meta-core = { path = "crates/core" }
 meta-runtime = { path = "crates/runtime" }
+meta-tailscale = { path = "crates/tailscale" }
 
 [profile.release]
 lto = "thin"
