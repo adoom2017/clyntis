@@ -11,8 +11,9 @@ replacement for every protocol or configuration option.
 - **Outbound:** DIRECT, REJECT, VLESS and Tailscale. VLESS runs over TCP,
   WebSocket or gRPC, including TLS, REALITY, XTLS Vision and UDP/XUDP.
   BoringSSL is the TLS backend. Tailscale is described [below](#tailscale-outbound).
-- **Routing:** rule/global/direct modes, select and url-test groups, domain/IP
-  rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
+- **Routing:** rule/global/direct modes, select and url-test groups (a url-test
+  group leaves a member as soon as it fails a round and re-tests right after a
+  network change), domain/IP rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
   profile (see `meta_config::custom`); a rule whose target or rule provider the
   profile lacks is skipped with a reason instead of failing the profile.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
@@ -72,6 +73,20 @@ rules:
   is bound to the physical egress, outside the TUN.
 - Destinations: peers' tailnet addresses, MagicDNS names (full or short), subnet
   routes with `accept-routes`, and anything else through `exit-node`.
+- At home, reach a subnet directly; away, through the tailnet: put `DIRECT` and
+  the Tailscale proxy in a `url-test` group whose `url` answers only on that LAN
+  (pick a service unique to it; common subnets such as `192.168.2.0/24` exist on
+  other networks too). DIRECT wins while the check answers; once it fails the
+  group switches to Tailscale, and a network change re-tests within seconds.
+
+  ```yaml
+  proxy-groups:
+    - {name: Home LAN, type: url-test, proxies: [DIRECT, Tailscale], url: 'http://192.168.2.50:9090/', interval: 30, tolerance: 20}
+  rules:
+    - IP-CIDR,192.168.2.0/24,Home LAN,no-resolve
+  ```
+- A network change rebinds the node's UDP socket, reconnects its DERP relays and
+  rediscovers direct paths at once; WireGuard sessions continue.
 - Limits: TCP only (UDP through Tailscale is not supported yet); login with an
   auth key only (an interactive login URL is logged but not awaited); node-key
   expiry is not renewed automatically; no peer relays, port mapping or

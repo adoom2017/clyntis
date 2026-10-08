@@ -128,6 +128,7 @@ struct Router {
     derp_in: mpsc::Sender<(Public, Vec<u8>)>,
     links: mpsc::Sender<(u32, Option<derp::Link>)>,
     udp: Option<Arc<UdpSocket>>,
+    udp_stop: CancellationToken,
     local_ip: Option<IpAddr>,
     stun_pending: HashMap<[u8; 12], Instant>,
     /// Published STUN-mapped addresses, and those seen in the current round:
@@ -555,6 +556,32 @@ impl Router {
         }
     }
 
+    /// Forgets what belonged to the previous network: DERP links (they
+    /// reconnect on demand, the home region at once), direct paths and our
+    /// candidates. WireGuard sessions survive; only their transport changes.
+    fn network_changed(&mut self) {
+        self.regions.clear();
+        self.by_addr.clear();
+        for state in self.states.values_mut() {
+            state.best = None;
+            state.pings.clear();
+            state.learned.clear();
+            state.last_discovery = None;
+        }
+        self.stun_addrs.clear();
+        self.stun_round.clear();
+        self.stun_pending.clear();
+        self.publish();
+        self.stun();
+        let home = self.routes.borrow().home;
+        if home != 0 {
+            self.regions
+                .insert(home, Region::Connecting(VecDeque::new()));
+            self.connect(home);
+        }
+        tracing::info!("Tailscale network changed; reconnecting relays and rediscovering paths");
+    }
+
     /// Asks a few DERP nodes' STUN servers for our public UDP address.
     fn stun(&mut self) {
         if self.udp.is_none() {
@@ -654,6 +681,44 @@ impl Router {
     }
 }
 
+/// A UDP socket on the current egress and its receive task, which forwards
+/// datagrams to `udp_in` until the returned token (or `stop`) is cancelled.
+async fn open_udp(
+    dialer: &dyn Dialer,
+    udp_in: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    stop: &CancellationToken,
+) -> (Option<Arc<UdpSocket>>, CancellationToken) {
+    let token = stop.child_token();
+    let socket = match dialer.bind_udp().await {
+        Ok(socket) => Arc::new(socket),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "Tailscale UDP unavailable; peers are reached through DERP only");
+            return (None, token);
+        }
+    };
+    let (receiver, done) = (socket.clone(), token.clone());
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; BUFFER];
+        loop {
+            tokio::select! {
+                _ = done.cancelled() => break,
+                received = receiver.recv_from(&mut buf) => match received {
+                    Ok((n, src)) => {
+                        if udp_in.try_send((src, buf[..n].to_vec())).is_err() && udp_in.is_closed() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "Tailscale UDP receive failed");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                },
+            }
+        }
+    });
+    (Some(socket), token)
+}
+
 /// Runs until `stop`. `from_stack` carries packets to encrypt; decrypted
 /// packets go to `to_stack`; discovered UDP candidates go to `endpoints`.
 #[allow(clippy::too_many_arguments)]
@@ -666,41 +731,14 @@ pub async fn run(
     to_stack: mpsc::Sender<Vec<u8>>,
     endpoints: watch::Sender<Endpoints>,
     paths: Paths,
+    mut network: watch::Receiver<u64>,
     stop: CancellationToken,
 ) {
     let (derp_in, mut derp_rx) = mpsc::channel(1024);
     let (links, mut links_rx) = mpsc::channel(16);
     let (udp_in, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(1024);
-    let udp = match dialer.bind_udp().await {
-        Ok(socket) => Some(Arc::new(socket)),
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "Tailscale UDP unavailable; peers are reached through DERP only");
-            None
-        }
-    };
+    let (udp, udp_stop) = open_udp(&*dialer, udp_in.clone(), &stop).await;
     let local_ip = dialer.local_ipv4().await;
-    if let Some(socket) = udp.clone() {
-        let stop = stop.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; BUFFER];
-            loop {
-                tokio::select! {
-                    _ = stop.cancelled() => break,
-                    received = socket.recv_from(&mut buf) => match received {
-                        Ok((n, src)) => {
-                            if udp_in.try_send((src, buf[..n].to_vec())).is_err() && udp_in.is_closed() {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            tracing::debug!(%error, "Tailscale UDP receive failed");
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    },
-                }
-            }
-        });
-    }
     let mut router = Router {
         key,
         disco,
@@ -715,6 +753,7 @@ pub async fn run(
         derp_in,
         links,
         udp,
+        udp_stop,
         local_ip,
         stun_pending: HashMap::new(),
         stun_addrs: Vec::new(),
@@ -729,6 +768,7 @@ pub async fn run(
     let mut timer = tokio::time::interval(Duration::from_millis(250));
     let mut home_check = tokio::time::interval(Duration::from_secs(5));
     let mut stun_timer = tokio::time::interval(STUN_INTERVAL);
+    let mut watching_network = true;
     loop {
         tokio::select! {
             biased;
@@ -754,6 +794,20 @@ pub async fn run(
             changed = routes.changed() => {
                 if changed.is_err() { break }
                 if router.stun_addrs.is_empty() { router.stun(); }
+            }
+            // The device moved to another network: old sockets, relays and
+            // paths are bound to the previous one.
+            changed = network.changed(), if watching_network => {
+                if changed.is_err() {
+                    watching_network = false;
+                    continue;
+                }
+                router.udp_stop.cancel();
+                let (udp, udp_stop) = open_udp(&*router.dialer, udp_in.clone(), &stop).await;
+                router.udp = udp;
+                router.udp_stop = udp_stop;
+                router.local_ip = router.dialer.local_ipv4().await;
+                router.network_changed();
             }
             _ = timer.tick() => router.timers(),
             _ = stun_timer.tick() => router.stun(),
@@ -861,6 +915,7 @@ mod tests {
             to_stack,
             endpoints,
             Default::default(),
+            watch::channel(0).1,
             stop.clone(),
         ));
         let packet = ip_packet(b"direct");

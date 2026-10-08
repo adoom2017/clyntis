@@ -156,6 +156,7 @@ struct Inner {
     disco: Private,
     endpoints: watch::Receiver<magic::Endpoints>,
     paths: magic::Paths,
+    network: watch::Sender<u64>,
     /// "connecting", "running" or "error", with the last error.
     lifecycle: Mutex<(&'static str, Option<String>)>,
 }
@@ -217,6 +218,7 @@ impl Node {
         let disco = Private::generate();
         let (endpoints, endpoints_rx) = watch::channel(Vec::new());
         let paths = magic::Paths::default();
+        let (network, network_rx) = watch::channel(0u64);
         tokio::spawn(magic::run(
             state.node.clone(),
             disco.clone(),
@@ -226,6 +228,7 @@ impl Node {
             to_stack,
             endpoints,
             paths.clone(),
+            network_rx,
             stop.clone(),
         ));
         let node = Self {
@@ -239,6 +242,7 @@ impl Node {
                 disco,
                 endpoints: endpoints_rx,
                 paths,
+                network,
                 lifecycle: Mutex::new(("connecting", None)),
             }),
         };
@@ -273,6 +277,12 @@ impl Node {
             .await
             .context("Tailscale is not connected to its tailnet yet")??;
         Ok(())
+    }
+
+    /// The device moved to another network: rebind UDP, reconnect relays and
+    /// rediscover direct paths now rather than when the old ones time out.
+    pub fn network_changed(&self) {
+        self.inner.network.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     pub fn status(&self) -> Status {

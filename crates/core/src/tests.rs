@@ -725,3 +725,39 @@ async fn proxy_status_reports_details_and_the_last_probe() {
     assert!(status["error"].as_str().is_some_and(|e| !e.is_empty()));
     assert!(status["checked"].as_u64().is_some());
 }
+
+#[test]
+fn url_test_switches_when_the_current_member_fails() {
+    let round = |direct: Option<u64>, tailscale: Option<u64>| {
+        vec![
+            ("DIRECT".to_owned(), direct),
+            ("Tailscale".to_owned(), tailscale),
+        ]
+    };
+    // At home: the LAN check answers directly.
+    assert_eq!(
+        url_test_choice(None, &round(Some(2), Some(60)), 20).as_deref(),
+        Some("DIRECT")
+    );
+    // Away: DIRECT fails, so the slower Tailscale wins even though DIRECT's
+    // last successful delay was far lower.
+    assert_eq!(
+        url_test_choice(Some("DIRECT"), &round(None, Some(60)), 20).as_deref(),
+        Some("Tailscale")
+    );
+    // Back home: DIRECT is faster by more than the tolerance.
+    assert_eq!(
+        url_test_choice(Some("Tailscale"), &round(Some(2), Some(60)), 20).as_deref(),
+        Some("DIRECT")
+    );
+    // Within the tolerance the current member stays.
+    assert_eq!(
+        url_test_choice(Some("Tailscale"), &round(Some(50), Some(60)), 20).as_deref(),
+        Some("Tailscale")
+    );
+    // Nothing works: keep whatever was selected.
+    assert_eq!(
+        url_test_choice(Some("DIRECT"), &round(None, None), 20),
+        None
+    );
+}

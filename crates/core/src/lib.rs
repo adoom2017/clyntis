@@ -46,6 +46,8 @@ pub struct Core {
     xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<meta_protocol::xudp::Multiplexer>>>,
     xudp_key: [u8; 32],
     tailscale: Mutex<HashMap<String, meta_tailscale::Node>>,
+    /// Bumped on every network change so url-test groups re-test at once.
+    network_epoch: tokio::sync::watch::Sender<u64>,
 }
 struct Policy {
     mode: Mode,
@@ -61,6 +63,32 @@ pub(crate) struct RouteDecision {
     pub(crate) node: String,
     pub(crate) group: String,
     pub(crate) rule: String,
+}
+
+/// The member a url-test group should use after a round of probes
+/// (`results`: member and delay, `None` when it failed). The current member
+/// is kept while it works and no other is faster by more than `tolerance`;
+/// once it fails this round, the fastest working member takes over. `None`
+/// when nothing worked: the group keeps its selection.
+fn url_test_choice(
+    current: Option<&str>,
+    results: &[(String, Option<u64>)],
+    tolerance: u64,
+) -> Option<String> {
+    let (best, best_delay) = results
+        .iter()
+        .filter_map(|(name, delay)| delay.map(|d| (name, d)))
+        .min_by_key(|(_, d)| *d)?;
+    let current_delay = current.and_then(|name| {
+        results
+            .iter()
+            .find(|(member, _)| member == name)
+            .and_then(|(_, delay)| *delay)
+    });
+    match current_delay {
+        Some(delay) if best_delay.saturating_add(tolerance) >= delay => current.map(str::to_owned),
+        _ => Some(best.clone()),
+    }
 }
 
 fn without_last_rule_field<'a>(raw: &'a str, expected: &str) -> &'a str {
@@ -244,6 +272,7 @@ impl Core {
             xudp_pool: Default::default(),
             xudp_key,
             tailscale: Default::default(),
+            network_epoch: tokio::sync::watch::channel(0).0,
         }))
     }
     pub async fn start(self: &Arc<Self>) -> Result<Running> {
@@ -417,28 +446,40 @@ impl Core {
             let core = self.clone();
             tasks.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(group.interval));
+                let mut network = core.network_epoch.subscribe();
                 loop {
-                    tokio::select! {_=core.stop.cancelled()=>break,_=interval.tick()=>{}}
-                    let mut best = None;
-                    for target in &group.proxies {
-                        if let Ok(delay) =
-                            core.probe(target, &group.url, Duration::from_secs(5)).await
-                            && best.as_ref().is_none_or(|(_, d)| delay < *d)
-                        {
-                            best = Some((target.clone(), delay));
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        _ = interval.tick() => {}
+                        // A new network can change which member works (a LAN
+                        // check URL reachable only at home): re-test once it
+                        // has settled instead of waiting for the interval.
+                        changed = network.changed() => {
+                            if changed.is_err() { break }
+                            tokio::select! {
+                                _ = core.stop.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                            }
+                            network.mark_unchanged();
+                            interval.reset();
                         }
                     }
-                    if let Some((target, delay)) = best {
-                        let mut policy = core.policy.write().unwrap();
-                        let old = policy
-                            .selection
-                            .get(&group.name)
-                            .and_then(|n| policy.delay.get(n))
-                            .copied()
-                            .unwrap_or(u64::MAX);
-                        if delay.saturating_add(group.tolerance) < old {
-                            policy.selection.insert(group.name.clone(), target);
+                    let results = futures_util::future::join_all(group.proxies.iter().map(|target| {
+                        let core = core.clone();
+                        let url = group.url.clone();
+                        async move {
+                            let delay = core.probe(target, &url, Duration::from_secs(5)).await.ok();
+                            (target.clone(), delay)
                         }
+                    }))
+                    .await;
+                    let mut policy = core.policy.write().unwrap();
+                    let current = policy.selection.get(&group.name).cloned();
+                    if let Some(next) = url_test_choice(current.as_deref(), &results, group.tolerance) {
+                        if current.as_deref() != Some(next.as_str()) {
+                            tracing::info!(group = %group.name, from = ?current, to = %next, "url-test group switched");
+                        }
+                        policy.selection.insert(group.name.clone(), next);
                     }
                 }
             });
@@ -1148,6 +1189,13 @@ impl Core {
             connection.cancel.cancel();
         }
         self.resolver.clear_cache();
+        self.network_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        let nodes: Vec<meta_tailscale::Node> =
+            self.tailscale.lock().unwrap().values().cloned().collect();
+        for node in nodes {
+            node.network_changed();
+        }
     }
     pub async fn probe(&self, name: &str, url: &str, timeout: Duration) -> Result<u64> {
         let result = self.probe_once(name, url, timeout).await;
