@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Mutex, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -22,8 +22,8 @@ pub struct ListInfo {
 /// Compiled block and allow sets. The user's allowlist can change while
 /// running; the lists' own exceptions come with them.
 pub struct Filter {
-    block: DomainSet,
-    list_allow: DomainSet,
+    block: Arc<DomainSet>,
+    list_allow: Arc<DomainSet>,
     user_allow: RwLock<DomainSet>,
     pub lists: Vec<ListInfo>,
 }
@@ -35,8 +35,17 @@ impl Filter {
         lists: Vec<ListInfo>,
     ) -> Self {
         Self {
-            block,
-            list_allow,
+            block: Arc::new(block),
+            list_allow: Arc::new(list_allow),
+            user_allow: RwLock::new(allow_set(user_allow)),
+            lists,
+        }
+    }
+    /// The same compiled lists with new status and allowlist.
+    pub fn with_lists(&self, user_allow: &[String], lists: Vec<ListInfo>) -> Self {
+        Self {
+            block: self.block.clone(),
+            list_allow: self.list_allow.clone(),
             user_allow: RwLock::new(allow_set(user_allow)),
             lists,
         }
@@ -50,6 +59,10 @@ impl Filter {
     }
     pub fn set_allow(&self, patterns: &[String]) {
         *self.user_allow.write().unwrap() = allow_set(patterns);
+    }
+    #[cfg(test)]
+    pub fn shares_lists(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.block, &other.block)
     }
     pub fn entries(&self) -> usize {
         self.block.len()

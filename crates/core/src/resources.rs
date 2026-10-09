@@ -19,6 +19,42 @@ pub struct Resources {
     matchers: HashMap<(String, String), Matcher>,
     /// Ad blocking lists, when `adblock.enable`.
     pub adblock: Option<Arc<crate::adblock::Filter>>,
+    /// What the file-backed providers and the ad blocking lists were built
+    /// from: a refresh that finds the same contents reuses them instead of
+    /// parsing again while the active snapshot still holds the old copy.
+    providers: HashMap<String, (ProviderSource, Matcher)>,
+    adblock_sources: Vec<ListSource>,
+}
+
+/// A file's length and SHA-256: unchanged contents, whatever the mtime (a
+/// periodic download of the same list replaces the file).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    digest: [u8; 32],
+}
+impl Stamp {
+    fn of(path: &Path) -> Result<Self> {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        let len = std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+        Ok(Self {
+            len,
+            digest: hasher.finalize().into(),
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderSource {
+    behavior: String,
+    format: String,
+    stamp: Stamp,
+}
+/// One configured list and its contents; `None` when it could not be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListSource {
+    list: meta_config::adblock::List,
+    stamp: Option<Stamp>,
 }
 impl Resources {
     /// Copies the `kind` matchers for every tag in `tags` into `out` when this
@@ -83,9 +119,10 @@ impl Resources {
         let mut refs = references(config)?;
         let mut pending = Staged::default();
         let mut providers = HashMap::new();
+        let mut provider_sources = HashMap::new();
         for (name, p) in &config.rule_providers {
-            let payload = if p.kind == "inline" {
-                p.payload.clone()
+            let matcher = if p.kind == "inline" {
+                provider_matcher(p, &p.payload)?
             } else {
                 let path = asset_path(&config.directory, &p.path)?;
                 let data = asset(
@@ -101,13 +138,25 @@ impl Resources {
                     &mut pending,
                 )
                 .await?;
-                parse_payload(&read_limited(&data)?, &p.format)?
+                let source = ProviderSource {
+                    behavior: p.behavior.clone(),
+                    format: p.format.clone(),
+                    stamp: Stamp::of(&data)?,
+                };
+                let matcher = match previous.providers.get(name) {
+                    Some((built, matcher)) if *built == source => matcher.clone(),
+                    _ => provider_matcher(p, &parse_payload(&read_limited(&data)?, &p.format)?)?,
+                };
+                provider_sources.insert(name.clone(), (source, matcher.clone()));
+                matcher
             };
-            let matcher = provider_matcher(p, &payload)?;
             matcher.references(&mut refs);
             providers.insert(name.clone(), matcher);
         }
-        let mut out = Self::default();
+        let mut out = Self {
+            providers: provider_sources,
+            ..Self::default()
+        };
         let mut seen = HashSet::new();
         refs.retain(|r| seen.insert(r.clone()));
         let ip_refs: Vec<_> = refs
@@ -312,7 +361,8 @@ impl Resources {
             out.matchers.insert(("rule-set".into(), name), bound);
         }
         out.rules(&config.rules)?;
-        out.adblock = adblock(config, refresh, &fetch, &mut pending).await;
+        (out.adblock, out.adblock_sources) =
+            adblock(config, refresh, &fetch, &mut pending, previous).await;
         pending.commit()?;
         Ok(out)
     }
@@ -320,29 +370,33 @@ impl Resources {
 
 /// Loads the ad blocking lists. A list that cannot be fetched or parsed is
 /// reported and left out: blocking must never stop the core from starting.
+/// Lists whose contents did not change since `previous` keep its compiled
+/// sets: rebuilding ~100,000 domains next to the live copy every refresh
+/// costs the iOS tunnel several MiB of its ~50 MiB.
 async fn adblock(
     config: &Config,
     refresh: bool,
     fetch: &Fetch<'_>,
     pending: &mut Staged,
-) -> Option<Arc<crate::adblock::Filter>> {
+    previous: &Resources,
+) -> (Option<Arc<crate::adblock::Filter>>, Vec<ListSource>) {
     let settings = &config.adblock;
     if !settings.enable || settings.lists.is_empty() {
-        return None;
+        return (None, vec![]);
     }
-    let mut block = meta_config::rule::DomainSetBuilder::default();
-    let mut allow = meta_config::rule::DomainSetBuilder::default();
-    let mut lists = Vec::new();
+    struct Resolved {
+        data: Result<PathBuf>,
+        updated: Option<u64>,
+    }
+    let mut resolved = Vec::new();
+    let mut sources = Vec::new();
     for list in &settings.lists {
         let path = config.directory.join(list.file_name());
-        // A fresh download is still staged under a temporary name: it was
-        // updated now. Otherwise the cached file's time.
-        let mut fresh = false;
-        let loaded: Result<usize> = async {
+        let data: Result<PathBuf> = async {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let data = asset(
+            asset(
                 &path,
                 &list.url,
                 Some(settings.interval),
@@ -350,13 +404,12 @@ async fn adblock(
                 fetch,
                 pending,
             )
-            .await?;
-            fresh = data != path;
-            let bytes = read_limited(&data)?;
-            meta_config::adblock::parse_list(&bytes, &list.format, &mut block, &mut allow)
+            .await
         }
         .await;
-        let updated = if fresh {
+        // A fresh download is still staged under a temporary name: it was
+        // updated now. Otherwise the cached file's time.
+        let updated = if data.as_ref().is_ok_and(|data| *data != path) {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
@@ -367,11 +420,43 @@ async fn adblock(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         }
         .map(|d| d.as_secs());
+        sources.push(ListSource {
+            list: list.clone(),
+            stamp: data.as_ref().ok().and_then(|data| Stamp::of(data).ok()),
+        });
+        resolved.push(Resolved { data, updated });
+    }
+    if let Some(active) = &previous.adblock
+        && previous.adblock_sources == sources
+    {
+        let lists = active
+            .lists
+            .iter()
+            .zip(&resolved)
+            .map(|(info, resolved)| crate::adblock::ListInfo {
+                updated: resolved.updated,
+                ..info.clone()
+            })
+            .collect();
+        tracing::debug!("ad blocking lists unchanged; reusing them");
+        return (
+            Some(Arc::new(active.with_lists(&settings.allow, lists))),
+            sources,
+        );
+    }
+    let mut block = meta_config::rule::DomainSetBuilder::default();
+    let mut allow = meta_config::rule::DomainSetBuilder::default();
+    let mut lists = Vec::new();
+    for (list, resolved) in settings.lists.iter().zip(resolved) {
+        let loaded = resolved.data.and_then(|data| {
+            let bytes = read_limited(&data)?;
+            meta_config::adblock::parse_list(&bytes, &list.format, &mut block, &mut allow)
+        });
         let info = match loaded {
             Ok(entries) => crate::adblock::ListInfo {
                 name: list.name.clone(),
                 entries,
-                updated,
+                updated: resolved.updated,
                 error: None,
             },
             Err(error) => {
@@ -379,7 +464,7 @@ async fn adblock(
                 crate::adblock::ListInfo {
                     name: list.name.clone(),
                     entries: 0,
-                    updated,
+                    updated: resolved.updated,
                     error: Some(format!("{error:#}")),
                 }
             }
@@ -392,7 +477,7 @@ async fn adblock(
         lists = filter.lists.len(),
         "ad blocking enabled"
     );
-    Some(Arc::new(filter))
+    (Some(Arc::new(filter)), sources)
 }
 /// Past its update interval (`interval` seconds, 0 or `None` never expires).
 fn expired(meta: Option<&std::fs::Metadata>, interval: Option<u64>) -> bool {
@@ -1301,6 +1386,58 @@ mod tests {
         assert!(Arc::ptr_eq(&domains(&first), &domains(&second)));
         assert!(domains(&second).matches("www.example.test"));
         std::fs::remove_dir_all(&config.directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchanged_providers_and_adblock_lists_are_reused() {
+        let dir = std::env::temp_dir().join(format!("meta-reuse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("adblock")).unwrap();
+        std::fs::write(dir.join("ads.txt"), "ads.test\n").unwrap();
+        std::fs::write(
+            dir.join("adblock/list.list"),
+            "payload:\n  - '+.one.test'\n",
+        )
+        .unwrap();
+        let mut config = Config::parse(
+            b"rule-providers:\n  ads: {type: file, path: ads.txt, behavior: domain, format: text}\nadblock:\n  enable: true\n  lists: [{name: list, url: 'https://example.invalid/l.yaml'}]\nrules: ['RULE-SET,ads,REJECT', 'MATCH,DIRECT']\n",
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        let dns =
+            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
+        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        let load = |previous| Resources::load(&config, &dns, &hooks, false, previous, None);
+        let provider = |r: &Resources| match &r.providers["ads"].1 {
+            Matcher::Or(nodes) => match &nodes[0] {
+                Matcher::Domains(set) => set.clone(),
+                _ => panic!("provider domains missing"),
+            },
+            _ => panic!("provider matcher missing"),
+        };
+        let filter = |r: &Resources| r.adblock.clone().unwrap();
+        let empty = Resources::default();
+        let first = load(&empty).await.unwrap();
+        let second = load(&first).await.unwrap();
+        assert!(Arc::ptr_eq(&provider(&first), &provider(&second)));
+        assert!(filter(&first).shares_lists(&filter(&second)));
+        assert_eq!(filter(&second).lists[0].entries, 1);
+        // Same contents rewritten (a periodic download): still reused.
+        std::fs::write(dir.join("ads.txt"), "ads.test\n").unwrap();
+        let third = load(&second).await.unwrap();
+        assert!(Arc::ptr_eq(&provider(&second), &provider(&third)));
+        // Changed contents are rebuilt.
+        std::fs::write(dir.join("ads.txt"), "other.test\n").unwrap();
+        std::fs::write(
+            dir.join("adblock/list.list"),
+            "payload:\n  - '+.two.test'\n",
+        )
+        .unwrap();
+        let fourth = load(&third).await.unwrap();
+        assert!(!Arc::ptr_eq(&provider(&third), &provider(&fourth)));
+        assert!(provider(&fourth).matches("other.test") && !provider(&fourth).matches("ads.test"));
+        assert!(!filter(&third).shares_lists(&filter(&fourth)));
+        assert!(filter(&fourth).blocks("x.two.test") && !filter(&fourth).blocks("x.one.test"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
