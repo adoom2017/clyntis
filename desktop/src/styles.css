@@ -1004,6 +1004,7 @@ textarea::placeholder {
 
 .adblock-panel {
   margin-top: 12px;
+  padding: 16px;
 }
 .adblock-panel h3 {
   display: flex;
@@ -1012,28 +1013,51 @@ textarea::placeholder {
 }
 .adblock-summary {
   display: grid;
-  grid-template-columns: repeat(4, auto) minmax(0, 1fr);
-  gap: 20px;
-  align-items: center;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
 }
-.adblock-summary > div strong {
+.adblock-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.adblock-metrics > div {
+  padding: 2px 16px;
+}
+.adblock-metrics > div:first-child {
+  padding-left: 0;
+}
+.adblock-metrics > div + div {
+  border-left: 1px solid var(--border);
+}
+.adblock-metrics strong {
   display: block;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+  line-height: 1.2;
 }
-.adblock-summary > div small {
+.adblock-metrics small {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 .adblock-top {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+}
+.adblock-top > small {
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.adblock-top ul {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 2px;
-  min-width: 0;
-  font-size: 12px;
+  gap: 3px;
 }
 .adblock-top li {
   display: flex;
@@ -1049,16 +1073,47 @@ textarea::placeholder {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.adblock-add {
-  display: grid;
-  grid-template-columns: 110px minmax(0, 1fr) 96px auto;
-  gap: 6px;
+@media (max-width: 800px) {
+  .adblock-summary {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
-.adblock-allow {
+.field select {
   width: 100%;
-  min-height: 90px;
-  font: 12px var(--mono, ui-monospace, monospace);
-  resize: vertical;
+  height: 34px;
+  color: var(--text);
+}
+.allow-add {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.allow-add input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+}
+.allow-list {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 260px;
+  overflow: auto;
+  margin-bottom: 10px;
+}
+.allow-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px 7px 12px;
+  font-size: 13px;
+}
+.allow-row + .allow-row {
+  border-top: 1px solid var(--border);
+}
+.allow-row span {
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Connections */

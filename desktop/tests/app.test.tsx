@@ -7,7 +7,8 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App from "../src/App";
+import App, { Modal } from "../src/App";
+import { useState } from "react";
 import { bytes, initial } from "../src/types";
 
 const { invoke, listen, open, save } = vi.hoisted(() => ({
@@ -387,5 +388,43 @@ describe("desktop workflows", () => {
     expect(bytes(0)).toBe("0 B");
     expect(bytes(1024)).toBe("1.0 KB");
     expect(bytes(1024 ** 3)).toBe("1.0 GB");
+  });
+});
+
+describe("Modal", () => {
+  it("keeps focus inside fields when the parent re-renders", () => {
+    function Host() {
+      const [tick, setTick] = useState(0);
+      return (
+        <>
+          <button onClick={() => setTick((t) => t + 1)}>tick {tick}</button>
+          {/* A new onClose on every render, as callers pass inline arrows. */}
+          <Modal title="测试" onClose={() => setTick(0)}>
+            <input autoFocus aria-label="名称" />
+            <select aria-label="格式">
+              <option>Clash</option>
+              <option>hosts</option>
+            </select>
+          </Modal>
+        </>
+      );
+    }
+    render(<Host />);
+    // autoFocus wins over focusing the dialog itself.
+    expect(document.activeElement).toBe(screen.getByLabelText("名称"));
+    const select = screen.getByLabelText("格式");
+    select.focus();
+    fireEvent.click(screen.getByText(/^tick/));
+    select.focus();
+    fireEvent.click(screen.getByText(/^tick/));
+    // A re-render must not pull focus back to the dialog (it closed the
+    // native select popup).
+    act(() => select.focus());
+    act(() => {
+      screen
+        .getByText(/^tick/)
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(document.activeElement).not.toBe(screen.getByRole("dialog"));
   });
 });

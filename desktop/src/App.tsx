@@ -925,7 +925,7 @@ function Empty({
     </section>
   );
 }
-function Modal({
+export function Modal({
   title,
   onClose,
   children,
@@ -937,11 +937,18 @@ function Modal({
   wide?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // Callers pass a new onClose on every render; reading it through a ref keeps
+  // the effect below to mount and unmount. Re-running it on each parent render
+  // moved focus back to the dialog, closing an open <select> and interrupting
+  // typing.
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement;
-    ref.current?.focus();
+    // Leave focus on an autoFocus field inside the dialog.
+    if (!ref.current?.contains(document.activeElement)) ref.current?.focus();
     const handler = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") close.current();
       if (event.key === "Tab") {
         const items = ref.current?.querySelectorAll<HTMLElement>(
           'button:not(:disabled),input,textarea,select,[tabindex="0"]',
@@ -967,7 +974,7 @@ function Modal({
       document.removeEventListener("keydown", handler);
       previous?.focus();
     };
-  }, [onClose]);
+  }, []);
   return (
     <div className="modal-backdrop">
       <div
@@ -1283,30 +1290,39 @@ function AdblockPanel({
       </div>
       {status.enabled && (
         <div className="adblock-summary">
-          <div>
-            <strong>{status.total.toLocaleString()}</strong>
-            <small>次拦截</small>
+          <div className="adblock-metrics">
+            <div>
+              <strong>{status.total.toLocaleString()}</strong>
+              <small>次拦截</small>
+            </div>
+            <div>
+              <strong>{status.dns.toLocaleString()}</strong>
+              <small>DNS</small>
+            </div>
+            <div>
+              <strong>{status.connections.toLocaleString()}</strong>
+              <small>连接</small>
+            </div>
+            <div>
+              <strong>{status.entries.toLocaleString()}</strong>
+              <small>条规则</small>
+            </div>
           </div>
-          <div>
-            <strong>{status.dns.toLocaleString()}</strong>
-            <small>DNS</small>
+          <div className="adblock-top">
+            <small>拦截最多</small>
+            {status.top.length ? (
+              <ul>
+                {status.top.slice(0, 3).map((item) => (
+                  <li key={item.domain}>
+                    <span>{item.domain}</span>
+                    <small>{item.count}</small>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <span className="muted">暂无拦截</span>
+            )}
           </div>
-          <div>
-            <strong>{status.connections.toLocaleString()}</strong>
-            <small>连接</small>
-          </div>
-          <div>
-            <strong>{status.entries.toLocaleString()}</strong>
-            <small>条规则</small>
-          </div>
-          <ul className="adblock-top">
-            {status.top.slice(0, 3).map((item) => (
-              <li key={item.domain}>
-                <span>{item.domain}</span>
-                <small>{item.count}</small>
-              </li>
-            ))}
-          </ul>
         </div>
       )}
       {open && (
@@ -1393,40 +1409,6 @@ function AdblockDetail({
     </div>
   );
 }
-/** One domain per line; keeps the typed text (blank lines while editing). */
-function AllowEditor({
-  value,
-  onChange,
-}: {
-  value: string[];
-  onChange: (value: string[]) => void;
-}) {
-  const [text, setText] = useState(value.join("\n"));
-  const parse = (raw: string) =>
-    raw
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-  // Follow outside changes (an entry allowed from the statistics).
-  useEffect(() => {
-    setText((current) =>
-      JSON.stringify(parse(current)) === JSON.stringify(value)
-        ? current
-        : value.join("\n"),
-    );
-  }, [value]);
-  return (
-    <textarea
-      className="adblock-allow"
-      value={text}
-      placeholder="wechat.com"
-      onChange={(e) => {
-        setText(e.target.value);
-        onChange(parse(e.target.value));
-      }}
-    />
-  );
-}
 function AdblockSettingsSection({
   value,
   onChange,
@@ -1435,9 +1417,7 @@ function AdblockSettingsSection({
   onChange: (value: AdblockSettings | null) => void;
 }) {
   const adblock = value ?? { ...defaultAdblock, enabled: false };
-  const [name, setName] = useState("");
-  const [url, setUrl] = useState("");
-  const [format, setFormat] = useState<AdListFormat>("clash");
+  const [dialog, setDialog] = useState<"list" | "allow" | null>(null);
   const update = (patch: Partial<AdblockSettings>) =>
     onChange({ ...adblock, ...patch });
   return (
@@ -1480,7 +1460,11 @@ function AdblockSettingsSection({
             </Setting>
           ))}
           {adblock.custom.map((list) => (
-            <Setting key={list.name} label={list.name} text={list.url}>
+            <Setting
+              key={list.name}
+              label={list.name}
+              text={`${list.format === "adguard" ? "AdGuard" : list.format === "hosts" ? "hosts" : "Clash"} · ${list.url}`}
+            >
               <button
                 className="text-button danger"
                 onClick={() =>
@@ -1493,57 +1477,193 @@ function AdblockSettingsSection({
               </button>
             </Setting>
           ))}
-          <Setting label="添加列表" text="Clash 规则集、hosts 或 AdGuard 格式">
-            <div className="adblock-add">
-              <input
-                value={name}
-                placeholder="名称"
-                onChange={(e) => setName(e.target.value)}
-              />
-              <input
-                value={url}
-                placeholder="https://…"
-                onChange={(e) => setUrl(e.target.value)}
-              />
-              <select
-                value={format}
-                onChange={(e) => setFormat(e.target.value as AdListFormat)}
-              >
-                <option value="clash">Clash</option>
-                <option value="hosts">hosts</option>
-                <option value="adguard">AdGuard</option>
-              </select>
-              <button
-                className="button secondary"
-                disabled={
-                  !name.trim() ||
-                  !/^https?:\/\//.test(url.trim()) ||
-                  adblock.custom.some((l) => l.name === name.trim())
-                }
-                onClick={() => {
-                  update({
-                    custom: [
-                      ...adblock.custom,
-                      { name: name.trim(), url: url.trim(), format },
-                    ],
-                  });
-                  setName("");
-                  setUrl("");
-                }}
-              >
-                添加
-              </button>
-            </div>
+          <Setting
+            label="自定义列表"
+            text="Clash 规则集、hosts 或 AdGuard 格式的链接"
+          >
+            <button
+              className="button secondary"
+              onClick={() => setDialog("list")}
+            >
+              <Plus size={14} />
+              添加
+            </button>
           </Setting>
-          <Setting label="白名单" text="每行一个域名，含其子域名；修改立即生效">
-            <AllowEditor
-              value={adblock.allow}
-              onChange={(allow) => update({ allow })}
-            />
+          <Setting
+            label="白名单"
+            text={
+              adblock.allow.length
+                ? `${adblock.allow.length} 个域名，包含其子域名；保存后立即生效，无需重启`
+                : "误拦的域名加入这里，包含其子域名；也可在概览的统计里一键放行"
+            }
+          >
+            <button
+              className="button secondary"
+              onClick={() => setDialog("allow")}
+            >
+              管理
+            </button>
           </Setting>
         </>
       )}
+      {dialog === "list" && (
+        <AdListDialog
+          taken={adblock.custom.map((l) => l.name)}
+          onClose={() => setDialog(null)}
+          onAdd={(list) => {
+            update({ custom: [...adblock.custom, list] });
+            setDialog(null);
+          }}
+        />
+      )}
+      {dialog === "allow" && (
+        <AllowDialog
+          value={adblock.allow}
+          onChange={(allow) => update({ allow })}
+          onClose={() => setDialog(null)}
+        />
+      )}
     </>
+  );
+}
+function AdListDialog({
+  taken,
+  onAdd,
+  onClose,
+}: {
+  taken: string[];
+  onAdd: (list: { name: string; url: string; format: AdListFormat }) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [format, setFormat] = useState<AdListFormat>("clash");
+  const duplicate = taken.includes(name.trim());
+  const valid =
+    !!name.trim() && !duplicate && /^https?:\/\/\S+$/.test(url.trim());
+  return (
+    <Modal title="添加自定义列表" onClose={onClose}>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (valid) onAdd({ name: name.trim(), url: url.trim(), format });
+        }}
+      >
+        <label className="field">
+          名称
+          <input
+            autoFocus
+            maxLength={64}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="例如：我的广告列表"
+          />
+        </label>
+        <label className="field">
+          链接
+          <input
+            type="url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com/ads.yaml"
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        <label className="field">
+          格式
+          <select
+            value={format}
+            onChange={(e) => setFormat(e.target.value as AdListFormat)}
+          >
+            <option value="clash">Clash 规则集（yaml 或 text）</option>
+            <option value="hosts">hosts（0.0.0.0 域名）</option>
+            <option value="adguard">AdGuard（||域名^）</option>
+          </select>
+        </label>
+        {duplicate && (
+          <p role="alert" className="inline-error">
+            已有同名列表。
+          </p>
+        )}
+        <p className="small muted">保存设置后下载，之后每天自动更新。</p>
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            取消
+          </button>
+          <button className="button primary" disabled={!valid}>
+            添加
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+function AllowDialog({
+  value,
+  onChange,
+  onClose,
+}: {
+  value: string[];
+  onChange: (value: string[]) => void;
+  onClose: () => void;
+}) {
+  const [domain, setDomain] = useState("");
+  const entry = domain.trim().toLowerCase().replace(/\.$/, "");
+  const valid =
+    /^(\+\.|\.)?[a-z0-9*]([a-z0-9*-]*[a-z0-9*])?(\.[a-z0-9*]([a-z0-9*-]*[a-z0-9*])?)+$/.test(
+      entry,
+    ) && !value.includes(entry);
+  return (
+    <Modal title="白名单" onClose={onClose}>
+      <form
+        className="allow-add"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!valid) return;
+          onChange([...value, entry]);
+          setDomain("");
+        }}
+      >
+        <input
+          autoFocus
+          value={domain}
+          onChange={(e) => setDomain(e.target.value)}
+          placeholder="例如：wechat.com"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button className="button secondary" disabled={!valid}>
+          <Plus size={14} />
+          添加
+        </button>
+      </form>
+      <div className="allow-list">
+        {value.length === 0 && (
+          <div className="allow-row muted">还没有放行的域名</div>
+        )}
+        {value.map((item) => (
+          <div className="allow-row" key={item}>
+            <span>{item}</span>
+            <button
+              className="icon-button"
+              aria-label={`移除 ${item}`}
+              onClick={() => onChange(value.filter((d) => d !== item))}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <p className="small muted">
+        包含子域名。记得点设置页底部的「保存」，保存后立即生效，无需重启。
+      </p>
+      <div className="modal-actions">
+        <button className="button primary" onClick={onClose}>
+          完成
+        </button>
+      </div>
+    </Modal>
   );
 }
 function Proxies({
