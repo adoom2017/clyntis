@@ -3,6 +3,7 @@ mod adblock;
 mod api;
 pub mod dns;
 mod inbound;
+mod memory;
 mod ntp;
 mod packet;
 mod profile;
@@ -1252,6 +1253,17 @@ impl Core {
             .values()
             .map(|s| s.snapshot())
             .collect()
+    }
+    pub fn connection_count(&self) -> usize {
+        self.connections.lock().unwrap().len()
+    }
+    /// Cancels every proxied connection; returns how many.
+    pub fn close_connections(&self) -> usize {
+        let connections = self.connections();
+        for connection in &connections {
+            connection.cancel.cancel();
+        }
+        connections.len()
     }
     pub fn close_connection(&self, id: &str) {
         if let Some(c) = self.connections.lock().unwrap().get(id) {

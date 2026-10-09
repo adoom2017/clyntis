@@ -459,9 +459,7 @@ pub extern "C" fn meta_destroy_v1(id: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn meta_close_connections_v1(id: u64) -> i32 {
     boundary(|| {
-        for connection in handle(id)?.core.connections() {
-            connection.cancel.cancel();
-        }
+        handle(id)?.core.close_connections();
         Ok(OK)
     })
 }

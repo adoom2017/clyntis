@@ -1,7 +1,10 @@
 //! Raw IP to proxy-session adapter. smoltcp owns TCP/IP protocol state.
 #[path = "packet_ipv6.rs"]
 mod ipv6;
-use crate::Core;
+use crate::{
+    Core,
+    memory::{self, MIB},
+};
 use anyhow::{Result, ensure};
 use meta_platform::PacketIo;
 use meta_protocol::Target;
@@ -50,6 +53,11 @@ struct Budget {
     udp_idle: Duration,
     /// Chunks of up to CHUNK bytes queued per direction for each TCP flow.
     tcp_queue: usize,
+    /// Footprint levels in bytes (0 disables): log the load every second,
+    /// refuse new flows, close every connection. See [`Guard`].
+    trace_above: u64,
+    shed_above: u64,
+    close_above: u64,
 }
 impl Budget {
     const DESKTOP: Self = Self {
@@ -60,6 +68,9 @@ impl Budget {
         udp_buffer: 65535,
         udp_idle: Duration::from_secs(120),
         tcp_queue: 4,
+        trace_above: 0,
+        shed_above: 0,
+        close_above: 0,
     };
     /// Holds DNS answers (EDNS, 4 KiB) and bursts of QUIC datagrams at MTU 1280.
     const HOSTED: Self = Self {
@@ -70,6 +81,9 @@ impl Budget {
         udp_buffer: 16 * 1024,
         udp_idle: Duration::from_secs(60),
         tcp_queue: 2,
+        trace_above: 32 * MIB,
+        shed_above: 40 * MIB,
+        close_above: 45 * MIB,
     };
     /// DNS clients use a fresh source port per query and retry within seconds,
     /// so a hijacked DNS flow needs no long idle period.
@@ -81,6 +95,95 @@ impl Budget {
             Self::HOSTED
         } else {
             Self::DESKTOP
+        }
+    }
+}
+
+/// Keeps a hosted tunnel under the jetsam limit: one was killed at 50 MiB
+/// within two seconds of a steady 26 MiB while an app streamed video. Above
+/// `trace_above` the load is logged every second to find what grew; above
+/// `shed_above` new flows are refused (clients retry); above `close_above`
+/// every connection is closed, so apps reconnect instead of the VPN failing.
+struct Guard {
+    budget: Budget,
+    sampled: Instant,
+    logged: Option<Instant>,
+    closed: Option<Instant>,
+    shedding: bool,
+}
+#[derive(Debug)]
+struct Load {
+    tcp_flows: usize,
+    udp_flows: usize,
+    udp_ports: usize,
+    queued_packets: usize,
+    tasks: usize,
+}
+impl Guard {
+    fn new(budget: Budget) -> Self {
+        Self {
+            budget,
+            sampled: Instant::now(),
+            logged: None,
+            closed: None,
+            shedding: false,
+        }
+    }
+    fn due(&self) -> bool {
+        self.budget.trace_above > 0 && self.sampled.elapsed() >= Duration::from_millis(250)
+    }
+    fn check(&mut self, core: &Core, load: impl FnOnce() -> Load) {
+        self.sampled = Instant::now();
+        let Some(usage) = memory::usage() else {
+            return;
+        };
+        let mib = |bytes: u64| format!("{:.1}", bytes as f64 / MIB as f64);
+        let since = |at: Option<Instant>, period: u64| {
+            at.is_none_or(|at| at.elapsed() >= Duration::from_secs(period))
+        };
+        let shedding = usage.footprint >= self.budget.shed_above;
+        if shedding != self.shedding {
+            self.shedding = shedding;
+            if shedding {
+                let released = memory::relieve();
+                tracing::warn!(
+                    footprint_mib = mib(usage.footprint),
+                    released_kib = released / 1024,
+                    "memory high; refusing new connections"
+                );
+            } else {
+                tracing::warn!(
+                    footprint_mib = mib(usage.footprint),
+                    "memory recovered; accepting new connections"
+                );
+            }
+        }
+        if usage.footprint >= self.budget.close_above && since(self.closed, 5) {
+            self.closed = Some(Instant::now());
+            let closed = core.close_connections();
+            let released = memory::relieve();
+            tracing::warn!(
+                footprint_mib = mib(usage.footprint),
+                closed,
+                released_kib = released / 1024,
+                "memory critical; closed all connections"
+            );
+        }
+        if usage.footprint >= self.budget.trace_above && since(self.logged, 1) {
+            self.logged = Some(Instant::now());
+            let load = load();
+            tracing::warn!(
+                footprint_mib = mib(usage.footprint),
+                heap_used_mib = mib(usage.heap_used),
+                heap_reserved_mib = mib(usage.heap_reserved),
+                connections = core.connection_count(),
+                tcp_flows = load.tcp_flows,
+                udp_flows = load.udp_flows,
+                udp_ports = load.udp_ports,
+                queued_packets = load.queued_packets,
+                tasks = load.tasks,
+                "memory load"
+            );
         }
     }
 }
@@ -512,6 +615,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut ipv6_dropped: u64 = 0;
     let mut fragments = ipv6::Reassembly::default();
     let mut last_expiry = Instant::now();
+    let mut guard = Guard::new(budget);
     loop {
         tokio::select! {
             biased;
@@ -535,7 +639,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) else { continue; };
                 if let Some((flow, syn)) = sniff(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }
-                    if flow.tcp && syn && !tcp_flows.contains_key(&flow) && tcp_flows.len() < budget.max_tcp {
+                    if flow.tcp && syn && !guard.shedding && !tcp_flows.contains_key(&flow) && tcp_flows.len() < budget.max_tcp {
                         let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]), tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]));
                         socket.set_timeout(Some(NetDuration::from_secs(300)));
                         socket.set_keep_alive(Some(NetDuration::from_secs(30)));
@@ -553,7 +657,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                         let core = core.clone();
                         let task = tasks.spawn(async move { (flow, tcp_session(core, flow, stream).await) });
                         tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
-                    } else if !flow.tcp && !ports.contains_key(&flow.target) && ports.len() < budget.max_ports {
+                    } else if !flow.tcp && !guard.shedding && !ports.contains_key(&flow.target) && ports.len() < budget.max_ports {
                         let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; budget.udp_buffer]);
                         let mut socket = udp::Socket::new(buffer(), buffer());
                         socket.bind(flow.target)?;
@@ -568,6 +672,15 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
             fragments.expire(last_expiry.into());
+        }
+        if guard.due() {
+            guard.check(&core, || Load {
+                tcp_flows: tcp_flows.len(),
+                udp_flows: udp_flows.len(),
+                udp_ports: ports.len(),
+                queued_packets: device.incoming.len(),
+                tasks: tasks.len(),
+            });
         }
         poll(&mut iface, now(), &mut device, &mut sockets);
         while let Some(result) = tasks.try_join_next() {
@@ -752,6 +865,9 @@ mod budget_tests {
         let worst = hosted.max_tcp * (2 * hosted.tcp_buffer + 2 * hosted.tcp_queue * CHUNK)
             + hosted.max_ports * 2 * hosted.udp_buffer;
         assert!(worst <= 20 * 1024 * 1024, "{worst}");
+        // The memory guard acts in order, before the kill at 50 MiB; desktops have none.
+        assert!(hosted.trace_above < hosted.shed_above && hosted.shed_above < hosted.close_above);
+        assert!(hosted.close_above < 50 * MIB && Budget::DESKTOP.trace_above == 0);
         // Hijacked DNS flows end quickly in both modes.
         assert_eq!(hosted.dns_idle(), Duration::from_secs(15));
         assert_eq!(Budget::DESKTOP.dns_idle(), Duration::from_secs(15));
