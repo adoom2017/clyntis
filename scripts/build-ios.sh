@@ -7,10 +7,33 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --release) configuration=release ;;
         --skip-project-generation) generate_project=false ;;
-        *) printf 'Usage: bash scripts/build-ios.sh [--release] [--skip-project-generation]\n' >&2; exit 2 ;;
+        --app-version|--build-number)
+            if [[ $# -lt 2 || $2 == --* ]]; then printf '%s requires a value.\n' "$1" >&2; exit 2; fi
+            if [[ $1 == --app-version ]]; then export CLYNTIS_APP_VERSION=$2; else export CLYNTIS_BUILD_NUMBER=$2; fi
+            shift ;;
+        *) printf 'Usage: bash scripts/build-ios.sh [--release] [--skip-project-generation] [--app-version X.Y.Z] [--build-number N]\n' >&2; exit 2 ;;
     esac
     shift
 done
+# Unspecified (or empty) values keep the defaults in ios/Version.xcconfig.
+override="$workspace/ios/build/Version.override.xcconfig"
+rm -f "$override"
+app_version=${CLYNTIS_APP_VERSION:-}
+build_number=${CLYNTIS_BUILD_NUMBER:-}
+if [[ -n $app_version && ! $app_version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf 'App version must be X.Y.Z, for example 1.2.3.\n' >&2; exit 2
+fi
+if [[ -n $build_number && ! $build_number =~ ^[1-9][0-9]*$ ]]; then
+    printf 'Build number must be a positive integer, for example 17.\n' >&2; exit 2
+fi
+if [[ -n $app_version || -n $build_number ]]; then
+    mkdir -p "$(dirname "$override")"
+    {
+        if [[ -n $app_version ]]; then printf 'MARKETING_VERSION = %s\n' "$app_version"; fi
+        if [[ -n $build_number ]]; then printf 'CURRENT_PROJECT_VERSION = %s\n' "$build_number"; fi
+    } > "$override"
+fi
+printf 'iOS version: %s (%s)\n' "${app_version:-default}" "${build_number:-default}"
 if [[ $(uname -s) != Darwin ]]; then printf 'iOS requires macOS and Xcode.\n' >&2; exit 1; fi
 if [[ $generate_project == true ]]; then command -v xcodegen >/dev/null; fi
 xcrun --sdk iphoneos --show-sdk-path >/dev/null

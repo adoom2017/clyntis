@@ -78,6 +78,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		E1A6F972733D4CE69035AC8B /* Version.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Version.xcconfig; sourceTree = "<group>"; };
 		08C48B38E9CA87387BC36EAC /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		16E5C6B7DCB40C68F7211D86 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		238BD3B82B99BE112B4D3D83 /* ConfigPasswordView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigPasswordView.swift; sourceTree = "<group>"; };
@@ -181,6 +182,7 @@
 		994D25EA0AF24E121AECB2BE = {
 			isa = PBXGroup;
 			children = (
+				E1A6F972733D4CE69035AC8B /* Version.xcconfig */,
 				FD817C6A169F8DFC4183D3B4 /* Assets.xcassets */,
 				632BCCA8C053F326296A5D8B /* App */,
 				9DB01F6BDB5B8860A9ABCCDA /* Shared */,
@@ -449,6 +451,7 @@
 		};
 		34A925A002F5CDAD3D3D6F03 /* Debug */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = E1A6F972733D4CE69035AC8B /* Version.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;
@@ -607,6 +610,7 @@
 		};
 		CC36E02E8846428EB7D98EE0 /* Release */ = {
 			isa = XCBuildConfiguration;
+			baseConfigurationReference = E1A6F972733D4CE69035AC8B /* Version.xcconfig */;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				CLANG_ANALYZER_NONNULL = YES;

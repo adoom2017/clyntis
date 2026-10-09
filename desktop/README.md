@@ -94,6 +94,19 @@ SystemConfiguration 操作物理网络服务。修改前写入恢复日志，崩
 npm run desktop:build
 ```
 
+默认应用版本读取 `package.json` 的 `version`，界面和 Tauri 安装包使用同一值。
+编译时可以覆盖版本号，并为 macOS 指定单独的构建号：
+
+```sh
+npm run desktop:build -- --app-version 1.0.0 --build-number 17
+```
+
+版本号使用 `X.Y.Z`，构建号使用正整数。也可设置环境变量 `CLYNTIS_APP_VERSION`
+和 `CLYNTIS_BUILD_NUMBER`（仅 macOS，其他平台忽略）；命令行参数优先，空值视为未指定。覆盖只作用于本次构建，
+不会改写 `package.json`。macOS 的版本号写入 `CFBundleShortVersionString`，构建号写入
+`CFBundleVersion`；未指定构建号时沿用 Tauri 默认值。Windows 使用相同的
+`--app-version` 参数。Rust workspace 的版本仍用于 Rust 包管理，与发行应用版本独立。
+
 产物位于 `target/release/bundle/`：Windows NSIS 安装包、macOS `.app` / DMG。
 脚本按宿主架构构建；交叉构建时，先安装对应 Rust target，再运行
 `npm run desktop:build -- --target <target>`，辅助程序和主应用会使用同一目标架构。

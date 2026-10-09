@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
+import { buildVersionArguments } from "./version.mjs";
 import {
   helpers,
   resolveIdentity,
@@ -21,7 +22,17 @@ if (targetIndex >= 0 && (!target || target.startsWith("-")))
 if (targetIndex < 0 && target) args.push("--target", target);
 const mac =
   process.platform === "darwin" && (!target || target.includes("apple-darwin"));
+const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+const versioned = buildVersionArguments(args, process.env, pkg.version, mac);
+const { version, buildNumber } = versioned;
+args.splice(0, args.length, ...versioned.args);
 let env = { ...process.env };
+env.CLYNTIS_APP_VERSION = version;
+const versionConfig = { version };
+if (buildNumber !== undefined)
+  versionConfig.bundle = { macOS: { bundleVersion: buildNumber } };
+args.push("--config", JSON.stringify(versionConfig));
+console.log(`应用版本：${version}${buildNumber ? ` (${buildNumber})` : ""}`);
 if (target) env.CLYNTIS_DESKTOP_TARGET = target;
 if (mac) env.MACOSX_DEPLOYMENT_TARGET = "13.0";
 let identity;

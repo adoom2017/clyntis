@@ -54,6 +54,30 @@ not rebuild the Rust core.
 
 ### Xcode Cloud
 
+App version and build number are shared by the app and tunnel. The defaults
+live in `ios/Version.xcconfig` (`MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`).
+To use a different version for a build, pass it to the core build:
+
+```sh
+bash scripts/build-ios.sh --release --app-version 1.0.0 --build-number 17
+```
+
+Either flag may be given alone, and `CLYNTIS_APP_VERSION` / `CLYNTIS_BUILD_NUMBER`
+work as environment variables. The script writes the values to the ignored
+`ios/build/Version.override.xcconfig`, which subsequent Xcode builds pick up;
+running it again without a version removes the override and restores the
+defaults. For a single command-line build, pass
+`MARKETING_VERSION=1.0.0 CURRENT_PROJECT_VERSION=17` to `xcodebuild` instead.
+Versions must be `X.Y.Z`; build numbers must be positive integers.
+
+In the Xcode Cloud workflow's **Environment** settings, add
+`CLYNTIS_APP_VERSION=1.0.0`. The post-clone hook applies it to both targets and
+uses `CI_BUILD_NUMBER` for the build number. When uploaded through Xcode Cloud,
+TestFlight uses Apple's cloud build number. To choose its next value, use
+**App Store Connect → Xcode Cloud → Settings → Build Number → Next Build Number**,
+then start a new build. This requires an Admin or App Manager role; see Apple's
+[build numbering documentation](https://developer.apple.com/documentation/xcode/setting-the-next-build-number-for-xcode-cloud-builds).
+
 The executable hook `ios/ci_scripts/ci_post_clone.sh` prepares the core before
 Xcode builds the app. It installs CMake and rustup when absent, selects the Rust
 version from `rust-toolchain.toml`, installs the device/simulator targets, fetches
@@ -66,8 +90,8 @@ and fail with `attempting to make an HTTP request, but --offline was specified`.
 
 Commit and push the hook, `scripts/build-ios.sh`, and the configured Xcode project
 to the branch used by the workflow. Select `ios/Clyntis.xcodeproj` and the
-`Clyntis` scheme in Xcode Cloud. No additional workflow environment variables or
-manual script step are required; Xcode Cloud automatically discovers the hook
+`Clyntis` scheme in Xcode Cloud. Version overrides are optional; no manual
+script step is required. Xcode Cloud automatically discovers the hook
 beside the project. Check the **Post-Clone** log for the Rust build and successful
 XCFramework creation. A fresh cloud build needs network access to Homebrew,
 Rust's distribution servers and Cargo dependencies, and takes longer than a

@@ -1930,11 +1930,14 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
   const [paused, setPaused] = useState(false);
   const [frozen, setFrozen] = useState<Log[]>([]);
   const [query, setQuery] = useState("");
-  const visible = (paused ? frozen : logs).filter(
-    (log) =>
-      (level === "all" || log.type === level) &&
-      log.payload.toLowerCase().includes(query.toLowerCase()),
-  );
+  // Newest first: logs arrive oldest-first, so reverse the filtered copy.
+  const visible = (paused ? frozen : logs)
+    .filter(
+      (log) =>
+        (level === "all" || log.type === level) &&
+        log.payload.toLowerCase().includes(query.toLowerCase()),
+    )
+    .reverse();
   return (
     <>
       <div className="toolbar">

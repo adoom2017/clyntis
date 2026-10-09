@@ -1,4 +1,7 @@
 name: Clyntis
+configFiles:
+  Debug: Version.xcconfig
+  Release: Version.xcconfig
 options:
   bundleIdPrefix: org.clyntis.ios
   deploymentTarget:
@@ -25,8 +28,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Clyntis
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen: {}
         NSAppTransportSecurity:
@@ -57,8 +60,8 @@ targets:
       path: Tunnel/Info.plist
       properties:
         CFBundleDisplayName: Clyntis
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         ClyntisAppGroup: "$(CLYNTIS_APP_GROUP)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel

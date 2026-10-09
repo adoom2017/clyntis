@@ -1,0 +1,6 @@
+// Default version shared by the app and packet tunnel. scripts/build-ios.sh
+// writes the optional override below when a version is specified; xcodebuild
+// settings such as MARKETING_VERSION=1.2.3 override both.
+MARKETING_VERSION = 0.1.0
+CURRENT_PROJECT_VERSION = 1
+#include? "build/Version.override.xcconfig"

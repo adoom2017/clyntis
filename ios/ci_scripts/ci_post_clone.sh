@@ -5,6 +5,9 @@ set -euo pipefail
 # path explicitly because the hook's working directory is ci_scripts.
 workspace=${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$workspace"
+# App Store Connect uses Xcode Cloud's build number for uploaded archives.
+# build-ios.sh below applies it and an optional CLYNTIS_APP_VERSION.
+if [[ -n ${CI_BUILD_NUMBER:-} ]]; then export CLYNTIS_BUILD_NUMBER=$CI_BUILD_NUMBER; fi
 if [[ $(uname -s) != Darwin ]]; then
     printf 'The Xcode Cloud iOS build requires macOS and Xcode.\n' >&2
     exit 1
