@@ -7,4 +7,6 @@ struct TunnelMessage: Codable {
     var node: String?
     /// A connection id for "close"; nil closes all.
     var id: String?
+    /// The ad blocking allowlist for "adblock-allow".
+    var allow: [String]?
 }

@@ -1002,6 +1002,65 @@ textarea::placeholder {
   color: var(--success);
 }
 
+.adblock-panel {
+  margin-top: 12px;
+}
+.adblock-panel h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.adblock-summary {
+  display: grid;
+  grid-template-columns: repeat(4, auto) minmax(0, 1fr);
+  gap: 20px;
+  align-items: center;
+}
+.adblock-summary > div strong {
+  display: block;
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.adblock-summary > div small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.adblock-top {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+}
+.adblock-top li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.adblock-top li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.adblock-top li small {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.adblock-add {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr) 96px auto;
+  gap: 6px;
+}
+.adblock-allow {
+  width: 100%;
+  min-height: 90px;
+  font: 12px var(--mono, ui-monospace, monospace);
+  resize: vertical;
+}
+
 /* Connections */
 .table-wrap {
   overflow: auto;

@@ -48,6 +48,7 @@ fn main() {
             app::custom_rules,
             app::save_custom_rules,
             app::proxies,
+            app::adblock_status,
             app::select_proxy,
             app::probe_proxy,
             app::connections,

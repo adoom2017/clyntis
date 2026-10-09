@@ -67,6 +67,20 @@ private struct ConnectionView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    if let adblock = model.adblock, adblock.enabled {
+                        NavigationLink { AdblockView(model: model) } label: {
+                            HStack {
+                                Label("去广告", systemImage: "nosign").foregroundStyle(.secondary)
+                                Spacer()
+                                Text("已拦截 \(adblock.total.formatted()) 次").monospacedDigit()
+                                Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(.tertiary)
+                            }
+                            .font(.subheadline)
+                            .padding(14)
+                            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 14))
+                        }
+                        .buttonStyle(.plain)
+                    }
                     VStack(alignment: .leading, spacing: 10) {
                         Text("路由模式").font(.subheadline).foregroundStyle(.secondary)
                         Picker("路由模式", selection: Binding(get: { model.mode }, set: { value in
@@ -130,6 +144,15 @@ private struct ProfilesView: View {
                             Text(model.overrides.isEmpty ? "跟随配置" : "已修改")
                         } label: {
                             Label("覆盖配置文件", systemImage: "slider.horizontal.3")
+                        }
+                    }
+                    NavigationLink {
+                        AdblockView(model: model)
+                    } label: {
+                        LabeledContent {
+                            Text(model.overrides.adblock?.enabled == true ? "已开启" : "未开启")
+                        } label: {
+                            Label("去广告", systemImage: "nosign")
                         }
                     }
                 } footer: {

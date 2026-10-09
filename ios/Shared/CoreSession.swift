@@ -155,6 +155,14 @@ final class CoreSession {
         })
     }
 
+    /// Replaces the ad blocking allowlist without restarting.
+    func updateAdblockAllow(_ allow: [String]) throws {
+        let data = try JSONSerialization.data(withJSONObject: ["adblock-allow": allow])
+        try Self.check(data.withUnsafeBytes {
+            meta_update_v1(handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+        })
+    }
+
     func updateMode(_ mode: String) throws {
         guard ["rule", "global", "direct"].contains(mode) else { throw ClientError.message("无效的代理模式。") }
         let data = try JSONSerialization.data(withJSONObject: ["mode": mode])

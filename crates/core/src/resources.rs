@@ -17,6 +17,8 @@ const LIMIT: usize = 128 * 1024 * 1024;
 #[derive(Default)]
 pub struct Resources {
     matchers: HashMap<(String, String), Matcher>,
+    /// Ad blocking lists, when `adblock.enable`.
+    pub adblock: Option<Arc<crate::adblock::Filter>>,
 }
 impl Resources {
     /// Copies the `kind` matchers for every tag in `tags` into `out` when this
@@ -310,9 +312,87 @@ impl Resources {
             out.matchers.insert(("rule-set".into(), name), bound);
         }
         out.rules(&config.rules)?;
+        out.adblock = adblock(config, refresh, &fetch, &mut pending).await;
         pending.commit()?;
         Ok(out)
     }
+}
+
+/// Loads the ad blocking lists. A list that cannot be fetched or parsed is
+/// reported and left out: blocking must never stop the core from starting.
+async fn adblock(
+    config: &Config,
+    refresh: bool,
+    fetch: &Fetch<'_>,
+    pending: &mut Staged,
+) -> Option<Arc<crate::adblock::Filter>> {
+    let settings = &config.adblock;
+    if !settings.enable || settings.lists.is_empty() {
+        return None;
+    }
+    let mut block = meta_config::rule::DomainSetBuilder::default();
+    let mut allow = meta_config::rule::DomainSetBuilder::default();
+    let mut lists = Vec::new();
+    for list in &settings.lists {
+        let path = config.directory.join(list.file_name());
+        // A fresh download is still staged under a temporary name: it was
+        // updated now. Otherwise the cached file's time.
+        let mut fresh = false;
+        let loaded: Result<usize> = async {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let data = asset(
+                &path,
+                &list.url,
+                Some(settings.interval),
+                refresh,
+                fetch,
+                pending,
+            )
+            .await?;
+            fresh = data != path;
+            let bytes = read_limited(&data)?;
+            meta_config::adblock::parse_list(&bytes, &list.format, &mut block, &mut allow)
+        }
+        .await;
+        let updated = if fresh {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        } else {
+            std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        }
+        .map(|d| d.as_secs());
+        let info = match loaded {
+            Ok(entries) => crate::adblock::ListInfo {
+                name: list.name.clone(),
+                entries,
+                updated,
+                error: None,
+            },
+            Err(error) => {
+                tracing::warn!(list = %list.name, error = %format!("{error:#}"), "ad blocking list unavailable");
+                crate::adblock::ListInfo {
+                    name: list.name.clone(),
+                    entries: 0,
+                    updated,
+                    error: Some(format!("{error:#}")),
+                }
+            }
+        };
+        lists.push(info);
+    }
+    let filter = crate::adblock::Filter::new(block.build(), allow.build(), &settings.allow, lists);
+    tracing::info!(
+        entries = filter.entries(),
+        lists = filter.lists.len(),
+        "ad blocking enabled"
+    );
+    Some(Arc::new(filter))
 }
 /// Past its update interval (`interval` seconds, 0 or `None` never expires).
 fn expired(meta: Option<&std::fs::Metadata>, interval: Option<u64>) -> bool {
@@ -384,6 +464,14 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
             parse_payload(&read_limited(&path)?, &p.format)?
         };
         provider_matcher(p, &payload)?.references(&mut refs);
+    }
+    if config.adblock.enable {
+        for list in &config.adblock.lists {
+            check(
+                &config.directory.join(list.file_name()),
+                Some(config.adblock.interval),
+            );
+        }
     }
     let interval = geo_interval(config);
     if refs.iter().any(|r| r.0 == "geoip") {

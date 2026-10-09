@@ -149,6 +149,27 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertTrue(ConnectionInfo.decode(nil).isEmpty)
     }
 
+    func testAdblockSettingsReachTheCoreAndItsStatus() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("adblock"), withIntermediateDirectories: true)
+        // A fresh cached copy of the preset list: nothing is downloaded.
+        try Data("payload:\n  - '+.ads.test'\n".utf8).write(to: root.appendingPathComponent("adblock/awavenue-ads.list"))
+        let overrides = AppOverrides(adblock: AdblockSettings(enabled: true, presets: ["awavenue"], allow: ["keep.ads.test"]))
+        let profile = Data("rules: ['MATCH,DIRECT']\n".utf8)
+        let session = try CoreSession(configuration: try overrides.applied(to: profile), directory: root)
+        defer { session.close() }
+        try session.start()
+        let object = try JSONSerialization.jsonObject(with: session.snapshot()) as? [String: Any]
+        let status = try XCTUnwrap(AdblockStatus.decode(object?["adblock"]))
+        XCTAssertTrue(status.enabled)
+        XCTAssertEqual(status.lists.first?.name, "AWAvenue-Ads")
+        XCTAssertEqual(status.lists.first?.entries, 1)
+        XCTAssertEqual(status.total, 0)
+        XCTAssertNoThrow(try session.updateAdblockAllow(["ads.test"]))
+        XCTAssertThrowsError(try session.updateAdblockAllow([""]))
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()

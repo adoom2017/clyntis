@@ -20,6 +20,15 @@ connected. It also provides:
   this device's tailnet name and addresses, home DERP region, UDP candidates and
   every peer's online state and path (direct with RTT, or relayed). Proxies
   outside every group appear under "其他节点".
+- **Ad blocking** (配置 → 去广告, and a card on the overview): turn it on, pick
+  preset lists (AWAvenue-Ads, anti-AD, AdGuard DNS filter) or add Clash / hosts
+  / AdGuard lists, and edit the allowlist. Listed domains get NXDOMAIN and
+  their connections are refused, ahead of every rule. Statistics show blocks
+  by DNS and connection, the most blocked domains and the latest blocks; swipe
+  "放行" to allow one at once. Allowlist edits apply to the running tunnel;
+  switching lists needs a reconnect. Lists are fetched by the app before
+  connecting like other routing resources; the large AdGuard list costs several
+  MB of the tunnel's memory.
 - **Connections** (概览 → 连接): open connections with target (the domain
   behind a fake IP), protocol, proxy chain, traffic and age; search, swipe to
   close one, or close all.

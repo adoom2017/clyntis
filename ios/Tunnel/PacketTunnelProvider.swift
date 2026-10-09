@@ -297,6 +297,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 case "select":
                     guard let group = message.group, let node = message.node else { throw ClientError.message("缺少节点。") }
                     try core.select(group: group, node: node)
+                case "adblock-allow":
+                    try core.updateAdblockAllow(message.allow ?? [])
                 case "close":
                     try core.closeConnection(message.id)
                 case "probe":

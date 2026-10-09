@@ -613,6 +613,17 @@ mod tests {
             validate(&runtime_yaml(&profile, &settings, &"s".repeat(32), &[]).unwrap()).unwrap();
         assert_eq!(config.log.log_level, "info");
         assert!(config.ipv6 && config.dns.ipv6);
+        settings.overrides.adblock = Some(meta_config::adblock::Settings {
+            enabled: true,
+            presets: vec!["awavenue".into()],
+            custom: vec![],
+            allow: vec!["ok.test".into()],
+        });
+        let config =
+            validate(&runtime_yaml(&profile, &settings, &"s".repeat(32), &[]).unwrap()).unwrap();
+        assert!(config.adblock.enable);
+        assert_eq!(config.adblock.lists.len(), 1);
+        assert_eq!(config.adblock.allow, ["ok.test"]);
         settings.overrides.log_level = Some("loud".into());
         assert!(settings.validate().is_err());
     }

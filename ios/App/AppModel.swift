@@ -23,6 +23,8 @@ final class AppModel {
     var nodeStatus: [String: NodeStatus] = [:]
     /// Open connections from the core snapshot, newest first.
     var connections: [ConnectionInfo] = []
+    /// Ad blocking state and counters from the snapshot.
+    var adblock: AdblockStatus?
     var probing: Set<String> = []
     /// Rules matched before every profile's own (see CustomRules).
     var customRules: [String] = []
@@ -87,6 +89,7 @@ final class AppModel {
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
                             self.ungrouped = []; self.nodeStatus = [:]; self.connections = []
+                            self.adblock = nil
                         }
                     }
                 }
@@ -287,6 +290,32 @@ final class AppModel {
         Diagnostics.app.info("custom rules saved (\(customRules.count))")
     }
 
+    /// Saves ad blocking settings. An allowlist-only change reaches the running
+    /// tunnel at once; other changes apply on the next connection.
+    /// Returns whether a reconnect is needed for them to take effect.
+    @discardableResult
+    func saveAdblock(_ value: AdblockSettings?) async throws -> Bool {
+        let previous = overrides.adblock
+        var next = overrides
+        next.adblock = value
+        try saveOverrides(next)
+        guard active else { return false }
+        if previous?.withoutAllow != value?.withoutAllow {
+            return true
+        }
+        if previous?.allow != value?.allow, connected {
+            try applySnapshot(await send(TunnelMessage(command: "adblock-allow", allow: value?.allow ?? [])))
+        }
+        return false
+    }
+
+    /// Adds `domain` to the allowlist (from the statistics), live.
+    func allowAdblock(_ domain: String) async {
+        guard var settings = overrides.adblock, !settings.allow.contains(domain) else { return }
+        settings.allow.append(domain)
+        do { try await saveAdblock(settings) } catch { self.error = error.localizedDescription }
+    }
+
     func saveOverrides(_ value: AppOverrides) throws {
         try value.save()
         overrides = AppOverrides.load()
@@ -460,6 +489,7 @@ final class AppModel {
         download = (object["download"] as? NSNumber)?.uint64Value ?? 0
         connectionCount = (object["connections"] as? [Any])?.count ?? 0
         connections = ConnectionInfo.decode(object["connections"])
+        adblock = AdblockStatus.decode(object["adblock"])
         if let config = object["config"] as? [String: Any] {
             mode = config["mode"] as? String ?? "rule"
             let selections = object["selections"] as? [String: String] ?? [:]

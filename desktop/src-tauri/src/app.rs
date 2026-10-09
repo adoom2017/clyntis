@@ -320,12 +320,23 @@ impl Desktop {
         settings.validate()?;
         let mut op = self.operation.lock().await;
         let previous = self.store.settings()?;
+        // An allowlist edit applies to the running core; everything else in
+        // the overrides needs a new runtime configuration.
+        let without_allow = |s: &Settings| {
+            let mut overrides = s.overrides.clone();
+            if let Some(adblock) = overrides.adblock.as_mut() {
+                adblock.allow.clear();
+            }
+            overrides
+        };
+        let allow = |s: &Settings| s.overrides.adblock.as_ref().map(|a| a.allow.clone());
+        let allow_changed = allow(&settings) != allow(&previous);
         let runtime_changed = settings.capture != previous.capture
             || settings.mixed_port != previous.mixed_port
             || settings.allow_lan != previous.allow_lan
             || settings.auto_dns != previous.auto_dns
             || settings.tun_interface != previous.tun_interface
-            || settings.overrides != previous.overrides;
+            || without_allow(&settings) != without_allow(&previous);
         if settings.launch_at_login != previous.launch_at_login {
             platform::autostart(&self.app, settings.launch_at_login)?;
         }
@@ -333,6 +344,15 @@ impl Desktop {
             self.store.save_settings(&settings)?;
             if runtime_changed && let Some((profile, _)) = op.active.clone() {
                 self.replace(&mut op, profile, settings.clone()).await?;
+            } else if allow_changed && let Some(engine) = op.engine.as_ref() {
+                let allow = allow(&settings).unwrap_or_default();
+                engine
+                    .request(
+                        reqwest::Method::PATCH,
+                        &["configs"],
+                        Some(serde_json::json!({ "adblock-allow": allow })),
+                    )
+                    .await?;
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -644,6 +664,14 @@ async fn controller(state: &Desktop) -> Reply<engine::Controller> {
         .as_ref()
         .map(Engine::controller)
         .context("内核未运行")
+        .map_err(error)
+}
+#[tauri::command]
+pub async fn adblock_status(state: State<'_, Desktop>) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::GET, &["adblock"], None)
+        .await
         .map_err(error)
 }
 #[tauri::command]

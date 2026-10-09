@@ -510,7 +510,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
 ) -> i32 {
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }
@@ -522,9 +522,16 @@ pub unsafe extern "C" fn meta_update_v1(id: u64, data: *const u8, len: usize) ->
         let value: serde_json::Value = serde_json::from_slice(unsafe { input(data, len)? })?;
         let object = value.as_object().context("update must be an object")?;
         ensure!(
-            object.keys().all(|k| k == "mode" || k == "rules"),
-            "only mode and rules can update online"
+            object
+                .keys()
+                .all(|k| k == "mode" || k == "rules" || k == "adblock-allow"),
+            "only mode, rules and adblock-allow can update online"
         );
+        if let Some(allow) = object.get("adblock-allow") {
+            handle(id)?
+                .core
+                .set_adblock_allow(serde_json::from_value(allow.clone())?)?;
+        }
         let mode = object
             .get("mode")
             .map(|v| serde_json::from_value(v.clone()))
@@ -533,7 +540,9 @@ pub unsafe extern "C" fn meta_update_v1(id: u64, data: *const u8, len: usize) ->
             .get("rules")
             .map(|v| serde_json::from_value(v.clone()))
             .transpose()?;
-        handle(id)?.core.update_policy(mode, rules)?;
+        if mode.is_some() || rules.is_some() {
+            handle(id)?.core.update_policy(mode, rules)?;
+        }
         Ok(OK)
     })
 }

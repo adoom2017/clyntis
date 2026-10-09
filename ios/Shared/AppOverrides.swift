@@ -9,6 +9,7 @@ struct AppOverrides: Codable, Equatable {
     var logLevel: String?
     var ipv6: Bool?
     var sniffing: Bool?
+    var adblock: AdblockSettings?
 
     var isEmpty: Bool { self == AppOverrides() }
 
@@ -34,4 +35,30 @@ struct AppOverrides: Codable, Equatable {
         if isEmpty { return configuration }
         return try CoreSession.applyOverrides(JSONEncoder().encode(self), to: configuration)
     }
+}
+
+/// Ad blocking settings; the core expands presets (meta_config::adblock).
+struct AdblockSettings: Codable, Equatable {
+    struct List: Codable, Equatable, Hashable {
+        var name: String
+        var url: String
+        var format: String
+    }
+    var enabled = true
+    var presets = ["awavenue"]
+    var custom: [List] = []
+    var allow: [String] = []
+
+    /// Everything except the allowlist, which the running core takes live.
+    var withoutAllow: AdblockSettings {
+        var copy = self
+        copy.allow = []
+        return copy
+    }
+
+    static let presetsOffered: [(id: String, name: String, detail: String)] = [
+        ("awavenue", "AWAvenue-Ads", "国内 App 广告接口，约 1,000 条，误杀少"),
+        ("anti-ad", "anti-AD", "覆盖面广，以国内为主，约 10 万条"),
+        ("adguard-dns", "AdGuard DNS filter", "偏海外的广告与追踪，约 18 万条，内存占用较大"),
+    ]
 }

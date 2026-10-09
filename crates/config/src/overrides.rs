@@ -17,6 +17,8 @@ pub struct Overrides {
     /// `sniffer.enable`. Turning it on for a profile without sniff rules adds
     /// mihomo's usual HTTP and TLS ports.
     pub sniffing: Option<bool>,
+    /// Ad blocking from the app's settings; replaces the profile's `adblock`.
+    pub adblock: Option<crate::adblock::Settings>,
 }
 
 impl Overrides {
@@ -26,6 +28,9 @@ impl Overrides {
                 LOG_LEVELS.contains(&level.as_str()),
                 "无效日志级别「{level}」"
             );
+        }
+        if let Some(adblock) = &self.adblock {
+            adblock.to_config()?;
         }
         Ok(())
     }
@@ -37,6 +42,12 @@ impl Overrides {
     /// Writes the chosen values into a parsed profile.
     pub fn apply_to(&self, map: &mut Mapping) -> Result<()> {
         self.validate()?;
+        if let Some(adblock) = &self.adblock {
+            map.insert(
+                Value::from("adblock"),
+                serde_yaml::to_value(adblock.to_config()?)?,
+            );
+        }
         if let Some(level) = &self.log_level {
             // The top-level key wins over `log.log-level` when both exist.
             map.insert(Value::from("log-level"), Value::from(level.as_str()));
@@ -102,11 +113,20 @@ mod tests {
             log_level: Some("warning".into()),
             ipv6: Some(true),
             sniffing: Some(true),
+            adblock: Some(crate::adblock::Settings {
+                enabled: true,
+                presets: vec!["awavenue".into()],
+                custom: vec![],
+                allow: vec!["ok.test".into()],
+            }),
         };
         let config = crate::Config::parse(overrides.apply(PROFILE).unwrap().as_bytes()).unwrap();
         assert_eq!(config.log.log_level, "warning");
         assert!(config.ipv6 && config.dns.ipv6);
         assert!(config.sniffer.enable);
+        assert!(config.adblock.enable);
+        assert_eq!(config.adblock.lists[0].name, "AWAvenue-Ads");
+        assert_eq!(config.adblock.allow, ["ok.test"]);
         // The profile's own sniff rules are kept.
         assert_eq!(config.sniffer.sniff.keys().collect::<Vec<_>>(), ["TLS"]);
         // Nested `log.log-level` cannot win over the chosen level.

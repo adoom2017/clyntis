@@ -30,6 +30,7 @@ pub fn router(core: Arc<Core>) -> Router {
         )
         .route("/configs", get(config).patch(update))
         .route("/proxies", get(proxies))
+        .route("/adblock", get(adblock))
         .route("/proxies/{name}", get(proxy).put(select))
         .route("/proxies/{name}/delay", get(delay))
         .route("/connections", get(connections).delete(close_all))
@@ -117,11 +118,15 @@ async fn config(State(core): State<Arc<Core>>) -> Json<Value> {
 async fn update(State(core): State<Arc<Core>>, Json(value): Json<Value>) -> ApiResult {
     let object = value.as_object().ok_or_else(|| error("expected object"))?;
     for key in object.keys() {
-        if key != "mode" && key != "rules" {
+        if key != "mode" && key != "rules" && key != "adblock-allow" {
             return Err(error(
-                "only mode/rules support online updates; restart for full configuration",
+                "only mode/rules/adblock-allow support online updates; restart for full configuration",
             ));
         }
+    }
+    if let Some(allow) = value.get("adblock-allow") {
+        let allow: Vec<String> = serde_json::from_value(allow.clone()).map_err(error)?;
+        core.set_adblock_allow(allow).map_err(error)?;
     }
     let mode = value
         .get("mode")
@@ -133,7 +138,9 @@ async fn update(State(core): State<Arc<Core>>, Json(value): Json<Value>) -> ApiR
         .map(|rules| serde_json::from_value(rules.clone()))
         .transpose()
         .map_err(error)?;
-    core.update_policy(mode, rules).map_err(error)?;
+    if mode.is_some() || rules.is_some() {
+        core.update_policy(mode, rules).map_err(error)?;
+    }
     Ok(Json(json!({})))
 }
 fn proxy_map(core: &Core) -> serde_json::Map<String, Value> {
@@ -159,6 +166,9 @@ fn proxy_map(core: &Core) -> serde_json::Map<String, Value> {
         }
     }
     output
+}
+async fn adblock(State(core): State<Arc<Core>>) -> Json<Value> {
+    Json(core.adblock_status())
 }
 async fn proxies(State(core): State<Arc<Core>>) -> Json<Value> {
     Json(json!({"proxies":proxy_map(&core)}))

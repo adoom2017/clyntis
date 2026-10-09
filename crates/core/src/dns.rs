@@ -45,6 +45,9 @@ pub struct Resolver {
     fake: Mutex<FakeMap>,
     policy: RwLock<DnsPolicy>,
     tailnet: RwLock<Option<TailnetNames>>,
+    adblock: RwLock<Option<std::sync::Arc<crate::adblock::Filter>>>,
+    /// Kept across resource refreshes so counts survive list updates.
+    pub(crate) adblock_stats: std::sync::Arc<crate::adblock::Stats>,
 }
 /// MagicDNS names of the running Tailscale proxies.
 pub type TailnetNames = std::sync::Arc<dyn Fn(&str) -> Option<IpAddr> + Send + Sync>;
@@ -73,6 +76,8 @@ impl Resolver {
             clock,
             policy: RwLock::new(DnsPolicy::default()),
             tailnet: RwLock::new(None),
+            adblock: RwLock::new(None),
+            adblock_stats: Default::default(),
             cache: Mutex::new(Cache::default()),
             fake: Mutex::new(FakeMap {
                 by_name: HashMap::new(),
@@ -90,6 +95,7 @@ impl Resolver {
         hosts: &std::collections::BTreeMap<String, meta_config::Strings>,
         resources: &crate::resources::Resources,
     ) -> Result<()> {
+        *self.adblock.write().unwrap() = resources.adblock.clone();
         fn matcher(
             pattern: &str,
             resources: &crate::resources::Resources,
@@ -146,6 +152,9 @@ impl Resolver {
     /// to their 100.x addresses; fake-ip answers keep the domain for rules.
     pub fn set_tailnet_names(&self, names: Option<TailnetNames>) {
         *self.tailnet.write().unwrap() = names;
+    }
+    pub(crate) fn adblock(&self) -> Option<std::sync::Arc<crate::adblock::Filter>> {
+        self.adblock.read().unwrap().clone()
     }
     pub fn set_hosts(&self, hosts: &std::collections::BTreeMap<String, meta_config::Strings>) {
         self.policy.write().unwrap().hosts = hosts.clone();
@@ -658,6 +667,21 @@ impl Resolver {
             .to_ascii()
             .trim_end_matches('.')
             .to_ascii_lowercase();
+        // Ad blocking answers first: the app fails at once instead of connecting.
+        if let Some(filter) = self.adblock()
+            && filter.blocks(&host)
+        {
+            self.adblock_stats.record(&host, "dns");
+            let mut response = Message::new();
+            response
+                .set_id(request.id())
+                .set_message_type(MessageType::Response)
+                .set_recursion_desired(request.recursion_desired())
+                .set_recursion_available(true)
+                .set_response_code(ResponseCode::NXDomain)
+                .add_query(query.clone());
+            return Ok(response.to_vec()?);
+        }
         let excluded = self
             .policy
             .read()

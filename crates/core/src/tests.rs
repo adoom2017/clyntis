@@ -787,3 +787,75 @@ async fn connections_show_the_domain_behind_a_fake_ip() {
     assert_eq!(hosts, ["example.com"]);
     relay.abort();
 }
+
+#[tokio::test]
+async fn adblock_refuses_dns_and_connections_and_counts_them() {
+    let dir = std::env::temp_dir().join(format!("meta-adblock-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("adblock")).unwrap();
+    // A fresh cached list: nothing is downloaded.
+    std::fs::write(
+        dir.join("adblock/test.list"),
+        "payload:\n  - '+.ads.test'\n",
+    )
+    .unwrap();
+    let mut config = meta_config::Config::parse(
+        b"dns: {enhanced-mode: fake-ip}\nadblock:\n  enable: true\n  lists: [{name: test, url: 'https://example.invalid/list.yaml'}]\n  allow: [keep.ads.test]\nrules: ['MATCH,DIRECT']\n",
+    )
+    .unwrap();
+    config.directory = dir.clone();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    core.prepare_resources(false).await.unwrap();
+    let query = |name: &str| {
+        let mut message = hickory_proto::op::Message::new();
+        message.set_id(7).add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii(name).unwrap(),
+            hickory_proto::rr::RecordType::A,
+        ));
+        message.to_vec().unwrap()
+    };
+    let code = |bytes: Vec<u8>| {
+        hickory_proto::op::Message::from_vec(&bytes)
+            .unwrap()
+            .response_code()
+    };
+    let nx = hickory_proto::op::ResponseCode::NXDomain;
+    assert_eq!(
+        code(core.resolver.answer(&query("x.ads.test.")).await.unwrap()),
+        nx
+    );
+    assert_ne!(
+        code(
+            core.resolver
+                .answer(&query("keep.ads.test."))
+                .await
+                .unwrap()
+        ),
+        nx
+    );
+    assert_ne!(
+        code(core.resolver.answer(&query("example.com.")).await.unwrap()),
+        nx
+    );
+    let decision = core
+        .route_decision(&Target::new("y.ads.test", 443).unwrap(), "tcp")
+        .await
+        .unwrap();
+    assert_eq!(
+        (decision.node.as_str(), decision.rule.as_str()),
+        ("REJECT", "Adblock")
+    );
+    let status = core.adblock_status();
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["total"], 2);
+    assert_eq!(status["dns"], 1);
+    assert_eq!(status["connections"], 1);
+    assert_eq!(status["lists"][0]["entries"], 1);
+    assert_eq!(status["recent"][0]["domain"], "y.ads.test");
+    // The allowlist changes without a restart.
+    core.set_adblock_allow(vec!["ads.test".into()]).unwrap();
+    assert_ne!(
+        code(core.resolver.answer(&query("x.ads.test.")).await.unwrap()),
+        nx
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

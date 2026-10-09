@@ -31,6 +31,7 @@ import {
   Pause,
   Play,
   Plus,
+  Ban,
   Power,
   RefreshCw,
   Search,
@@ -68,6 +69,11 @@ import {
   tailscaleStateText,
   type LogLevel,
   type Overrides,
+  type AdblockSettings,
+  type AdblockStatus,
+  type AdListFormat,
+  adblockPresets,
+  defaultAdblock,
   type CustomRules,
   ruleTypes,
   splitRule,
@@ -499,6 +505,9 @@ export default function App() {
                   ))}
                 </section>
               </div>
+              {running && (
+                <AdblockPanel settings={state.settings} perform={perform} />
+              )}
               <div className="capture-strip">
                 <span className="muted">接管</span>
                 <div className="segmented">
@@ -1224,6 +1233,319 @@ function Editor({
   );
 }
 
+function AdblockPanel({
+  settings,
+  perform,
+}: {
+  settings: Settings;
+  perform: Perform;
+}) {
+  const [status, setStatus] = useState<AdblockStatus | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const load = () =>
+      void invoke<AdblockStatus>("adblock_status")
+        .then(setStatus)
+        .catch(() => setStatus(null));
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const allow = (domain: string) => {
+    const adblock = settings.overrides.adblock ?? defaultAdblock;
+    if (adblock.allow.includes(domain)) return;
+    const next: Settings = {
+      ...settings,
+      overrides: {
+        ...settings.overrides,
+        adblock: { ...adblock, allow: [...adblock.allow, domain] },
+      },
+    };
+    void perform(
+      () => invoke("save_settings", { settings: next }),
+      `已放行 ${domain}`,
+    );
+  };
+  if (!status) return null;
+  return (
+    <section className="panel adblock-panel">
+      <div className="panel-title">
+        <h3>
+          <Ban size={15} /> 去广告
+        </h3>
+        {status.enabled ? (
+          <button className="text-button" onClick={() => setOpen(true)}>
+            详情
+          </button>
+        ) : (
+          <span className="muted small">未开启，可在设置中启用</span>
+        )}
+      </div>
+      {status.enabled && (
+        <div className="adblock-summary">
+          <div>
+            <strong>{status.total.toLocaleString()}</strong>
+            <small>次拦截</small>
+          </div>
+          <div>
+            <strong>{status.dns.toLocaleString()}</strong>
+            <small>DNS</small>
+          </div>
+          <div>
+            <strong>{status.connections.toLocaleString()}</strong>
+            <small>连接</small>
+          </div>
+          <div>
+            <strong>{status.entries.toLocaleString()}</strong>
+            <small>条规则</small>
+          </div>
+          <ul className="adblock-top">
+            {status.top.slice(0, 3).map((item) => (
+              <li key={item.domain}>
+                <span>{item.domain}</span>
+                <small>{item.count}</small>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {open && (
+        <Modal title="去广告统计" onClose={() => setOpen(false)} wide>
+          <AdblockDetail status={status} onAllow={allow} />
+        </Modal>
+      )}
+    </section>
+  );
+}
+function AdblockDetail({
+  status,
+  onAllow,
+}: {
+  status: AdblockStatus;
+  onAllow: (domain: string) => void;
+}) {
+  const time = (seconds: number) =>
+    new Date(seconds * 1000).toLocaleTimeString();
+  return (
+    <div className="node-detail">
+      <p className="muted small">
+        自 {new Date(status.since * 1000).toLocaleString()} 起，共拦截{" "}
+        {status.total} 次（DNS {status.dns}，连接 {status.connections}），涉及{" "}
+        {status.domains} 个域名。误拦时点「放行」加入白名单，立即生效。
+      </p>
+      <dl className="detail-list">
+        {status.lists.map((list) => (
+          <div key={list.name}>
+            <dt>{list.name}</dt>
+            <dd className={list.error ? "danger-text" : ""}>
+              {list.error
+                ? `不可用：${list.error}`
+                : `${list.entries.toLocaleString()} 条${list.updated ? ` · 更新于 ${new Date(list.updated * 1000).toLocaleString()}` : ""}`}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <h4 className="detail-heading">拦截最多</h4>
+      <div className="peer-list">
+        {status.top.length === 0 && (
+          <div className="peer-row muted">暂无拦截</div>
+        )}
+        {status.top.map((item) => (
+          <div className="peer-row" key={item.domain}>
+            <span className="peer-name">
+              <strong>{item.domain}</strong>
+            </span>
+            <span className="peer-path">{item.count} 次</span>
+            <button
+              className="text-button"
+              onClick={() => onAllow(item.domain)}
+            >
+              放行
+            </button>
+          </div>
+        ))}
+      </div>
+      <h4 className="detail-heading">最近拦截</h4>
+      <div className="peer-list">
+        {status.recent.length === 0 && (
+          <div className="peer-row muted">暂无拦截</div>
+        )}
+        {status.recent.map((item, index) => (
+          <div
+            className="peer-row"
+            key={`${item.time}-${item.domain}-${index}`}
+          >
+            <span className="peer-name">
+              <strong>{item.domain}</strong>
+              <small>
+                {time(item.time)} · {item.via === "dns" ? "DNS" : "连接"}
+              </small>
+            </span>
+            <button
+              className="text-button"
+              onClick={() => onAllow(item.domain)}
+            >
+              放行
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+/** One domain per line; keeps the typed text (blank lines while editing). */
+function AllowEditor({
+  value,
+  onChange,
+}: {
+  value: string[];
+  onChange: (value: string[]) => void;
+}) {
+  const [text, setText] = useState(value.join("\n"));
+  const parse = (raw: string) =>
+    raw
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  // Follow outside changes (an entry allowed from the statistics).
+  useEffect(() => {
+    setText((current) =>
+      JSON.stringify(parse(current)) === JSON.stringify(value)
+        ? current
+        : value.join("\n"),
+    );
+  }, [value]);
+  return (
+    <textarea
+      className="adblock-allow"
+      value={text}
+      placeholder="wechat.com"
+      onChange={(e) => {
+        setText(e.target.value);
+        onChange(parse(e.target.value));
+      }}
+    />
+  );
+}
+function AdblockSettingsSection({
+  value,
+  onChange,
+}: {
+  value: AdblockSettings | null | undefined;
+  onChange: (value: AdblockSettings | null) => void;
+}) {
+  const adblock = value ?? { ...defaultAdblock, enabled: false };
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [format, setFormat] = useState<AdListFormat>("clash");
+  const update = (patch: Partial<AdblockSettings>) =>
+    onChange({ ...adblock, ...patch });
+  return (
+    <>
+      <Setting
+        label="启用去广告"
+        text="广告域名在 DNS 层直接拒绝，并优先于所有规则"
+      >
+        <Toggle
+          checked={adblock.enabled}
+          onChange={(enabled) =>
+            onChange(
+              enabled && !value
+                ? { ...defaultAdblock }
+                : { ...adblock, enabled },
+            )
+          }
+          label="启用去广告"
+        />
+      </Setting>
+      {adblock.enabled && (
+        <>
+          {adblockPresets.map((preset) => (
+            <Setting
+              key={preset.id}
+              label={preset.name}
+              text={preset.description}
+            >
+              <Toggle
+                checked={adblock.presets.includes(preset.id)}
+                onChange={(on) =>
+                  update({
+                    presets: on
+                      ? [...adblock.presets, preset.id]
+                      : adblock.presets.filter((id) => id !== preset.id),
+                  })
+                }
+                label={preset.name}
+              />
+            </Setting>
+          ))}
+          {adblock.custom.map((list) => (
+            <Setting key={list.name} label={list.name} text={list.url}>
+              <button
+                className="text-button danger"
+                onClick={() =>
+                  update({
+                    custom: adblock.custom.filter((l) => l.name !== list.name),
+                  })
+                }
+              >
+                移除
+              </button>
+            </Setting>
+          ))}
+          <Setting label="添加列表" text="Clash 规则集、hosts 或 AdGuard 格式">
+            <div className="adblock-add">
+              <input
+                value={name}
+                placeholder="名称"
+                onChange={(e) => setName(e.target.value)}
+              />
+              <input
+                value={url}
+                placeholder="https://…"
+                onChange={(e) => setUrl(e.target.value)}
+              />
+              <select
+                value={format}
+                onChange={(e) => setFormat(e.target.value as AdListFormat)}
+              >
+                <option value="clash">Clash</option>
+                <option value="hosts">hosts</option>
+                <option value="adguard">AdGuard</option>
+              </select>
+              <button
+                className="button secondary"
+                disabled={
+                  !name.trim() ||
+                  !/^https?:\/\//.test(url.trim()) ||
+                  adblock.custom.some((l) => l.name === name.trim())
+                }
+                onClick={() => {
+                  update({
+                    custom: [
+                      ...adblock.custom,
+                      { name: name.trim(), url: url.trim(), format },
+                    ],
+                  });
+                  setName("");
+                  setUrl("");
+                }}
+              >
+                添加
+              </button>
+            </div>
+          </Setting>
+          <Setting label="白名单" text="每行一个域名，含其子域名；修改立即生效">
+            <AllowEditor
+              value={adblock.allow}
+              onChange={(allow) => update({ allow })}
+            />
+          </Setting>
+        </>
+      )}
+    </>
+  );
+}
 function Proxies({
   running,
   busy,
@@ -2147,6 +2469,13 @@ function SettingsPage({
             onChange={(v) => override("sniffing", v)}
           />
         </Setting>
+      </section>
+      <h3 className="settings-heading">去广告</h3>
+      <section className="panel settings-section">
+        <AdblockSettingsSection
+          value={settings.overrides.adblock}
+          onChange={(adblock) => override("adblock", adblock)}
+        />
       </section>
       <h3 className="settings-heading">辅助服务</h3>
       <section className="panel settings-section">

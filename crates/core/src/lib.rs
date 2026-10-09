@@ -1,4 +1,5 @@
 //! Embeddable proxy core. Runtime and OS policy belong to the host.
+mod adblock;
 mod api;
 pub mod dns;
 mod inbound;
@@ -332,10 +333,13 @@ impl Core {
             let core = self.clone();
             tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(5));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{if core.save_profile().is_err(){tracing::warn!("cannot save profile");}}}}});
         }
-        if self.config.geo_auto_update || !self.config.rule_providers.is_empty() {
+        if self.config.geo_auto_update
+            || !self.config.rule_providers.is_empty()
+            || self.config.adblock.enable
+        {
             let core = self.clone();
             tasks.spawn(async move {
-                let seconds=core.config.rule_providers.values().filter(|p|p.interval>0).map(|p|p.interval).chain(std::iter::once(if core.config.geo_auto_update{core.config.geo_update_interval.saturating_mul(3600)}else{86400})).min().unwrap_or(86400).max(1);
+                let seconds=core.config.rule_providers.values().filter(|p|p.interval>0).map(|p|p.interval).chain(core.config.adblock.enable.then_some(core.config.adblock.interval)).chain(std::iter::once(if core.config.geo_auto_update{core.config.geo_update_interval.saturating_mul(3600)}else{86400})).min().unwrap_or(86400).max(1);
                 let mut interval=tokio::time::interval(Duration::from_secs(seconds));interval.tick().await;
                 loop {tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}};tokio::select!{_=core.stop.cancelled()=>break,result=core.prepare_resources(true)=>{if result.is_err(){tracing::warn!("routing resource refresh failed; retaining previous snapshot");}}}}
             });
@@ -575,6 +579,21 @@ impl Core {
         target: &Target,
         network: &str,
     ) -> Result<RouteDecision> {
+        // Ad blocking precedes every rule and mode; DNS already refused these
+        // names, so this catches apps that resolved them some other way.
+        if target.ip().is_none()
+            && let Some(filter) = self.resolver.adblock()
+            && filter.blocks(&target.host)
+        {
+            self.resolver
+                .adblock_stats
+                .record(&target.host, "connection");
+            return Ok(RouteDecision {
+                node: "REJECT".into(),
+                group: "REJECT".into(),
+                rule: "Adblock".into(),
+            });
+        }
         let (mode, rules, raw_rules) = {
             let p = self.policy.read().unwrap();
             (p.mode.clone(), p.rules.clone(), p.raw_rules.clone())
@@ -1119,6 +1138,30 @@ impl Core {
                 tracing::debug!(id = %outbound.tracker.state.snapshot().id, "TCP relay cancelled");
             },
             result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => { result?; },
+        }
+        Ok(())
+    }
+    /// Ad blocking state: whether it is on, the loaded lists and the counters
+    /// (totals, most blocked domains, latest blocks).
+    pub fn adblock_status(&self) -> serde_json::Value {
+        let filter = self.resolver.adblock();
+        let mut status = self.resolver.adblock_stats.snapshot(20);
+        status["enabled"] = serde_json::json!(filter.is_some());
+        status["entries"] = serde_json::json!(filter.as_ref().map_or(0, |f| f.entries()));
+        status["lists"] =
+            serde_json::json!(filter.as_ref().map(|f| f.lists.clone()).unwrap_or_default());
+        status
+    }
+    /// Replaces the user's allowlist without restarting; validated like the
+    /// configuration's `adblock.allow`.
+    pub fn set_adblock_allow(&self, allow: Vec<String>) -> Result<()> {
+        meta_config::adblock::Adblock {
+            allow: allow.clone(),
+            ..Default::default()
+        }
+        .validate()?;
+        if let Some(filter) = self.resolver.adblock() {
+            filter.set_allow(&allow);
         }
         Ok(())
     }

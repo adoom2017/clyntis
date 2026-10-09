@@ -25,6 +25,60 @@ export interface Overrides {
   logLevel?: LogLevel | null;
   ipv6?: boolean | null;
   sniffing?: boolean | null;
+  adblock?: AdblockSettings | null;
+}
+export type AdListFormat = "clash" | "hosts" | "adguard";
+export interface AdList {
+  name: string;
+  url: string;
+  format: AdListFormat;
+}
+/** Ad blocking settings; the core expands presets and merges them. */
+export interface AdblockSettings {
+  enabled: boolean;
+  presets: string[];
+  custom: AdList[];
+  allow: string[];
+}
+export const adblockPresets = [
+  {
+    id: "awavenue",
+    name: "AWAvenue-Ads",
+    description: "国内 App 广告接口，约 1,000 条，误杀少",
+  },
+  {
+    id: "anti-ad",
+    name: "anti-AD",
+    description: "覆盖面广，以国内为主，约 10 万条",
+  },
+  {
+    id: "adguard-dns",
+    name: "AdGuard DNS filter",
+    description: "偏海外的广告与追踪，约 18 万条",
+  },
+] as const;
+export const defaultAdblock: AdblockSettings = {
+  enabled: true,
+  presets: ["awavenue"],
+  custom: [],
+  allow: [],
+};
+export interface AdblockStatus {
+  enabled: boolean;
+  entries: number;
+  since: number;
+  total: number;
+  dns: number;
+  connections: number;
+  domains: number;
+  lists: {
+    name: string;
+    entries: number;
+    updated: number | null;
+    error: string | null;
+  }[];
+  top: { domain: string; count: number }[];
+  recent: { time: number; domain: string; via: "dns" | "connection" }[];
 }
 export interface ProfileSummary {
   id: string;

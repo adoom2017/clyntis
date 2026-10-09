@@ -1,3 +1,4 @@
+pub mod adblock;
 pub mod compat;
 pub mod crypto;
 pub mod custom;
@@ -58,6 +59,7 @@ pub struct Config {
     pub profile: Profile,
     pub ntp: Ntp,
     pub sniffer: Sniffer,
+    pub adblock: adblock::Adblock,
     #[serde(skip)]
     pub directory: std::path::PathBuf,
     #[serde(skip)]
@@ -101,6 +103,7 @@ impl Default for Config {
             profile: Profile::default(),
             ntp: Ntp::default(),
             sniffer: Sniffer::default(),
+            adblock: adblock::Adblock::default(),
             directory: ".".into(),
             internal_allow_native_profile: false,
             internal_host_packet_io: false,
@@ -455,6 +458,7 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> Result<()> {
+        self.adblock.validate()?;
         ensure!(
             self.internal_allow_native_profile && self.global_client_fingerprint == "native"
                 || [
