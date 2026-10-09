@@ -47,6 +47,7 @@ struct AdblockView: View {
 
     var body: some View {
         List {
+            statusSection
             Section {
                 Toggle("启用去广告", isOn: Binding(get: { settings?.enabled ?? false }, set: { on in
                     var next = settings ?? AdblockSettings()
@@ -104,7 +105,7 @@ struct AdblockView: View {
                     }
                 } header: { Text("白名单") } footer: { Text("包含子域名；修改后立即生效。") }
             }
-            if needsReconnect && model.active {
+            if needsReconnect && model.active && !(model.adblockState == .pending && model.connected) {
                 Section {
                     Button("重新连接以生效") {
                         Task { await model.reconnect(); needsReconnect = false }
@@ -112,7 +113,6 @@ struct AdblockView: View {
                     .disabled(model.busy)
                 } footer: { Text("开关和列表的修改需要重新连接。") }
             }
-            if let status = model.adblock, status.enabled { statistics(status) }
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
         }
         .navigationTitle("去广告")
@@ -121,6 +121,23 @@ struct AdblockView: View {
             next.custom.append(list)
             save(next)
         } }
+    }
+
+    /// Statistics first; otherwise why there are none yet.
+    @ViewBuilder private var statusSection: some View {
+        if let status = model.adblock, status.enabled {
+            statistics(status)
+        } else if model.adblockState == .pending && model.connected {
+            Section("统计") {
+                Text("去广告已开启，重新连接后开始拦截并统计。").foregroundStyle(.secondary)
+                Button("重新连接") { Task { await model.reconnect(); needsReconnect = false } }
+                    .disabled(model.busy)
+            }
+        } else if !model.connected && settings?.enabled == true {
+            Section("统计") {
+                Text("连接后显示拦截统计。").foregroundStyle(.secondary)
+            }
+        }
     }
 
     @ViewBuilder private func statistics(_ status: AdblockStatus) -> some View {

@@ -309,6 +309,21 @@ final class AppModel {
         return false
     }
 
+    /// The running core's ad blocking compared with the saved settings.
+    enum AdblockState { case off, pending, on }
+    var adblockState: AdblockState {
+        let wanted = overrides.adblock?.enabled == true
+        if adblock?.enabled == true { return .on }
+        return wanted ? .pending : .off
+    }
+    var adblockSummary: String {
+        switch adblockState {
+        case .on: "已拦截 \((adblock?.total ?? 0).formatted()) 次"
+        case .pending: "重新连接后生效"
+        case .off: "未开启"
+        }
+    }
+
     /// Adds `domain` to the allowlist (from the statistics), live.
     func allowAdblock(_ domain: String) async {
         guard var settings = overrides.adblock, !settings.allow.contains(domain) else { return }

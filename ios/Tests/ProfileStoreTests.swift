@@ -170,6 +170,22 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertThrowsError(try session.updateAdblockAllow([""]))
     }
 
+    @MainActor
+    func testAdblockSummaryExplainsMissingStatistics() throws {
+        let model = AppModel()
+        XCTAssertEqual(model.adblockSummary, "未开启")
+        model.overrides.adblock = AdblockSettings()
+        // Turned on in settings, not yet in the running core.
+        XCTAssertEqual(model.adblockState, .pending)
+        XCTAssertEqual(model.adblockSummary, "重新连接后生效")
+        model.adblock = AdblockStatus.decode([
+            "enabled": true, "entries": 961, "since": 0, "total": 1234, "dns": 1200, "connections": 34,
+            "domains": 20, "lists": [], "top": [], "recent": [],
+        ])
+        XCTAssertEqual(model.adblockState, .on)
+        XCTAssertEqual(model.adblockSummary, "已拦截 \(1234.formatted()) 次")
+    }
+
     func testLogFileRedactsCredentialsAndRoundTrips() throws {
         let log = LogFile.shared
         log.clear()

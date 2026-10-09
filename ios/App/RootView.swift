@@ -67,12 +67,12 @@ private struct ConnectionView: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    if let adblock = model.adblock, adblock.enabled {
+                    if model.connected {
                         NavigationLink { AdblockView(model: model) } label: {
                             HStack {
                                 Label("去广告", systemImage: "nosign").foregroundStyle(.secondary)
                                 Spacer()
-                                Text("已拦截 \(adblock.total.formatted()) 次").monospacedDigit()
+                                Text(model.adblockSummary).monospacedDigit()
                                 Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(.tertiary)
                             }
                             .font(.subheadline)
