@@ -59,6 +59,17 @@ struct Policy {
     /// The last probe of each proxy: delay or error, and when (Unix seconds).
     probes: HashMap<String, (Option<u64>, Option<String>, u64)>,
 }
+/// A connection refused by its route (REJECT); carries the decision so the
+/// caller can log it like any other connection.
+#[derive(Debug)]
+pub(crate) struct Rejected(pub(crate) RouteDecision);
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("connection rejected")
+    }
+}
+impl std::error::Error for Rejected {}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RouteDecision {
     pub(crate) node: String,
@@ -908,10 +919,20 @@ impl Core {
         source: &str,
     ) -> Result<(BoxStream, String)> {
         let display_target = self.restore_target(target);
-        let (stream, decision) = tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = self.stop.cancelled() => bail!("core stopped"),
-            result = tokio::time::timeout(Duration::from_secs(20), self.dial_inner(&display_target, selected, "tcp")) => result??,
+            result = tokio::time::timeout(Duration::from_secs(20), self.dial_inner(&display_target, selected, "tcp")) => result?,
+        };
+        let (stream, decision) = match outcome {
+            Ok(dialed) => dialed,
+            Err(error) => {
+                // Refused connections are logged too, so REJECT rules show up.
+                if let Some(Rejected(decision)) = error.downcast_ref::<Rejected>() {
+                    Self::log_connection("TCP", source, &display_target, decision);
+                }
+                return Err(error);
+            }
         };
         Self::log_connection("TCP", source, &display_target, &decision);
         Ok((stream, decision.node))
@@ -958,7 +979,7 @@ impl Core {
                 return Ok::<BoxStream, anyhow::Error>(Box::new(self.raw_tcp(&target).await?));
             }
             if name == "REJECT" {
-                bail!("connection rejected");
+                return Err(Rejected(decision.clone()).into());
             }
             let p = self
                 .config
@@ -1016,6 +1037,13 @@ impl Core {
             _=self.stop.cancelled()=>bail!("core stopped"),
             result=tokio::time::timeout(Duration::from_secs(20),async {
                 let decision=self.route_decision(&target,"udp").await?;
+                if decision.node=="REJECT" {
+                    if let Some(source)=source {
+                        let source=source.split_once(':').map(|(_,value)|value).unwrap_or(source);
+                        Self::log_connection("UDP",source,&target,&decision);
+                    }
+                    bail!("UDP rejected");
+                }
                 let inner=self.datagram_inner(&target,&decision.node,global_id).await?;
                 if let Some(source)=source {
                     let source=source.split_once(':').map(|(_,value)|value).unwrap_or(source);

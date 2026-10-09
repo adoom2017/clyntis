@@ -191,6 +191,10 @@ impl crate::Core {
         source: &str,
     ) -> anyhow::Result<(meta_protocol::BoxStream, String)> {
         let decision = self.route_decision(route, "tcp").await?;
+        if decision.node == "REJECT" {
+            Self::log_connection("TCP", source, route, &decision);
+            anyhow::bail!(crate::Rejected(decision));
+        }
         let (stream, _) = self.dial(destination, Some(&decision.node)).await?;
         Self::log_connection("TCP", source, route, &decision);
         Ok((stream, decision.node))
