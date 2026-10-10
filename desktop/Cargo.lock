@@ -2946,6 +2946,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "libc",
  "maxminddb",
  "meta-config",
  "meta-platform",
