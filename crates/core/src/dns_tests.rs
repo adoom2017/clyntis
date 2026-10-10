@@ -354,3 +354,45 @@ async fn exhausted_fake_pools_fail_without_overflow_or_mapping_reuse() {
         allocated
     );
 }
+
+#[test]
+fn fake_ip_capacity_evicts_the_least_recently_queried_without_reusing_addresses() {
+    let resolver = Resolver::new(
+        Dns {
+            fake_ip_range: "198.18.0.0/29".parse().unwrap(),
+            ..Dns::default()
+        },
+        Arc::new(meta_platform::DefaultHooks),
+    );
+    resolver.set_fake_capacity(3);
+    let a = resolver.fake_address("a.test", false).unwrap();
+    let b = resolver.fake_address("b.test", false).unwrap();
+    let c = resolver.fake_address("c.test", false).unwrap();
+    // Queried again: now the most recent, so b goes first.
+    assert_eq!(resolver.fake_address("a.test", false).unwrap(), a);
+    let d = resolver.fake_address("d.test", false).unwrap();
+    assert_eq!(resolver.original(b), None);
+    assert_eq!(resolver.original(a).as_deref(), Some("a.test"));
+    // b's address is not handed out while unused ones remain.
+    assert!(![a, b, c].contains(&d));
+    let names: Vec<_> = resolver.export_fake().into_iter().map(|e| e.0).collect();
+    assert_eq!(names, ["c.test", "a.test", "d.test"]);
+    // The pool (offsets 2..=6) wraps around past live mappings, many times.
+    for i in 0..50 {
+        let ip = resolver.fake_address(&format!("n{i}.test"), false).unwrap();
+        assert_eq!(resolver.original(ip), Some(format!("n{i}.test")));
+        assert_eq!(resolver.export_fake().len(), 3);
+    }
+    // Restoring more than the capacity keeps the most recent.
+    let next = Resolver::new(
+        Dns {
+            fake_ip_range: "198.18.0.0/29".parse().unwrap(),
+            ..Dns::default()
+        },
+        Arc::new(meta_platform::DefaultHooks),
+    );
+    next.set_fake_capacity(2);
+    next.import_fake(&resolver.export_fake()).unwrap();
+    let kept: Vec<_> = next.export_fake().into_iter().map(|e| e.0).collect();
+    assert_eq!(kept, ["n48.test", "n49.test"]);
+}

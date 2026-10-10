@@ -31,6 +31,9 @@ use std::{
 use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
+/// Fake-IP names kept by the iOS tunnel; apps query again within seconds
+/// (answers have a one-second TTL), so evicted names come back at once.
+const HOSTED_FAKE_CAPACITY: usize = 8192;
 pub struct Core {
     pub config: Config,
     pub resolver: Arc<dns::Resolver>,
@@ -47,6 +50,9 @@ pub struct Core {
     /// The user's ad blocking allowlist: the configuration's until the apps
     /// replace it while running, and kept across resource refreshes.
     adblock_allow: RwLock<Vec<String>>,
+    /// What the saved profile last held: the selection and the fake-IP
+    /// generation, so an unchanged profile is not exported and written again.
+    saved_profile: Mutex<Option<(HashMap<String, String>, u64)>>,
     clock: Arc<meta_protocol::tls::Clock>,
     xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<meta_protocol::xudp::Multiplexer>>>,
     xudp_key: [u8; 32],
@@ -250,6 +256,10 @@ impl Core {
             clock.clone(),
         ));
         resolver.set_hosts(&config.hosts);
+        if config.internal_host_packet_io {
+            // ~300 bytes per name: 2.4 MiB instead of 9.4 MiB at the default.
+            resolver.set_fake_capacity(HOSTED_FAKE_CAPACITY);
+        }
         let mut selection = HashMap::new();
         for group in &config.proxy_groups {
             selection.insert(group.name.clone(), group.proxies[0].clone());
@@ -273,6 +283,7 @@ impl Core {
         xudp_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         Ok(Arc::new(Self {
             adblock_allow: RwLock::new(config.adblock.allow.clone()),
+            saved_profile: Mutex::new(None),
             config,
             resolver,
             hooks,

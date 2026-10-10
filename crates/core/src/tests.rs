@@ -876,3 +876,32 @@ async fn adblock_refuses_dns_and_connections_and_counts_them() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn saved_profile_is_written_only_after_a_change() {
+    let dir = std::env::temp_dir().join(format!("meta-profile-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut config = meta_config::Config::parse(
+        b"dns: {enhanced-mode: fake-ip}\nprofile: {store-selected: true, store-fake-ip: true}\nrules: ['MATCH,DIRECT']\n",
+    )
+    .unwrap();
+    config.directory = dir.clone();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let path = dir.join(".meta-profile.json");
+    core.save_profile().unwrap();
+    assert!(path.exists());
+    std::fs::remove_file(&path).unwrap();
+    core.save_profile().unwrap();
+    assert!(!path.exists(), "unchanged profile rewritten");
+    let ip = core.resolver.fake_address("saved.test", false).unwrap();
+    // Queries of a known name change nothing worth saving.
+    core.resolver.fake_address("saved.test", false).unwrap();
+    core.save_profile().unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("saved.test") && saved.contains(&ip.to_string()));
+    std::fs::remove_file(&path).unwrap();
+    core.resolver.fake_address("saved.test", false).unwrap();
+    core.save_profile().unwrap();
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}

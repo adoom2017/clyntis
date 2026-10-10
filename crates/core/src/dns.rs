@@ -10,7 +10,7 @@ use meta_config::Dns;
 use meta_platform::Hooks;
 use meta_protocol::Target;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{Mutex, RwLock},
     time::{Duration, Instant},
@@ -20,22 +20,144 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "dns_tests.rs"]
 mod tests;
 
+/// A cached response in wire form: decoded messages took ~25 times the
+/// space, 16 MiB for a full cache, which the iOS tunnel cannot afford.
 struct CacheEntry {
-    response: Message,
+    response: Vec<u8>,
     inserted: Instant,
     expires: Instant,
     size: usize,
 }
+const CACHE_ENTRIES: usize = 4096;
+const CACHE_BYTES: usize = 1024 * 1024;
+/// Per-entry allocator and table overhead beyond the key and response bytes.
+const CACHE_OVERHEAD: usize = 256;
 #[derive(Default)]
 struct Cache {
     entries: HashMap<Vec<u8>, CacheEntry>,
     size: usize,
 }
+
+/// Fake-IP mappings up to `capacity` names; past it the least recently
+/// queried name gives up its mapping. Addresses advance through the whole
+/// pool before any is reused, so a client still holding an evicted address
+/// reaches nothing rather than an unrelated name.
 struct FakeMap {
-    by_name: HashMap<(String, bool), IpAddr>,
+    /// Address and the use stamp of its latest query.
+    by_name: HashMap<(String, bool), (IpAddr, u64)>,
     by_ip: HashMap<IpAddr, String>,
+    /// (address, stamp) in use order, oldest first; an entry whose stamp is
+    /// no longer the name's latest is stale and skipped.
+    order: VecDeque<(IpAddr, u64)>,
+    stamp: u64,
     next4: u64,
     next6: u128,
+    capacity: usize,
+    /// Changes whenever a mapping is added or dropped, so unchanged mappings
+    /// are not saved again.
+    generation: u64,
+}
+pub const FAKE_CAPACITY: usize = 32768;
+impl FakeMap {
+    fn new(capacity: usize) -> Self {
+        Self {
+            by_name: HashMap::new(),
+            by_ip: HashMap::new(),
+            order: VecDeque::new(),
+            stamp: 0,
+            next4: 2,
+            next6: 2,
+            capacity,
+            generation: 0,
+        }
+    }
+    fn get(&mut self, key: &(String, bool)) -> Option<IpAddr> {
+        let (ip, stamp) = self.by_name.get_mut(key)?;
+        self.stamp += 1;
+        *stamp = self.stamp;
+        let ip = *ip;
+        self.order.push_back((ip, self.stamp));
+        if self.order.len() > 2 * self.capacity.max(64) {
+            self.compact();
+        }
+        Some(ip)
+    }
+    fn insert(&mut self, name: String, ip: IpAddr) {
+        self.stamp += 1;
+        self.generation += 1;
+        self.order.push_back((ip, self.stamp));
+        self.by_ip.insert(ip, name.clone());
+        self.by_name.insert((name, ip.is_ipv6()), (ip, self.stamp));
+    }
+    /// Drops the least recently queried mapping.
+    fn evict(&mut self) {
+        while let Some((ip, stamp)) = self.order.pop_front() {
+            let Some(name) = self.by_ip.get(&ip) else {
+                continue;
+            };
+            let key = (name.clone(), ip.is_ipv6());
+            if self.by_name.get(&key).is_some_and(|entry| entry.1 == stamp) {
+                self.by_name.remove(&key);
+                self.by_ip.remove(&ip);
+                self.generation += 1;
+                return;
+            }
+        }
+    }
+    fn compact(&mut self) {
+        let mut live: Vec<_> = self.by_name.values().copied().collect();
+        live.sort_by_key(|entry| entry.1);
+        self.order = live.into();
+    }
+    /// Names and addresses, least recently queried first.
+    fn export(&self) -> Vec<(String, IpAddr)> {
+        let mut entries: Vec<_> = self
+            .by_name
+            .iter()
+            .map(|((name, _), (ip, stamp))| (*stamp, name.clone(), *ip))
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        entries
+            .into_iter()
+            .map(|(_, name, ip)| (name, ip))
+            .collect()
+    }
+    /// The next unmapped address, wrapping around the pool.
+    fn allocate(&mut self, net4: ipnet::Ipv4Net, net6: ipnet::Ipv6Net, v6: bool) -> Result<IpAddr> {
+        for _ in 0..=self.by_ip.len() {
+            let ip = if v6 {
+                // Offsets 2..=size-1 (the network and the gateway are reserved).
+                let last = match net6.prefix_len() {
+                    0 => u128::MAX,
+                    prefix => (1u128 << (128 - prefix)) - 1,
+                };
+                ensure!(last >= 2, "fake-IP v6 pool exhausted");
+                if self.next6 > last {
+                    self.next6 = 2;
+                }
+                let ip = std::net::Ipv6Addr::from(u128::from(net6.network()) + self.next6);
+                self.next6 += 1;
+                IpAddr::V6(ip)
+            } else {
+                // Offsets 2..=size-2, also leaving out the broadcast address.
+                let last = (1u64 << (32 - net4.prefix_len())).saturating_sub(2);
+                ensure!(last >= 2, "fake-IP v4 pool exhausted");
+                if self.next4 > last {
+                    self.next4 = 2;
+                }
+                let ip = std::net::Ipv4Addr::from(
+                    u32::try_from(u64::from(u32::from(net4.network())) + self.next4)
+                        .context("fake-IP v4 pool exhausted")?,
+                );
+                self.next4 += 1;
+                IpAddr::V4(ip)
+            };
+            if !self.by_ip.contains_key(&ip) {
+                return Ok(ip);
+            }
+        }
+        anyhow::bail!("fake-IP pool exhausted")
+    }
 }
 pub struct Resolver {
     pub config: Dns,
@@ -79,12 +201,7 @@ impl Resolver {
             adblock: RwLock::new(None),
             adblock_stats: Default::default(),
             cache: Mutex::new(Cache::default()),
-            fake: Mutex::new(FakeMap {
-                by_name: HashMap::new(),
-                by_ip: HashMap::new(),
-                next4: 2,
-                next6: 2,
-            }),
+            fake: Mutex::new(FakeMap::new(FAKE_CAPACITY)),
         }
     }
     pub fn clock(&self) -> std::sync::Arc<meta_protocol::tls::Clock> {
@@ -200,23 +317,31 @@ impl Resolver {
             }
             && self.original(ip).is_none()
     }
+    /// Mappings, least recently queried first.
     pub fn export_fake(&self) -> Vec<(String, IpAddr)> {
-        self.fake
-            .lock()
-            .unwrap()
-            .by_ip
-            .iter()
-            .map(|(ip, name)| (name.clone(), *ip))
-            .collect()
+        self.fake.lock().unwrap().export()
     }
+    /// Changes whenever a fake-IP mapping is added or dropped.
+    pub fn fake_generation(&self) -> u64 {
+        self.fake.lock().unwrap().generation
+    }
+    /// Keeps at most `capacity` mappings, dropping the least recently queried.
+    pub fn set_fake_capacity(&self, capacity: usize) {
+        let mut map = self.fake.lock().unwrap();
+        map.capacity = capacity.max(1);
+        while map.by_name.len() > map.capacity {
+            map.evict();
+        }
+    }
+    /// Restores exported mappings, oldest first; past the capacity only the
+    /// most recent are kept, while addresses still advance past all of them.
     pub fn import_fake(&self, entries: &[(String, IpAddr)]) -> Result<()> {
-        ensure!(entries.len() <= 32768, "saved fake-IP capacity exceeded");
-        let mut map = FakeMap {
-            by_name: HashMap::new(),
-            by_ip: HashMap::new(),
-            next4: 2,
-            next6: 2,
-        };
+        ensure!(
+            entries.len() <= FAKE_CAPACITY,
+            "saved fake-IP capacity exceeded"
+        );
+        let capacity = self.fake.lock().unwrap().capacity;
+        let mut map = FakeMap::new(capacity);
         let mut skipped = 0usize;
         for (name, ip) in entries {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
@@ -250,11 +375,16 @@ impl Resolver {
                 continue;
             }
             ensure!(
-                map.by_ip.insert(*ip, name.clone()).is_none()
-                    && map.by_name.insert((name, ip.is_ipv6()), *ip).is_none(),
+                !map.by_ip.contains_key(ip)
+                    && !map.by_name.contains_key(&(name.clone(), ip.is_ipv6())),
                 "duplicate saved fake-IP"
             );
+            map.insert(name, *ip);
         }
+        while map.by_name.len() > map.capacity {
+            map.evict();
+        }
+        map.generation = 0;
         *self.fake.lock().unwrap() = map;
         if skipped != 0 {
             tracing::warn!(
@@ -364,8 +494,8 @@ impl Resolver {
             let cache = self.cache.lock().unwrap();
             if let Some(entry) = cache.entries.get(&key)
                 && entry.expires > Instant::now()
+                && let Ok(mut response) = Message::from_vec(&entry.response)
             {
-                let mut response = entry.response.clone();
                 response.set_id(request.id());
                 let elapsed = entry.inserted.elapsed().as_secs().min(u32::MAX as u64) as u32;
                 for record in response.answers_mut().iter_mut() {
@@ -411,14 +541,19 @@ impl Resolver {
                 ResponseCode::NoError | ResponseCode::NXDomain
             )
         {
-            let size = key.len() + response.to_vec()?.len();
+            // Encoders reserve far more than a typical answer needs.
+            let mut bytes = response.to_vec()?;
+            bytes.shrink_to_fit();
+            let mut key = key;
+            key.shrink_to_fit();
+            let size = key.len() + bytes.len() + CACHE_OVERHEAD;
             let mut cache = self.cache.lock().unwrap();
             cache
                 .entries
                 .retain(|_, entry| entry.expires > Instant::now());
             cache.entries.remove(&key);
             cache.size = cache.entries.values().map(|entry| entry.size).sum();
-            while cache.entries.len() >= 4096 || cache.size + size > 8 * 1024 * 1024 {
+            while cache.entries.len() >= CACHE_ENTRIES || cache.size + size > CACHE_BYTES {
                 let Some(oldest) = cache
                     .entries
                     .iter()
@@ -429,11 +564,11 @@ impl Resolver {
                 };
                 cache.size -= cache.entries.remove(&oldest).unwrap().size;
             }
-            if size <= 8 * 1024 * 1024 {
+            if size <= CACHE_BYTES {
                 cache.entries.insert(
                     key,
                     CacheEntry {
-                        response: response.clone(),
+                        response: bytes,
                         inserted: Instant::now(),
                         expires: Instant::now() + Duration::from_secs(ttl as u64),
                         size,
@@ -770,38 +905,15 @@ impl Resolver {
     pub(crate) fn fake_address(&self, host: &str, v6: bool) -> Result<IpAddr> {
         absolute_name(host).context("unsupported fake-IP hostname")?;
         let mut map = self.fake.lock().unwrap();
-        let key = (host.into(), v6);
-        if let Some(ip) = map.by_name.get(&key) {
-            return Ok(*ip);
+        let key = (host.to_owned(), v6);
+        if let Some(ip) = map.get(&key) {
+            return Ok(ip);
         }
-        ensure!(
-            map.by_name.len() < 32768,
-            "fake-IP capacity reached; refusing to reuse live mappings"
-        );
-        let ip = if v6 {
-            let net = self.config.fake_ip_range6;
-            let address = u128::from(net.network())
-                .checked_add(map.next6)
-                .context("fake-IP v6 pool exhausted")?;
-            let ip = std::net::Ipv6Addr::from(address);
-            ensure!(net.contains(&ip), "fake-IP v6 pool exhausted");
-            map.next6 += 1;
-            IpAddr::V6(ip)
-        } else {
-            let net = self.config.fake_ip_range;
-            let address = u64::from(u32::from(net.network())) + map.next4;
-            let ip = std::net::Ipv4Addr::from(
-                u32::try_from(address).context("fake-IP v4 pool exhausted")?,
-            );
-            ensure!(
-                net.contains(&ip) && ip != net.broadcast(),
-                "fake-IP v4 pool exhausted"
-            );
-            map.next4 += 1;
-            IpAddr::V4(ip)
-        };
-        map.by_name.insert(key, ip);
-        map.by_ip.insert(ip, host.into());
+        if map.by_name.len() >= map.capacity {
+            map.evict();
+        }
+        let ip = map.allocate(self.config.fake_ip_range, self.config.fake_ip_range6, v6)?;
+        map.insert(key.0, ip);
         Ok(ip)
     }
 }

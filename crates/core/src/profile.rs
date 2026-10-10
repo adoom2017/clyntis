@@ -46,12 +46,25 @@ impl Core {
         if !self.config.profile.store_selected && !self.config.profile.store_fake_ip {
             return Ok(());
         }
+        let selection = if self.config.profile.store_selected {
+            self.policy.read().unwrap().selection.clone()
+        } else {
+            Default::default()
+        };
+        let generation = if self.config.profile.store_fake_ip {
+            self.resolver.fake_generation()
+        } else {
+            0
+        };
+        // Called every few seconds: export and write only after a change.
+        let mut last = self.saved_profile.lock().unwrap();
+        if last.as_ref().is_some_and(|(saved, saved_generation)| {
+            *saved == selection && *saved_generation == generation
+        }) {
+            return Ok(());
+        }
         let saved = Saved {
-            selection: if self.config.profile.store_selected {
-                self.policy.read().unwrap().selection.clone()
-            } else {
-                Default::default()
-            },
+            selection,
             fake: if self.config.profile.store_fake_ip {
                 self.resolver.export_fake()
             } else {
@@ -61,6 +74,8 @@ impl Core {
         crate::resources::atomic_write(
             &self.config.directory.join(".meta-profile.json"),
             &serde_json::to_vec(&saved)?,
-        )
+        )?;
+        *last = Some((saved.selection, generation));
+        Ok(())
     }
 }
