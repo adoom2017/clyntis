@@ -691,6 +691,22 @@ pub async fn test_route(
         .map_err(error)
 }
 #[tauri::command]
+pub async fn dns_leak_audit(state: State<'_, Desktop>) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::GET, &["dns", "leak"], None)
+        .await
+        .map_err(error)
+}
+#[tauri::command]
+pub async fn dns_leak_test(state: State<'_, Desktop>) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::POST, &["dns", "leak", "test"], None)
+        .await
+        .map_err(error)
+}
+#[tauri::command]
 pub async fn proxies(state: State<'_, Desktop>) -> Reply<Value> {
     controller(&state)
         .await?

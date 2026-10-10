@@ -830,6 +830,8 @@ async fn route_test_reports_the_rule_and_the_selected_node() {
     );
     assert!(result["rule"].is_null());
     assert_eq!(test(r#"{"target":"exa mple.com"}"#).await.0, 400);
+    let (status, audit) = api_call(core.clone(), "GET", "/dns/leak", "", true).await;
+    assert_eq!((status, audit["leaking"].as_bool()), (200, Some(false)));
     assert_eq!(
         test(r#"{"target":"example.com","network":"icmp"}"#).await.0,
         400

@@ -688,6 +688,15 @@ fn route_test_reports_the_rule_and_node_as_json() {
         (Some("REJECT"), Some(8443))
     );
     assert_eq!(test(r#"{"target":""}"#).0, ERROR);
+    let mut bytes = vec![0; 4096];
+    let mut length = 0;
+    assert_eq!(
+        unsafe { meta_dns_leak_v1(id, 0, bytes.as_mut_ptr(), bytes.len(), &mut length) },
+        OK
+    );
+    let leak: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+    assert_eq!(leak["audit"]["leaking"], false);
+    assert!(leak.get("test").is_none());
     assert_eq!(test(r#"{"target":"a.example","port":0}"#).0, ERROR);
     assert_eq!(meta_destroy_v1(id), OK);
     assert_eq!(test(r#"{"target":"a.example"}"#).0, ERROR);

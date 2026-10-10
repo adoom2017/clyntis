@@ -9,6 +9,8 @@ mod packet;
 mod profile;
 mod resources;
 pub use resources::Freshness;
+mod dns_leak;
+pub use dns_leak::{DnsLeakAudit, DnsLeakTest};
 mod route_test;
 pub use route_test::{RouteTest, parse_test_target};
 mod sniff;
@@ -95,6 +97,8 @@ pub(crate) struct Trace {
     pub(crate) decision: RouteDecision,
     pub(crate) ip: Option<std::net::IpAddr>,
     pub(crate) index: Option<usize>,
+    /// Whether a rule made the core resolve the name itself.
+    pub(crate) looked_up: bool,
 }
 impl Trace {
     fn new(
@@ -111,6 +115,7 @@ impl Trace {
             },
             ip,
             index: None,
+            looked_up: false,
         }
     }
 }
@@ -674,6 +679,7 @@ impl Core {
         }
         let mut ip = target.ip();
         let mut resolved = ip.is_some();
+        let mut looked_up = false;
         let host = target.host.trim_end_matches('.').to_ascii_lowercase();
         for (index, rule) in rules.into_iter().enumerate() {
             let matched = rule.matcher.evaluate(
@@ -691,6 +697,7 @@ impl Core {
                     .ok()
                     .and_then(|v| v.first().map(SocketAddr::ip));
                 resolved = true;
+                looked_up = true;
             }
             if matched == Some(true)
                 || (matched.is_none() && rule.matches(&host, ip, target.port, network))
@@ -705,10 +712,13 @@ impl Core {
                     ip,
                 );
                 trace.index = Some(index);
+                trace.looked_up = looked_up;
                 return Ok(trace);
             }
         }
-        Ok(Trace::new("DIRECT", "DIRECT", "Fallback", ip))
+        let mut trace = Trace::new("DIRECT", "DIRECT", "Fallback", ip);
+        trace.looked_up = looked_up;
+        Ok(trace)
     }
     #[cfg(test)]
     async fn route(&self, target: &Target, network: &str) -> Result<String> {

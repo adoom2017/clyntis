@@ -32,6 +32,8 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/proxies", get(proxies))
         .route("/adblock", get(adblock))
         .route("/rules/test", post(test_route))
+        .route("/dns/leak", get(dns_leak_audit))
+        .route("/dns/leak/test", post(dns_leak_test))
         .route("/proxies/{name}", get(proxy).put(select))
         .route("/proxies/{name}/delay", get(delay))
         .route("/connections", get(connections).delete(close_all))
@@ -194,6 +196,16 @@ async fn test_route(State(core): State<Arc<Core>>, Json(value): Json<Value>) -> 
         .unwrap_or("tcp");
     let target = crate::parse_test_target(target, port).map_err(error)?;
     let result = core.test_route(&target, network).await.map_err(error)?;
+    Ok(Json(serde_json::to_value(result).map_err(error)?))
+}
+async fn dns_leak_audit(State(core): State<Arc<Core>>) -> ApiResult {
+    Ok(Json(
+        serde_json::to_value(core.dns_leak_audit()).map_err(error)?,
+    ))
+}
+/// Online test through bash.ws; takes up to about 30 seconds.
+async fn dns_leak_test(State(core): State<Arc<Core>>) -> ApiResult {
+    let result = core.dns_leak_test().await.map_err(error)?;
     Ok(Json(serde_json::to_value(result).map_err(error)?))
 }
 async fn proxies(State(core): State<Arc<Core>>) -> Json<Value> {

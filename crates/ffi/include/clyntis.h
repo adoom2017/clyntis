@@ -131,6 +131,12 @@ int32_t meta_probe_v1(meta_handle handle, const uint8_t *name, size_t name_lengt
  * and node. Blocks while a rule resolves the name: never on the packet path. */
 int32_t meta_test_route_v1(meta_handle handle, const uint8_t *json, size_t length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* DNS leak detection as JSON: {"audit":{leaking,findings[]}} for online=0
+ * (immediate); with online=1 also "test" (bash.ws: exit, node, matched,
+ * routed and local resolvers). online=1 blocks up to ~30 s: never on the
+ * packet path. */
+int32_t meta_dns_leak_v1(meta_handle handle, uint32_t online,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 int32_t meta_write_packet_v1(meta_handle handle, const uint8_t *packet, size_t length);
 int32_t meta_read_packet_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 #ifdef __cplusplus

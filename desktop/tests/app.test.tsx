@@ -384,7 +384,7 @@ describe("desktop workflows", () => {
       }),
     );
   });
-  it("tests which rule and node a domain would use", async () => {
+  it("tests routes and DNS leaks on the rules page", async () => {
     const view = {
       rules: ["DOMAIN-SUFFIX,example.com,Proxy"],
       targets: ["DIRECT", "REJECT", "Proxy"],
@@ -405,6 +405,36 @@ describe("desktop workflows", () => {
           matched: "DomainSuffix(example.com)",
           chain: ["Proxy", "Auto", "HK 01"],
           node: "HK 01",
+          resolved_locally: true,
+        };
+      if (command === "dns_leak_audit")
+        return {
+          leaking: true,
+          findings: [
+            {
+              level: "risk",
+              code: "resolving-rules",
+              title: "1 条 IP 规则会在匹配前本地解析域名",
+              detail: "加上 no-resolve",
+              items: ["第 3 条：GEOIP,CN,DIRECT"],
+            },
+          ],
+        };
+      if (command === "dns_leak_test")
+        return {
+          exit: [{ ip: "203.0.113.9", country: "Japan", asn: "AS64500" }],
+          node: "HK 01",
+          matched: "MATCH,Proxy",
+          routed: {
+            resolvers: [{ ip: "198.51.100.53", country: "Japan", asn: "" }],
+            conclusion: "DNS is not leaking.",
+            error: null,
+          },
+          local: {
+            resolvers: [{ ip: "192.0.2.1", country: "China", asn: "" }],
+            conclusion: "DNS may be leaking.",
+            error: null,
+          },
         };
       return { ...structuredClone(initial), status: "running" };
     });
@@ -423,6 +453,13 @@ describe("desktop workflows", () => {
     expect(await screen.findByText("HK 01")).toBeInTheDocument();
     expect(screen.getByText("Proxy → Auto → HK 01")).toBeInTheDocument();
     expect(screen.getByText(/第 1 条 · 自定义规则/)).toBeInTheDocument();
+    expect(screen.getByText(/存在 DNS 泄露/)).toBeInTheDocument();
+    expect(screen.getByText("第 3 条：GEOIP,CN,DIRECT")).toBeInTheDocument();
+    expect(screen.getByText("配置检查发现 DNS 泄露风险")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "在线检测" }));
+    expect(await screen.findByText("198.51.100.53")).toBeInTheDocument();
+    expect(screen.getByText("未发现泄露")).toBeInTheDocument();
+    expect(screen.getByText("可能存在泄露")).toBeInTheDocument();
   });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");

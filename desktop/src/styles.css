@@ -803,6 +803,60 @@ textarea::placeholder {
   margin: 0;
   overflow-wrap: anywhere;
 }
+.dns-leak {
+  padding-bottom: 12px;
+}
+.dns-leak .panel-title {
+  margin: 12px 0 8px;
+}
+.leak-finding {
+  border-left: 3px solid var(--border);
+  padding: 6px 10px;
+  margin: 8px 0;
+}
+.leak-finding.risk {
+  border-color: var(--danger);
+}
+.leak-finding.warning {
+  border-color: var(--warning);
+}
+.leak-finding ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+.leak-level {
+  font-size: 11px;
+  margin-right: 6px;
+  color: var(--muted);
+}
+.leak-finding.risk .leak-level {
+  color: var(--danger);
+}
+.leak-finding.warning .leak-level {
+  color: var(--warning);
+}
+.leak-test {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 12px;
+  font-size: 13px;
+}
+.leak-probe {
+  margin-top: 12px;
+}
+.leak-probe-title,
+.leak-server {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+.leak-probe-title {
+  justify-content: space-between;
+}
 .rule-check {
   display: inline-flex;
   align-items: center;

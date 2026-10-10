@@ -30,6 +30,9 @@ pub struct RouteTest {
     pub chain: Vec<String>,
     /// The proxy (or DIRECT/REJECT) the connection would leave through.
     pub node: String,
+    /// Whether a rule made the core resolve the name through its own
+    /// upstreams before matching: with a proxy `node`, a DNS leak.
+    pub resolved_locally: bool,
 }
 
 /// Parses what a person types to test: a domain or IP address, optionally with
@@ -90,6 +93,7 @@ impl Core {
             decision,
             ip,
             index,
+            looked_up,
         } = self.trace_route(&target, network, false).await?;
         let rule = index.and_then(|i| self.policy.read().unwrap().raw_rules.get(i).cloned());
         let chain = self.chain(&decision.group)?;
@@ -104,6 +108,7 @@ impl Core {
             matched: decision.rule,
             chain,
             node: decision.node,
+            resolved_locally: looked_up,
         })
     }
 }
@@ -111,6 +116,26 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::parse_test_target;
+
+    #[tokio::test]
+    async fn a_proxied_name_resolved_by_an_ip_rule_is_flagged() {
+        let config = meta_config::Config::parse(b"hosts: {'leak.test': 10.9.9.9}\nproxy-groups:\n- {name: Proxy, type: select, proxies: [REJECT]}\nrules: ['DOMAIN,plain.test,Proxy', 'IP-CIDR,192.0.2.0/24,DIRECT', 'MATCH,Proxy']\n").unwrap();
+        let core =
+            crate::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let test = |host: &str| {
+            let core = core.clone();
+            let target = parse_test_target(host, None).unwrap();
+            async move { core.test_route(&target, "tcp").await.unwrap() }
+        };
+        let leaked = test("leak.test").await;
+        assert_eq!(
+            (leaked.node.as_str(), leaked.resolved_locally),
+            ("REJECT", true)
+        );
+        assert_eq!(leaked.ip, Some("10.9.9.9".parse().unwrap()));
+        assert!(!test("plain.test").await.resolved_locally);
+        assert!(!test("10.9.9.9").await.resolved_locally);
+    }
 
     #[test]
     fn typed_targets_parse_with_sensible_ports() {

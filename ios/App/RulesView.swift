@@ -37,6 +37,7 @@ struct RulesView: View {
     var body: some View {
         List {
             RouteTestSection(model: model)
+            DnsLeakSection(model: model)
             if model.customRules.isEmpty {
                 ContentUnavailableView("还没有自定义规则", systemImage: "list.bullet.indent",
                                        description: Text("自定义规则对所有配置生效，并优先于配置自带的规则。"))
@@ -172,6 +173,11 @@ private struct RouteTestSection: View {
                                 .font(.caption).foregroundStyle(.secondary)
                                 .multilineTextAlignment(.trailing)
                         }
+                        if result.resolvedLocally, !["DIRECT", "REJECT"].contains(result.node) {
+                            Text("匹配前已在本地解析域名，存在 DNS 泄露")
+                                .font(.caption).foregroundStyle(.red)
+                                .multilineTextAlignment(.trailing)
+                        }
                     }
                 }
             }
@@ -193,6 +199,132 @@ private struct RouteTestSection: View {
                 result = nil
                 failure = error.localizedDescription
             }
+        }
+    }
+}
+
+/// Configuration review and the online bash.ws test.
+private struct DnsLeakSection: View {
+    let model: AppModel
+    @State private var audit: DnsLeakResult.Audit?
+    @State private var test: DnsLeakResult.Test?
+    @State private var testing = false
+    @State private var failure: String?
+
+    var body: some View {
+        Section {
+            if let audit {
+                Label(audit.leaking ? "配置检查发现 DNS 泄露风险"
+                        : audit.findings.isEmpty ? "配置检查未发现问题" : "配置检查未发现泄露，但有以下提示",
+                      systemImage: audit.leaking ? "exclamationmark.shield" : "checkmark.shield")
+                    .foregroundStyle(audit.leaking ? .red : .primary)
+                ForEach(audit.findings, id: \.code) { finding in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(Self.levelText[finding.level] ?? finding.level)
+                                .font(.caption.bold()).foregroundStyle(Self.levelColor(finding.level))
+                            Text(finding.title).font(.subheadline.weight(.semibold))
+                        }
+                        Text(finding.detail).font(.caption).foregroundStyle(.secondary)
+                        ForEach(finding.items, id: \.self) { item in
+                            Text(item).font(.caption.monospaced()).lineLimit(2)
+                        }
+                    }
+                }
+            }
+            Button(action: runTest) {
+                HStack {
+                    Text(testing ? "检测中…" : "在线检测")
+                    if testing { Spacer(); ProgressView() }
+                }
+            }
+            .disabled(!model.connected || testing)
+            if let failure { Text(failure).foregroundStyle(.red) }
+            if let test {
+                LabeledContent("出口 IP") {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        ForEach(test.exit, id: \.ip) { server in
+                            Text(server.ip)
+                            Text(Self.place(server)).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Text("bash.ws 当前经「\(test.node)」（\(test.matched)）访问"
+                     + (test.node == "DIRECT" ? "，结果反映直连时的情况。" : "。"))
+                    .font(.caption).foregroundStyle(.secondary)
+                probe("应用访问时的解析器", test.routed)
+                probe("内核上游 DNS 的解析器", test.local)
+            }
+        } header: {
+            Text("DNS 泄露检测")
+        } footer: {
+            Text(model.connected
+                 ? "配置检查在本地完成；在线检测会向 bash.ws 发送随机域名，并暴露出口和解析器的 IP。"
+                 : "连接 VPN 后可检测。")
+        }
+        .task(id: model.connected) { await check() }
+    }
+
+    private static let levelText = ["risk": "泄露", "warning": "注意", "info": "提示"]
+
+    private static func levelColor(_ level: String) -> Color {
+        switch level {
+        case "risk": .red
+        case "warning": .orange
+        default: .secondary
+        }
+    }
+
+    private static func place(_ server: DnsLeakResult.Server) -> String {
+        [server.country, server.asn].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    private func probe(_ title: String, _ probe: DnsLeakResult.Probe) -> some View {
+        let conclusion = probe.conclusion ?? ""
+        let leaking = probe.error != nil || conclusion.localizedCaseInsensitiveContains("may be leaking")
+            || conclusion.localizedCaseInsensitiveContains("leak detected")
+        let verdict = probe.error
+            ?? (conclusion.localizedCaseInsensitiveContains("not leaking") ? "未发现泄露"
+                : conclusion.localizedCaseInsensitiveContains("leak") ? "可能存在泄露"
+                : conclusion.isEmpty ? "没有结果" : conclusion)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(verdict).font(.caption).foregroundStyle(leaking ? .red : .secondary)
+            }
+            ForEach(probe.resolvers, id: \.ip) { server in
+                HStack(alignment: .firstTextBaseline) {
+                    Text(server.ip).font(.caption.monospaced())
+                    Spacer()
+                    Text(Self.place(server)).font(.caption).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+        }
+    }
+
+    private func check() async {
+        guard model.connected else {
+            audit = nil
+            test = nil
+            return
+        }
+        do { audit = try await model.dnsLeak(online: false).audit }
+        catch { failure = error.localizedDescription }
+    }
+
+    private func runTest() {
+        guard model.connected, !testing else { return }
+        testing = true
+        failure = nil
+        Task {
+            defer { testing = false }
+            do {
+                let result = try await model.dnsLeak(online: true)
+                audit = result.audit
+                test = result.test
+            } catch { failure = error.localizedDescription }
         }
     }
 }

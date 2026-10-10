@@ -12,4 +12,6 @@ struct TunnelMessage: Codable {
     /// The domain, address or URL for "test-route", and "tcp" or "udp".
     var target: String?
     var network: String?
+    /// "dns-leak": also run the online bash.ws test.
+    var online: Bool?
 }

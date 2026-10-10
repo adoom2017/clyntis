@@ -48,6 +48,8 @@ fn main() {
             app::custom_rules,
             app::save_custom_rules,
             app::test_route,
+            app::dns_leak_audit,
+            app::dns_leak_test,
             app::proxies,
             app::adblock_status,
             app::select_proxy,

@@ -20,7 +20,17 @@ replacement for every protocol or configuration option.
   node it would leave through (each group's selection along the way), without
   connecting: `POST /rules/test` with `{"target": "example.com", "port": 443,
   "network": "tcp"}` (only `target` is required), `meta_test_route_v1` over the
-  C ABI, and the apps' rules page.
+  C ABI, and the apps' rules page. It also says when a rule resolved a proxied
+  name locally (a DNS leak).
+- **DNS leak detection:** a configuration review lists what leaks or exposes
+  names: redir-host mode, IP rules without `no-resolve` ahead of a proxy (each
+  rule listed), plaintext upstreams and system DNS that bypasses the TUN
+  (`GET /dns/leak`). An online test (`POST /dns/leak/test`, about 30 s) asks
+  bash.ws which resolvers looked up random names, along two paths: connecting
+  like an app (through the rules) and through the core's own upstreams, beside
+  the exit address. C ABI: `meta_dns_leak_v1`; the apps show both on the rules
+  page. The online test sends random names to bash.ws and reveals the exit
+  and resolver addresses to it.
 - **Ad blocking** (`adblock` section, written by the apps' settings): domain
   lists in Clash rule-provider, hosts or AdGuard (`||domain^`, with `@@`
   exceptions) format are downloaded and refreshed like rule providers. Listed

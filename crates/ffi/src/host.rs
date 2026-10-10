@@ -134,6 +134,7 @@ enum Command {
         String,
         std::sync::mpsc::SyncSender<Result<meta_core::RouteTest, String>>,
     ),
+    DnsLeakTest(std::sync::mpsc::SyncSender<Result<meta_core::DnsLeakTest, String>>),
     NetworkChanged(std::sync::mpsc::SyncSender<Result<(), String>>),
     #[cfg(target_os = "android")]
     SetFd(
@@ -218,6 +219,16 @@ impl Handle {
                                     let _ = reply.send(result);
                                 });
                             },
+                            Some(Command::DnsLeakTest(reply)) => {
+                                let core = owner.clone();
+                                tokio::spawn(async move {
+                                    let result = core
+                                        .dns_leak_test()
+                                        .await
+                                        .map_err(|e| format!("{e:#}"));
+                                    let _ = reply.send(result);
+                                });
+                            },
                             Some(Command::NetworkChanged(reply)) => {
                                 owner.network_changed().await;
                                 let _ = reply.send(Ok(()));
@@ -295,6 +306,17 @@ impl Handle {
             .map_err(|_| anyhow::anyhow!("core worker is busy or stopped"))?;
         result
             .recv_timeout(Duration::from_secs(15))
+            .map_err(|_| anyhow::anyhow!("core worker did not answer"))?
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+    /// The online DNS leak test; blocks the caller for up to ~30 seconds.
+    pub(crate) fn dns_leak_test(&self) -> Result<meta_core::DnsLeakTest> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .try_send(Command::DnsLeakTest(reply))
+            .map_err(|_| anyhow::anyhow!("core worker is busy or stopped"))?;
+        result
+            .recv_timeout(Duration::from_secs(40))
             .map_err(|_| anyhow::anyhow!("core worker did not answer"))?
             .map_err(|e| anyhow::anyhow!(e))
     }

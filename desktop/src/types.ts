@@ -225,6 +225,41 @@ export interface RouteTest {
   /** The rule's target, then each group's selection down to `node`. */
   chain: string[];
   node: string;
+  /** A rule resolved the name through the core's upstreams before matching. */
+  resolved_locally: boolean;
+}
+export interface DnsLeakFinding {
+  level: "risk" | "warning" | "info";
+  code: string;
+  title: string;
+  detail: string;
+  items: string[];
+}
+/** Offline review of the running configuration (`GET /dns/leak`). */
+export interface DnsLeakAudit {
+  leaking: boolean;
+  findings: DnsLeakFinding[];
+}
+export interface LeakServer {
+  ip: string;
+  country: string;
+  asn: string;
+}
+export interface LeakProbe {
+  resolvers: LeakServer[];
+  conclusion: string | null;
+  error: string | null;
+}
+/** Online test through bash.ws (`POST /dns/leak/test`). */
+export interface DnsLeakTest {
+  exit: LeakServer[];
+  /** Node and rule bash.ws traffic uses; the test reflects that route. */
+  node: string;
+  matched: string;
+  /** Resolvers seen when connecting like an app (through the rules). */
+  routed: LeakProbe;
+  /** Resolvers behind the core's own upstreams. */
+  local: LeakProbe;
 }
 export const ruleTypes: { type: string; label: string; placeholder: string }[] =
   [

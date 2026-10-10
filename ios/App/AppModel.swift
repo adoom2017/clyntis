@@ -490,6 +490,17 @@ final class AppModel {
         return try JSONDecoder().decode(RouteTest.self, from: data)
     }
 
+    /// The configuration review, plus the online bash.ws test when `online`.
+    func dnsLeak(online: Bool) async throws -> DnsLeakResult {
+        guard connected else { throw ClientError.message("VPN 未连接。") }
+        let data = try await send(TunnelMessage(command: "dns-leak", online: online), timeout: online ? 45 : 5)
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let error = object["error"] as? String {
+            throw ClientError.message(error)
+        }
+        return try JSONDecoder().decode(DnsLeakResult.self, from: data)
+    }
+
     private func send(_ message: TunnelMessage, timeout: Double = 5) async throws -> Data {
         guard let session = manager?.connection as? NETunnelProviderSession else {
             throw ClientError.message("VPN 会话不可用。")
@@ -563,6 +574,50 @@ struct RouteTest: Decodable {
     /// The rule's target, then each group's selection down to `node`.
     let chain: [String]
     let node: String
+    /// A rule resolved the name through the core's upstreams before matching.
+    let resolvedLocally: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case host, port, network, ip, rule, index, matched, chain, node
+        case resolvedLocally = "resolved_locally"
+    }
+}
+
+/// DNS leak detection (see `meta_dns_leak_v1`).
+struct DnsLeakResult: Decodable {
+    struct Finding: Decodable {
+        /// "risk", "warning" or "info".
+        let level: String
+        let code: String
+        let title: String
+        let detail: String
+        let items: [String]
+    }
+    struct Audit: Decodable {
+        let leaking: Bool
+        let findings: [Finding]
+    }
+    struct Server: Decodable {
+        let ip: String
+        let country: String
+        let asn: String
+    }
+    struct Probe: Decodable {
+        let resolvers: [Server]
+        let conclusion: String?
+        let error: String?
+    }
+    struct Test: Decodable {
+        let exit: [Server]
+        /// Node and rule bash.ws traffic uses; the test reflects that route.
+        let node: String
+        let matched: String
+        /// Resolvers seen when connecting like an app, and behind the core's upstreams.
+        let routed: Probe
+        let local: Probe
+    }
+    let audit: Audit
+    let test: Test?
 }
 
 private final class MessageReply: @unchecked Sendable {

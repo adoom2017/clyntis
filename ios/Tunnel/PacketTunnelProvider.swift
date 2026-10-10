@@ -324,6 +324,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                     return
+                case "dns-leak":
+                    let online = message.online ?? false
+                    // The online test takes seconds of network I/O: off the packet queue.
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            completionHandler?(try core.dnsLeak(online: online))
+                        } catch {
+                            completionHandler?(try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription]))
+                        }
+                    }
+                    return
                 default: throw ClientError.message("不支持的内核命令。")
                 }
                 completionHandler?(try core.snapshot())

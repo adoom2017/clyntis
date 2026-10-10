@@ -638,6 +638,30 @@ pub unsafe extern "C" fn meta_test_route_v1(
         unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
     })
 }
+/// DNS leak detection as JSON. `online` 0: the configuration review only
+/// (`{"audit": {...}}`), immediate. `online` 1: also the bash.ws test
+/// (`{"audit": {...}, "test": {...}}`); blocks for up to ~30 seconds, so
+/// call it off the packet path.
+///
+/// # Safety
+/// Buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_dns_leak_v1(
+    id: u64,
+    online: u32,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let handle = handle(id)?;
+        let mut value = serde_json::json!({ "audit": handle.core.dns_leak_audit() });
+        if online != 0 {
+            value["test"] = serde_json::to_value(handle.dns_leak_test()?)?;
+        }
+        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
 /// # Safety
 /// Data must be readable for len bytes. The packet is copied before return.
 #[unsafe(no_mangle)]

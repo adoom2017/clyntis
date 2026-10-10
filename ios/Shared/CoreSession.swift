@@ -155,6 +155,12 @@ final class CoreSession {
         }
     }
 
+    /// DNS leak detection as the core's JSON (`audit`, and `test` when
+    /// `online`). Online blocks for up to ~30 s: never on the packet queue.
+    func dnsLeak(online: Bool) throws -> Data {
+        try Self.read { meta_dns_leak_v1(handle, online ? 1 : 0, $0, $1, $2) }
+    }
+
     /// Closes connection `id`, or every connection when `id` is nil.
     func closeConnection(_ id: String?) throws {
         guard let id else {
