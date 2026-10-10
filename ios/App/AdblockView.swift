@@ -39,6 +39,7 @@ struct AdblockStatus: Decodable, Equatable {
 struct AdblockView: View {
     @Bindable var model: AppModel
     @State private var failure: String?
+    @State private var allowFailure: String?
     @State private var needsReconnect = false
     @State private var addingList = false
     @State private var newAllow = ""
@@ -116,6 +117,9 @@ struct AdblockView: View {
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
         }
         .navigationTitle("去广告")
+        .alert("无法放行", isPresented: Binding(get: { allowFailure != nil }, set: { if !$0 { allowFailure = nil } })) {
+            Button("好", role: .cancel) {}
+        } message: { Text(allowFailure ?? "") }
         .sheet(isPresented: $addingList) { AddListView { list in
             var next = settings ?? AdblockSettings()
             next.custom.append(list)
@@ -154,22 +158,49 @@ struct AdblockView: View {
         if !status.top.isEmpty {
             Section("拦截最多") {
                 ForEach(status.top) { item in
-                    LabeledContent(item.domain, value: "\(item.count) 次")
-                        .swipeActions { Button("放行") { Task { await model.allowAdblock(item.domain) } }.tint(.green) }
+                    HStack {
+                        Text(item.domain).lineLimit(1)
+                        Spacer()
+                        Text("\(item.count) 次").foregroundStyle(.secondary)
+                        allowButton(item.domain)
+                    }
+                    .swipeActions { Button("放行") { allow(item.domain) }.tint(.green) }
                 }
             }
         }
         if !status.recent.isEmpty {
             Section {
                 ForEach(Array(status.recent.enumerated()), id: \.offset) { _, item in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.domain).font(.subheadline.monospaced()).lineLimit(1)
-                        Text("\(Date(timeIntervalSince1970: item.time).formatted(date: .omitted, time: .standard)) · \(item.via == "dns" ? "DNS" : "连接")")
-                            .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.domain).font(.subheadline.monospaced()).lineLimit(1)
+                            Text("\(Date(timeIntervalSince1970: item.time).formatted(date: .omitted, time: .standard)) · \(item.via == "dns" ? "DNS" : "连接")")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        allowButton(item.domain)
                     }
-                    .swipeActions { Button("放行") { Task { await model.allowAdblock(item.domain) } }.tint(.green) }
+                    .swipeActions { Button("放行") { allow(item.domain) }.tint(.green) }
                 }
-            } header: { Text("最近拦截") } footer: { Text("左滑「放行」加入白名单，立即生效。") }
+            } header: { Text("最近拦截") } footer: { Text("点「放行」把域名加入白名单，立即生效。") }
+        }
+    }
+
+    /// One tap adds the domain to the allowlist; allowed ones say so.
+    @ViewBuilder private func allowButton(_ domain: String) -> some View {
+        if settings?.allow.contains(domain) == true {
+            Text("已放行").font(.caption).foregroundStyle(.green)
+        } else {
+            Button("放行") { allow(domain) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.green)
+        }
+    }
+
+    private func allow(_ domain: String) {
+        Task {
+            do { try await model.allowAdblock(domain) } catch { allowFailure = error.localizedDescription }
         }
     }
 

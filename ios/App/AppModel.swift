@@ -325,10 +325,14 @@ final class AppModel {
     }
 
     /// Adds `domain` to the allowlist (from the statistics), live.
-    func allowAdblock(_ domain: String) async {
-        guard var settings = overrides.adblock, !settings.allow.contains(domain) else { return }
+    /// Adds `domain` to the app's allowlist and applies it to the running core.
+    func allowAdblock(_ domain: String) async throws {
+        guard var settings = overrides.adblock else {
+            throw ClientError.message("去广告由配置文件开启，请在配置的 adblock.allow 中放行，或在本页开启去广告后再放行。")
+        }
+        guard !settings.allow.contains(domain) else { return }
         settings.allow.append(domain)
-        do { try await saveAdblock(settings) } catch { self.error = error.localizedDescription }
+        _ = try await saveAdblock(settings)
     }
 
     func saveOverrides(_ value: AppOverrides) throws {
