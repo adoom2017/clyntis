@@ -1777,6 +1777,7 @@ dependencies = [
  "meta-config",
  "meta-core",
  "meta-platform",
+ "meta-protocol",
  "serde_json",
  "smoltcp",
  "socket2",

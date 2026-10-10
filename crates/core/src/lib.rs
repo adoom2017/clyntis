@@ -9,6 +9,8 @@ mod packet;
 mod profile;
 mod resources;
 pub use resources::Freshness;
+mod route_test;
+pub use route_test::{RouteTest, parse_test_target};
 mod sniff;
 mod tailscale;
 #[cfg(test)]
@@ -85,6 +87,32 @@ pub(crate) struct RouteDecision {
     pub(crate) node: String,
     pub(crate) group: String,
     pub(crate) rule: String,
+}
+
+/// A route decision with what led to it: the address IP rules saw and the
+/// index of the matching rule.
+pub(crate) struct Trace {
+    pub(crate) decision: RouteDecision,
+    pub(crate) ip: Option<std::net::IpAddr>,
+    pub(crate) index: Option<usize>,
+}
+impl Trace {
+    fn new(
+        node: impl Into<String>,
+        group: impl Into<String>,
+        rule: impl Into<String>,
+        ip: Option<std::net::IpAddr>,
+    ) -> Self {
+        Self {
+            decision: RouteDecision {
+                node: node.into(),
+                group: group.into(),
+                rule: rule.into(),
+            },
+            ip,
+            index: None,
+        }
+    }
 }
 
 /// The member a url-test group should use after a round of probes
@@ -611,38 +639,38 @@ impl Core {
         target: &Target,
         network: &str,
     ) -> Result<RouteDecision> {
+        Ok(self.trace_route(target, network, true).await?.decision)
+    }
+    /// Routes `target` like a connection would. `record` counts an ad block
+    /// hit; route tests leave the counters alone.
+    async fn trace_route(&self, target: &Target, network: &str, record: bool) -> Result<Trace> {
         // Ad blocking precedes every rule and mode; DNS already refused these
         // names, so this catches apps that resolved them some other way.
         if target.ip().is_none()
             && let Some(filter) = self.resolver.adblock()
             && filter.blocks(&target.host)
         {
-            self.resolver
-                .adblock_stats
-                .record(&target.host, "connection");
-            return Ok(RouteDecision {
-                node: "REJECT".into(),
-                group: "REJECT".into(),
-                rule: "Adblock".into(),
-            });
+            if record {
+                self.resolver
+                    .adblock_stats
+                    .record(&target.host, "connection");
+            }
+            return Ok(Trace::new("REJECT", "REJECT", "Adblock", None));
         }
         let (mode, rules, raw_rules) = {
             let p = self.policy.read().unwrap();
             (p.mode.clone(), p.rules.clone(), p.raw_rules.clone())
         };
         if mode == Mode::Direct {
-            return Ok(RouteDecision {
-                node: "DIRECT".into(),
-                group: "DIRECT".into(),
-                rule: "Mode(Direct)".into(),
-            });
+            return Ok(Trace::new("DIRECT", "DIRECT", "Mode(Direct)", None));
         }
         if mode == Mode::Global {
-            return Ok(RouteDecision {
-                node: self.leaf("GLOBAL")?,
-                group: "GLOBAL".into(),
-                rule: "Mode(Global)".into(),
-            });
+            return Ok(Trace::new(
+                self.leaf("GLOBAL")?,
+                "GLOBAL",
+                "Mode(Global)",
+                None,
+            ));
         }
         let mut ip = target.ip();
         let mut resolved = ip.is_some();
@@ -667,27 +695,30 @@ impl Core {
             if matched == Some(true)
                 || (matched.is_none() && rule.matches(&host, ip, target.port, network))
             {
-                return Ok(RouteDecision {
-                    node: self.leaf(&rule.target)?,
-                    group: rule.target.clone(),
-                    rule: raw_rules
+                let mut trace = Trace::new(
+                    self.leaf(&rule.target)?,
+                    rule.target.clone(),
+                    raw_rules
                         .get(index)
                         .map(|raw| describe_rule(raw, &rule.target))
                         .unwrap_or_else(|| "Match".into()),
-                });
+                    ip,
+                );
+                trace.index = Some(index);
+                return Ok(trace);
             }
         }
-        Ok(RouteDecision {
-            node: "DIRECT".into(),
-            group: "DIRECT".into(),
-            rule: "Fallback".into(),
-        })
+        Ok(Trace::new("DIRECT", "DIRECT", "Fallback", ip))
     }
     #[cfg(test)]
     async fn route(&self, target: &Target, network: &str) -> Result<String> {
         Ok(self.route_decision(target, network).await?.node)
     }
     fn leaf(&self, name: &str) -> Result<String> {
+        Ok(self.chain(name)?.pop().unwrap_or_default())
+    }
+    /// `name` followed by each group's selection down to the node it uses.
+    fn chain(&self, name: &str) -> Result<Vec<String>> {
         let policy = self.policy.read().unwrap();
         let mut name = name.to_owned();
         if name == "GLOBAL" {
@@ -699,11 +730,11 @@ impl Core {
                 .or_else(|| self.config.proxies.first().map(|p| p.name.clone()))
                 .unwrap_or("DIRECT".into());
         }
+        let mut chain = vec![name];
         for _ in 0..=self.config.proxy_groups.len() {
-            if let Some(selected) = policy.selection.get(&name) {
-                name = selected.clone();
-            } else {
-                return Ok(name);
+            match policy.selection.get(chain.last().unwrap()) {
+                Some(selected) => chain.push(selected.clone()),
+                None => return Ok(chain),
             }
         }
         bail!("group cycle")

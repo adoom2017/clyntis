@@ -602,6 +602,42 @@ pub unsafe extern "C" fn meta_probe_v1(
         Ok(OK)
     })
 }
+/// Routes a domain or address like a new connection, without connecting.
+/// Input JSON: `{"target": "example.com", "port": 443, "network": "tcp"}`
+/// (only `target` is required; it may also be an IP address or URL). Output:
+/// the core's `RouteTest` as JSON (`rule`, `matched`, `chain`, `node`, ...).
+/// Blocks while a rule resolves the name: call it off the packet path.
+///
+/// # Safety
+/// `data` must be readable for `len` bytes; buffer and length output must be
+/// writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_test_route_v1(
+    id: u64,
+    data: *const u8,
+    len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let value: serde_json::Value = serde_json::from_slice(unsafe { input(data, len)? })?;
+        let target = value["target"].as_str().context("target required")?;
+        let port = match &value["port"] {
+            serde_json::Value::Null => None,
+            port => Some(
+                port.as_u64()
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|p| *p != 0)
+                    .context("invalid port")?,
+            ),
+        };
+        let network = value["network"].as_str().unwrap_or("tcp");
+        let target = meta_core::parse_test_target(target, port)?;
+        let result = handle(id)?.test_route(target, network)?;
+        unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
+    })
+}
 /// # Safety
 /// Data must be readable for len bytes. The packet is copied before return.
 #[unsafe(no_mangle)]

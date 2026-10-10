@@ -143,6 +143,18 @@ final class CoreSession {
         return delay
     }
 
+    /// Which rule `target` (a domain, address or URL) matches and the node it
+    /// would use, as the core's JSON. May resolve the name: never call it on
+    /// the packet queue.
+    func testRoute(_ target: String, network: String) throws -> Data {
+        let request = try JSONSerialization.data(withJSONObject: ["target": target, "network": network])
+        return try request.withUnsafeBytes { request in
+            try Self.read {
+                meta_test_route_v1(handle, request.bindMemory(to: UInt8.self).baseAddress, request.count, $0, $1, $2)
+            }
+        }
+    }
+
     /// Closes connection `id`, or every connection when `id` is nil.
     func closeConnection(_ id: String?) throws {
         guard let id else {

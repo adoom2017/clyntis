@@ -656,3 +656,39 @@ fn closing_connections_accepts_one_id_or_all() {
     );
     assert_eq!(meta_destroy_v1(id), OK);
 }
+
+#[test]
+fn route_test_reports_the_rule_and_node_as_json() {
+    let id = create(
+        b"proxy-groups:\n- {name: Pick, type: select, proxies: [REJECT, DIRECT]}\nrules: ['DOMAIN-KEYWORD,video,Pick', 'MATCH,DIRECT']\n",
+        std::ptr::null(),
+    );
+    let test = |request: &str| {
+        let mut bytes = vec![0; 4096];
+        let mut length = 0;
+        let status = unsafe {
+            meta_test_route_v1(
+                id,
+                request.as_ptr(),
+                request.len(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut length,
+            )
+        };
+        (status, bytes[..length].to_vec())
+    };
+    let (status, bytes) = test(r#"{"target":"video.example:8443"}"#);
+    assert_eq!(status, OK);
+    let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["rule"], "DOMAIN-KEYWORD,video,Pick");
+    assert_eq!(result["chain"], serde_json::json!(["Pick", "REJECT"]));
+    assert_eq!(
+        (result["node"].as_str(), result["port"].as_u64()),
+        (Some("REJECT"), Some(8443))
+    );
+    assert_eq!(test(r#"{"target":""}"#).0, ERROR);
+    assert_eq!(test(r#"{"target":"a.example","port":0}"#).0, ERROR);
+    assert_eq!(meta_destroy_v1(id), OK);
+    assert_eq!(test(r#"{"target":"a.example"}"#).0, ERROR);
+}

@@ -479,6 +479,17 @@ final class AppModel {
         }
     }
 
+    /// Which rule `target` matches in the running core and the node it uses.
+    func testRoute(_ target: String, network: String) async throws -> RouteTest {
+        guard connected else { throw ClientError.message("VPN 未连接。") }
+        let data = try await send(TunnelMessage(command: "test-route", target: target, network: network), timeout: 15)
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let error = object["error"] as? String {
+            throw ClientError.message(error)
+        }
+        return try JSONDecoder().decode(RouteTest.self, from: data)
+    }
+
     private func send(_ message: TunnelMessage, timeout: Double = 5) async throws -> Data {
         guard let session = manager?.connection as? NETunnelProviderSession else {
             throw ClientError.message("VPN 会话不可用。")
@@ -535,6 +546,23 @@ struct ProxyGroup: Identifiable {
     let name: String
     let nodes: [String]
     let selected: String?
+}
+
+/// How the core would route a domain or address now (see `meta_test_route_v1`).
+struct RouteTest: Decodable {
+    let host: String
+    let port: Int
+    let network: String
+    /// The address IP rules saw, when a rule needed one.
+    let ip: String?
+    /// The matching rule as written; nil for ad blocking, modes and fallback.
+    let rule: String?
+    let index: Int?
+    /// Short form: `DomainSuffix(x)`, `Adblock`, `Mode(Global)`, `Fallback`.
+    let matched: String
+    /// The rule's target, then each group's selection down to `node`.
+    let chain: [String]
+    let node: String
 }
 
 private final class MessageReply: @unchecked Sendable {

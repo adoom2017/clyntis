@@ -384,6 +384,46 @@ describe("desktop workflows", () => {
       }),
     );
   });
+  it("tests which rule and node a domain would use", async () => {
+    const view = {
+      rules: ["DOMAIN-SUFFIX,example.com,Proxy"],
+      targets: ["DIRECT", "REJECT", "Proxy"],
+      skipped: [],
+      profile: "日常",
+    };
+    invoke.mockImplementation(async (command) => {
+      if (command === "custom_rules") return view;
+      if (command === "test_route")
+        return {
+          host: "www.example.com",
+          port: 443,
+          network: "tcp",
+          mode: "rule",
+          ip: null,
+          rule: "DOMAIN-SUFFIX,example.com,Proxy",
+          index: 0,
+          matched: "DomainSuffix(example.com)",
+          chain: ["Proxy", "Auto", "HK 01"],
+          node: "HK 01",
+        };
+      return { ...structuredClone(initial), status: "running" };
+    });
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "规则" }));
+    fireEvent.change(await screen.findByLabelText("测试目标"), {
+      target: { value: " www.example.com " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "测试" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("test_route", {
+        target: "www.example.com",
+        network: "tcp",
+      }),
+    );
+    expect(await screen.findByText("HK 01")).toBeInTheDocument();
+    expect(screen.getByText("Proxy → Auto → HK 01")).toBeInTheDocument();
+    expect(screen.getByText(/第 1 条 · 自定义规则/)).toBeInTheDocument();
+  });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");
     expect(bytes(1024)).toBe("1.0 KB");

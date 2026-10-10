@@ -9,4 +9,7 @@ struct TunnelMessage: Codable {
     var id: String?
     /// The ad blocking allowlist for "adblock-allow".
     var allow: [String]?
+    /// The domain, address or URL for "test-route", and "tcp" or "udp".
+    var target: String?
+    var network: String?
 }

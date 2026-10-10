@@ -129,6 +129,11 @@ enum Command {
         u64,
         std::sync::mpsc::SyncSender<Result<u64, String>>,
     ),
+    TestRoute(
+        meta_protocol::Target,
+        String,
+        std::sync::mpsc::SyncSender<Result<meta_core::RouteTest, String>>,
+    ),
     NetworkChanged(std::sync::mpsc::SyncSender<Result<(), String>>),
     #[cfg(target_os = "android")]
     SetFd(
@@ -202,6 +207,17 @@ impl Handle {
                                     let _ = reply.send(result);
                                 });
                             },
+                            // Like probes: a rule may need a DNS lookup.
+                            Some(Command::TestRoute(target, network, reply)) => {
+                                let core = owner.clone();
+                                tokio::spawn(async move {
+                                    let result = core
+                                        .test_route(&target, &network)
+                                        .await
+                                        .map_err(|e| format!("{e:#}"));
+                                    let _ = reply.send(result);
+                                });
+                            },
                             Some(Command::NetworkChanged(reply)) => {
                                 owner.network_changed().await;
                                 let _ = reply.send(Ok(()));
@@ -263,6 +279,22 @@ impl Handle {
             .map_err(|_| anyhow::anyhow!("core worker is busy or stopped"))?;
         result
             .recv_timeout(Duration::from_millis(timeout_ms + 5_000))
+            .map_err(|_| anyhow::anyhow!("core worker did not answer"))?
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+    /// Routes `target` like a new connection; blocks the caller while a rule
+    /// resolves the name.
+    pub(crate) fn test_route(
+        &self,
+        target: meta_protocol::Target,
+        network: &str,
+    ) -> Result<meta_core::RouteTest> {
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        self.commands
+            .try_send(Command::TestRoute(target, network.to_owned(), reply))
+            .map_err(|_| anyhow::anyhow!("core worker is busy or stopped"))?;
+        result
+            .recv_timeout(Duration::from_secs(15))
             .map_err(|_| anyhow::anyhow!("core worker did not answer"))?
             .map_err(|e| anyhow::anyhow!(e))
     }

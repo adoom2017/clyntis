@@ -16,6 +16,11 @@ replacement for every protocol or configuration option.
   network change), domain/IP rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
   profile (see `meta_config::custom`); a rule whose target or rule provider the
   profile lacks is skipped with a reason instead of failing the profile.
+  A route test shows which rule a domain, IP address or URL matches and the
+  node it would leave through (each group's selection along the way), without
+  connecting: `POST /rules/test` with `{"target": "example.com", "port": 443,
+  "network": "tcp"}` (only `target` is required), `meta_test_route_v1` over the
+  C ABI, and the apps' rules page.
 - **Ad blocking** (`adblock` section, written by the apps' settings): domain
   lists in Clash rule-provider, hosts or AdGuard (`||domain^`, with `@@`
   exceptions) format are downloaded and refreshed like rule providers. Listed

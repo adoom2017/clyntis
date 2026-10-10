@@ -789,6 +789,54 @@ async fn connections_show_the_domain_behind_a_fake_ip() {
 }
 
 #[tokio::test]
+async fn route_test_reports_the_rule_and_the_selected_node() {
+    let config = Config::parse(b"secret: s\nproxy-groups:\n- {name: Outer, type: select, proxies: [Inner, REJECT]}\n- {name: Inner, type: select, proxies: [DIRECT, REJECT]}\nrules: ['DOMAIN-SUFFIX,example.com,Outer', 'IP-CIDR,10.0.0.0/8,REJECT,no-resolve', 'MATCH,Inner']\n").unwrap();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let test = |body: &'static str| api_call(core.clone(), "POST", "/rules/test", body, true);
+    let (status, result) = test(r#"{"target":"https://WWW.Example.com/path"}"#).await;
+    assert_eq!(status, 200);
+    assert_eq!(result["host"], "www.example.com");
+    assert_eq!(result["port"], 443);
+    assert_eq!(result["rule"], "DOMAIN-SUFFIX,example.com,Outer");
+    assert_eq!(result["index"], 0);
+    assert_eq!(result["matched"], "DomainSuffix(example.com)");
+    assert_eq!(
+        result["chain"],
+        serde_json::json!(["Outer", "Inner", "DIRECT"])
+    );
+    assert_eq!(result["node"], "DIRECT");
+    let (_, result) = test(r#"{"target":"10.1.2.3","port":22}"#).await;
+    assert_eq!(
+        (result["node"].as_str(), result["index"].as_u64()),
+        (Some("REJECT"), Some(1))
+    );
+    assert_eq!(
+        (result["ip"].as_str(), result["port"].as_u64()),
+        (Some("10.1.2.3"), Some(22))
+    );
+    core.select("Inner", "REJECT").unwrap();
+    let (_, result) = test(r#"{"target":"192.0.2.1","network":"udp"}"#).await;
+    assert_eq!(result["matched"], "Match");
+    assert_eq!(result["chain"], serde_json::json!(["Inner", "REJECT"]));
+    core.set_mode(meta_config::Mode::Global);
+    let (_, result) = test(r#"{"target":"example.org"}"#).await;
+    assert_eq!(
+        (result["matched"].as_str(), result["mode"].as_str()),
+        (Some("Mode(Global)"), Some("global"))
+    );
+    assert_eq!(
+        result["chain"],
+        serde_json::json!(["Outer", "Inner", "REJECT"])
+    );
+    assert!(result["rule"].is_null());
+    assert_eq!(test(r#"{"target":"exa mple.com"}"#).await.0, 400);
+    assert_eq!(
+        test(r#"{"target":"example.com","network":"icmp"}"#).await.0,
+        400
+    );
+}
+
+#[tokio::test]
 async fn adblock_refuses_dns_and_connections_and_counts_them() {
     let dir = std::env::temp_dir().join(format!("meta-adblock-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(dir.join("adblock")).unwrap();
@@ -842,6 +890,15 @@ async fn adblock_refuses_dns_and_connections_and_counts_them() {
         .unwrap();
     assert_eq!(
         (decision.node.as_str(), decision.rule.as_str()),
+        ("REJECT", "Adblock")
+    );
+    // Route tests report the block without counting it.
+    let tested = core
+        .test_route(&Target::new("t.ads.test", 443).unwrap(), "tcp")
+        .await
+        .unwrap();
+    assert_eq!(
+        (tested.node.as_str(), tested.matched.as_str()),
         ("REJECT", "Adblock")
     );
     let status = core.adblock_status();

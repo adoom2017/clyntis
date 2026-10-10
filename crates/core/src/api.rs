@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get},
+    routing::{delete, get, post},
 };
 use serde_json::{Value, json};
 use std::{
@@ -31,6 +31,7 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/configs", get(config).patch(update))
         .route("/proxies", get(proxies))
         .route("/adblock", get(adblock))
+        .route("/rules/test", post(test_route))
         .route("/proxies/{name}", get(proxy).put(select))
         .route("/proxies/{name}/delay", get(delay))
         .route("/connections", get(connections).delete(close_all))
@@ -169,6 +170,31 @@ fn proxy_map(core: &Core) -> serde_json::Map<String, Value> {
 }
 async fn adblock(State(core): State<Arc<Core>>) -> Json<Value> {
     Json(core.adblock_status())
+}
+/// Body: `{"target": "example.com", "port": 443, "network": "tcp"}`; only
+/// `target` is required (a domain, IP address or URL).
+async fn test_route(State(core): State<Arc<Core>>, Json(value): Json<Value>) -> ApiResult {
+    let target = value
+        .get("target")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("target required"))?;
+    let port = value
+        .get("port")
+        .filter(|v| !v.is_null())
+        .map(|v| {
+            v.as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0)
+                .ok_or_else(|| error("invalid port"))
+        })
+        .transpose()?;
+    let network = value
+        .get("network")
+        .and_then(Value::as_str)
+        .unwrap_or("tcp");
+    let target = crate::parse_test_target(target, port).map_err(error)?;
+    let result = core.test_route(&target, network).await.map_err(error)?;
+    Ok(Json(serde_json::to_value(result).map_err(error)?))
 }
 async fn proxies(State(core): State<Arc<Core>>) -> Json<Value> {
     Json(json!({"proxies":proxy_map(&core)}))

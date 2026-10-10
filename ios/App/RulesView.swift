@@ -36,6 +36,7 @@ struct RulesView: View {
 
     var body: some View {
         List {
+            RouteTestSection(model: model)
             if model.customRules.isEmpty {
                 ContentUnavailableView("还没有自定义规则", systemImage: "list.bullet.indent",
                                        description: Text("自定义规则对所有配置生效，并优先于配置自带的规则。"))
@@ -101,6 +102,98 @@ struct RulesView: View {
 
     private func refresh() {
         skipped = model.skippedCustomRules()
+    }
+}
+
+/// Which rule a domain or address matches in the running core and the node
+/// it leaves through.
+private struct RouteTestSection: View {
+    let model: AppModel
+    @State private var target = ""
+    @State private var network = "tcp"
+    @State private var testing = false
+    @State private var result: RouteTest?
+    @State private var failure: String?
+
+    private static let matchText = [
+        "Adblock": "去广告拦截（优先于所有规则）",
+        "Mode(Global)": "全局模式",
+        "Mode(Direct)": "直连模式",
+        "Fallback": "没有规则匹配，默认直连",
+    ]
+
+    private var trimmed: String { target.trimmingCharacters(in: .whitespaces) }
+
+    var body: some View {
+        Section {
+            TextField("域名或 IP，如 www.google.com", text: $target)
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                .keyboardType(.URL).font(.body.monospaced())
+                .submitLabel(.search).onSubmit(test)
+            Picker("网络", selection: $network) {
+                Text("TCP").tag("tcp")
+                Text("UDP").tag("udp")
+            }
+            .pickerStyle(.segmented)
+            Button(action: test) {
+                HStack {
+                    Text("测试")
+                    if testing { Spacer(); ProgressView() }
+                }
+            }
+            .disabled(!model.connected || testing || trimmed.isEmpty)
+            if let failure { Text(failure).foregroundStyle(.red) }
+            if let result {
+                LabeledContent("目标") {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("\(result.host.contains(":") ? "[\(result.host)]" : result.host):\(result.port)")
+                        if let ip = result.ip, ip != result.host {
+                            Text("解析为 \(ip)").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                LabeledContent("匹配规则") {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(result.rule ?? Self.matchText[result.matched] ?? result.matched)
+                            .font(result.rule == nil ? .body : .footnote.monospaced())
+                            .multilineTextAlignment(.trailing)
+                        if let rule = result.rule, let index = result.index {
+                            Text("第 \(index + 1) 条" + (model.customRules.contains(rule) ? " · 自定义规则" : ""))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                LabeledContent("出站节点") {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(result.node).fontWeight(.semibold)
+                            .foregroundStyle(result.node == "REJECT" ? .red : .primary)
+                        if result.chain.count > 1 {
+                            Text(result.chain.joined(separator: " → "))
+                                .font(.caption).foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                }
+            }
+        } header: {
+            Text("路由测试")
+        } footer: {
+            if !model.connected { Text("连接 VPN 后可测试域名或 IP 会匹配哪条规则、从哪个节点出站。") }
+        }
+    }
+
+    private func test() {
+        guard model.connected, !testing, !trimmed.isEmpty else { return }
+        testing = true
+        failure = nil
+        Task {
+            defer { testing = false }
+            do { result = try await model.testRoute(trimmed, network: network) }
+            catch {
+                result = nil
+                failure = error.localizedDescription
+            }
+        }
     }
 }
 

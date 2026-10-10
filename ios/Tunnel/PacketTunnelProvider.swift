@@ -313,6 +313,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                     return
+                case "test-route":
+                    guard let target = message.target else { throw ClientError.message("缺少测试目标。") }
+                    // A rule may resolve the name: off the packet queue.
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            completionHandler?(try core.testRoute(target, network: message.network ?? "tcp"))
+                        } catch {
+                            completionHandler?(try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription]))
+                        }
+                    }
+                    return
                 default: throw ClientError.message("不支持的内核命令。")
                 }
                 completionHandler?(try core.snapshot())

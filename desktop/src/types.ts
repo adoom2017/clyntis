@@ -208,6 +208,24 @@ export interface CustomRules {
   skipped: { rule: string; reason: string }[];
   profile: string | null;
 }
+/** How the core would route a domain or address now (`POST /rules/test`). */
+export interface RouteTest {
+  host: string;
+  port: number;
+  network: "tcp" | "udp";
+  mode: Mode;
+  /** The address IP rules saw; null when none was needed or resolving failed. */
+  ip: string | null;
+  /** The matching rule as written; null for ad blocking, modes and fallback. */
+  rule: string | null;
+  /** Zero-based position among the active rules (custom rules come first). */
+  index: number | null;
+  /** Short form as in the connection log: `DomainSuffix(x)`, `Adblock`… */
+  matched: string;
+  /** The rule's target, then each group's selection down to `node`. */
+  chain: string[];
+  node: string;
+}
 export const ruleTypes: { type: string; label: string; placeholder: string }[] =
   [
     { type: "DOMAIN-SUFFIX", label: "域名后缀", placeholder: "example.com" },

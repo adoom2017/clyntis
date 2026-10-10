@@ -774,6 +774,35 @@ textarea::placeholder {
   flex: 1;
   min-width: 160px;
 }
+.route-test form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+}
+.route-test input {
+  flex: 1;
+  min-width: 200px;
+}
+.route-test > p {
+  margin-bottom: 12px;
+}
+.route-result {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+}
+.route-result dt {
+  color: var(--muted);
+}
+.route-result dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 .rule-check {
   display: inline-flex;
   align-items: center;

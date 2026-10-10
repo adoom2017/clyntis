@@ -675,6 +675,22 @@ pub async fn adblock_status(state: State<'_, Desktop>) -> Reply<Value> {
         .map_err(error)
 }
 #[tauri::command]
+pub async fn test_route(
+    state: State<'_, Desktop>,
+    target: String,
+    network: String,
+) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request(
+            reqwest::Method::POST,
+            &["rules", "test"],
+            Some(json!({"target":target,"network":network})),
+        )
+        .await
+        .map_err(error)
+}
+#[tauri::command]
 pub async fn proxies(state: State<'_, Desktop>) -> Reply<Value> {
     controller(&state)
         .await?

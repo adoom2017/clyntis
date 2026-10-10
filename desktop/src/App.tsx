@@ -75,6 +75,7 @@ import {
   adblockPresets,
   defaultAdblock,
   type CustomRules,
+  type RouteTest,
   ruleTypes,
   splitRule,
   type Snapshot,
@@ -2144,6 +2145,7 @@ function RulesPage({
   const disabled = busy || saving;
   return (
     <>
+      <RouteTester running={running} customRules={data.rules} />
       <section className="panel settings-section rule-form">
         <form
           onSubmit={(event) => {
@@ -2316,6 +2318,126 @@ function RulesPage({
         </p>
       )}
     </>
+  );
+}
+const routeMatchText: Record<string, string> = {
+  Adblock: "去广告拦截（优先于所有规则）",
+  "Mode(Global)": "全局模式",
+  "Mode(Direct)": "直连模式",
+  Fallback: "没有规则匹配，默认直连",
+};
+function RouteTester({
+  running,
+  customRules,
+}: {
+  running: boolean;
+  customRules: string[];
+}) {
+  const [target, setTarget] = useState("");
+  const [network, setNetwork] = useState<"tcp" | "udp">("tcp");
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<RouteTest | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  const test = async () => {
+    setTesting(true);
+    setFailure(null);
+    try {
+      setResult(
+        await invoke<RouteTest>("test_route", {
+          target: target.trim(),
+          network,
+        }),
+      );
+    } catch (e) {
+      setResult(null);
+      setFailure(String(e));
+    } finally {
+      setTesting(false);
+    }
+  };
+  return (
+    <section className="panel settings-section route-test">
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          void test();
+        }}
+      >
+        <input
+          aria-label="测试目标"
+          value={target}
+          onChange={(e) => setTarget(e.target.value)}
+          placeholder="测试域名或 IP，如 www.google.com、8.8.8.8:53"
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <select
+          aria-label="网络"
+          value={network}
+          onChange={(e) => setNetwork(e.target.value as "tcp" | "udp")}
+        >
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+        </select>
+        <button
+          className="button secondary"
+          disabled={!running || testing || !target.trim()}
+          title={running ? undefined : "启动内核后可测试"}
+        >
+          {testing ? (
+            <LoaderCircle className="spin" size={16} />
+          ) : (
+            <Search size={16} />
+          )}
+          测试
+        </button>
+      </form>
+      {!running && <p className="small muted">启动内核后可测试路由。</p>}
+      {failure && (
+        <p className="inline-error" role="alert">
+          {failure}
+        </p>
+      )}
+      {result && (
+        <dl className="route-result" aria-label="路由测试结果">
+          <dt>目标</dt>
+          <dd>
+            {result.host.includes(":") ? `[${result.host}]` : result.host}:
+            {result.port} · {result.network.toUpperCase()}
+            {result.ip && result.ip !== result.host && (
+              <span className="chain">解析为 {result.ip}</span>
+            )}
+          </dd>
+          <dt>匹配规则</dt>
+          <dd>
+            {result.rule ? (
+              <>
+                <strong>{result.rule}</strong>
+                <span className="chain">
+                  第 {(result.index ?? 0) + 1} 条
+                  {customRules.includes(result.rule) ? " · 自定义规则" : ""}
+                </span>
+              </>
+            ) : (
+              <strong>
+                {routeMatchText[result.matched] ?? result.matched}
+              </strong>
+            )}
+          </dd>
+          <dt>出站节点</dt>
+          <dd>
+            <strong
+              className={result.node === "REJECT" ? "danger-text" : undefined}
+            >
+              {result.node}
+            </strong>
+            {result.chain.length > 1 && (
+              <span className="chain">{result.chain.join(" → ")}</span>
+            )}
+          </dd>
+        </dl>
+      )}
+    </section>
   );
 }
 function BulkRules({
