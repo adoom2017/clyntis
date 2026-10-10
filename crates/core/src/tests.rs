@@ -857,5 +857,22 @@ async fn adblock_refuses_dns_and_connections_and_counts_them() {
         code(core.resolver.answer(&query("x.ads.test.")).await.unwrap()),
         nx
     );
+    // A resource refresh keeps it, whether the lists are reused or rebuilt.
+    core.prepare_resources(false).await.unwrap();
+    assert_ne!(
+        code(core.resolver.answer(&query("z.ads.test.")).await.unwrap()),
+        nx
+    );
+    std::fs::write(
+        dir.join("adblock/test.list"),
+        "payload:\n  - '+.ads.test'\n  - '+.more.test'\n",
+    )
+    .unwrap();
+    core.prepare_resources(false).await.unwrap();
+    assert_eq!(core.adblock_status()["lists"][0]["entries"], 2);
+    assert_ne!(
+        code(core.resolver.answer(&query("w.ads.test.")).await.unwrap()),
+        nx
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

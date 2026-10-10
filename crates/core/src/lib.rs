@@ -44,6 +44,9 @@ pub struct Core {
     lifecycle: Mutex<bool>,
     pub events: tokio::sync::broadcast::Sender<String>,
     resources: RwLock<Arc<resources::Resources>>,
+    /// The user's ad blocking allowlist: the configuration's until the apps
+    /// replace it while running, and kept across resource refreshes.
+    adblock_allow: RwLock<Vec<String>>,
     clock: Arc<meta_protocol::tls::Clock>,
     xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<meta_protocol::xudp::Multiplexer>>>,
     xudp_key: [u8; 32],
@@ -269,6 +272,7 @@ impl Core {
         xudp_key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         xudp_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         Ok(Arc::new(Self {
+            adblock_allow: RwLock::new(config.adblock.allow.clone()),
             config,
             resolver,
             hooks,
@@ -582,6 +586,11 @@ impl Core {
         let mut policy = self.policy.write().unwrap();
         let rules = next.rules(&policy.raw_rules)?;
         self.resolver.configure(&config.hosts, &next)?;
+        // Read after the new lists are live, so a concurrent change of the
+        // allowlist reaches them either here or in set_adblock_allow.
+        if let Some(filter) = &next.adblock {
+            filter.set_allow(&self.adblock_allow.read().unwrap());
+        }
         policy.rules = rules;
         *resources = next;
         Ok(())
@@ -1189,6 +1198,7 @@ impl Core {
             ..Default::default()
         }
         .validate()?;
+        *self.adblock_allow.write().unwrap() = allow.clone();
         if let Some(filter) = self.resolver.adblock() {
             filter.set_allow(&allow);
         }
