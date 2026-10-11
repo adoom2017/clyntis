@@ -15,6 +15,13 @@ use tracing_subscriber::{Layer, filter::LevelFilter, layer::Context, prelude::*}
 const CAPACITY: usize = 2000;
 static BUFFER: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 static INIT: Once = Once::new();
+/// Where panics are also written at once, for a host whose process may not
+/// live to drain the buffer (`<host directory>/panic.log`).
+static PANIC_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+pub(crate) fn set_panic_file(path: std::path::PathBuf) {
+    *PANIC_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
 
 /// Installs the process-wide subscriber once, at the first core's log level.
 pub(crate) fn init(level: &str) {
@@ -31,6 +38,13 @@ pub(crate) fn init(level: &str) {
             .with(filter)
             .with(BufferLayer)
             .try_init();
+        // Panics in tasks and threads are otherwise silent on hosts without
+        // stderr: record them in the buffer and, synchronously, in a file.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            record_panic(info);
+            previous(info);
+        }));
     });
 }
 
@@ -48,6 +62,37 @@ pub(crate) fn drain(take: impl FnOnce(&[u8]) -> anyhow::Result<bool>) -> anyhow:
         buffer.clear();
     }
     Ok(())
+}
+
+fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
+    let thread = std::thread::current();
+    let message = format!(
+        "panic in thread {}: {info}\n{}",
+        thread.name().unwrap_or("unnamed"),
+        std::backtrace::Backtrace::force_capture()
+    );
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    // try_lock: the panic may have happened while a lock was held.
+    if let Ok(mut buffer) = BUFFER.try_lock() {
+        if buffer.len() == CAPACITY {
+            buffer.pop_front();
+        }
+        buffer.push_back(
+            serde_json::json!({"time": time, "type": "error", "payload": message}).to_string(),
+        );
+    }
+    if let Ok(path) = PANIC_FILE.try_lock()
+        && let Some(path) = path.as_ref()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{time:.3} {message}");
+    }
 }
 
 fn push(line: String) {

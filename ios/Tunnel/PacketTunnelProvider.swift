@@ -20,9 +20,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var routesIPv6: Bool?
     private var healthTimer: DispatchSourceTimer?
     private var logTimer: DispatchSourceTimer?
+    private let watchdog = TunnelWatchdog()
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         log.info("start: begin memory=\(memory())")
+        watchdog.reportPreviousSession()
+        watchdog.start(watching: queue)
         queue.async {
             var step = "read profile"
             do {
@@ -35,6 +38,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 log.info("start: profile=\(id.uuidString)")
                 step = "open profile store"
                 let store = try ProfileStore.shared()
+                Self.reportCorePanics(in: store.directory(for: id))
                 var hooks = meta_hooks_v1()
                 hooks.size = UInt32(MemoryLayout<meta_hooks_v1>.size)
                 hooks.version = 1
@@ -105,6 +109,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         log.info("stop: reason=\(reason.rawValue) memory=\(memory())")
+        watchdog.stop()
         queue.async {
             self.shutdown()
             completionHandler()
@@ -116,12 +121,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         logTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
-        timer.setEventHandler { Diagnostics.collectCoreLogs() }
+        timer.setEventHandler { [watchdog] in watchdog.track("collect logs") { Diagnostics.collectCoreLogs() } }
         logTimer = timer
         timer.resume()
     }
 
     private func shutdown() {
+        watchdog.stop()
         Diagnostics.collectCoreLogs()
         logTimer?.cancel()
         logTimer = nil
@@ -150,6 +156,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func submit(_ packets: [Data], index: Int, epoch: UUID) {
         guard self.epoch == epoch, let core else { return }
+        watchdog.begin("write packets")
+        defer { watchdog.end() }
         var index = index
         while index < packets.count {
             let packet = packets[index]
@@ -175,6 +183,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func drainPackets() {
         guard let core else { return }
+        watchdog.begin("read packets")
+        defer { watchdog.end() }
         var packets: [Data] = [], protocols: [NSNumber] = []
         var buffer = Data(count: 65_535)
         for _ in 0..<64 {
@@ -236,6 +246,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// re-tested url-test groups and reconnected Tailscale's DERP relay.
     private func pathSettled(_ path: Network.NWPath) {
         guard let core, receivedInitialPath else { return }
+        watchdog.begin("network change")
+        defer { watchdog.end() }
         let snapshot = NetworkSnapshot(path)
         let changes = appliedNetwork.map { snapshot.changes(from: $0) } ?? ["initial"]
         guard !changes.isEmpty else {
@@ -283,6 +295,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.monitor = monitor
     }
 
+    override func sleep(completionHandler: @escaping () -> Void) {
+        log.info("sleep memory=\(memory())")
+        completionHandler()
+    }
+
+    override func wake() {
+        log.info("wake memory=\(memory())")
+    }
+
+    /// Logs core panics recorded by a previous run (`panic.log`, written by the
+    /// core's panic hook even when the process died right after).
+    private static func reportCorePanics(in directory: URL) {
+        let file = directory.appendingPathComponent("panic.log")
+        guard let text = try? String(contentsOf: file, encoding: .utf8), !text.isEmpty else { return }
+        log.error("start: the core panicked in an earlier run:\n\(text.suffix(8_000))")
+        try? FileManager.default.removeItem(at: file)
+    }
+
     private func fail(_ error: Error) {
         log.error("fail: \(Diagnostics.describe(error)) memory=\(memory())")
         shutdown()
@@ -295,6 +325,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var ticks = 0
         timer.setEventHandler { [weak self] in
             guard let self, let core = self.core else { return }
+            self.watchdog.begin("health snapshot")
+            defer { self.watchdog.end() }
             do {
                 let state = try JSONSerialization.jsonObject(with: core.snapshot()) as? [String: Any]
                 if state?["stopped"] as? Bool == true {
@@ -320,6 +352,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     throw ClientError.message("VPN 未连接。")
                 }
                 let message = try JSONDecoder().decode(TunnelMessage.self, from: messageData)
+                self.watchdog.begin("app message \(message.command)")
+                defer { self.watchdog.end() }
                 switch message.command {
                 case "snapshot": break
                 case "mode":
@@ -391,11 +425,15 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
 
     init(_ path: Network.NWPath) {
         status = "\(path.status)"
-        interfaces = path.availableInterfaces.map { "\($0.name)(\(Self.kind($0.type)))" }
+        // availableInterfaces still lists this tunnel (utun, `.other`) and may
+        // repeat an interface; only distinct physical ones matter.
+        var seen = Set<String>()
+        let physical = path.availableInterfaces.filter { $0.type != .other && seen.insert($0.name).inserted }
+        interfaces = physical.map { "\($0.name)(\(Self.kind($0.type)))" }
         gateways = path.gateways.map { "\($0)" }.sorted()
         ipv4 = path.supportsIPv4
         ipv6 = path.supportsIPv6
-        addresses = Self.ipv4Addresses(on: Set(path.availableInterfaces.map(\.name)))
+        addresses = Self.ipv4Addresses(on: Set(physical.map(\.name)))
     }
 
     /// Names of the fields that differ from `old`; empty when nothing that
@@ -440,5 +478,103 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
             }
         }
         return result.sorted()
+    }
+}
+
+/// Watches the tunnel queue from its own queue. Everything on the tunnel
+/// queue (packets, timers, log collection) stops together when it blocks, so
+/// the watchdog reports what it is stuck in, and keeps a heartbeat file so the
+/// next start can tell an exit without `stopTunnel` (a crash or a kill by the
+/// system) and when it happened.
+private final class TunnelWatchdog {
+    private let queue = DispatchQueue(label: "org.clyntis.ios.tunnel-watchdog")
+    private let lock = NSLock()
+    private var operation = "starting"
+    private var operationSince = Date()
+    private var answered = Date()
+    private var reported: Date?
+    private var timer: DispatchSourceTimer?
+    private let heartbeat = ProfileStore.sharedContainer()?.appendingPathComponent("tunnel-heartbeat.json")
+
+    /// Called on the tunnel queue around work that could block it.
+    func begin(_ name: String) {
+        lock.lock()
+        operation = name
+        operationSince = Date()
+        lock.unlock()
+    }
+
+    func end() { begin("idle") }
+
+    func track(_ name: String, _ body: () -> Void) {
+        begin(name)
+        defer { end() }
+        body()
+    }
+
+    /// Logs how the previous session ended when it never stopped cleanly.
+    func reportPreviousSession() {
+        guard let heartbeat, let data = try? Data(contentsOf: heartbeat),
+              let beat = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        log.warning("start: the previous session ended without stopping (crash or killed by iOS); "
+                    + "last heartbeat \(beat["time"] ?? "?") operation=\(beat["operation"] ?? "?") "
+                    + "memory=\(beat["memory"] ?? "?") queue_blocked_s=\(beat["blocked"] ?? "?")")
+        try? FileManager.default.removeItem(at: heartbeat)
+    }
+
+    func start(watching tunnelQueue: DispatchQueue) {
+        queue.sync {
+            timer?.cancel()
+            lock.lock()
+            answered = Date()
+            reported = nil
+            lock.unlock()
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + 5, repeating: 5)
+            timer.setEventHandler { [weak self] in self?.tick(tunnelQueue) }
+            self.timer = timer
+            timer.resume()
+        }
+    }
+
+    /// A clean stop: no heartbeat is left for the next start to report.
+    func stop() {
+        queue.sync {
+            timer?.cancel()
+            timer = nil
+            if let heartbeat { try? FileManager.default.removeItem(at: heartbeat) }
+        }
+    }
+
+    private func tick(_ tunnelQueue: DispatchQueue) {
+        tunnelQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.answered = Date()
+            self.lock.unlock()
+        }
+        let now = Date()
+        lock.lock()
+        let blocked = now.timeIntervalSince(answered)
+        let operation = self.operation
+        let busy = now.timeIntervalSince(operationSince)
+        let report = blocked > 10 && reported.map { now.timeIntervalSince($0) >= 30 } ?? true
+        if report { reported = now }
+        if blocked <= 10 { reported = nil }
+        lock.unlock()
+        let footprint = String(format: "%.1f", Diagnostics.footprintMiB())
+        if report {
+            log.warning("tunnel queue blocked for \(Int(blocked)) s in \(operation) (\(Int(busy)) s) memory=\(footprint) MiB")
+        }
+        guard let heartbeat else { return }
+        let beat: [String: Any] = [
+            "time": ISO8601DateFormatter().string(from: now),
+            "operation": operation,
+            "memory": footprint,
+            "blocked": Int(blocked),
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: beat) {
+            try? data.write(to: heartbeat, options: .atomic)
+        }
     }
 }

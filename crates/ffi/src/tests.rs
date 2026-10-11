@@ -292,8 +292,13 @@ fn checked_handles_independent_runtimes_and_caller_buffers() {
     assert_eq!(id, 0);
 }
 
+/// Held by tests that create packet-tunnel cores: each sets the process-wide
+/// panic file to its own directory.
+static PANIC_FILE_USERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn packet_tunnel_host_keeps_credentials_and_disables_desktop_listeners() {
+    let _panic_file = PANIC_FILE_USERS.lock().unwrap_or_else(|e| e.into_inner());
     let directory = std::env::temp_dir().join(format!("clyntis-ios-{}", uuid_for_test()));
     std::fs::create_dir(&directory).unwrap();
     let path = directory.to_str().unwrap().as_bytes();
@@ -344,6 +349,7 @@ fn uuid_for_test() -> u64 {
 
 #[test]
 fn packet_tunnel_host_rejects_invalid_resource_directory_and_clears_handle() {
+    let _panic_file = PANIC_FILE_USERS.lock().unwrap_or_else(|e| e.into_inner());
     let mut id = 99;
     assert_eq!(
         unsafe {
@@ -700,4 +706,27 @@ fn route_test_reports_the_rule_and_node_as_json() {
     assert_eq!(test(r#"{"target":"a.example","port":0}"#).0, ERROR);
     assert_eq!(meta_destroy_v1(id), OK);
     assert_eq!(test(r#"{"target":"a.example"}"#).0, ERROR);
+}
+
+#[test]
+fn panics_reach_the_panic_file_even_if_the_process_dies() {
+    let _panic_file = PANIC_FILE_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = std::env::temp_dir().join(format!("clyntis-panic-{}", uuid_for_test()));
+    std::fs::create_dir(&directory).unwrap();
+    logs::init("info");
+    logs::set_panic_file(directory.join("panic.log"));
+    let marker = format!("test panic {}", uuid_for_test());
+    let message = marker.clone();
+    let result = std::thread::Builder::new()
+        .name("panicking-worker".into())
+        .spawn(move || panic!("{message}"))
+        .unwrap()
+        .join();
+    assert!(result.is_err());
+    let written = std::fs::read_to_string(directory.join("panic.log")).unwrap();
+    assert!(
+        written.contains(&marker) && written.contains("panicking-worker"),
+        "{written}"
+    );
+    let _ = std::fs::remove_dir_all(directory);
 }

@@ -393,6 +393,7 @@ unsafe fn create(
                 path.is_absolute() && path.is_dir(),
                 "host directory must exist and be absolute"
             );
+            logs::set_panic_file(path.join("panic.log"));
             config.directory = path;
             config.internal_host_packet_io = true;
             config.port = 0;
