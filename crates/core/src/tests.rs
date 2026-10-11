@@ -964,3 +964,27 @@ fn saved_profile_is_written_only_after_a_change() {
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn a_panicking_packet_loop_stops_the_core() {
+    struct Panics;
+    #[async_trait::async_trait]
+    impl meta_platform::PacketIo for Panics {
+        async fn recv(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            panic!("packet source failed");
+        }
+        async fn send(&self, _: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let config = Config::parse(b"tun: {enable: true}\nrules: ['MATCH,DIRECT']\n").unwrap();
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let running = core
+        .start_with_packets(Some(Arc::new(Panics)))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), core.stop.cancelled())
+        .await
+        .expect("the core kept running after its packet loop panicked");
+    drop(running);
+}

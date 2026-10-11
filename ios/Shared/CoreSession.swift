@@ -131,6 +131,12 @@ final class CoreSession {
         try Self.read { meta_snapshot_v1(handle, $0, $1, $2) }
     }
 
+    /// Whether the core stopped, its connection count and traffic: the cheap
+    /// periodic check (the snapshot also serializes the configuration).
+    func status() throws -> Data {
+        try Self.read { meta_status_v1(handle, $0, $1, $2) }
+    }
+
     /// Delay through `name` in milliseconds; blocks, so never call it on the
     /// packet queue. The outcome also lands in the snapshot's `proxies`.
     func probe(_ name: String, timeoutMs: UInt32 = 8000) throws -> UInt32 {

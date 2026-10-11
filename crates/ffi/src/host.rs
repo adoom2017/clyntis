@@ -135,7 +135,6 @@ enum Command {
         std::sync::mpsc::SyncSender<Result<meta_core::RouteTest, String>>,
     ),
     DnsLeakTest(std::sync::mpsc::SyncSender<Result<meta_core::DnsLeakTest, String>>),
-    NetworkChanged(std::sync::mpsc::SyncSender<Result<(), String>>),
     #[cfg(target_os = "android")]
     SetFd(
         std::os::fd::OwnedFd,
@@ -145,6 +144,7 @@ enum Command {
 pub(crate) struct Handle {
     pub(crate) core: Arc<Core>,
     commands: mpsc::Sender<Command>,
+    network: tokio::sync::watch::Sender<u64>,
     worker: Mutex<Option<JoinHandle<()>>>,
     pub(crate) packet_input: Option<mpsc::Sender<Vec<u8>>>,
     pub(crate) packet_output: Mutex<PacketsOut>,
@@ -163,6 +163,10 @@ impl Handle {
             .enable_all()
             .build()?;
         let (commands, mut receiver) = mpsc::channel::<Command>(4);
+        // Network changes bypass the bounded command queue: a full queue or a
+        // slow reply made the host treat a change as fatal. Changes made
+        // while one is handled collapse into the next.
+        let (network, mut network_changes) = tokio::sync::watch::channel(0u64);
         let (input_sender, input_receiver) = mpsc::channel(256);
         let (output_sender, output_receiver) = mpsc::channel(256);
         let packet_input = core.config.tun.enable.then_some(input_sender);
@@ -188,6 +192,10 @@ impl Handle {
                     tokio::select! {
                         biased;
                         _ = owner.stop.cancelled() => break,
+                        changed = network_changes.changed() => match changed {
+                            Ok(()) => owner.network_changed().await,
+                            Err(_) => break,
+                        },
                         command = receiver.recv() => match command {
                             Some(Command::Start(reply)) => {
                                 let result = match owner.start_with_packets(packets.clone()).await {
@@ -229,10 +237,6 @@ impl Handle {
                                     let _ = reply.send(result);
                                 });
                             },
-                            Some(Command::NetworkChanged(reply)) => {
-                                owner.network_changed().await;
-                                let _ = reply.send(Ok(()));
-                            },
                             #[cfg(target_os = "android")]
                             Some(Command::SetFd(fd, reply)) => {
                                 let result = if running.is_some() || !owner.config.tun.enable {
@@ -261,6 +265,7 @@ impl Handle {
         Ok(Self {
             core,
             commands,
+            network,
             worker: Mutex::new(Some(worker)),
             packet_input,
             packet_queue_enabled,
@@ -320,13 +325,20 @@ impl Handle {
             .map_err(|_| anyhow::anyhow!("core worker did not answer"))?
             .map_err(|e| anyhow::anyhow!(e))
     }
+    /// Queues a network change for the worker and returns at once; changes
+    /// queued while one is handled are handled together.
     pub(crate) fn network_changed(&self) -> Result<()> {
-        self.command(Command::NetworkChanged)
+        check_lifecycle()?;
+        ensure!(!self.core.stop.is_cancelled(), "core is stopped");
+        self.network
+            .send_modify(|count| *count = count.wrapping_add(1));
+        Ok(())
     }
     #[cfg(target_os = "android")]
     pub(crate) fn set_fd(&self, fd: std::os::fd::OwnedFd) -> Result<()> {
         self.command(|reply| Command::SetFd(fd, reply))
     }
+    #[cfg(target_os = "android")]
     fn command(
         &self,
         make: impl FnOnce(std::sync::mpsc::SyncSender<Result<(), String>>) -> Command,

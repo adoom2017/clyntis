@@ -106,6 +106,9 @@ int32_t meta_start_v1(meta_handle handle);
 int32_t meta_stop_v1(meta_handle handle);
 int32_t meta_destroy_v1(meta_handle handle);
 int32_t meta_close_connections_v1(meta_handle handle);
+/* The device network changed. Returns at once (the core rebuilds sockets,
+ * relays and paths in the background; changes in quick succession are
+ * handled together). Fails only for an unknown or stopped core. */
 int32_t meta_network_changed_v1(meta_handle handle);
 #ifdef __ANDROID__
 /* Before start, duplicates a configured TUN fd. The host keeps its original fd.
@@ -114,6 +117,9 @@ int32_t meta_set_tun_fd_v1(meta_handle handle, int32_t fd);
 #endif
 int32_t meta_error_v1(uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_snapshot_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
+/* Cheap periodic check: {"stopped":bool,"connections":n,"upload":n,"download":n}.
+ * Use it instead of meta_snapshot_v1 when the configuration is not needed. */
+int32_t meta_status_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_update_v1(meta_handle handle, const uint8_t *json, size_t length);
 int32_t meta_select_v1(meta_handle handle, const uint8_t *group, size_t group_length, const uint8_t *node, size_t node_length);
 /* Close connection `id` from meta_snapshot_v1's "connections" (unknown or

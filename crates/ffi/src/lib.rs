@@ -464,6 +464,9 @@ pub extern "C" fn meta_close_connections_v1(id: u64) -> i32 {
         Ok(OK)
     })
 }
+/// Tells the core the device network changed (sockets, relays and paths are
+/// rebuilt). Returns at once; changes reported while one is being handled are
+/// handled together. Fails only for an unknown or stopped core.
 #[unsafe(no_mangle)]
 pub extern "C" fn meta_network_changed_v1(id: u64) -> i32 {
     boundary(|| {
@@ -510,6 +513,31 @@ pub unsafe extern "C" fn meta_snapshot_v1(
     boundary(|| {
         let handle = handle(id)?;
         let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
+/// The few figures a host checks periodically, as JSON: `stopped`,
+/// `connections` (a count), `upload` and `download`. Unlike
+/// `meta_snapshot_v1` it does not serialize the configuration and the
+/// connection list, which cost a tunnel CPU and memory every few seconds.
+///
+/// # Safety
+/// Buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_status_v1(
+    id: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let handle = handle(id)?;
+        let value = serde_json::json!({
+            "stopped": handle.core.stop.is_cancelled(),
+            "connections": handle.core.connection_count(),
+            "upload": handle.core.upload.load(Ordering::Relaxed),
+            "download": handle.core.download.load(Ordering::Relaxed),
+        });
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }

@@ -21,6 +21,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var healthTimer: DispatchSourceTimer?
     private var logTimer: DispatchSourceTimer?
     private let watchdog = TunnelWatchdog()
+    /// Packets dropped as malformed; logged at 1, 10, 100… so a flood cannot
+    /// fill the log.
+    private var droppedPackets = 0
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         log.info("start: begin memory=\(memory())")
@@ -132,6 +135,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         logTimer?.cancel()
         logTimer = nil
         epoch = UUID()
+        droppedPackets = 0
         monitor?.cancel()
         monitor = nil
         receivedInitialPath = false
@@ -154,21 +158,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func submit(_ packets: [Data], index: Int, epoch: UUID) {
+    /// Hands packets to the core. While its input is full the rest wait,
+    /// retried after `delay` ms, doubling up to 100 ms: a fixed 2 ms retry
+    /// against a stalled core woke the extension 500 times a second.
+    private func submit(_ packets: [Data], index: Int, epoch: UUID, delay: Int = 2, waited: Int = 0) {
         guard self.epoch == epoch, let core else { return }
         watchdog.begin("write packets")
         defer { watchdog.end() }
         var index = index
         while index < packets.count {
             let packet = packets[index]
+            index += 1
+            // One malformed packet must not end the VPN: the core refuses it
+            // with the same error as a stopped core, so drop it here.
+            guard (20...65_535).contains(packet.count),
+                  [4, 6].contains(packet[packet.startIndex] >> 4) else {
+                dropped("malformed packet from the system (\(packet.count) bytes)")
+                continue
+            }
             let result = packet.withUnsafeBytes {
                 meta_write_packet_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
             }
             if result == META_WOULD_BLOCK {
                 // Keep unread packets rather than silently dropping a saturated batch.
-                let nextIndex = index
-                queue.asyncAfter(deadline: .now() + .milliseconds(2)) {
-                    self.submit(packets, index: nextIndex, epoch: epoch)
+                let retry = index - 1, total = waited + delay
+                if waited < 5_000, total >= 5_000 {
+                    log.warning("core packet input full for 5 s; still retrying memory=\(memory())")
+                }
+                queue.asyncAfter(deadline: .now() + .milliseconds(delay)) {
+                    self.submit(packets, index: retry, epoch: epoch, delay: min(delay * 2, 100), waited: total)
                 }
                 return
             }
@@ -176,9 +194,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.fail(ClientError.message("无法向内核写入 IP 数据包。"))
                 return
             }
-            index += 1
         }
         readPackets(epoch: epoch)
+    }
+
+    private func dropped(_ reason: String) {
+        droppedPackets += 1
+        var power = 1
+        while power < droppedPackets { power *= 10 }
+        if power == droppedPackets {
+            log.warning("dropped \(droppedPackets) packet(s) so far; latest: \(reason)")
+        }
     }
 
     private func drainPackets() {
@@ -187,31 +213,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         defer { watchdog.end() }
         var packets: [Data] = [], protocols: [NSNumber] = []
         var buffer = Data(count: 65_535)
+        var emptied = false
         for _ in 0..<64 {
             var length = 0
             let result = buffer.withUnsafeMutableBytes {
                 meta_read_packet_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count, &length)
             }
-            if result == META_WOULD_BLOCK { break }
-            guard result == META_OK, length > 0 else {
+            if result == META_WOULD_BLOCK {
+                emptied = true
+                break
+            }
+            guard result == META_OK else {
                 fail(ClientError.message("无法读取内核 IP 数据包。"))
                 return
             }
+            guard length > 0 else { continue }
             let packet = Data(buffer.prefix(length))
             let version = packet[packet.startIndex] >> 4
             guard version == 4 || version == 6 else {
-                fail(ClientError.message("内核返回了无效 IP 数据包。"))
-                return
+                dropped("invalid packet from the core (version \(version))")
+                continue
             }
             packets.append(packet)
             protocols.append(NSNumber(value: version == 4 ? AF_INET : AF_INET6))
         }
-        guard !packets.isEmpty else { return }
-        guard packetFlow.writePackets(packets, withProtocols: protocols) else {
-            fail(ClientError.message("系统无法接收 VPN 数据包。"))
-            return
+        if !packets.isEmpty, !packetFlow.writePackets(packets, withProtocols: protocols) {
+            // The flow refuses while it is being torn down; stopTunnel follows.
+            dropped("the system refused \(packets.count) packet(s)")
         }
-        if packets.count == 64 { queue.async { self.drainPackets() } }
+        if !emptied { queue.async { self.drainPackets() } }
     }
 
     /// Routes for the tunnel; IPv6 only when `ipv6`. Completes on `queue`.
@@ -257,7 +287,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         appliedNetwork = snapshot
         log.info("network changed: \(changes.joined(separator: ", ")) (\(ignoredPathUpdates) unchanged updates ignored) \(snapshot)")
         ignoredPathUpdates = 0
-        do { try core.networkChanged() } catch { fail(error); return }
+        // Returns at once; fails only when the core already stopped, which
+        // the health check reports.
+        do { try core.networkChanged() } catch {
+            log.warning("network change not delivered: \(Diagnostics.describe(error))")
+        }
         let ipv6 = profileIPv6 && path.supportsIPv6
         guard let routed = routesIPv6, routed != ipv6 else { return }
         let epoch = self.epoch
@@ -325,10 +359,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var ticks = 0
         timer.setEventHandler { [weak self] in
             guard let self, let core = self.core else { return }
-            self.watchdog.begin("health snapshot")
+            self.watchdog.begin("health check")
             defer { self.watchdog.end() }
             do {
-                let state = try JSONSerialization.jsonObject(with: core.snapshot()) as? [String: Any]
+                let state = try JSONSerialization.jsonObject(with: core.status()) as? [String: Any]
                 if state?["stopped"] as? Bool == true {
                     self.fail(ClientError.message("代理内核已停止，请重新连接。"))
                     return
@@ -336,7 +370,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // Memory against the ~50 MiB extension limit, with the load behind it.
                 ticks += 1
                 if ticks % 6 == 0 {
-                    let connections = (state?["connections"] as? [Any])?.count ?? 0
+                    let connections = (state?["connections"] as? NSNumber)?.intValue ?? 0
                     log.info("running: memory=\(memory()) connections=\(connections)")
                 }
             } catch { self.fail(error) }

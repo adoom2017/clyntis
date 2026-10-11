@@ -730,3 +730,27 @@ fn panics_reach_the_panic_file_even_if_the_process_dies() {
     );
     let _ = std::fs::remove_dir_all(directory);
 }
+
+#[test]
+fn network_changes_never_block_or_fail_on_a_busy_worker() {
+    let id = create(b"rules: ['MATCH,DIRECT']\n", std::ptr::null());
+    let started = Instant::now();
+    // More than the command queue holds: none may be refused.
+    for _ in 0..100 {
+        assert_eq!(meta_network_changed_v1(id), OK);
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let mut bytes = vec![0; 256];
+    let mut length = 0;
+    assert_eq!(
+        unsafe { meta_status_v1(id, bytes.as_mut_ptr(), bytes.len(), &mut length) },
+        OK
+    );
+    let status: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+    assert_eq!(
+        status,
+        serde_json::json!({"stopped": false, "connections": 0, "upload": 0, "download": 0})
+    );
+    assert_eq!(meta_destroy_v1(id), OK);
+    assert_eq!(meta_network_changed_v1(id), ERROR);
+}

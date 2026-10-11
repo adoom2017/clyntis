@@ -407,10 +407,19 @@ impl Core {
         if let Some(packets) = packets {
             let core = self.clone();
             tasks.spawn(async move {
+                // Stops the core however the loop ends, a panic included: a
+                // dead packet loop under a live core passed every health
+                // check while no packet got through.
+                struct StopOnExit(Arc<Core>);
+                impl Drop for StopOnExit {
+                    fn drop(&mut self) {
+                        self.0.stop.cancel();
+                    }
+                }
+                let _stop = StopOnExit(core.clone());
                 if let Err(error) = packet::run(core.clone(), packets).await {
                     tracing::error!(%error, "packet interface stopped");
                 }
-                core.stop.cancel();
             });
         }
         let ip = if self.config.allow_lan {

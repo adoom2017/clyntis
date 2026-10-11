@@ -101,14 +101,20 @@ impl Budget {
 
 /// Keeps a hosted tunnel under the jetsam limit: one was killed at 50 MiB
 /// within two seconds of a steady 26 MiB while an app streamed video. Above
-/// `trace_above` the load is logged every second to find what grew; above
+/// `trace_above` the load is logged when the footprint moved by a MiB (at
+/// most every second) or every 30 s, to find what grew without flooding the
+/// host's log; above
 /// `shed_above` new flows are refused (clients retry); above `close_above`
 /// every connection is closed, so apps reconnect instead of the VPN failing.
 struct Guard {
     budget: Budget,
     sampled: Instant,
     logged: Option<Instant>,
+    logged_footprint: u64,
     closed: Option<Instant>,
+    /// When closing everything was last reported: repeats that closed and
+    /// released nothing are logged at most once a minute.
+    closed_logged: Option<Instant>,
     shedding: bool,
 }
 #[derive(Debug)]
@@ -125,7 +131,9 @@ impl Guard {
             budget,
             sampled: Instant::now(),
             logged: None,
+            logged_footprint: 0,
             closed: None,
+            closed_logged: None,
             shedding: false,
         }
     }
@@ -162,15 +170,23 @@ impl Guard {
             self.closed = Some(Instant::now());
             let closed = core.close_connections();
             let released = memory::relieve();
-            tracing::warn!(
-                footprint_mib = mib(usage.footprint),
-                closed,
-                released_kib = released / 1024,
-                "memory critical; closed all connections"
-            );
+            if closed > 0 || released >= MIB || since(self.closed_logged, 60) {
+                self.closed_logged = Some(Instant::now());
+                tracing::warn!(
+                    footprint_mib = mib(usage.footprint),
+                    closed,
+                    released_kib = released / 1024,
+                    "memory critical; closed all connections"
+                );
+            }
         }
-        if usage.footprint >= self.budget.trace_above && since(self.logged, 1) {
+        let moved = usage.footprint.abs_diff(self.logged_footprint) >= MIB;
+        if usage.footprint >= self.budget.trace_above
+            && since(self.logged, 1)
+            && (moved || since(self.logged, 30))
+        {
             self.logged = Some(Instant::now());
+            self.logged_footprint = usage.footprint;
             let load = load();
             tracing::warn!(
                 footprint_mib = mib(usage.footprint),
