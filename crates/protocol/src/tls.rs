@@ -9,7 +9,10 @@ use boring::{
         CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslMethod,
         SslOptions, SslSession, SslSessionCacheMode, SslVerifyMode, SslVersion,
     },
-    x509::X509,
+    x509::{
+        X509,
+        store::{X509Store, X509StoreBuilder},
+    },
 };
 use foreign_types_shared::ForeignType;
 use rand::seq::SliceRandom;
@@ -448,6 +451,23 @@ struct ContextKey {
     server_name: String,
 }
 static CONTEXTS: OnceLock<Mutex<HashMap<ContextKey, SslConnector>>> = OnceLock::new();
+/// The webpki roots, parsed once and shared by every verifying context: a
+/// context with its own copy holds about 1.2 MiB, and contexts are cached per
+/// server name, which cost the iOS tunnel tens of MiB of its ~50 MiB limit.
+static ROOTS: OnceLock<X509Store> = OnceLock::new();
+
+fn roots() -> Result<&'static X509Store> {
+    if let Some(store) = ROOTS.get() {
+        return Ok(store);
+    }
+    let mut builder = X509StoreBuilder::new()?;
+    for root in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        if let Ok(cert) = X509::from_der(root.as_ref()) {
+            let _ = builder.add_cert(cert);
+        }
+    }
+    Ok(ROOTS.get_or_init(|| builder.build()))
+}
 static SESSIONS: OnceLock<Mutex<VecDeque<(ContextKey, SslSession)>>> = OnceLock::new();
 
 fn store_session(key: ContextKey, session: SslSession) {
@@ -529,11 +549,7 @@ fn build_connector(
     }
     if verify && !reality {
         builder.set_verify(SslVerifyMode::PEER);
-        for root in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-            if let Ok(cert) = X509::from_der(root.as_ref()) {
-                let _ = builder.cert_store_mut().add_cert(cert);
-            }
-        }
+        builder.set_cert_store_ref(roots()?);
     } else {
         builder.set_verify(SslVerifyMode::NONE);
     }
@@ -1174,6 +1190,26 @@ mod tests {
             normalized_fixture(&hello),
             "bbaf12e4f0e0a9dee376d9ddbdc25d259f6f714e200ab2780f71c6332ec1d261"
         );
+    }
+
+    #[test]
+    fn verifying_contexts_share_one_root_store() {
+        let store = |server_name: &str| {
+            let (connector, ..) = connector(&TlsConnectConfig {
+                server_name: server_name.into(),
+                alpn: vec!["http/1.1".into()],
+                verify_cert: true,
+                fingerprint: TlsFingerprint::Native,
+                reality: None,
+            })
+            .unwrap();
+            foreign_types_shared::ForeignTypeRef::as_ptr(connector.context().cert_store())
+        };
+        // Contexts are cached per server name; each copy of the roots held
+        // about 1.2 MiB (Tailscale probes every DERP region by name).
+        let first = store("derp1.example.com");
+        assert_eq!(first, store("derp2.example.com"));
+        assert_eq!(first, roots().unwrap().as_ptr());
     }
 
     #[tokio::test]
