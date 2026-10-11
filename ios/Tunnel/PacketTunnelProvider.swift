@@ -11,6 +11,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var epoch = UUID()
     private var monitor: NWPathMonitor?
     private var receivedInitialPath = false
+    /// The network the core last adapted to, and the coalescing of path updates.
+    private var appliedNetwork: NetworkSnapshot?
+    private var pendingNetwork: DispatchWorkItem?
+    private var ignoredPathUpdates = 0
     /// Whether the profile enables IPv6, and whether the applied settings route it.
     private var profileIPv6 = false
     private var routesIPv6: Bool?
@@ -125,6 +129,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         monitor?.cancel()
         monitor = nil
         receivedInitialPath = false
+        pendingNetwork?.cancel()
+        pendingNetwork = nil
+        appliedNetwork = nil
+        ignoredPathUpdates = 0
         routesIPv6 = nil
         healthTimer?.cancel()
         healthTimer = nil
@@ -219,34 +227,57 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private static let pathSettleDelay: DispatchTimeInterval = .seconds(1)
+
+    /// Tells the core about a settled path only when sockets bound to the old
+    /// one may no longer work. NWPathMonitor also reports updates that change
+    /// none of that (IPv6 temporary address rotation, DNS or cost changes,
+    /// every ~25 s on some Wi-Fi networks); each closed every connection,
+    /// re-tested url-test groups and reconnected Tailscale's DERP relay.
+    private func pathSettled(_ path: Network.NWPath) {
+        guard let core, receivedInitialPath else { return }
+        let snapshot = NetworkSnapshot(path)
+        let changes = appliedNetwork.map { snapshot.changes(from: $0) } ?? ["initial"]
+        guard !changes.isEmpty else {
+            ignoredPathUpdates += 1
+            return
+        }
+        appliedNetwork = snapshot
+        log.info("network changed: \(changes.joined(separator: ", ")) (\(ignoredPathUpdates) unchanged updates ignored) \(snapshot)")
+        ignoredPathUpdates = 0
+        do { try core.networkChanged() } catch { fail(error); return }
+        let ipv6 = profileIPv6 && path.supportsIPv6
+        guard let routed = routesIPv6, routed != ipv6 else { return }
+        let epoch = self.epoch
+        applySettings(ipv6: ipv6) { error in
+            guard self.epoch == epoch, self.core != nil else { return }
+            if let error {
+                log.error("network settings update failed: \(Diagnostics.describe(error))")
+            } else {
+                log.info("IPv6 \(ipv6 ? "now routed through the tunnel" : "left on the device network") after network change")
+            }
+        }
+    }
+
     /// Calls `ready` with the first device path, then reacts to changes. Only
     /// physical interfaces count: this tunnel and other VPNs are `.other`, and
     /// our own IPv6 route must not look like IPv6 connectivity.
     private func watchNetwork(ready: @escaping (Network.NWPath) -> Void) {
         let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other])
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self, let core = self.core else { return }
+            guard let self, self.core != nil else { return }
             guard self.receivedInitialPath else {
                 self.receivedInitialPath = true
+                self.appliedNetwork = NetworkSnapshot(path)
                 ready(path)
                 return
             }
-            // Even an address change on the same interface invalidates old sockets.
-            // NWPathMonitor already emits changes; an interface-name comparison
-            // would miss transitions between Wi-Fi and cellular with both present.
-            log.info("network path changed ipv6=\(path.supportsIPv6)")
-            do { try core.networkChanged() } catch { self.fail(error); return }
-            let ipv6 = self.profileIPv6 && path.supportsIPv6
-            guard let routed = self.routesIPv6, routed != ipv6 else { return }
-            let epoch = self.epoch
-            self.applySettings(ipv6: ipv6) { error in
-                guard self.epoch == epoch, self.core != nil else { return }
-                if let error {
-                    log.error("network settings update failed: \(Diagnostics.describe(error))")
-                } else {
-                    log.info("IPv6 \(ipv6 ? "now routed through the tunnel" : "left on the device network") after network change")
-                }
-            }
+            // A switch emits several updates within a second: settle first, then
+            // compare with what the core last adapted to.
+            self.pendingNetwork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.pathSettled(path) }
+            self.pendingNetwork = work
+            self.queue.asyncAfter(deadline: .now() + Self.pathSettleDelay, execute: work)
         }
         monitor.start(queue: queue)
         self.monitor = monitor
@@ -342,5 +373,72 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler?(try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription]))
             }
         }
+    }
+}
+
+/// What a network change must alter before sockets need rebinding: status,
+/// the usable interfaces in preference order, their gateways, IPv4/IPv6
+/// reachability and the interfaces' IPv4 addresses (an address can change on
+/// the same interface and gateway). IPv6 addresses are left out: temporary
+/// ones rotate without breaking anything.
+private struct NetworkSnapshot: Equatable, CustomStringConvertible {
+    let status: String
+    let interfaces: [String]
+    let gateways: [String]
+    let ipv4: Bool
+    let ipv6: Bool
+    let addresses: [String]
+
+    init(_ path: Network.NWPath) {
+        status = "\(path.status)"
+        interfaces = path.availableInterfaces.map { "\($0.name)(\(Self.kind($0.type)))" }
+        gateways = path.gateways.map { "\($0)" }.sorted()
+        ipv4 = path.supportsIPv4
+        ipv6 = path.supportsIPv6
+        addresses = Self.ipv4Addresses(on: Set(path.availableInterfaces.map(\.name)))
+    }
+
+    /// Names of the fields that differ from `old`; empty when nothing that
+    /// matters to sockets changed.
+    func changes(from old: NetworkSnapshot) -> [String] {
+        var changed: [String] = []
+        if status != old.status { changed.append("status") }
+        if interfaces != old.interfaces { changed.append("interfaces") }
+        if gateways != old.gateways { changed.append("gateways") }
+        if ipv4 != old.ipv4 || ipv6 != old.ipv6 { changed.append("ip-versions") }
+        if addresses != old.addresses { changed.append("addresses") }
+        return changed
+    }
+
+    var description: String {
+        "status=\(status) interfaces=\(interfaces) ipv4=\(ipv4) ipv6=\(ipv6) addresses=\(addresses)"
+    }
+
+    private static func kind(_ type: NWInterface.InterfaceType) -> String {
+        switch type {
+        case .wifi: "wifi"
+        case .cellular: "cellular"
+        case .wiredEthernet: "wired"
+        case .loopback: "loopback"
+        default: "other"
+        }
+    }
+
+    private static func ipv4Addresses(on names: Set<String>) -> [String] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return [] }
+        defer { freeifaddrs(head) }
+        var result: [String] = []
+        for entry in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let name = String(cString: entry.pointee.ifa_name)
+            guard names.contains(name), let address = entry.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count),
+                           nil, 0, NI_NUMERICHOST) == 0 {
+                result.append("\(name)=\(String(cString: host))")
+            }
+        }
+        return result.sorted()
     }
 }

@@ -164,7 +164,9 @@ pub async fn connect(
     writer.flush().await?;
     let (tx, mut rx) = mpsc::channel::<Frame>(512);
     let name = node.host_name.clone();
-    let pong = tx.clone();
+    // Weak: a strong sender here would keep the writer waiting after the
+    // router dropped the Link, so neither task (nor the connection) ended.
+    let pong = tx.downgrade();
     let reader_task = tokio::spawn(async move {
         let result: Result<()> = async {
             loop {
@@ -181,6 +183,9 @@ pub async fn connect(
                         }
                     }
                     PING if payload.len() == 8 => {
+                        let Some(pong) = pong.upgrade() else {
+                            return Ok(());
+                        };
                         let _ = pong.try_send(Frame::Pong(payload[..8].try_into().unwrap()));
                     }
                     RESTARTING => bail!("DERP server restarting"),
@@ -229,6 +234,91 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meta_protocol::BoxStream;
+    use std::sync::Mutex;
+
+    /// Hands out one end of an in-memory stream as the "TLS" connection.
+    struct Pipe(Mutex<Option<tokio::io::DuplexStream>>);
+    #[async_trait::async_trait]
+    impl Dialer for Pipe {
+        async fn connect_tcp(&self, _: &str, _: u16) -> Result<BoxStream> {
+            bail!("unused")
+        }
+        async fn connect_tls(&self, _: &str, _: u16) -> Result<BoxStream> {
+            Ok(Box::new(
+                self.0.lock().unwrap().take().context("one connection")?,
+            ))
+        }
+        async fn resolve(&self, _: &str) -> Result<Vec<std::net::IpAddr>> {
+            Ok(vec![])
+        }
+        async fn bind_udp(&self) -> Result<tokio::net::UdpSocket> {
+            bail!("unused")
+        }
+        async fn local_ipv4(&self) -> Option<std::net::IpAddr> {
+            None
+        }
+    }
+
+    /// Dropping the last `Link` must close the connection: the iOS tunnel
+    /// replaces its DERP links on every network change (several a minute
+    /// while the path flaps), and each one left open leaked its TLS
+    /// connection and tasks, since the server's keepalives kept it alive.
+    #[tokio::test]
+    async fn dropping_the_link_closes_the_connection() {
+        let (client, mut server) = tokio::io::duplex(1 << 20);
+        let dialer = Pipe(Mutex::new(Some(client)));
+        let server_key = Private::generate();
+        let serve = async {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                server.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            server
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n")
+                .await
+                .unwrap();
+            let mut greeting = MAGIC.to_vec();
+            greeting.extend_from_slice(&server_key.public().0);
+            server
+                .write_all(&frame(SERVER_KEY, &greeting))
+                .await
+                .unwrap();
+            let mut pending = Vec::new();
+            let (kind, hello) = read_frame(&mut server, &mut pending).await.unwrap();
+            assert_eq!(kind, CLIENT_INFO);
+            let client = Public(hello[..32].try_into().unwrap());
+            let info = seal(&server_key, &client, b"{}");
+            server.write_all(&frame(SERVER_INFO, &info)).await.unwrap();
+            pending
+        };
+        let (inbound, _inbound_rx) = mpsc::channel(8);
+        let node = DerpNode {
+            host_name: "derp.test".into(),
+            ..Default::default()
+        };
+        let client_key = Private::generate();
+        let (link, mut pending) =
+            tokio::join!(connect(&dialer, &node, &client_key, true, inbound), serve);
+        let link = link.unwrap();
+        // The reader answers pings through the writer.
+        server.write_all(&frame(PING, b"12345678")).await.unwrap();
+        let (kind, payload) = loop {
+            let (kind, payload) = read_frame(&mut server, &mut pending).await.unwrap();
+            if kind != NOTE_PREFERRED {
+                break (kind, payload);
+            }
+        };
+        assert_eq!((kind, payload.as_slice()), (PONG, &b"12345678"[..]));
+        drop(link);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), server.read_to_end(&mut rest))
+            .await
+            .expect("the DERP connection stayed open after its Link was dropped")
+            .unwrap();
+    }
 
     #[test]
     fn naclbox_round_trips_and_rejects_other_keys() {
