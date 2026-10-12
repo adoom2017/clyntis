@@ -13,6 +13,7 @@ import {
   Activity,
   ArrowDown,
   ArrowUp,
+  ArrowRight,
   Check,
   ChevronRight,
   CircleAlert,
@@ -34,6 +35,7 @@ import {
   Ban,
   Power,
   RefreshCw,
+  Route,
   Search,
   Settings2,
   ShieldCheck,
@@ -419,7 +421,33 @@ export default function App() {
                     </button>
                   )}
                   <div className="connection-details">
-                    <span>{captureText[state.settings.capture]}</span>
+                    <div
+                      className="segmented"
+                      role="group"
+                      aria-label="接管方式"
+                    >
+                      {(["manual", "system", "tun"] as Capture[]).map(
+                        (capture) => (
+                          <button
+                            key={capture}
+                            disabled={disabled}
+                            aria-pressed={state.settings.capture === capture}
+                            className={
+                              state.settings.capture === capture
+                                ? "selected"
+                                : ""
+                            }
+                            onClick={() =>
+                              void perform(() =>
+                                invoke("set_capture", { capture }),
+                              )
+                            }
+                          >
+                            {captureText[capture]}
+                          </button>
+                        ),
+                      )}
+                    </div>
                     <span>{modeText[state.mode]}</span>
                     <span>127.0.0.1:{state.settings.mixedPort}</span>
                   </div>
@@ -463,10 +491,12 @@ export default function App() {
                       <span>
                         <i className="legend-dot green" />
                         下载
+                        <b>{bytes(traffic.at(-1)?.down ?? 0)}/s</b>
                       </span>
                       <span>
                         <i className="legend-dot blue" />
                         上传
+                        <b>{bytes(traffic.at(-1)?.up ?? 0)}/s</b>
                       </span>
                     </div>
                   </div>
@@ -512,31 +542,6 @@ export default function App() {
               {running && (
                 <AdblockPanel settings={state.settings} perform={perform} />
               )}
-              <div className="capture-strip">
-                <span className="muted">接管</span>
-                <div className="segmented">
-                  {(["manual", "system", "tun"] as Capture[]).map((capture) => (
-                    <button
-                      key={capture}
-                      disabled={disabled}
-                      className={
-                        state.settings.capture === capture ? "selected" : ""
-                      }
-                      onClick={() =>
-                        void perform(() => invoke("set_capture", { capture }))
-                      }
-                    >
-                      {captureText[capture]}
-                    </button>
-                  ))}
-                </div>
-                <button
-                  className="text-button"
-                  onClick={() => setPage("settings")}
-                >
-                  辅助服务 <ChevronRight size={14} />
-                </button>
-              </div>
             </>
           )}
           {page === "profiles" && (
@@ -608,22 +613,28 @@ export default function App() {
                         <p className="inline-error">{profile.lastError}</p>
                       )}
                       <div className="profile-actions">
-                        <button
-                          className="button secondary compact"
-                          disabled={disabled || profile.id === state.selected}
-                          onClick={() =>
-                            void perform(() =>
-                              invoke("select_profile", { id: profile.id }),
-                            )
-                          }
-                        >
-                          {profile.id === state.selected ? "使用中" : "使用"}
-                        </button>
+                        {profile.id === state.selected ? (
+                          <span className="current-tag">
+                            <Check size={13} />
+                            当前
+                          </span>
+                        ) : (
+                          <button
+                            className="button secondary compact"
+                            disabled={disabled}
+                            onClick={() =>
+                              void perform(() =>
+                                invoke("select_profile", { id: profile.id }),
+                              )
+                            }
+                          >
+                            使用
+                          </button>
+                        )}
                         {profile.subscription && (
                           <button
-                            className="icon-button"
+                            className="action-button"
                             disabled={disabled}
-                            title="检查更新"
                             aria-label={`更新 ${profile.name}`}
                             onClick={() =>
                               void perform(
@@ -635,11 +646,12 @@ export default function App() {
                               )
                             }
                           >
-                            <RefreshCw size={16} />
+                            <RefreshCw size={14} />
+                            检查更新
                           </button>
                         )}
                         <button
-                          className="text-button"
+                          className="action-button"
                           disabled={disabled}
                           onClick={() =>
                             void perform(async () => {
@@ -668,6 +680,7 @@ export default function App() {
                             })
                           }
                         >
+                          <PencilLine size={14} />
                           编辑
                         </button>
                         {profile.pending && (
@@ -686,7 +699,7 @@ export default function App() {
                           </button>
                         )}
                         <button
-                          className="icon-button"
+                          className="action-button"
                           disabled={disabled}
                           title="回滚到上一版本"
                           aria-label={`回滚 ${profile.name}`}
@@ -708,16 +721,17 @@ export default function App() {
                             )
                           }
                         >
-                          <Undo2 size={16} />
+                          <Undo2 size={14} />
+                          回滚
                         </button>
                         <button
-                          className="icon-button"
+                          className="action-button"
                           disabled={disabled}
-                          title="加密导出"
                           aria-label={`加密导出 ${profile.name}`}
                           onClick={() => exportEncrypted(profile)}
                         >
-                          <FileLock2 size={16} />
+                          <FileLock2 size={14} />
+                          加密导出
                         </button>
                         <button
                           className="icon-button danger"
@@ -757,7 +771,12 @@ export default function App() {
             </>
           )}
           {page === "proxies" && (
-            <Proxies running={running} busy={disabled} perform={perform} />
+            <Proxies
+              running={running}
+              mode={state.mode}
+              busy={disabled}
+              perform={perform}
+            />
           )}
           {page === "rules" && (
             <RulesPage busy={disabled} running={running} confirm={setModal} />
@@ -784,7 +803,38 @@ export default function App() {
 function delayTone(delay: number | null | undefined) {
   if (delay === null) return "unavailable";
   if (delay === undefined) return "";
-  return delay < 300 ? "fast" : "slow";
+  return delay < 150 ? "fast" : delay < 300 ? "medium" : "slow";
+}
+/** The core's built-in outbounds, by name or by the type it reports. */
+function builtinOutbound(
+  name: string,
+  proxy: Proxy | undefined,
+): "direct" | "reject" | null {
+  const kind = (proxy?.type ?? name).toLowerCase();
+  if (kind === "direct" || kind === "pass") return "direct";
+  if (kind.startsWith("reject")) return "reject";
+  return null;
+}
+/** A group member that routes rather than carries traffic: another group
+ * or a built-in outbound. Everything else is a proxy server. */
+function isPolicy(name: string, proxy: Proxy | undefined) {
+  return !!proxy?.all || builtinOutbound(name, proxy) !== null;
+}
+const groupTypeText: Record<string, string> = {
+  Selector: "手动",
+  URLTest: "自动",
+  Fallback: "故障转移",
+  LoadBalance: "负载均衡",
+};
+/** Proxy groups folded on the nodes page; a per-viewer convenience. */
+const collapsedKey = "clyntis.collapsed-groups";
+function loadCollapsed(): string[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(collapsedKey) ?? "[]");
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
 }
 
 type Perform = (
@@ -862,6 +912,7 @@ function TrafficChart({ values }: { values: Traffic[] }) {
   return (
     <div className="traffic-chart">
       <span className="chart-max">{bytes(max)}/s</span>
+      <span className="chart-max half">{bytes(max / 2)}/s</span>
       <svg
         viewBox="0 0 600 150"
         preserveAspectRatio="none"
@@ -873,8 +924,12 @@ function TrafficChart({ values }: { values: Traffic[] }) {
             <stop offset="0%" stopColor="var(--accent)" stopOpacity=".16" />
             <stop offset="100%" stopColor="var(--accent)" stopOpacity="0" />
           </linearGradient>
+          <linearGradient id="upload-fill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--upload)" stopOpacity=".22" />
+            <stop offset="100%" stopColor="var(--upload)" stopOpacity="0" />
+          </linearGradient>
         </defs>
-        {[22, 58, 95, 132].map((y) => (
+        {[22, 77, 132].map((y) => (
           <line
             key={y}
             x1="0"
@@ -897,11 +952,15 @@ function TrafficChart({ values }: { values: Traffic[] }) {
           strokeLinejoin="round"
           vectorEffect="non-scaling-stroke"
         />
+        <polygon
+          points={`0,132 ${line("up")} 600,132`}
+          fill="url(#upload-fill)"
+        />
         <polyline
           points={line("up")}
           fill="none"
           stroke="var(--upload)"
-          strokeWidth="1.5"
+          strokeWidth="2"
           strokeLinejoin="round"
           vectorEffect="non-scaling-stroke"
         />
@@ -1672,10 +1731,12 @@ function AllowDialog({
 }
 function Proxies({
   running,
+  mode,
   busy,
   perform,
 }: {
   running: boolean;
+  mode: Mode;
   busy: boolean;
   perform: Perform;
 }) {
@@ -1684,6 +1745,19 @@ function Proxies({
   const [probing, setProbing] = useState<string[]>([]);
   const [delays, setDelays] = useState<Record<string, number | null>>({});
   const [detail, setDetail] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(loadCollapsed);
+  const toggleGroup = (name: string) =>
+    setCollapsed((current) => {
+      const next = current.includes(name)
+        ? current.filter((n) => n !== name)
+        : [...current, name];
+      try {
+        localStorage.setItem(collapsedKey, JSON.stringify(next));
+      } catch {
+        // Folding still works for this session.
+      }
+      return next;
+    });
   const refresh = useCallback(async () => {
     const data = await invoke<{ proxies: Record<string, Proxy> }>("proxies");
     setNodes(data.proxies);
@@ -1728,7 +1802,10 @@ function Proxies({
     return (
       <Empty icon={<Globe2 />} title="未连接" text="连接后可选择节点和测速。" />
     );
-  const groups = Object.values(nodes).filter((p) => p.all);
+  // GLOBAL only routes traffic in global mode; elsewhere it is noise.
+  const groups = Object.values(nodes).filter(
+    (p) => p.all && (p.name !== "GLOBAL" || mode === "global"),
+  );
   return (
     <>
       <div className="toolbar">
@@ -1760,105 +1837,161 @@ function Proxies({
               history: [],
             } as Proxy,
           ]
-      ).map((group) => (
-        <section className="panel proxy-group" key={group.name}>
-          <div className="panel-title">
-            <h3>
-              {group.name}
-              <span className="count-tag">{group.all?.length}</span>
-            </h3>
-            <span className="muted small">
-              {group.type === "Selector"
-                ? "手动"
-                : group.type === "URLTest"
-                  ? "自动"
-                  : ""}
-            </span>
-          </div>
-          <div className="node-grid">
-            {group.all
-              ?.filter((name) =>
-                name.toLowerCase().includes(query.toLowerCase()),
-              )
-              .map((name) => {
-                const delay =
-                  name in delays
-                    ? delays[name]
-                    : nodes[name]?.history.at(-1)?.delay;
-                return (
-                  <div
-                    className={`node-card ${group.now === name ? "selected" : ""}`}
-                    key={name}
-                  >
-                    <button
-                      className="node-select"
-                      disabled={busy || group.type !== "Selector"}
-                      onClick={() =>
-                        void perform(async () => {
-                          await invoke("select_proxy", {
-                            group: group.name,
-                            name,
-                          });
-                          await refresh();
-                        })
-                      }
+      ).map((group) => {
+        // A search shows matches in every group, folded or not.
+        const folded = !query && collapsed.includes(group.name);
+        return (
+          <section
+            className={`panel proxy-group ${folded ? "folded" : ""}`}
+            key={group.name}
+          >
+            <button
+              className="group-header"
+              aria-expanded={!folded}
+              onClick={() => toggleGroup(group.name)}
+            >
+              <ChevronDown size={16} className="group-chevron" />
+              <h3>
+                {group.name}
+                <span className="count-tag">{group.all?.length}</span>
+              </h3>
+              {folded && group.now && (
+                <span className="group-now">{group.now}</span>
+              )}
+              <span className="muted small">
+                {groupTypeText[group.type] ?? ""}
+              </span>
+            </button>
+            {!folded &&
+              (() => {
+                const members = (group.all ?? []).filter((name) =>
+                  name.toLowerCase().includes(query.toLowerCase()),
+                );
+                // Groups and built-in outbounds route traffic; proxies carry it.
+                const policies = members.filter((name) =>
+                  isPolicy(name, nodes[name]),
+                );
+                const proxies = members.filter(
+                  (name) => !isPolicy(name, nodes[name]),
+                );
+                const card = (name: string) => {
+                  const delay =
+                    name in delays
+                      ? delays[name]
+                      : nodes[name]?.history.at(-1)?.delay;
+                  const builtin = builtinOutbound(name, nodes[name]);
+                  return (
+                    <div
+                      className={`node-card ${isPolicy(name, nodes[name]) ? "policy" : ""} ${group.now === name ? "selected" : ""}`}
+                      key={name}
                     >
-                      <span className="node-icon">
-                        <Globe2 size={18} />
-                      </span>
-                      <span>
-                        <strong>{name}</strong>
-                        <small
-                          className={
-                            nodes[name]?.status?.tailscale?.state === "error"
-                              ? "danger-text"
-                              : ""
-                          }
-                        >
-                          {nodeSummary(nodes[name]?.status, nodes[name]?.type)}
-                        </small>
-                      </span>
-                      {group.now === name && (
-                        <Check size={16} className="accent" />
-                      )}
-                    </button>
-                    {nodes[name]?.status && (
                       <button
-                        className="node-info"
-                        aria-label={`${name} 状态`}
-                        onClick={() => setDetail(name)}
-                      >
-                        <Info size={15} />
-                      </button>
-                    )}
-                    {nodes[name]?.type === "Tailscale" ? null : (
-                      <button
-                        className={`delay ${delayTone(delay)}`}
-                        aria-label={`测试 ${name} 延迟`}
-                        disabled={
-                          busy ||
-                          probing.includes(name) ||
-                          ["DIRECT", "REJECT"].includes(name)
+                        className="node-select"
+                        disabled={busy || group.type !== "Selector"}
+                        onClick={() =>
+                          void perform(async () => {
+                            await invoke("select_proxy", {
+                              group: group.name,
+                              name,
+                            });
+                            await refresh();
+                          })
                         }
-                        onClick={() => void probe(name)}
                       >
-                        {probing.includes(name) ? (
-                          <LoaderCircle className="spin" size={13} />
-                        ) : delay === null ? (
-                          "超时"
-                        ) : delay === undefined ? (
-                          "测速"
-                        ) : (
-                          `${delay} ms`
+                        {nodes[name]?.all ? (
+                          <span className="node-icon" title="代理组">
+                            <Layers3 size={16} />
+                          </span>
+                        ) : builtin === "reject" ? (
+                          <span className="node-icon reject" title="拒绝">
+                            <Ban size={16} />
+                          </span>
+                        ) : builtin === "direct" ? (
+                          <span className="node-icon" title="直连">
+                            <ArrowRight size={16} />
+                          </span>
+                        ) : null}
+                        <span>
+                          <strong>{name}</strong>
+                          <small
+                            className={
+                              nodes[name]?.status?.tailscale?.state === "error"
+                                ? "danger-text"
+                                : ""
+                            }
+                          >
+                            {nodes[name]?.all
+                              ? `代理组 · ${groupTypeText[nodes[name].type] ?? nodes[name].type}${nodes[name].now ? ` · 当前 ${nodes[name].now}` : ""}`
+                              : builtin === "direct"
+                                ? "直连，不经过代理"
+                                : builtin === "reject"
+                                  ? "拒绝连接"
+                                  : nodeSummary(
+                                      nodes[name]?.status,
+                                      nodes[name]?.type,
+                                    )}
+                          </small>
+                        </span>
+                        {group.now === name && (
+                          <Check size={16} className="accent" />
                         )}
                       </button>
+                      {nodes[name]?.status && (
+                        <button
+                          className="node-info"
+                          aria-label={`${name} 状态`}
+                          onClick={() => setDetail(name)}
+                        >
+                          <Info size={15} />
+                        </button>
+                      )}
+                      {nodes[name]?.type === "Tailscale" || builtin ? null : (
+                        <button
+                          className={`delay ${delayTone(delay)}`}
+                          aria-label={`测试 ${name} 延迟`}
+                          disabled={busy || probing.includes(name)}
+                          onClick={() => void probe(name)}
+                        >
+                          {probing.includes(name) ? (
+                            <LoaderCircle className="spin" size={13} />
+                          ) : delay === null ? (
+                            "超时"
+                          ) : delay === undefined ? (
+                            "测速"
+                          ) : (
+                            `${delay} ms`
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  );
+                };
+                return (
+                  <>
+                    {policies.length > 0 && (
+                      <>
+                        <div className="member-label">
+                          策略<span>{policies.length}</span>
+                        </div>
+                        <div className="node-grid">{policies.map(card)}</div>
+                      </>
                     )}
-                  </div>
+                    {proxies.length > 0 && (
+                      <>
+                        {policies.length > 0 && (
+                          <div className="member-label">
+                            节点<span>{proxies.length}</span>
+                          </div>
+                        )}
+                        <div className="node-grid">{proxies.map(card)}</div>
+                      </>
+                    )}
+                  </>
                 );
-              })}
-          </div>
-        </section>
-      ))}
+              })()}
+          </section>
+        );
+      })}
       {detail && nodes[detail]?.status && (
         <Modal title={detail} onClose={() => setDetail(null)} wide>
           <NodeDetail
@@ -2038,13 +2171,13 @@ function ConnectionPage({
         </p>
       )}
       <div className="panel table-wrap">
-        <table>
+        <table className="connection-table">
           <thead>
             <tr>
               <th>目标地址</th>
               <th>协议 / 代理链</th>
-              <th>下载</th>
-              <th>上传</th>
+              <th className="num">下载</th>
+              <th className="num">上传</th>
               <th />
             </tr>
           </thead>
@@ -2056,11 +2189,15 @@ function ConnectionPage({
                   <span className="muted">:{item.metadata.port}</span>
                 </td>
                 <td>
-                  <span className="tiny-tag">{item.network.toUpperCase()}</span>
-                  <span className="chain">{item.chains.join(" → ")}</span>
+                  <span className="route-line">
+                    <span className="tiny-tag">
+                      {item.network.toUpperCase()}
+                    </span>
+                    <span className="muted">{item.chains.join(" → ")}</span>
+                  </span>
                 </td>
-                <td>{bytes(item.download)}</td>
-                <td>{bytes(item.upload)}</td>
+                <td className="num">{bytes(item.download)}</td>
+                <td className="num">{bytes(item.upload)}</td>
                 <td>
                   <button
                     className="icon-button"
@@ -2148,8 +2285,7 @@ function RulesPage({
   const disabled = busy || saving;
   return (
     <>
-      <RouteTester running={running} customRules={data.rules} />
-      <DnsLeakPanel running={running} rules={data.rules} />
+      <h3 className="settings-heading">自定义规则</h3>
       <section className="panel settings-section rule-form">
         <form
           onSubmit={(event) => {
@@ -2321,6 +2457,9 @@ function RulesPage({
           」；切换到没有该代理组的配置时，对应规则会被跳过。
         </p>
       )}
+      <h3 className="settings-heading spaced">诊断</h3>
+      <RouteTester running={running} customRules={data.rules} />
+      <DnsLeakPanel running={running} rules={data.rules} />
     </>
   );
 }
@@ -2361,6 +2500,12 @@ function RouteTester({
   };
   return (
     <section className="panel settings-section route-test">
+      <div className="panel-title">
+        <h3>
+          <Route size={16} />
+          路由测试
+        </h3>
+      </div>
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -2672,6 +2817,25 @@ function BulkRules({
     </Modal>
   );
 }
+/** Quiet the parts of a log line the eye skips (network tags, local
+ * addresses, arrows) so destinations and rules stand out. */
+const quietLogPart =
+  /(\[(?:TCP|UDP)\]|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b|-->)/;
+function LogPayload({ text }: { text: string }) {
+  return (
+    <span>
+      {text.split(quietLogPart).map((part, i) =>
+        i % 2 ? (
+          <span key={i} className="log-quiet">
+            {part}
+          </span>
+        ) : (
+          part
+        ),
+      )}
+    </span>
+  );
+}
 function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
   const [level, setLevel] = useState("all");
   const [paused, setPaused] = useState(false);
@@ -2740,16 +2904,16 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
       <div className="panel logs-panel" role="log" aria-live="off">
         {visible.length ? (
           visible.map((log, i) => (
-            <div className="log-row" key={`${log.time}-${i}`}>
+            <div className={`log-row ${log.type}`} key={`${log.time}-${i}`}>
               <time>
                 {new Date(log.time * 1000).toLocaleTimeString("zh-CN", {
                   hour12: false,
                 })}
               </time>
               <span className={`log-level ${log.type}`}>
-                {log.type.toUpperCase()}
+                {log.type === "warning" ? "WARN" : log.type.toUpperCase()}
               </span>
-              <span>{log.payload}</span>
+              <LogPayload text={log.payload} />
             </div>
           ))
         ) : (
@@ -2816,6 +2980,7 @@ function SettingsPage({
   const override = <K extends keyof Overrides>(key: K, value: Overrides[K]) =>
     setSettings((s) => ({ ...s, overrides: { ...s.overrides, [key]: value } }));
   const dirty = JSON.stringify(settings) !== JSON.stringify(state.settings);
+  const portInvalid = settings.mixedPort < 1024 || settings.mixedPort > 65535;
   return (
     <>
       <h3 className="settings-heading">网络</h3>
@@ -2998,26 +3163,34 @@ function SettingsPage({
           </div>
         </Setting>
       </section>
-      <div className="save-bar">
-        {dirty && <span className="small muted">有未保存的更改</span>}
-        <button
-          className="button primary"
-          disabled={
-            busy ||
-            !dirty ||
-            settings.mixedPort < 1024 ||
-            settings.mixedPort > 65535
-          }
-          onClick={() =>
-            void perform(
-              () => invoke("save_settings", { settings }),
-              "设置已保存",
-            )
-          }
-        >
-          保存
-        </button>
-      </div>
+      {/* Changes wait for 保存: switching capture or the port restarts the
+          core, so nothing applies while a value is half typed. */}
+      {dirty && (
+        <div className="save-bar" role="region" aria-label="未保存的设置">
+          <span>
+            {portInvalid ? "代理端口需在 1024–65535 之间" : "有未保存的更改"}
+          </span>
+          <button
+            className="button secondary"
+            disabled={busy}
+            onClick={() => setSettings(state.settings)}
+          >
+            撤销
+          </button>
+          <button
+            className="button primary"
+            disabled={busy || portInvalid}
+            onClick={() =>
+              void perform(
+                () => invoke("save_settings", { settings }),
+                "设置已保存",
+              )
+            }
+          >
+            保存
+          </button>
+        </div>
+      )}
     </>
   );
 }
