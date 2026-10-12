@@ -48,7 +48,7 @@ struct AdblockView: View {
 
     var body: some View {
         List {
-            statusSection
+            // Settings first; statistics and recent blocks below them.
             Section {
                 Toggle("启用去广告", isOn: Binding(get: { settings?.enabled ?? false }, set: { on in
                     var next = settings ?? AdblockSettings()
@@ -115,6 +115,7 @@ struct AdblockView: View {
                 } footer: { Text("开关和列表的修改需要重新连接。") }
             }
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
+            statusSection
         }
         .navigationTitle("去广告")
         .alert("无法放行", isPresented: Binding(get: { allowFailure != nil }, set: { if !$0 { allowFailure = nil } })) {
@@ -127,7 +128,7 @@ struct AdblockView: View {
         } }
     }
 
-    /// Statistics first; otherwise why there are none yet.
+    /// Statistics and recent blocks; otherwise why there are none yet.
     @ViewBuilder private var statusSection: some View {
         if let status = model.adblock, status.enabled {
             statistics(status)
