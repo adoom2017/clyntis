@@ -600,7 +600,8 @@ final class AppModel {
             let selections = object["selections"] as? [String: String] ?? [:]
             groups = (config["proxy-groups"] as? [[String: Any]] ?? []).compactMap { group in
                 guard let name = group["name"] as? String, let nodes = group["proxies"] as? [String] else { return nil }
-                return ProxyGroup(name: name, nodes: nodes, selected: selections[name])
+                return ProxyGroup(name: name, type: group["type"] as? String ?? "", nodes: nodes,
+                                  selected: selections[name])
             }
             let grouped = Set(groups.flatMap(\.nodes))
             ungrouped = (config["proxies"] as? [[String: Any]] ?? [])
@@ -619,8 +620,27 @@ struct PendingImport {
 struct ProxyGroup: Identifiable {
     var id: String { name }
     let name: String
+    /// As written in the profile: select, url-test, fallback, load-balance.
+    let type: String
     let nodes: [String]
     let selected: String?
+
+    var typeText: String {
+        ["select": "手动", "url-test": "自动", "fallback": "故障转移", "load-balance": "负载均衡"][type] ?? type
+    }
+}
+
+/// The core's built-in outbounds, which route without a server of their own.
+enum BuiltinOutbound {
+    case direct, reject
+
+    init?(_ name: String) {
+        switch name.uppercased() {
+        case "DIRECT", "PASS": self = .direct
+        case let name where name.hasPrefix("REJECT"): self = .reject
+        default: return nil
+        }
+    }
 }
 
 /// How the core would route a domain or address now (see `meta_test_route_v1`).

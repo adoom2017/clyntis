@@ -69,6 +69,13 @@ extension NodeStatus {
         return (try? decoder.decode([String: NodeStatus].self, from: data)) ?? [:]
     }
 
+    /// The last delay test for lists ("85 ms", "超时"), shown apart from
+    /// `summary` so it can carry its own colour.
+    var delayText: String? {
+        if let delay { return "\(delay) ms" }
+        return error != nil && tailscale == nil ? "超时" : nil
+    }
+
     /// One line for lists: what matters most for this kind of node.
     var summary: String {
         if let tailscale {
@@ -77,7 +84,6 @@ extension NodeStatus {
                 + (tailscale.directPeers > 0 ? " · \(tailscale.directPeers) 直连" : "")
         }
         var parts = [type]
-        if let delay { parts.append("\(delay) ms") } else if error != nil { parts.append("超时") }
         if connections > 0 { parts.append("\(connections) 连接") }
         return parts.joined(separator: " · ")
     }

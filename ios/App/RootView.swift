@@ -242,6 +242,9 @@ private struct ProfilesView: View {
 
 private struct NodesView: View {
     @Bindable var model: AppModel
+    private func isPolicy(_ name: String) -> Bool {
+        BuiltinOutbound(name) != nil || model.groups.contains { $0.name == name }
+    }
     var body: some View {
         NavigationStack {
             List {
@@ -250,11 +253,28 @@ private struct NodesView: View {
                         description: Text(model.connected ? "当前配置未定义节点" : "连接后可选择节点"))
                 }
                 ForEach(model.groups) { group in
-                    Section(group.name) {
-                        ForEach(group.nodes, id: \.self) { node in
+                    // Groups and built-in outbounds route traffic; proxies carry it.
+                    let policies = group.nodes.filter(isPolicy)
+                    let proxies = group.nodes.filter { !isPolicy($0) }
+                    Section {
+                        if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "策略", count: policies.count) }
+                        ForEach(policies, id: \.self) { node in
+                            PolicyRow(model: model, name: node, group: model.groups.first { $0.name == node },
+                                      selected: group.selected == node) {
+                                Task { await model.select(group: group.name, node: node) }
+                            }
+                        }
+                        if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "节点", count: proxies.count) }
+                        ForEach(proxies, id: \.self) { node in
                             NodeRow(model: model, name: node, selected: group.selected == node) {
                                 Task { await model.select(group: group.name, node: node) }
                             }
+                        }
+                    } header: {
+                        HStack {
+                            Text(group.name)
+                            Spacer()
+                            Text(group.typeText)
                         }
                     }
                 }
@@ -278,6 +298,54 @@ private struct NodesView: View {
     }
 }
 
+private struct MemberLabel: View {
+    let title: String
+    let count: Int
+    var body: some View {
+        Text("\(title) \(count)")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 2, trailing: 20))
+    }
+}
+
+/// Another group or a built-in outbound inside a group: icon, what it does,
+/// and no delay or server details.
+private struct PolicyRow: View {
+    @Bindable var model: AppModel
+    let name: String
+    let group: ProxyGroup?
+    let selected: Bool
+    let select: () -> Void
+    var body: some View {
+        let builtin = BuiltinOutbound(name)
+        Button(action: select) {
+            HStack(spacing: 12) {
+                Image(systemName: group != nil ? "square.stack.3d.up" : builtin == .reject ? "nosign" : "arrow.right")
+                    .foregroundStyle(builtin == .reject ? Color.red : Color.accentColor)
+                    .frame(width: 22)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name).foregroundStyle(.primary)
+                    Text(detail(builtin)).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "checkmark").foregroundStyle(.tint).opacity(selected ? 1 : 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .disabled(model.busy || !model.connected)
+    }
+    private func detail(_ builtin: BuiltinOutbound?) -> String {
+        if let group {
+            return ["代理组", group.typeText, group.selected.map { "当前 \($0)" }]
+                .compactMap { $0 }.joined(separator: " · ")
+        }
+        return builtin == .reject ? "拒绝连接" : "直连，不经过代理"
+    }
+}
+
 private struct NodeRow: View {
     @Bindable var model: AppModel
     let name: String
@@ -296,7 +364,11 @@ private struct NodeRow: View {
                         }
                     }
                     Spacer()
-                    if model.probing.contains(name) { ProgressView().controlSize(.small) }
+                    if model.probing.contains(name) {
+                        ProgressView().controlSize(.small)
+                    } else if let status = model.nodeStatus[name], let delay = status.delayText {
+                        Text(delay).font(.caption.monospacedDigit()).foregroundStyle(delayTone(status))
+                    }
                     Image(systemName: "checkmark").foregroundStyle(.tint).opacity(selected ? 1 : 0)
                 }
                 .contentShape(Rectangle())
@@ -314,8 +386,12 @@ private struct NodeRow: View {
     }
     private func tone(_ status: NodeStatus) -> Color {
         if let tailscale = status.tailscale { return tailscale.state == "error" ? .red : .secondary }
-        if status.delay == nil && status.error != nil { return .red }
         return .secondary
+    }
+    /// The desktop's tiers: under 150 ms good, under 300 ms fair, else slow.
+    private func delayTone(_ status: NodeStatus) -> Color {
+        guard let delay = status.delay else { return .red }
+        return delay < 150 ? .green : delay < 300 ? .orange : .red
     }
 }
 
