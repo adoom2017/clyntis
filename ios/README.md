@@ -34,6 +34,12 @@ connected. It also provides:
   close one, or close all.
 - **Logs** (日志): app, tunnel and core logs from the shared App Group file, with
   share and clear actions; credentials are redacted.
+- **Automatic reconnection** (配置 → 断开后自动重连, off by default): iOS
+  connect-on-demand restarts the VPN after it ends without the user stopping it
+  (a crash, a kill by the system, a reboot). Disconnecting in the app turns it
+  off first; after three failed starts within five minutes the app pauses it
+  and shows why. The tunnel log says whether a start came from the app or from
+  iOS, and reports a previous session that ended without stopping.
 
 The VPN is a separate `NEPacketTunnelProvider` extension. It exchanges raw IPv4
 and IPv6 packets with the Rust core through the versioned C API; it does not
@@ -233,8 +239,8 @@ Those require a provisioned device and working server details.
   VLESS and Tailscale outbounds. Unknown fields fail validation;
   Trojan/Hysteria2 outbounds remain unimplemented. UDP through Tailscale is not
   supported yet.
-- No on-demand connection, reconnect-on-launch, desktop system proxy, tray, or
-  local HTTP controller. Node groups, status and statistics are available after
+- No per-network on-demand rules (such as skipping a home Wi-Fi), desktop
+  system proxy, tray, or local HTTP controller. Node groups, status and statistics are available after
   connection.
 - Intel simulator slices, distribution signing and App Store packaging are not
   included in the build script.

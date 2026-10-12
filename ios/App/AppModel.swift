@@ -30,6 +30,10 @@ final class AppModel {
     var customRules: [String] = []
     /// App settings that replace the profile's values (see AppOverrides).
     var overrides = AppOverrides()
+    /// Whether iOS reconnects the VPN after it ends without the user asking
+    /// (connect-on-demand). Off unless the user turns it on.
+    private(set) var autoReconnect = UserDefaults.standard.bool(forKey: AppModel.autoReconnectKey)
+    private static let autoReconnectKey = "autoReconnect"
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
     private var store: ProfileStore?
@@ -66,6 +70,7 @@ final class AppModel {
             Diagnostics.app.info("load: \(managers.count) VPN configuration(s), ours=\(self.manager != nil)")
             if let manager {
                 status = manager.connection.status
+                stopRetryingFailedStarts()
                 if active, let rawID = (manager.protocolConfiguration as? NETunnelProviderProtocol)?
                     .providerConfiguration?["profileID"] as? String {
                     selectedID = UUID(uuidString: rawID)
@@ -79,6 +84,7 @@ final class AppModel {
                         self.status = connection.status
                         Diagnostics.app.info("vpn status -> \(connection.status.rawValue)")
                         if connection.status == .disconnected {
+                            self.stopRetryingFailedStarts()
                             // Ask the system why the tunnel stopped (start failure, provider error, ...).
                             connection.fetchLastDisconnectError { error in
                                 if let error {
@@ -106,7 +112,7 @@ final class AppModel {
 
     func toggleConnection() async {
         guard !busy, let store else { return }
-        if active { manager?.connection.stopVPNTunnel(); return }
+        if active { await disconnect(); return }
         #if targetEnvironment(simulator)
         error = "模拟器不支持 VPN，请在已签名的真机上运行。"
         return
@@ -164,7 +170,7 @@ final class AppModel {
             manager.protocolConfiguration = proto
             manager.localizedDescription = "Clyntis"
             manager.isEnabled = true
-            manager.isOnDemandEnabled = false
+            Self.configureOnDemand(manager, enabled: autoReconnect)
             step = "save preferences"
             log.info("connect: \(step)")
             try await manager.saveToPreferences()
@@ -174,7 +180,7 @@ final class AppModel {
             self.manager = manager
             step = "start tunnel"
             log.info("connect: \(step) enabled=\(manager.isEnabled) status=\(manager.connection.status.rawValue)")
-            try manager.connection.startVPNTunnel()
+            try manager.connection.startVPNTunnel(options: ["source": "app" as NSString])
             status = manager.connection.status
             log.info("connect: start requested, status=\(self.status.rawValue)")
             if resources == .expired { refreshResources(bytes, directory: directory) }
@@ -183,6 +189,64 @@ final class AppModel {
             self.error = error.localizedDescription
         }
         #endif
+    }
+
+    /// Stops the tunnel. Connect-on-demand goes off first: left on, iOS would
+    /// start the tunnel again at once. Connecting turns it back on.
+    func disconnect() async {
+        guard let manager else { return }
+        if manager.isOnDemandEnabled {
+            manager.isOnDemandEnabled = false
+            do { try await manager.saveToPreferences() } catch {
+                Diagnostics.app.error("disconnect: turning off auto reconnect failed: \(Diagnostics.describe(error))")
+            }
+        }
+        manager.connection.stopVPNTunnel()
+    }
+
+    /// Takes effect at once while connected; otherwise on the next connect, so
+    /// turning it on while disconnected does not connect by itself.
+    func setAutoReconnect(_ enabled: Bool) async {
+        autoReconnect = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.autoReconnectKey)
+        Diagnostics.app.info("auto reconnect \(enabled ? "on" : "off")")
+        guard active, let manager else { return }
+        Self.configureOnDemand(manager, enabled: enabled)
+        do { try await manager.saveToPreferences() } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// One rule: stay connected on every network. With it enabled, iOS starts
+    /// the tunnel whenever it is down and the user did not stop it.
+    private static func configureOnDemand(_ manager: NETunnelProviderManager, enabled: Bool) {
+        let rule = NEOnDemandRuleConnect()
+        rule.interfaceTypeMatch = .any
+        manager.onDemandRules = [rule]
+        manager.isOnDemandEnabled = enabled
+    }
+
+    /// iOS keeps restarting an on-demand tunnel that fails to start (a broken
+    /// profile, missing files). After three failed starts within five minutes
+    /// automatic reconnection is turned off and the reason shown; connecting
+    /// by hand turns it on again.
+    private func stopRetryingFailedStarts() {
+        guard let manager else { return }
+        Task {
+            // The system may have changed it (turning the VPN off in Settings).
+            try? await manager.loadFromPreferences()
+            guard manager.isOnDemandEnabled else { return }
+            let failures = StartFailures.recent(within: 300)
+            guard failures.count >= 3, let last = failures.last else { return }
+            manager.isOnDemandEnabled = false
+            do {
+                try await manager.saveToPreferences()
+                Diagnostics.app.error("auto reconnect paused after \(failures.count) failed starts: \(last.reason)")
+                self.error = "VPN 连续 \(failures.count) 次启动失败，已暂停自动重连：\(last.reason)"
+            } catch {
+                Diagnostics.app.error("pausing auto reconnect failed: \(Diagnostics.describe(error))")
+            }
+        }
     }
 
     /// An encrypted file waiting for its password; the UI prompts while this is set.
@@ -362,7 +426,7 @@ final class AppModel {
     /// Stops the tunnel and starts it again so changed rules take effect.
     func reconnect() async {
         guard active else { return }
-        manager?.connection.stopVPNTunnel()
+        await disconnect()
         for _ in 0..<50 where status != .disconnected && status != .invalid {
             try? await Task.sleep(for: .milliseconds(200))
         }

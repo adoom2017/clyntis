@@ -158,6 +158,15 @@ private struct ProfilesView: View {
                 } footer: {
                     Text("对所有配置生效，优先于配置文件自身的规则和设置")
                 }
+                Section {
+                    Toggle(isOn: Binding(get: { model.autoReconnect },
+                                         set: { enabled in Task { await model.setAutoReconnect(enabled) } })) {
+                        Label("断开后自动重连", systemImage: "arrow.clockwise.circle")
+                    }
+                } footer: {
+                    Text("VPN 意外断开（异常退出、被系统结束、网络恢复或重启手机）后由系统自动重新连接。"
+                         + "在 App 里断开不会触发；在系统设置里关闭 VPN 时，系统通常也会暂停自动重连。")
+                }
                 if model.profiles.isEmpty {
                     ContentUnavailableView("还没有配置", systemImage: "doc.badge.plus",
                                            description: Text("点右上角 + 导入 Clash YAML 文件或链接"))

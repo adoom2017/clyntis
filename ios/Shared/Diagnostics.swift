@@ -63,3 +63,42 @@ struct DiagnosticLog {
         LogFile.shared.append(level: "error", source: category, message: message)
     }
 }
+
+/// Recent tunnel start failures, shared by the tunnel (which records them) and
+/// the app (which turns automatic reconnection off when starts keep failing,
+/// since iOS would otherwise retry a broken configuration indefinitely).
+enum StartFailures {
+    private static var url: URL? {
+        ProfileStore.sharedContainer()?.appendingPathComponent("tunnel-start-failures.json")
+    }
+
+    static func record(_ reason: String) {
+        guard let url else { return }
+        var entries = load()
+        entries.append(Entry(time: Date().timeIntervalSince1970, reason: reason))
+        if let data = try? JSONEncoder().encode(Array(entries.suffix(10))) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    static func clear() {
+        guard let url else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Failures within `interval` seconds, oldest first.
+    static func recent(within interval: TimeInterval) -> [Entry] {
+        let since = Date().timeIntervalSince1970 - interval
+        return load().filter { $0.time >= since }
+    }
+
+    struct Entry: Codable {
+        let time: TimeInterval
+        let reason: String
+    }
+
+    private static func load() -> [Entry] {
+        guard let url, let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONDecoder().decode([Entry].self, from: data)) ?? []
+    }
+}

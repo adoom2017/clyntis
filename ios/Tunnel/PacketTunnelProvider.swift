@@ -26,7 +26,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var droppedPackets = 0
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        log.info("start: begin memory=\(memory())")
+        // The app passes "source"; iOS starts the tunnel without options when
+        // connect-on-demand brings it back (after a crash, a kill or a reboot).
+        let source = (options?["source"] as? String) ?? "system (on demand)"
+        log.info("start: begin source=\(source) memory=\(memory())")
         watchdog.reportPreviousSession()
         watchdog.start(watching: queue)
         queue.async {
@@ -91,6 +94,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                         if let error {
                             log.error("start: network settings failed: \(Diagnostics.describe(error))")
+                            StartFailures.record("network settings: \(error.localizedDescription)")
                             self.shutdown()
                             completionHandler(error)
                             return
@@ -99,11 +103,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         self.drainPackets()
                         self.watchCore()
                         log.info("start: tunnel up memory=\(memory())")
+                        StartFailures.clear()
                         completionHandler(nil)
                     }
                 }
             } catch {
                 log.error("start: failed at \(step): \(Diagnostics.describe(error)) memory=\(memory())")
+                StartFailures.record("\(step): \(error.localizedDescription)")
                 self.shutdown()
                 completionHandler(error)
             }
