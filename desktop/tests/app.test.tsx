@@ -425,14 +425,13 @@ describe("desktop workflows", () => {
           exit: [{ ip: "203.0.113.9", country: "Japan", asn: "AS64500" }],
           node: "HK 01",
           matched: "MATCH,Proxy",
+          verdict: "ok",
           routed: {
             resolvers: [{ ip: "198.51.100.53", country: "Japan", asn: "" }],
-            conclusion: "DNS is not leaking.",
             error: null,
           },
           local: {
             resolvers: [{ ip: "192.0.2.1", country: "China", asn: "" }],
-            conclusion: "DNS may be leaking.",
             error: null,
           },
         };
@@ -459,7 +458,7 @@ describe("desktop workflows", () => {
     fireEvent.click(screen.getByRole("button", { name: "在线检测" }));
     expect(await screen.findByText("198.51.100.53")).toBeInTheDocument();
     expect(screen.getByText("未发现泄露")).toBeInTheDocument();
-    expect(screen.getByText("可能存在泄露")).toBeInTheDocument();
+    expect(screen.getByText("本地解析由这些服务器完成")).toBeInTheDocument();
   });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");

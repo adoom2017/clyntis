@@ -247,7 +247,6 @@ export interface LeakServer {
 }
 export interface LeakProbe {
   resolvers: LeakServer[];
-  conclusion: string | null;
   error: string | null;
 }
 /** Online test through bash.ws (`POST /dns/leak/test`). */
@@ -256,6 +255,9 @@ export interface DnsLeakTest {
   /** Node and rule bash.ws traffic uses; the test reflects that route. */
   node: string;
   matched: string;
+  /** Whether proxied names reached the core's own upstreams: `direct` when
+   * bash.ws is not proxied, `unknown` when a probe saw no resolvers. */
+  verdict: "leak" | "ok" | "direct" | "unknown";
   /** Resolvers seen when connecting like an app (through the rules). */
   routed: LeakProbe;
   /** Resolvers behind the core's own upstreams. */

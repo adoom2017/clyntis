@@ -49,8 +49,6 @@ pub struct LeakServer {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct LeakProbe {
     pub resolvers: Vec<LeakServer>,
-    /// bash.ws's verdict, comparing these resolvers with the exit address.
-    pub conclusion: Option<String>,
     pub error: Option<String>,
 }
 
@@ -62,6 +60,10 @@ pub struct DnsLeakTest {
     /// The node and rule bash.ws traffic uses: the test reflects that route.
     pub node: String,
     pub matched: String,
+    /// `leak` (a proxied name reached the core's own upstreams), `ok`,
+    /// `direct` (bash.ws is not proxied: nothing to leak from) or `unknown`
+    /// (a probe saw no resolvers).
+    pub verdict: &'static str,
     /// Names connected to like an app would: through the matching rule, so a
     /// proxy resolves them remotely unless a rule resolves them first.
     pub routed: LeakProbe,
@@ -96,8 +98,33 @@ fn listed(items: impl IntoIterator<Item = String>) -> Vec<String> {
     shown
 }
 
-/// bash.ws's `?json` result: entries typed `ip` (the exit), `dns` (a
-/// resolver) and `conclusion`.
+/// Whether names connected to through a proxy reached the core's own
+/// upstreams: a routed resolver with a local resolver's address, or from its
+/// network in the same country (resolvers answer from pools of addresses).
+/// bash.ws's own conclusion compares resolvers with the exit instead, and so
+/// flags every proxy server that uses a public resolver.
+fn verdict(node: &str, routed: &LeakProbe, local: &LeakProbe) -> &'static str {
+    if node == "DIRECT" {
+        return "direct";
+    }
+    if routed.resolvers.is_empty() || local.resolvers.is_empty() {
+        return "unknown";
+    }
+    let upstream = |server: &LeakServer| {
+        local.resolvers.iter().any(|own| {
+            own.ip == server.ip
+                || (!own.asn.is_empty() && own.asn == server.asn && own.country == server.country)
+        })
+    };
+    if routed.resolvers.iter().any(upstream) {
+        "leak"
+    } else {
+        "ok"
+    }
+}
+
+/// bash.ws's `?json` result: entries typed `ip` (the exit) and `dns` (a
+/// resolver); its `conclusion` is not used (see `verdict`).
 fn parse_result(body: &[u8]) -> Result<(Vec<LeakServer>, LeakProbe)> {
     let value: serde_json::Value =
         serde_json::from_slice(body).context("bash.ws 返回了无效的结果")?;
@@ -128,9 +155,6 @@ fn parse_result(body: &[u8]) -> Result<(Vec<LeakServer>, LeakProbe)> {
         match entry.get("type").and_then(|v| v.as_str()) {
             Some("ip") if !exit.contains(&server) => exit.push(server),
             Some("dns") if !probe.resolvers.contains(&server) => probe.resolvers.push(server),
-            Some("conclusion") => {
-                probe.conclusion = Some(server.ip).filter(|c| !c.is_empty());
-            }
             _ => {}
         }
     }
@@ -289,6 +313,7 @@ impl Core {
         }
         Ok(DnsLeakTest {
             exit,
+            verdict: verdict(&route.node, &routed, &local),
             node: route.node,
             matched: route.rule.unwrap_or(route.matched),
             routed,
@@ -431,10 +456,43 @@ mod tests {
         assert_eq!(exit[0].country, "Japan");
         assert_eq!(probe.resolvers.len(), 2);
         assert_eq!(probe.resolvers[1].asn, "");
-        assert_eq!(probe.conclusion.as_deref(), Some("DNS is not leaking."));
         let (_, failed) =
             parse_result(br#"{"error":"No DNS servers found. Try again..."}"#).unwrap();
         assert!(failed.error.is_some() && failed.resolvers.is_empty());
         assert!(parse_result(b"<html>").is_err());
+    }
+
+    #[test]
+    fn proxied_names_leak_only_when_the_core_upstreams_see_them() {
+        let server = |ip: &str, country: &str, asn: &str| LeakServer {
+            ip: ip.into(),
+            country: country.into(),
+            asn: asn.into(),
+        };
+        let probe = |resolvers| LeakProbe {
+            resolvers,
+            error: None,
+        };
+        let local = probe(vec![
+            server("121.196.194.72", "China", "AS37963 Alibaba"),
+            server("122.228.2.4", "China", "AS134771 Wenzhou"),
+        ]);
+        // A proxy server's public resolver: bash.ws calls this a leak.
+        let remote = probe(vec![server(
+            "104.23.250.71",
+            "United States",
+            "AS13335 CloudFlare",
+        )]);
+        assert_eq!(verdict("vless", &remote, &local), "ok");
+        assert_eq!(verdict("DIRECT", &local, &local), "direct");
+        // Another address from an upstream's pool.
+        let leaked = probe(vec![
+            server("104.23.250.71", "United States", "AS13335 CloudFlare"),
+            server("121.196.198.190", "China", "AS37963 Alibaba"),
+        ]);
+        assert_eq!(verdict("vless", &leaked, &local), "leak");
+        let unnamed = probe(vec![server("122.228.2.4", "", "")]);
+        assert_eq!(verdict("vless", &unnamed, &local), "leak");
+        assert_eq!(verdict("vless", &remote, &probe(Vec::new())), "unknown");
     }
 }

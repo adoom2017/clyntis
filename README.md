@@ -28,7 +28,9 @@ replacement for every protocol or configuration option.
   (`GET /dns/leak`). An online test (`POST /dns/leak/test`, about 30 s) asks
   bash.ws which resolvers looked up random names, along two paths: connecting
   like an app (through the rules) and through the core's own upstreams, beside
-  the exit address. C ABI: `meta_dns_leak_v1`; the apps show both on the rules
+  the exit address. Proxied names leak when the first path's resolvers
+  include the second's (same address, or same network and country); bash.ws's
+  own verdict, which compares resolvers with the exit, is not used. C ABI: `meta_dns_leak_v1`; the apps show both on the rules
   page. The online test sends random names to bash.ws and reveals the exit
   and resolver addresses to it.
 - **Ad blocking** (`adblock` section, written by the apps' settings): domain

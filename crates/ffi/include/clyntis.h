@@ -139,7 +139,7 @@ int32_t meta_test_route_v1(meta_handle handle, const uint8_t *json, size_t lengt
     uint8_t *buffer, size_t capacity, size_t *output_length);
 /* DNS leak detection as JSON: {"audit":{leaking,findings[]}} for online=0
  * (immediate); with online=1 also "test" (bash.ws: exit, node, matched,
- * routed and local resolvers). online=1 blocks up to ~30 s: never on the
+ * verdict, routed and local resolvers). online=1 blocks up to ~30 s: never on the
  * packet path. */
 int32_t meta_dns_leak_v1(meta_handle handle, uint32_t online,
     uint8_t *buffer, size_t capacity, size_t *output_length);

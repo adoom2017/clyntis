@@ -668,7 +668,6 @@ struct DnsLeakResult: Decodable {
     }
     struct Probe: Decodable {
         let resolvers: [Server]
-        let conclusion: String?
         let error: String?
     }
     struct Test: Decodable {
@@ -676,6 +675,8 @@ struct DnsLeakResult: Decodable {
         /// Node and rule bash.ws traffic uses; the test reflects that route.
         let node: String
         let matched: String
+        /// leak, ok, direct (bash.ws not proxied) or unknown (no resolvers seen).
+        let verdict: String
         /// Resolvers seen when connecting like an app, and behind the core's upstreams.
         let routed: Probe
         let local: Probe

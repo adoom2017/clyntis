@@ -2452,27 +2452,38 @@ function RouteTester({
   );
 }
 const findingLevelText = { risk: "泄露", warning: "注意", info: "提示" };
-function leakConclusion(probe: LeakProbe) {
-  if (probe.error) return probe.error;
-  const text = probe.conclusion ?? "";
-  if (/not leaking/i.test(text)) return "未发现泄露";
-  if (/leak/i.test(text)) return "可能存在泄露";
-  return text || "没有结果";
-}
-function LeakResolvers({ title, probe }: { title: string; probe: LeakProbe }) {
+const leakVerdictText = {
+  leak: "存在泄露：本地上游看到了走代理的域名",
+  ok: "未发现泄露",
+  direct: "直连，无代理路径可检查",
+  unknown: "无法判断",
+};
+function LeakResolvers({
+  title,
+  probe,
+  verdict,
+}: {
+  title: string;
+  probe: LeakProbe;
+  verdict?: DnsLeakTest["verdict"];
+}) {
+  const status =
+    probe.error ??
+    (verdict
+      ? leakVerdictText[verdict]
+      : probe.resolvers.length
+        ? "本地解析由这些服务器完成"
+        : "没有结果");
   return (
     <div className="leak-probe">
       <div className="leak-probe-title">
         <strong>{title}</strong>
         <span
           className={
-            probe.error ||
-            /may be leaking|leak detected/i.test(probe.conclusion ?? "")
-              ? "danger-text"
-              : "muted"
+            probe.error || verdict === "leak" ? "danger-text" : "muted"
           }
         >
-          {leakConclusion(probe)}
+          {status}
         </span>
       </div>
       {probe.resolvers.map((server) => (
@@ -2597,7 +2608,11 @@ function DnsLeakPanel({
               ? "，结果反映直连时的情况；让 bash.ws 走代理后再测可检查代理路径。"
               : "。"}
           </p>
-          <LeakResolvers title="应用访问时的解析器" probe={test.routed} />
+          <LeakResolvers
+            title="应用访问时的解析器"
+            probe={test.routed}
+            verdict={test.verdict}
+          />
           <LeakResolvers title="内核上游 DNS 的解析器" probe={test.local} />
         </div>
       )}

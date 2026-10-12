@@ -252,7 +252,7 @@ private struct DnsLeakSection: View {
                 Text("bash.ws 当前经「\(test.node)」（\(test.matched)）访问"
                      + (test.node == "DIRECT" ? "，结果反映直连时的情况。" : "。"))
                     .font(.caption).foregroundStyle(.secondary)
-                probe("应用访问时的解析器", test.routed)
+                probe("应用访问时的解析器", test.routed, verdict: test.verdict)
                 probe("内核上游 DNS 的解析器", test.local)
             }
         } header: {
@@ -279,19 +279,24 @@ private struct DnsLeakSection: View {
         [server.country, server.asn].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
-    private func probe(_ title: String, _ probe: DnsLeakResult.Probe) -> some View {
-        let conclusion = probe.conclusion ?? ""
-        let leaking = probe.error != nil || conclusion.localizedCaseInsensitiveContains("may be leaking")
-            || conclusion.localizedCaseInsensitiveContains("leak detected")
-        let verdict = probe.error
-            ?? (conclusion.localizedCaseInsensitiveContains("not leaking") ? "未发现泄露"
-                : conclusion.localizedCaseInsensitiveContains("leak") ? "可能存在泄露"
-                : conclusion.isEmpty ? "没有结果" : conclusion)
+    private static let verdictText = [
+        "leak": "存在泄露：本地上游看到了走代理的域名",
+        "ok": "未发现泄露",
+        "direct": "直连，无代理路径可检查",
+        "unknown": "无法判断",
+    ]
+
+    /// `verdict` judges the routed probe; the local one only lists who resolves locally.
+    private func probe(_ title: String, _ probe: DnsLeakResult.Probe, verdict: String? = nil) -> some View {
+        let leaking = probe.error != nil || verdict == "leak"
+        let status = probe.error
+            ?? verdict.map { Self.verdictText[$0] ?? $0 }
+            ?? (probe.resolvers.isEmpty ? "没有结果" : "本地解析由这些服务器完成")
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title).font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(verdict).font(.caption).foregroundStyle(leaking ? .red : .secondary)
+                Text(status).font(.caption).foregroundStyle(leaking ? .red : .secondary)
             }
             ForEach(probe.resolvers, id: \.ip) { server in
                 HStack(alignment: .firstTextBaseline) {
