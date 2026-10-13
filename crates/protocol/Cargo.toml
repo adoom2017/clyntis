@@ -1,13 +1,13 @@
 [package]
-name = "meta-protocol"
+name = "clyntis-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 [features]
 fuzzing = []
 [dependencies]
-meta-config.workspace = true
-meta-platform.workspace = true
+clyntis-config.workspace = true
+clyntis-platform.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

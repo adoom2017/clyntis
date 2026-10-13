@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
-meta-core.workspace = true
-meta-runtime.workspace = true
+clyntis-core.workspace = true
+clyntis-runtime.workspace = true
 tokio-util.workspace = true
-meta-config.workspace = true
-meta-platform.workspace = true
+clyntis-config.workspace = true
+clyntis-platform.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive", "env"] }

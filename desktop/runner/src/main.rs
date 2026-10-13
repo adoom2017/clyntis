@@ -60,13 +60,13 @@ async fn run() -> Result<()> {
         "unsafe runtime paths"
     );
     if config.tun.enable {
-        meta_runtime::recover(&directory)?;
+        clyntis_runtime::recover(&directory)?;
     }
     let proxy_path = directory.join("system-proxy.json");
     let mut proxy = clyntis_desktop_service::system_proxy::ProxyGuard::recover(proxy_path)?;
     let stop = CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let run = meta_runtime::run(config, stop.clone(), Some(ready_tx));
+    let run = clyntis_runtime::run(config, stop.clone(), Some(ready_tx));
     tokio::pin!(run);
     let ready = tokio::select! {
         result = &mut run => { result?; anyhow::bail!("core exited before ready"); },

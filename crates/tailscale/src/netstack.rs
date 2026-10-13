@@ -1,7 +1,7 @@
 //! Userspace TCP/IP for outbound connections from this node's tailnet
 //! addresses. IP packets go to and come from the WireGuard router.
 use anyhow::{Result, bail};
-use meta_protocol::BoxStream;
+use clyntis_protocol::BoxStream;
 use smoltcp::{
     iface::{Config, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},

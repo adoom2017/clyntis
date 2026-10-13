@@ -1,10 +1,10 @@
 //! Ad blocking at run time: the compiled lists, the allowlist, the endpoints
 //! of resolvers that bypass DNS filtering, and counters.
-use ipnet::IpNet;
-use meta_config::{
+use clyntis_config::{
     adblock::{Adblock, HTTPDNS_ADDRESSES, HTTPDNS_DOMAINS, HTTPDNS_PORTS},
     rule::{DomainSet, DomainSetBuilder},
 };
+use ipnet::IpNet;
 use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
@@ -76,7 +76,7 @@ impl Endpoints {
         }
         Self {
             domains: domains.build(),
-            // Checked by meta-config's tests.
+            // Checked by clyntis-config's tests.
             addresses: HTTPDNS_ADDRESSES
                 .iter()
                 .filter_map(|net| net.parse().ok())
@@ -177,7 +177,7 @@ fn allow_set(patterns: &[String]) -> DomainSet {
     let mut builder = DomainSetBuilder::default();
     for pattern in patterns {
         // Validated with the configuration; skip anything else defensively.
-        let _ = meta_config::adblock::allow_pattern(&mut builder, pattern);
+        let _ = clyntis_config::adblock::allow_pattern(&mut builder, pattern);
     }
     builder.build()
 }

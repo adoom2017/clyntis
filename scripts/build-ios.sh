@@ -45,9 +45,9 @@ mkdir -p "$target_dir"
 target_dir=$(cd "$target_dir" && pwd)
 for target in aarch64-apple-ios aarch64-apple-ios-sim; do
     if [[ $configuration == release ]]; then
-        cargo build -p meta-ffi --target "$target" --target-dir "$target_dir" --locked --offline --release
+        cargo build -p clyntis-ffi --target "$target" --target-dir "$target_dir" --locked --offline --release
     else
-        cargo build -p meta-ffi --target "$target" --target-dir "$target_dir" --locked --offline
+        cargo build -p clyntis-ffi --target "$target" --target-dir "$target_dir" --locked --offline
     fi
 done
 headers="$workspace/ios/build/core-headers"
@@ -57,8 +57,8 @@ printf 'module ClyntisCore {\n  header "clyntis.h"\n  export *\n}\n' > "$headers
 output="$workspace/ios/Frameworks/ClyntisCore.xcframework"
 if [[ -d $output ]]; then rm -rf "$output"; fi
 xcodebuild -create-xcframework \
-    -library "$target_dir/aarch64-apple-ios/$configuration/libmeta_ffi.a" -headers "$headers" \
-    -library "$target_dir/aarch64-apple-ios-sim/$configuration/libmeta_ffi.a" -headers "$headers" \
+    -library "$target_dir/aarch64-apple-ios/$configuration/libclyntis_ffi.a" -headers "$headers" \
+    -library "$target_dir/aarch64-apple-ios-sim/$configuration/libclyntis_ffi.a" -headers "$headers" \
     -output "$output"
 if [[ $generate_project == true ]]; then
     xcodegen generate --spec ios/project.yml

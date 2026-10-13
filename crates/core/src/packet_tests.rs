@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use meta_config::Config as CoreConfig;
+use clyntis_config::Config as CoreConfig;
 use std::net::SocketAddr;
 use tokio::sync::Mutex;
 
@@ -167,7 +167,7 @@ async fn raw_ip_tcp_udp_ipv4_ipv6_and_half_close() {
                 let (device, host_io) = pair();
                 let mut config = CoreConfig::default();
                 config.tun.enable = true;
-                let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+                let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
                 let running = core.start_with_packets(Some(device)).await.unwrap();
                 let payload: Vec<u8> = (0..if tcp { 131072 } else { 4000 })
                     .map(|n| (n % 251) as u8)
@@ -231,7 +231,7 @@ async fn packet_dns_hijack_returns_fake_ip_without_upstream() {
         let (device, host_io) = pair();
         let mut config = CoreConfig::default();
         config.tun.enable = true;
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let running = core.start_with_packets(Some(device)).await.unwrap();
         let mut query = hickory_proto::op::Message::new();
         query.set_id(42).add_query(hickory_proto::op::Query::query(
@@ -269,7 +269,7 @@ async fn oversized_ipv6_reply_does_not_stop_packet_delivery() {
         let (device, host_io) = pair();
         let mut config = CoreConfig::default();
         config.tun.enable = true;
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let running = core.start_with_packets(Some(device)).await.unwrap();
         let socket = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
         let target = socket.local_addr().unwrap();
@@ -295,7 +295,7 @@ async fn udp_upload_does_not_cancel_a_partial_vless_response() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = CoreConfig::parse(format!("proxies:\n- name: vless\n  type: vless\n  server: 127.0.0.1\n  port: {}\n  uuid: 11223344-5566-7788-99aa-bbccddeeff00\nrules: ['MATCH,vless']\n", listener.local_addr().unwrap().port()).as_bytes()).unwrap();
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let flow = Flow { source: "10.0.0.2:12345".parse().unwrap(), target: "192.0.2.1:9999".parse().unwrap(), tcp: false };
         let (input, receiver) = mpsc::channel(16); let (output, mut replies) = mpsc::channel(16);
         let session = tokio::spawn(udp_session(core.clone(), flow, receiver, output));
@@ -320,7 +320,7 @@ async fn tun_sse_resumes_after_six_minutes_with_tcp_keepalive() {
     let (device, host_io) = pair();
     let mut config = CoreConfig::default();
     config.tun.enable = true;
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let running = core.start_with_packets(Some(device)).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
@@ -376,7 +376,7 @@ async fn tun_download_keeps_up_with_sparse_host_acks() {
     let (device, host_io) = pair();
     let mut config = CoreConfig::default();
     config.tun.enable = true;
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let running = core.start_with_packets(Some(device)).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
@@ -520,7 +520,7 @@ async fn rejected_udp_gets_port_unreachable_at_once() {
         let mut config = CoreConfig::default();
         config.tun.enable = true;
         config.rules = vec!["DST-PORT,443,REJECT".into(), "MATCH,DIRECT".into()];
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let running = core.start_with_packets(Some(device)).await.unwrap();
         let app = [10, 0, 0, 2];
         let remote = [203, 0, 113, 9];

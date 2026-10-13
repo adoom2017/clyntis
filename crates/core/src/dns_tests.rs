@@ -4,7 +4,7 @@ use super::*;
 fn restores_valid_fake_entries_alongside_legacy_url_label() {
     let resolver = Resolver::new(
         Dns::default(),
-        std::sync::Arc::new(meta_platform::DefaultHooks),
+        std::sync::Arc::new(clyntis_platform::DefaultHooks),
     );
     let valid_ip = resolver.fake_address("persist.test", false).unwrap();
     let mut entries = resolver.export_fake();
@@ -14,7 +14,7 @@ fn restores_valid_fake_entries_alongside_legacy_url_label() {
     ));
     let next = Resolver::new(
         Dns::default(),
-        std::sync::Arc::new(meta_platform::DefaultHooks),
+        std::sync::Arc::new(clyntis_platform::DefaultHooks),
     );
     next.import_fake(&entries).unwrap();
     assert_eq!(next.original(valid_ip).as_deref(), Some("persist.test"));
@@ -29,7 +29,7 @@ fn restores_valid_fake_entries_alongside_legacy_url_label() {
 async fn url_label_in_wire_query_cannot_poison_fake_ip_profile() {
     let resolver = Resolver::new(
         Dns::default(),
-        std::sync::Arc::new(meta_platform::DefaultHooks),
+        std::sync::Arc::new(clyntis_platform::DefaultHooks),
     );
     let name = Name::from_labels([b"https://im".as_slice(), b"dingtalk", b"com"]).unwrap();
     let mut query = Message::new();
@@ -90,19 +90,20 @@ async fn policy_proxy_resolver_hosts_and_fake_persistence() {
             proxy_server_nameserver: vec![address.clone()],
             ..Dns::default()
         };
-        config
-            .nameserver_policy
-            .insert("+.policy.test".into(), meta_config::Strings::One(address));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        config.nameserver_policy.insert(
+            "+.policy.test".into(),
+            clyntis_config::Strings::One(address),
+        );
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let resolver = Resolver::new(config.clone(), hooks.clone());
         let mut hosts = std::collections::BTreeMap::new();
         hosts.insert(
             "local.test".into(),
-            meta_config::Strings::One("192.0.2.8".into()),
+            clyntis_config::Strings::One("192.0.2.8".into()),
         );
         hosts.insert(
             "alias.test".into(),
-            meta_config::Strings::One("local.test".into()),
+            clyntis_config::Strings::One("local.test".into()),
         );
         resolver
             .configure(&hosts, &crate::resources::Resources::default())
@@ -173,7 +174,7 @@ async fn lookup_and_bootstrap_accept_names_without_final_dot() {
             ipv6: false,
             ..Dns::default()
         },
-        Arc::new(meta_platform::DefaultHooks),
+        Arc::new(clyntis_platform::DefaultHooks),
     );
     let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         let mut buffer = [0; 4096];
@@ -252,7 +253,7 @@ async fn cache_preserves_negative_answers_ttls_and_query_flags() {
                     udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
                 }
             }));
-            let resolver = Resolver::new(config, Arc::new(meta_platform::DefaultHooks));
+            let resolver = Resolver::new(config, Arc::new(clyntis_platform::DefaultHooks));
             for id in [10, 20] {
                 let reply = Message::from_vec(
                     &resolver
@@ -328,7 +329,7 @@ async fn exhausted_fake_pools_fail_without_overflow_or_mapping_reuse() {
                 fake_ip_range6: v6.parse().unwrap(),
                 ..Dns::default()
             },
-            Arc::new(meta_platform::DefaultHooks),
+            Arc::new(clyntis_platform::DefaultHooks),
         );
         for kind in [RecordType::A, RecordType::AAAA] {
             let mut query = request("exhausted.test", 1);
@@ -344,7 +345,7 @@ async fn exhausted_fake_pools_fail_without_overflow_or_mapping_reuse() {
             fake_ip_range: "198.18.0.0/30".parse().unwrap(),
             ..Dns::default()
         },
-        Arc::new(meta_platform::DefaultHooks),
+        Arc::new(clyntis_platform::DefaultHooks),
     );
     let allocated = resolver.fake_address("first.test", false).unwrap();
     assert!(resolver.fake_address("second.test", false).is_err());
@@ -362,7 +363,7 @@ fn fake_ip_capacity_evicts_the_least_recently_queried_without_reusing_addresses(
             fake_ip_range: "198.18.0.0/29".parse().unwrap(),
             ..Dns::default()
         },
-        Arc::new(meta_platform::DefaultHooks),
+        Arc::new(clyntis_platform::DefaultHooks),
     );
     resolver.set_fake_capacity(3);
     let a = resolver.fake_address("a.test", false).unwrap();
@@ -389,7 +390,7 @@ fn fake_ip_capacity_evicts_the_least_recently_queried_without_reusing_addresses(
             fake_ip_range: "198.18.0.0/29".parse().unwrap(),
             ..Dns::default()
         },
-        Arc::new(meta_platform::DefaultHooks),
+        Arc::new(clyntis_platform::DefaultHooks),
     );
     next.set_fake_capacity(2);
     next.import_fake(&resolver.export_fake()).unwrap();

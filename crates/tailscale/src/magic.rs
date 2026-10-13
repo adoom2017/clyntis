@@ -829,7 +829,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meta_protocol::BoxStream;
+    use clyntis_protocol::BoxStream;
 
     struct Loopback;
     #[async_trait::async_trait]

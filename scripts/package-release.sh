@@ -130,14 +130,14 @@ if $explicit_target; then build_root="$build_root/$target"; fi
 build_root="$build_root/release"
 
 case "$target" in
-    *apple*) artifacts=(clyntis libmeta_ffi.dylib libmeta_ffi.a) ;;
-    *) artifacts=(clyntis libmeta_ffi.so libmeta_ffi.a) ;;
+    *apple*) artifacts=(clyntis libclyntis_ffi.dylib libclyntis_ffi.a) ;;
+    *) artifacts=(clyntis libclyntis_ffi.so libclyntis_ffi.a) ;;
 esac
 for artifact in "${artifacts[@]}"; do
     cp "$build_root/$artifact" "$package_root/"
 done
 if [[ -n $codesign_identity ]]; then
-    for artifact in libmeta_ffi.dylib clyntis; do
+    for artifact in libclyntis_ffi.dylib clyntis; do
         codesign --force --sign "$codesign_identity" --options runtime --timestamp "$package_root/$artifact"
         codesign --verify --strict --verbose=2 "$package_root/$artifact"
     done

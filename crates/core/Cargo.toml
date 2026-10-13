@@ -1,13 +1,13 @@
 [package]
-name = "meta-core"
+name = "clyntis-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
-meta-config.workspace = true
-meta-protocol.workspace = true
-meta-platform.workspace = true
-meta-tailscale.workspace = true
+clyntis-config.workspace = true
+clyntis-protocol.workspace = true
+clyntis-platform.workspace = true
+clyntis-tailscale.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

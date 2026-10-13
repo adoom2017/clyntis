@@ -1,7 +1,7 @@
 //! Just enough HTTP/1.1 for Tailscale's endpoints: one request per connection,
 //! either read to the end or upgraded to another protocol.
 use anyhow::{Context, Result, bail, ensure};
-use meta_protocol::BoxStream;
+use clyntis_protocol::BoxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct Response {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use meta_core::{Core, Running};
-use meta_platform::{PacketIo, PlatformHooks};
+use clyntis_core::{Core, Running};
+use clyntis_platform::{PacketIo, PlatformHooks};
 use std::{
     cell::Cell,
     ffi::c_void,
@@ -130,11 +130,11 @@ enum Command {
         std::sync::mpsc::SyncSender<Result<u64, String>>,
     ),
     TestRoute(
-        meta_protocol::Target,
+        clyntis_protocol::Target,
         String,
-        std::sync::mpsc::SyncSender<Result<meta_core::RouteTest, String>>,
+        std::sync::mpsc::SyncSender<Result<clyntis_core::RouteTest, String>>,
     ),
-    DnsLeakTest(std::sync::mpsc::SyncSender<Result<meta_core::DnsLeakTest, String>>),
+    DnsLeakTest(std::sync::mpsc::SyncSender<Result<clyntis_core::DnsLeakTest, String>>),
     #[cfg(target_os = "android")]
     SetFd(
         std::os::fd::OwnedFd,
@@ -151,7 +151,7 @@ pub(crate) struct Handle {
     packet_queue_enabled: Arc<AtomicBool>,
 }
 impl Handle {
-    pub(crate) fn new(id: u64, config: meta_config::Config, hooks: HostHooks) -> Result<Self> {
+    pub(crate) fn new(id: u64, config: clyntis_config::Config, hooks: HostHooks) -> Result<Self> {
         #[cfg(target_os = "android")]
         ensure!(
             hooks.protect.is_some(),
@@ -242,7 +242,7 @@ impl Handle {
                                 let result = if running.is_some() || !owner.config.tun.enable {
                                     Err("TUN fd must be set before start with tun.enable=true".into())
                                 } else {
-                                    match meta_platform::native::NativeTun::from_owned_fd(fd) {
+                                    match clyntis_platform::native::NativeTun::from_owned_fd(fd) {
                                         Ok(device) => {
                                             queue_enabled.store(false, Ordering::Release);
                                             packets = Some(Arc::new(device));
@@ -302,9 +302,9 @@ impl Handle {
     /// resolves the name.
     pub(crate) fn test_route(
         &self,
-        target: meta_protocol::Target,
+        target: clyntis_protocol::Target,
         network: &str,
-    ) -> Result<meta_core::RouteTest> {
+    ) -> Result<clyntis_core::RouteTest> {
         let (reply, result) = std::sync::mpsc::sync_channel(1);
         self.commands
             .try_send(Command::TestRoute(target, network.to_owned(), reply))
@@ -315,7 +315,7 @@ impl Handle {
             .map_err(|e| anyhow::anyhow!(e))
     }
     /// The online DNS leak test; blocks the caller for up to ~30 seconds.
-    pub(crate) fn dns_leak_test(&self) -> Result<meta_core::DnsLeakTest> {
+    pub(crate) fn dns_leak_test(&self) -> Result<clyntis_core::DnsLeakTest> {
         let (reply, result) = std::sync::mpsc::sync_channel(1);
         self.commands
             .try_send(Command::DnsLeakTest(reply))

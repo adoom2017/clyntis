@@ -1,6 +1,6 @@
 //! Parses real downloaded lists: `ADBLOCK_LISTS=clash:a.yaml,adguard:b.txt
-//! cargo test -p meta-config --release --test adblock_lists -- --ignored --nocapture`
-use meta_config::{adblock::parse_list, rule::DomainSetBuilder};
+//! cargo test -p clyntis-config --release --test adblock_lists -- --ignored --nocapture`
+use clyntis_config::{adblock::parse_list, rule::DomainSetBuilder};
 
 #[test]
 #[ignore]

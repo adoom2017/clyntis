@@ -38,7 +38,7 @@ fn split_ed(path: &str, configured: usize, header: &str) -> (String, usize, Stri
 pub async fn connect(
     mut stream: BoxStream,
     authority: &str,
-    options: &meta_config::WsOptions,
+    options: &clyntis_config::WsOptions,
     early: &[u8],
 ) -> Result<(BoxStream, usize)> {
     let (mut path, max_early, early_header) = split_ed(
@@ -530,7 +530,7 @@ mod tests {
         });
         let mut headers = std::collections::BTreeMap::new();
         headers.insert("Host".into(), "front.example".into());
-        let options = meta_config::WsOptions {
+        let options = clyntis_config::WsOptions {
             path: "/ws".into(),
             headers,
             max_early_data: 4,
@@ -564,7 +564,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let options = meta_config::WsOptions {
+        let options = clyntis_config::WsOptions {
             v2ray_http_upgrade: true,
             v2ray_http_upgrade_fast_open: true,
             ..Default::default()

@@ -47,7 +47,7 @@ impl crate::Core {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("no NTP server address"))?;
-        let socket = meta_platform::udp_bind_for(
+        let socket = clyntis_platform::udp_bind_for(
             if address.is_ipv4() {
                 "0.0.0.0:0"
             } else {

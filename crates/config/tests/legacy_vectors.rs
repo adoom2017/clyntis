@@ -1,5 +1,5 @@
 //! Generated with Go crypto/aes + crypto/cipher using Alpha's key/IV rules.
-use meta_config::crypto::{decrypt, encrypt};
+use clyntis_config::crypto::{decrypt, encrypt};
 
 #[test]
 fn alpha_cfb128_golden_vectors() {

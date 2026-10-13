@@ -1,7 +1,7 @@
 //! Lossy import is explicit and confined to newly created profiles. Keep raw YAML
 //! values: serializing Config would discard credentials and provider URLs.
 use anyhow::{Context, Result, ensure};
-use meta_config::{Config, Group, Proxy, ProxyKind, RuleProvider};
+use clyntis_config::{Config, Group, Proxy, ProxyKind, RuleProvider};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
@@ -319,7 +319,7 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
             .enumerate()
         {
             let compatible = value.as_str().is_some_and(|raw| {
-                meta_config::rule::Rule::parse(raw).is_ok_and(|rule| {
+                clyntis_config::rule::Rule::parse(raw).is_ok_and(|rule| {
                     let mut references = vec![];
                     rule.matcher.references(&mut references);
                     names.contains(&rule.target)

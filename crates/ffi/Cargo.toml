@@ -1,15 +1,15 @@
 [package]
-name = "meta-ffi"
+name = "clyntis-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 [lib]
 crate-type = ["rlib", "staticlib", "cdylib"]
 [dependencies]
-meta-core.workspace = true
-meta-config.workspace = true
-meta-platform.workspace = true
-meta-protocol.workspace = true
+clyntis-core.workspace = true
+clyntis-config.workspace = true
+clyntis-platform.workspace = true
+clyntis-protocol.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }

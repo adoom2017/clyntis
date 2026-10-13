@@ -37,7 +37,7 @@ struct AppOverrides: Codable, Equatable {
     }
 }
 
-/// Ad blocking settings; the core expands presets (meta_config::adblock).
+/// Ad blocking settings; the core expands presets (clyntis_config::adblock).
 struct AdblockSettings: Codable, Equatable {
     struct List: Codable, Equatable, Hashable {
         var name: String

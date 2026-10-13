@@ -2,8 +2,8 @@
 //! would leave through, without opening a connection.
 use crate::{Core, Trace};
 use anyhow::{Context, Result, ensure};
-use meta_config::Mode;
-use meta_protocol::Target;
+use clyntis_config::Mode;
+use clyntis_protocol::Target;
 use serde::Serialize;
 use std::net::IpAddr;
 
@@ -119,9 +119,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_proxied_name_resolved_by_an_ip_rule_is_flagged() {
-        let config = meta_config::Config::parse(b"hosts: {'leak.test': 10.9.9.9}\nproxy-groups:\n- {name: Proxy, type: select, proxies: [REJECT]}\nrules: ['DOMAIN,plain.test,Proxy', 'IP-CIDR,192.0.2.0/24,DIRECT', 'MATCH,Proxy']\n").unwrap();
+        let config = clyntis_config::Config::parse(b"hosts: {'leak.test': 10.9.9.9}\nproxy-groups:\n- {name: Proxy, type: select, proxies: [REJECT]}\nrules: ['DOMAIN,plain.test,Proxy', 'IP-CIDR,192.0.2.0/24,DIRECT', 'MATCH,Proxy']\n").unwrap();
         let core =
-            crate::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks)).unwrap();
+            crate::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let test = |host: &str| {
             let core = core.clone();
             let target = parse_test_target(host, None).unwrap();

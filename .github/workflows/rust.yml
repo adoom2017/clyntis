@@ -28,6 +28,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all -- --check
+      - name: Versions follow the desktop app
+        if: runner.os == 'Linux'
+        run: bash scripts/set-version.sh --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - name: Build local desktop package (Windows)

@@ -1,6 +1,6 @@
 //! Fixed-version external oracle. It is never linked or launched by the product.
 use anyhow::{Context, Result, ensure};
-use meta_protocol::{Datagram, Target, vless, xudp};
+use clyntis_protocol::{Datagram, Target, vless, xudp};
 use std::{
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -157,7 +157,7 @@ async fn scenario() -> Result<()> {
         });
         for (index, port) in ports.iter().copied().enumerate() {
             eprintln!("TCP host={host} tls={}", index == 1);
-            let proxy: meta_config::Proxy = serde_json::from_value(
+            let proxy: clyntis_config::Proxy = serde_json::from_value(
                 serde_json::json!({"name":"test","type":"vless","server":"127.0.0.1","port":port,"uuid":id,"tls":index==1,"servername":"localhost","skip-cert-verify":true}),
             )?;
             let target = Target::new(host, tcp_port)?;
@@ -271,7 +271,7 @@ async fn scenario() -> Result<()> {
             }
         }
         eprintln!("XUDP pooled flows host={host}");
-        let proxy: meta_config::Proxy = serde_json::from_value(serde_json::json!({
+        let proxy: clyntis_config::Proxy = serde_json::from_value(serde_json::json!({
             "name":"xudp-pool-oracle","type":"vless","server":"127.0.0.1",
             "port":ports[0],"uuid":id
         }))?;
@@ -309,7 +309,7 @@ async fn scenario() -> Result<()> {
             } else {
                 value["grpc-opts"] = serde_json::json!({"grpc-service-name":"custom"});
             }
-            let proxy: meta_config::Proxy = serde_json::from_value(value)?;
+            let proxy: clyntis_config::Proxy = serde_json::from_value(value)?;
             let target = Target::new(host, tcp_port)?;
             let socket = TcpStream::connect(("127.0.0.1", port)).await?;
             let mut stream = match tokio::time::timeout(

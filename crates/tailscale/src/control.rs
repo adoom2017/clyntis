@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use bytes::Bytes;
-use meta_protocol::BoxStream;
+use clyntis_protocol::BoxStream;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 

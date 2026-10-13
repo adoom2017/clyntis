@@ -234,7 +234,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meta_protocol::BoxStream;
+    use clyntis_protocol::BoxStream;
     use std::sync::Mutex;
 
     /// Hands out one end of an in-memory stream as the "TLS" connection.

@@ -30,7 +30,7 @@ $previousOracle = $env:XRAY_BIN
 Push-Location $workspace
 try {
     $env:XRAY_BIN = (Resolve-Path -LiteralPath $XrayPath).Path
-    cargo test -p meta-protocol --locked --offline --test xray_vless --test reality_interop -- --ignored --nocapture
+    cargo test -p clyntis-protocol --locked --offline --test xray_vless --test reality_interop -- --ignored --nocapture
     if ($LASTEXITCODE -ne 0) { throw 'VLESS interoperability tests failed.' }
 } finally {
     $env:XRAY_BIN = $previousOracle

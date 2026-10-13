@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, ValueEnum};
-use meta_config::{Config, ProxyKind, crypto};
+use clyntis_config::{Config, ProxyKind, crypto};
 #[cfg(target_os = "macos")]
-use meta_runtime::{detect_macos_egress, public_egress_targets};
+use clyntis_runtime::{detect_macos_egress, public_egress_targets};
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
@@ -208,9 +208,9 @@ fn write_output(args: &Args, action: Action, bytes: &[u8]) -> Result<()> {
 
 fn run(mut args: Args) -> Result<()> {
     if args.recover_tun {
-        meta_platform::desktop::recover(&args.directory)?;
+        clyntis_platform::desktop::recover(&args.directory)?;
         #[cfg(target_os = "macos")]
-        meta_platform::macos_dns::recover(&args.directory)?;
+        clyntis_platform::macos_dns::recover(&args.directory)?;
         return Ok(());
     }
     if args.action.is_some() && args.config.is_some() {
@@ -311,7 +311,7 @@ fn run(mut args: Args) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(meta_runtime::prefetch_resources(config))?;
+        runtime.block_on(clyntis_runtime::prefetch_resources(config))?;
         println!("Routing resource test successful");
         return Ok(());
     }
@@ -329,7 +329,7 @@ fn run(mut args: Args) -> Result<()> {
         .build()?;
     runtime.block_on(async {
         let stop = tokio_util::sync::CancellationToken::new();
-        let run = meta_runtime::run(config, stop.clone(), None);
+        let run = clyntis_runtime::run(config, stop.clone(), None);
         tokio::pin!(run);
         tokio::select! {
             result = &mut run => result,

@@ -175,7 +175,7 @@ extern "C" fn callback(
 
 pub(crate) fn install(
     ssl: &mut boring::ssl::Ssl,
-    options: &meta_config::Reality,
+    options: &clyntis_config::Reality,
     clock: &Arc<crate::tls::Clock>,
 ) -> Result<RealityGuard> {
     let public: [u8; 32] = URL_SAFE_NO_PAD

@@ -8,4 +8,4 @@ fi
 
 export XRAY_BIN=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-cargo test -p meta-protocol --locked --offline --test xray_vless --test reality_interop -- --ignored --nocapture
+cargo test -p clyntis-protocol --locked --offline --test xray_vless --test reality_interop -- --ignored --nocapture

@@ -11,8 +11,8 @@ path = "src/main.rs"
 [dependencies]
 clyntis-desktop-model.workspace = true
 clyntis-desktop-service.workspace = true
-meta-runtime.workspace = true
-meta-config.workspace = true
+clyntis-runtime.workspace = true
+clyntis-config.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

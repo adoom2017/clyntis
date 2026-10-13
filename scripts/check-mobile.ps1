@@ -24,11 +24,11 @@ try {
         foreach ($tool in @($env:CC_aarch64_linux_android, $env:CXX_aarch64_linux_android, $env:AR_aarch64_linux_android)) {
             if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) { throw "Missing Android NDK tool: $tool" }
         }
-        cargo build -p meta-ffi --target aarch64-linux-android @buildOptions
+        cargo build -p clyntis-ffi --target aarch64-linux-android @buildOptions
     } else {
         if (-not $IsMacOS) { throw 'iOS compilation requires macOS with Xcode and the iPhoneOS SDK.' }
         $env:IPHONEOS_DEPLOYMENT_TARGET = '12.0'
-        cargo build -p meta-ffi --target aarch64-apple-ios @buildOptions
+        cargo build -p clyntis-ffi --target aarch64-apple-ios @buildOptions
     }
     if ($LASTEXITCODE -ne 0) { throw 'Mobile core/FFI build failed.' }
 } finally {

@@ -6,8 +6,8 @@ use crate::{
     memory::{self, MIB},
 };
 use anyhow::{Result, ensure};
-use meta_platform::PacketIo;
-use meta_protocol::Target;
+use clyntis_platform::PacketIo;
+use clyntis_protocol::Target;
 use smoltcp::{
     iface::{Config, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
@@ -90,7 +90,7 @@ impl Budget {
     fn dns_idle(self) -> Duration {
         self.udp_idle.min(Duration::from_secs(15))
     }
-    fn for_config(config: &meta_config::Config) -> Self {
+    fn for_config(config: &clyntis_config::Config) -> Self {
         if config.internal_host_packet_io {
             Self::HOSTED
         } else {
@@ -970,7 +970,7 @@ mod budget_tests {
 
     #[test]
     fn hosted_tunnels_use_the_compact_budget() {
-        let mut config = meta_config::Config::default();
+        let mut config = clyntis_config::Config::default();
         assert_eq!(Budget::for_config(&config), Budget::DESKTOP);
         config.internal_host_packet_io = true;
         let hosted = Budget::for_config(&config);

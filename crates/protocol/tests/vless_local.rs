@@ -4,12 +4,12 @@ use boring::{
     ssl::{SslAcceptor, SslMethod, SslVersion},
     x509::X509,
 };
-use meta_config::Config;
-use meta_protocol::{Datagram, Target, vless, xudp};
+use clyntis_config::Config;
+use clyntis_protocol::{Datagram, Target, vless, xudp};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn proxy(tls: bool, insecure: bool) -> meta_config::Proxy {
+fn proxy(tls: bool, insecure: bool) -> clyntis_config::Proxy {
     Config::parse(format!("proxies:\n- name: test\n  type: vless\n  server: localhost\n  port: 443\n  uuid: 11223344-5566-7788-99aa-bbccddeeff00\n  tls: {tls}\n  skip-cert-verify: {insecure}\n  client-fingerprint: chrome\n").as_bytes()).unwrap().proxies.remove(0)
 }
 
@@ -113,7 +113,7 @@ async fn tcp_plain_and_tls_fragmented_reply_and_large_transfer() -> Result<()> {
                 let (client, server) = tokio::io::duplex(512 * 1024);
                 let server_config = tls_server();
                 let task = tokio::spawn(async move {
-                    let mut server: meta_protocol::BoxStream = if tls {
+                    let mut server: clyntis_protocol::BoxStream = if tls {
                         Box::new(tokio_boring::accept(&server_config, server).await?)
                     } else {
                         Box::new(server)

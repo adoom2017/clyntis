@@ -1,12 +1,12 @@
 [package]
-name = "meta-runtime"
+name = "clyntis-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
-meta-core.workspace = true
-meta-config.workspace = true
-meta-platform.workspace = true
+clyntis-core.workspace = true
+clyntis-config.workspace = true
+clyntis-platform.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

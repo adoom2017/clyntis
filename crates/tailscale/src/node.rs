@@ -12,8 +12,8 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, bail};
+use clyntis_protocol::BoxStream;
 use ipnet::IpNet;
-use meta_protocol::BoxStream;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, SocketAddr},

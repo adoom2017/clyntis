@@ -14,7 +14,7 @@ replacement for every protocol or configuration option.
 - **Routing:** rule/global/direct modes, select and url-test groups (a url-test
   group leaves a member as soon as it fails a round and re-tests right after a
   network change), domain/IP rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
-  profile (see `meta_config::custom`); a rule whose target or rule provider the
+  profile (see `clyntis_config::custom`); a rule whose target or rule provider the
   profile lacks is skipped with a reason instead of failing the profile.
   A route test shows which rule a domain, IP address or URL matches and the
   node it would leave through (each group's selection along the way), without
@@ -175,6 +175,11 @@ pwsh -File scripts/check-boringssl-toolchain.ps1 build -p clyntis --release --lo
 The pinned `Cargo.lock` is used by these commands. Optional external protocol
 oracles and privileged TUN tests need their own environment and are not part of
 the basic run path.
+
+The desktop app's version (`desktop/package.json`) is the product version: the
+`clyntis-*` crates of both Cargo workspaces and the iOS app follow it.
+`bash scripts/set-version.sh 1.2.3` sets it everywhere, lockfiles included, and
+CI fails if `bash scripts/set-version.sh --check` finds any of them behind.
 
 ## Quick start
 
@@ -339,6 +344,6 @@ settings (`meta_overrides_apply_v1`), checks and prefetches routing resources
 (`meta_resources_state_v1`, `meta_prefetch_resources_v1`) and drains logs
 (`meta_drain_logs_v1`); every function documents its buffer contract in the
 header. For a separate host-library build, use
-`cargo build -p meta-ffi --release --locked`; mobile target builds use the
+`cargo build -p clyntis-ffi --release --locked`; mobile target builds use the
 `scripts/check-mobile.sh` or `scripts/check-mobile.ps1` helpers with the relevant
 SDK/NDK installed.

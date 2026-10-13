@@ -23,7 +23,7 @@ pub struct Settings {
     pub auto_connect: bool,
     pub subscription_interval_hours: u16,
     /// Values chosen here replace the profile's own (log level, IPv6, sniffing).
-    pub overrides: meta_config::overrides::Overrides,
+    pub overrides: clyntis_config::overrides::Overrides,
 }
 impl Default for Settings {
     fn default() -> Self {

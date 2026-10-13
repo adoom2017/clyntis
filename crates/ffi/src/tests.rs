@@ -40,7 +40,7 @@ fn decrypt_config_preserves_plaintext_and_caller_buffer_contract() {
         "1234567890123456789012345",
         "密码测试",
     ] {
-        let encoded = meta_config::crypto::encrypt(plaintext, password).unwrap();
+        let encoded = clyntis_config::crypto::encrypt(plaintext, password).unwrap();
         let wrapped = format!(" \n{}\r\n{}\t", &encoded[..16], &encoded[16..]);
         let mut length = 99;
         let mut short = [0xaa; 2];
@@ -172,9 +172,9 @@ fn encrypt_config_round_trips_through_decrypt() {
 
 #[test]
 fn decrypt_config_rejects_bad_password_and_invalid_input_without_plaintext() {
-    let valid = meta_config::crypto::encrypt(b"mode: direct\n", "correct").unwrap();
+    let valid = clyntis_config::crypto::encrypt(b"mode: direct\n", "correct").unwrap();
     let invalid =
-        meta_config::crypto::encrypt(b"unknown-field: private-secret\n", "correct").unwrap();
+        clyntis_config::crypto::encrypt(b"unknown-field: private-secret\n", "correct").unwrap();
     for (data, password) in [
         (valid.as_bytes(), "wrong"),
         (invalid.as_bytes(), "correct"),
@@ -574,7 +574,8 @@ fn custom_rules_validate_list_targets_and_apply() {
         OK
     );
     let applied: serde_json::Value = serde_json::from_slice(&buffer[..length]).unwrap();
-    let merged = meta_config::Config::parse(applied["yaml"].as_str().unwrap().as_bytes()).unwrap();
+    let merged =
+        clyntis_config::Config::parse(applied["yaml"].as_str().unwrap().as_bytes()).unwrap();
     assert_eq!(merged.rules, ["DOMAIN,ads.test,REJECT", "MATCH,Auto"]);
     assert_eq!(applied["skipped"][0]["rule"], "DOMAIN,x.test,Gone");
 }
@@ -599,7 +600,7 @@ fn overrides_replace_profile_settings() {
         },
         OK
     );
-    let merged = meta_config::Config::parse(&buffer[..length]).unwrap();
+    let merged = clyntis_config::Config::parse(&buffer[..length]).unwrap();
     assert_eq!(merged.log.log_level, "error");
     assert!(merged.ipv6);
     let invalid = br#"{"logLevel":"loud"}"#;
@@ -621,7 +622,7 @@ fn overrides_replace_profile_settings() {
 
 #[test]
 fn resource_state_reports_missing_files_without_parsing_them() {
-    let dir = std::env::temp_dir().join(format!("meta-ffi-state-{}", uuid_for_test()));
+    let dir = std::env::temp_dir().join(format!("clyntis-ffi-state-{}", uuid_for_test()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = b"geo-auto-update: true\nrules: ['GEOSITE,cn,DIRECT', 'MATCH,DIRECT']\n";
     let path = dir.to_str().unwrap().as_bytes();

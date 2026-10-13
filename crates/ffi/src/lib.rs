@@ -118,7 +118,7 @@ pub unsafe extern "C" fn meta_decrypt_config_v1(
             .copied()
             .filter(|byte| !byte.is_ascii_whitespace())
             .collect();
-        let plaintext = meta_config::crypto::decrypt(&ciphertext, password).map_err(|_| {
+        let plaintext = clyntis_config::crypto::decrypt(&ciphertext, password).map_err(|_| {
             anyhow::anyhow!("cannot decrypt configuration: check password and format")
         })?;
         ensure!(
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn meta_decrypt_config_v1(
             "decrypted configuration is empty or exceeds 16 MiB"
         );
         // CFB has no authentication tag. Never expose unvalidated plaintext.
-        meta_config::Config::parse(&plaintext).map_err(|_| {
+        clyntis_config::Config::parse(&plaintext).map_err(|_| {
             anyhow::anyhow!("cannot decrypt configuration: check password and format")
         })?;
         unsafe { output(&plaintext, buffer, capacity, length) }
@@ -153,8 +153,8 @@ pub unsafe extern "C" fn meta_encrypt_config_v1(
         let password = std::str::from_utf8(unsafe { input(password, password_len)? })?;
         ensure!(!password.is_empty(), "password is required");
         // Refuse to produce an export that could never be imported again.
-        meta_config::Config::parse(plaintext)?;
-        let encoded = meta_config::crypto::encrypt(plaintext, password)?;
+        clyntis_config::Config::parse(plaintext)?;
+        let encoded = clyntis_config::crypto::encrypt(plaintext, password)?;
         unsafe { output(encoded.as_bytes(), buffer, capacity, length) }
     })
 }
@@ -199,7 +199,7 @@ pub unsafe extern "C" fn meta_create_packet_tunnel_v1(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn meta_custom_rule_validate_v1(rule: *const u8, len: usize) -> i32 {
     boundary(|| {
-        meta_config::custom::validate(std::str::from_utf8(unsafe { input(rule, len)? })?)?;
+        clyntis_config::custom::validate(std::str::from_utf8(unsafe { input(rule, len)? })?)?;
         Ok(OK)
     })
 }
@@ -219,7 +219,7 @@ pub unsafe extern "C" fn meta_custom_rule_targets_v1(
 ) -> i32 {
     boundary(|| {
         let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
-        let targets = meta_config::custom::targets(yaml)?;
+        let targets = clyntis_config::custom::targets(yaml)?;
         unsafe { output(&serde_json::to_vec(&targets)?, buffer, capacity, length) }
     })
 }
@@ -243,7 +243,7 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
     boundary(|| {
         let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
         let rules: Vec<String> = serde_json::from_slice(unsafe { input(rules, rules_len)? })?;
-        let applied = meta_config::custom::apply(yaml, &rules)?;
+        let applied = clyntis_config::custom::apply(yaml, &rules)?;
         let value = serde_json::json!({"yaml": applied.yaml, "skipped": applied.skipped});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn meta_overrides_apply_v1(
 ) -> i32 {
     boundary(|| {
         let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
-        let overrides: meta_config::overrides::Overrides =
+        let overrides: clyntis_config::overrides::Overrides =
             serde_json::from_slice(unsafe { input(overrides, overrides_len)? })?;
         let yaml = overrides.apply(yaml)?;
         unsafe { output(yaml.as_bytes(), buffer, capacity, length) }
@@ -313,7 +313,7 @@ pub unsafe extern "C" fn meta_prefetch_resources_v1(
     directory_len: usize,
 ) -> i32 {
     boundary(|| {
-        let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        let mut config = clyntis_config::Config::parse(unsafe { input(data, len)? })?;
         let path = std::path::PathBuf::from(std::str::from_utf8(unsafe {
             input(directory, directory_len)?
         })?);
@@ -323,11 +323,12 @@ pub unsafe extern "C" fn meta_prefetch_resources_v1(
         );
         config.directory = path;
         config.tun.enable = false;
-        let core = meta_core::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks))?;
+        let core =
+            clyntis_core::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks))?;
         // Current files were validated when they were downloaded, and the
         // tunnel parses them again anyway; parsing ~20 MB of geo data here
         // only delayed every connect.
-        if core.resource_freshness()? == meta_core::Freshness::Current {
+        if core.resource_freshness()? == clyntis_core::Freshness::Current {
             return Ok(OK);
         }
         tokio::runtime::Builder::new_current_thread()
@@ -355,16 +356,17 @@ pub unsafe extern "C" fn meta_resources_state_v1(
 ) -> i32 {
     boundary(|| {
         ensure!(!state.is_null(), "state output is required");
-        let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        let mut config = clyntis_config::Config::parse(unsafe { input(data, len)? })?;
         config.directory = std::path::PathBuf::from(std::str::from_utf8(unsafe {
             input(directory, directory_len)?
         })?);
         config.tun.enable = false;
-        let core = meta_core::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks))?;
+        let core =
+            clyntis_core::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks))?;
         let value = match core.resource_freshness()? {
-            meta_core::Freshness::Current => 0,
-            meta_core::Freshness::Expired => 1,
-            meta_core::Freshness::Missing => 2,
+            clyntis_core::Freshness::Current => 0,
+            clyntis_core::Freshness::Expired => 1,
+            clyntis_core::Freshness::Missing => 2,
         };
         unsafe { state.write(value) };
         Ok(OK)
@@ -384,7 +386,7 @@ unsafe fn create(
             *out = 0;
         }
         host::check_lifecycle()?;
-        let mut config = meta_config::Config::parse(unsafe { input(data, len)? })?;
+        let mut config = clyntis_config::Config::parse(unsafe { input(data, len)? })?;
         logs::init(&config.log.log_level);
         if let Some((path, path_len)) = directory {
             let path =
@@ -662,7 +664,7 @@ pub unsafe extern "C" fn meta_test_route_v1(
             ),
         };
         let network = value["network"].as_str().unwrap_or("tcp");
-        let target = meta_core::parse_test_target(target, port)?;
+        let target = clyntis_core::parse_test_target(target, port)?;
         let result = handle(id)?.test_route(target, network)?;
         unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
     })

@@ -1,7 +1,7 @@
 use crate::Core;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use meta_protocol::{Datagram, Target};
+use clyntis_protocol::{Datagram, Target};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},

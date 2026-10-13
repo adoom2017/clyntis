@@ -59,4 +59,4 @@ if [[ $# -gt 0 ]]; then
 fi
 
 cd "$workspace"
-cargo build -p meta-ffi --target "$target" "${options[@]}"
+cargo build -p clyntis-ffi --target "$target" "${options[@]}"

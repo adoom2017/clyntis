@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 clyntis-desktop-model.workspace = true
-meta-runtime.workspace = true
-meta-config.workspace = true
+clyntis-runtime.workspace = true
+clyntis-config.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

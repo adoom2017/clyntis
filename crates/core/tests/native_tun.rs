@@ -1,6 +1,6 @@
 #![cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-use meta_core::Core;
-use meta_platform::{DefaultHooks, native::NativeTun};
+use clyntis_core::Core;
+use clyntis_platform::{DefaultHooks, native::NativeTun};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -33,7 +33,7 @@ async fn operating_system_tcp_and_udp_use_native_tun_and_restore_route() {
 async fn scenario() {
     let oracle = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = oracle.local_addr().unwrap();
-    let config = meta_config::Config::parse(format!("ipv6: true\ntun: {{enable: true, auto-route: false}}\nproxies:\n- name: test\n  type: vless\n  server: 127.0.0.1\n  port: {}\n  uuid: 11223344-5566-7788-99aa-bbccddeeff00\nrules: ['MATCH,test']\n", address.port()).as_bytes()).unwrap();
+    let config = clyntis_config::Config::parse(format!("ipv6: true\ntun: {{enable: true, auto-route: false}}\nproxies:\n- name: test\n  type: vless\n  server: 127.0.0.1\n  port: {}\n  uuid: 11223344-5566-7788-99aa-bbccddeeff00\nrules: ['MATCH,test']\n", address.port()).as_bytes()).unwrap();
     let core = Core::new(config, Arc::new(DefaultHooks)).unwrap();
     let name = if cfg!(target_os = "macos") {
         "utun19"

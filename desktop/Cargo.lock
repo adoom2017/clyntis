@@ -813,16 +813,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "clyntis-config"
+version = "1.0.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64 0.22.1",
+ "cfb-mode",
+ "ipnet",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_yaml",
+ "sha1",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "clyntis-core"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clyntis-config",
+ "clyntis-platform",
+ "clyntis-protocol",
+ "clyntis-tailscale",
+ "futures-util",
+ "hickory-proto",
+ "http",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-util",
+ "ipnet",
+ "libc",
+ "maxminddb",
+ "prost",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "smoltcp",
+ "socket2",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "clyntis-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "clyntis-config",
  "clyntis-desktop-model",
  "clyntis-desktop-service",
+ "clyntis-runtime",
  "futures-util",
- "meta-config",
- "meta-runtime",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -839,10 +894,10 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop-model"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
- "meta-config",
+ "clyntis-config",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -857,13 +912,13 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop-runner"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
+ "clyntis-config",
  "clyntis-desktop-model",
  "clyntis-desktop-service",
- "meta-config",
- "meta-runtime",
+ "clyntis-runtime",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -871,14 +926,14 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop-service"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "clyntis-config",
  "clyntis-desktop-model",
+ "clyntis-runtime",
  "libc",
- "meta-config",
- "meta-runtime",
  "serde",
  "serde_json",
  "tempfile",
@@ -887,6 +942,112 @@ dependencies = [
  "uuid",
  "windows-service",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "clyntis-platform"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ipnet",
+ "netdev",
+ "route_manager",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
+ "tun-rs",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "clyntis-protocol"
+version = "1.0.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "blake2",
+ "boring",
+ "boring-sys",
+ "brotli 8.0.4",
+ "bytes",
+ "clyntis-config",
+ "clyntis-platform",
+ "flate2",
+ "foreign-types-shared",
+ "futures-util",
+ "h2",
+ "hkdf",
+ "hmac",
+ "http",
+ "httparse",
+ "rand 0.8.8",
+ "serde",
+ "sha1",
+ "sha2",
+ "socket2",
+ "tokio",
+ "tokio-boring",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "webpki-root-certs",
+ "x25519-dalek",
+ "x509-parser",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "clyntis-runtime"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clyntis-config",
+ "clyntis-core",
+ "clyntis-platform",
+ "flate2",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "clyntis-tailscale"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "blake2",
+ "boringtun",
+ "bytes",
+ "chacha20poly1305",
+ "clyntis-protocol",
+ "crypto_box",
+ "h2",
+ "hex",
+ "hkdf",
+ "http",
+ "httparse",
+ "ipnet",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "smoltcp",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "x25519-dalek",
+ "zstd",
 ]
 
 [[package]]
@@ -2908,167 +3069,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "meta-config"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "base64 0.22.1",
- "cfb-mode",
- "ipnet",
- "regex",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_yaml",
- "sha1",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "meta-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "hickory-proto",
- "http",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-util",
- "ipnet",
- "libc",
- "maxminddb",
- "meta-config",
- "meta-platform",
- "meta-protocol",
- "meta-tailscale",
- "prost",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "smoltcp",
- "socket2",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "meta-platform"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "ipnet",
- "netdev",
- "route_manager",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tracing",
- "tun-rs",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "meta-protocol"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "blake2",
- "boring",
- "boring-sys",
- "brotli 8.0.4",
- "bytes",
- "flate2",
- "foreign-types-shared",
- "futures-util",
- "h2",
- "hkdf",
- "hmac",
- "http",
- "httparse",
- "meta-config",
- "meta-platform",
- "rand 0.8.8",
- "serde",
- "sha1",
- "sha2",
- "socket2",
- "tokio",
- "tokio-boring",
- "tokio-util",
- "tracing",
- "uuid",
- "webpki-root-certs",
- "x25519-dalek",
- "x509-parser",
- "zeroize",
- "zstd",
-]
-
-[[package]]
-name = "meta-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "flate2",
- "meta-config",
- "meta-core",
- "meta-platform",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "meta-tailscale"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "blake2",
- "boringtun",
- "bytes",
- "chacha20poly1305",
- "crypto_box",
- "h2",
- "hex",
- "hkdf",
- "http",
- "httparse",
- "ipnet",
- "meta-protocol",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "smoltcp",
- "tokio",
- "tokio-util",
- "tracing",
- "x25519-dalek",
- "zstd",
 ]
 
 [[package]]

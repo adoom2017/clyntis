@@ -1,7 +1,7 @@
 use crate::{Connection, Core};
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
-use meta_protocol::{Datagram, Target};
+use clyntis_protocol::{Datagram, Target};
 use std::{
     pin::Pin,
     sync::{

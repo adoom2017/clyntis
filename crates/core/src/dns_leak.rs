@@ -3,8 +3,8 @@
 //! random names.
 use crate::Core;
 use anyhow::{Context, Result, ensure};
-use meta_config::{Mode, rule::Matcher};
-use meta_protocol::{BoxStream, Target};
+use clyntis_config::{Mode, rule::Matcher};
+use clyntis_protocol::{BoxStream, Target};
 use serde::Serialize;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -349,14 +349,14 @@ impl Core {
     async fn leak_get(&self, path: &str) -> Result<Vec<u8>> {
         use http_body_util::{BodyExt, Empty, Limited};
         let (stream, _) = self.dial(&Target::new(SERVICE, 443)?, None).await?;
-        let tls: BoxStream = meta_protocol::tls::SecureConnector::new(self.clock.clone())
+        let tls: BoxStream = clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
             .connect(
                 stream,
-                &meta_protocol::tls::TlsConnectConfig {
+                &clyntis_protocol::tls::TlsConnectConfig {
                     server_name: SERVICE.into(),
                     alpn: vec!["http/1.1".into()],
                     verify_cert: true,
-                    fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                    fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
                     reality: None,
                 },
             )
@@ -389,8 +389,8 @@ mod tests {
     use super::*;
 
     fn core(yaml: &str) -> std::sync::Arc<Core> {
-        let config = meta_config::Config::parse(yaml.as_bytes()).unwrap();
-        Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks)).unwrap()
+        let config = clyntis_config::Config::parse(yaml.as_bytes()).unwrap();
+        Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks)).unwrap()
     }
 
     fn codes(audit: &DnsLeakAudit) -> Vec<&'static str> {
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(codes(&audit), ["dns-disabled"]);
     }
 
-    /// Live: `cargo test -p meta-core live_dns_leak_test -- --ignored --nocapture`.
+    /// Live: `cargo test -p clyntis-core live_dns_leak_test -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "needs the network and bash.ws"]
     async fn live_dns_leak_test() {

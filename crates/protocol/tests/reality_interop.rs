@@ -6,7 +6,7 @@ use boring::{
     ssl::{SslAcceptor, SslMethod, SslVersion},
     x509::X509,
 };
-use meta_protocol::{Datagram, Target, vless, xudp};
+use clyntis_protocol::{Datagram, Target, vless, xudp};
 use std::{
     process::{Child, Command, Stdio},
     time::Duration,
@@ -167,7 +167,7 @@ async fn scenario() -> Result<()> {
             value["uuid"] = vision_id.to_string().into();
             value["flow"] = "xtls-rprx-vision".into();
         }
-        let proxy: meta_config::Proxy = serde_json::from_value(value)?;
+        let proxy: clyntis_config::Proxy = serde_json::from_value(value)?;
         let mut stream = vless::connect(
             TcpStream::connect(("127.0.0.1", port)).await?,
             &proxy,
@@ -185,7 +185,7 @@ async fn scenario() -> Result<()> {
         ensure!(reply == payload, "REALITY TCP echo failed, vision={vision}");
     }
 
-    let proxy: meta_config::Proxy = serde_json::from_value(base)?;
+    let proxy: clyntis_config::Proxy = serde_json::from_value(base)?;
     eprintln!("REALITY XUDP: connect");
     let target = Target::new("127.0.0.1", udp_port)?;
     let stream = vless::connect(

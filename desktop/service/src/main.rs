@@ -69,7 +69,7 @@ async fn serve(stop: CancellationToken) -> Result<()> {
     for entry in std::fs::read_dir(&root)? {
         let entry = entry?;
         if Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
-            meta_runtime::recover(&entry.path())?;
+            clyntis_runtime::recover(&entry.path())?;
         }
     }
     let _ = ProxyGuard::recover(root.join("system-proxy.json"))?;
@@ -143,7 +143,7 @@ impl Runner {
         } else {
             Ok(())
         };
-        let recovery = meta_runtime::recover(&self.directory);
+        let recovery = clyntis_runtime::recover(&self.directory);
         exit.and(recovery)
     }
 }
@@ -239,7 +239,7 @@ async fn session(
                         ensure!(config.external_controller.as_deref() == Some("127.0.0.1:0") && config.secret.len() >= 32, "unsafe controller");
                         let directory = root.join(Uuid::parse_str(&profile_id)?.to_string());
                         private_dir(&directory)?;
-                        meta_runtime::recover(&directory)?;
+                        clyntis_runtime::recover(&directory)?;
                         let names = clyntis_desktop_model::profiles::resource_names(&config);
                         for (name, bytes) in std::mem::take(&mut pending_resources) {
                             ensure!(names.contains(&name), "unreferenced routing resource");

@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     socket: S,
-    proxy: &meta_config::Proxy,
+    proxy: &clyntis_config::Proxy,
     target: &Target,
     command: u8,
 ) -> Result<BoxStream> {
@@ -27,7 +27,7 @@ pub async fn connect<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 }
 pub async fn connect_with_options<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     socket: S,
-    proxy: &meta_config::Proxy,
+    proxy: &clyntis_config::Proxy,
     target: &Target,
     command: u8,
     default_profile: &str,
@@ -35,7 +35,7 @@ pub async fn connect_with_options<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 ) -> Result<BoxStream> {
     use anyhow::Context as _;
     ensure!(
-        proxy.kind == meta_config::ProxyKind::Vless,
+        proxy.kind == clyntis_config::ProxyKind::Vless,
         "expected VLESS proxy"
     );
     ensure!(
@@ -408,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_transport_uses_sni_authority_and_vless_framing() -> Result<()> {
-        let mut proxy = meta_config::Config::parse(
+        let mut proxy = clyntis_config::Config::parse(
             b"proxies:\n- name: grpc-e2e\n  type: vless\n  server: 192.0.2.1\n  port: 443\n  uuid: 11223344-5566-7788-99aa-bbccddeeff00\n  network: grpc\n  servername: front.example\n  grpc-opts:\n    grpc-service-name: custom\n",
         )?
         .proxies
@@ -482,7 +482,7 @@ mod tests {
     async fn websocket_transport_carries_vless_binary_stream() -> Result<()> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use sha1::{Digest as _, Sha1};
-        let proxy = meta_config::Config::parse(
+        let proxy = clyntis_config::Config::parse(
             b"proxies:\n- name: ws-e2e\n  type: vless\n  server: origin.example\n  port: 80\n  uuid: 11223344-5566-7788-99aa-bbccddeeff00\n  network: ws\n  ws-opts:\n    path: /transport\n    headers:\n      Host: front.example\n",
         )?
         .proxies

@@ -163,7 +163,7 @@ fn uninstall() -> Result<()> {
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
             if Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
-                meta_runtime::recover(&entry.path())?;
+                clyntis_runtime::recover(&entry.path())?;
             }
         }
     }

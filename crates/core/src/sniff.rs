@@ -1,4 +1,4 @@
-use meta_protocol::Target;
+use clyntis_protocol::Target;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
@@ -189,7 +189,7 @@ impl crate::Core {
         route: &Target,
         destination: &Target,
         source: &str,
-    ) -> anyhow::Result<(meta_protocol::BoxStream, String)> {
+    ) -> anyhow::Result<(clyntis_protocol::BoxStream, String)> {
         let decision = self.route_decision(route, "tcp").await?;
         if decision.node == "REJECT" {
             Self::log_connection("TCP", source, route, &decision);
@@ -201,7 +201,7 @@ impl crate::Core {
     }
 }
 fn domain(pattern: &str, host: &str) -> bool {
-    meta_config::rule::domain_pattern(pattern)
+    clyntis_config::rule::domain_pattern(pattern)
         .is_ok_and(|m| m.evaluate(&host.to_ascii_lowercase(), None, 0, "", false) == Some(true))
 }
 #[cfg(test)]
@@ -218,10 +218,10 @@ mod tests {
     }
 
     fn fake_ip_core() -> std::sync::Arc<crate::Core> {
-        let mut config = meta_config::Config::default();
+        let mut config = clyntis_config::Config::default();
         config.dns.enhanced_mode = "fake-ip".into();
         config.sniffer.enable = false; // recovery must not depend on the sniffer
-        crate::Core::new(config, std::sync::Arc::new(meta_platform::DefaultHooks)).unwrap()
+        crate::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks)).unwrap()
     }
 
     #[tokio::test]

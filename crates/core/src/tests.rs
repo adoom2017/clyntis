@@ -11,7 +11,7 @@ async fn additional_system_dns_listener_answers_local_queries() {
     config.dns.enable = true;
     config.dns.listen = "127.0.0.1:0".into();
     config.dns.enhanced_mode = "fake-ip".into();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let mut running = core
         .start_with_packets_and_system_dns(None, Some(address))
         .await
@@ -86,7 +86,7 @@ async fn listener_conflicts_identify_service_transport_and_address() {
             "controller" => config.external_controller = Some(address.to_string()),
             _ => unreachable!(),
         }
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let error = match core.start().await {
             Err(error) => error,
             Ok(_) => panic!("occupied TCP listener unexpectedly started"),
@@ -108,7 +108,7 @@ async fn listener_conflicts_identify_service_transport_and_address() {
     let mut config = Config::default();
     config.dns.enable = true;
     config.dns.listen = address.to_string();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let error = match core.start().await {
         Err(error) => error,
         Ok(_) => panic!("occupied UDP listener unexpectedly started"),
@@ -153,7 +153,7 @@ async fn api_call(
 #[tokio::test]
 async fn controller_policy_updates_are_atomic_and_redacted() {
     let config = Config::parse(b"secret: api-secret\nauthentication: ['user:password']\nproxy-groups:\n- name: choose\n  type: select\n  proxies: [DIRECT, REJECT]\nrules: ['MATCH,DIRECT']\n").unwrap();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     assert_eq!(
         api_call(core.clone(), "GET", "/configs", "", false).await.0,
         401
@@ -221,7 +221,7 @@ async fn controller_policy_updates_are_atomic_and_redacted() {
 #[tokio::test]
 async fn live_tcp_counters_close_and_abort_release_registry() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let core = Core::new(Config::default(), Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(Config::default(), Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         for abort in [false, true] {
             let (mut client, inbound) = tokio::io::duplex(1024);
             let (outbound, mut peer) = tokio::io::duplex(1024);
@@ -281,7 +281,7 @@ async fn udp_counters_close_and_core_cancellation_cover_dns_routing() {
         config.dns.nameserver = vec![dns.local_addr().unwrap().to_string()];
         config.dns.ipv6 = false;
         config.rules = vec!["IP-CIDR,192.0.2.0/24,REJECT".into(), "MATCH,DIRECT".into()];
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let target = Target::parse(&udp.local_addr().unwrap().to_string()).unwrap();
         let session = core.datagram(&target).await.unwrap();
         session.send(&target, b"ping").await.unwrap();
@@ -366,7 +366,7 @@ async fn dns_upstreams_race_and_lost_queries_are_resent() {
         dns_server(0).await.to_string(),
     ];
     config.dns.ipv6 = false;
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let started = std::time::Instant::now();
     let addresses = core.resolver.lookup("race.test", 80).await.unwrap();
     assert_eq!(addresses[0].ip().to_string(), "192.0.2.7");
@@ -380,7 +380,7 @@ async fn dns_upstreams_race_and_lost_queries_are_resent() {
     let mut config = Config::default();
     config.dns.nameserver = vec![dns_server(1).await.to_string()];
     config.dns.ipv6 = false;
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let started = std::time::Instant::now();
     let addresses = core.resolver.lookup("resend.test", 80).await.unwrap();
     assert_eq!(addresses[0].ip().to_string(), "192.0.2.7");
@@ -434,7 +434,7 @@ async fn ipv6_http_forwarding_and_probe_preserve_authority() {
             mixed_port: port,
             ..Config::default()
         };
-        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let running = core.start().await.unwrap();
         let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         client.write_all(format!("GET http://{address}/inspect?q=1 HTTP/1.1\r\nHost: wrong.test\r\nProxy-Authorization: Basic ignored\r\n\r\n").as_bytes()).await.unwrap();
@@ -456,7 +456,7 @@ async fn mixed_socks_and_http_connect_use_vless_and_restore_fake_ip() {
             let mut config = configuration(oracle.local_addr().unwrap(), false);
             config.mixed_port = free_port();
             let port = config.mixed_port;
-            let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+            let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
             let name = hickory_proto::rr::Name::from_ascii("example.test").unwrap();
             let mut query = hickory_proto::op::Message::new();
             query.add_query(hickory_proto::op::Query::query(
@@ -545,7 +545,7 @@ async fn core_selects_udp_or_xudp_from_configuration() {
             let oracle = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let core = Core::new(
                 configuration(oracle.local_addr().unwrap(), xudp),
-                Arc::new(meta_platform::DefaultHooks),
+                Arc::new(clyntis_platform::DefaultHooks),
             )
             .unwrap();
             let task = tokio::spawn(async move {
@@ -590,7 +590,7 @@ async fn xudp_pools_flows_and_reuses_source_global_id() {
         let oracle = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let core = Core::new(
             configuration(oracle.local_addr().unwrap(), true),
-            Arc::new(meta_platform::DefaultHooks),
+            Arc::new(clyntis_platform::DefaultHooks),
         )
         .unwrap();
         let task = tokio::spawn(async move {
@@ -668,7 +668,7 @@ async fn socks_udp_reconnects_after_outbound_closes() {
             let mut config = configuration(oracle.local_addr().unwrap(), xudp);
             config.socks_port = free_port();
             let port = config.socks_port;
-            let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+            let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
             let running = core.start().await.unwrap();
             let task = tokio::spawn(async move {
                 for round in 0..3u8 {
@@ -739,7 +739,7 @@ async fn socks_udp_reconnects_after_outbound_closes() {
 
 #[tokio::test(start_paused = true)]
 async fn tcp_relay_survives_six_minutes_without_application_data() {
-    let core = Core::new(Config::default(), Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(Config::default(), Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let (mut client, inbound) = tokio::io::duplex(1024);
     let (outbound, mut peer) = tokio::io::duplex(1024);
     let owner = core.clone();
@@ -779,11 +779,11 @@ async fn tcp_relay_survives_six_minutes_without_application_data() {
 
 #[tokio::test]
 async fn proxy_status_reports_details_and_the_last_probe() {
-    let config = meta_config::Config::parse(
+    let config = clyntis_config::Config::parse(
         b"proxies:\n  - {name: node, type: vless, server: 127.0.0.1, port: 9, uuid: 11111111-1111-4111-8111-111111111111, tls: true, flow: xtls-rprx-vision}\nrules: ['MATCH,node']\n",
     )
     .unwrap();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let status = &core.proxy_status()["node"];
     assert_eq!(status["type"], "VLESS");
     assert_eq!(status["server"], "127.0.0.1:9");
@@ -841,7 +841,7 @@ fn url_test_switches_when_the_current_member_fails() {
 async fn connections_show_the_domain_behind_a_fake_ip() {
     let mut config = Config::default();
     config.dns.enhanced_mode = "fake-ip".into();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let fake = core.resolver.fake_address("example.com", false).unwrap();
     let target = Target::new(fake.to_string(), 443).unwrap();
     let (inbound, _client) = tokio::io::duplex(64);
@@ -866,7 +866,7 @@ async fn connections_show_the_domain_behind_a_fake_ip() {
 #[tokio::test]
 async fn route_test_reports_the_rule_and_the_selected_node() {
     let config = Config::parse(b"secret: s\nproxy-groups:\n- {name: Outer, type: select, proxies: [Inner, REJECT]}\n- {name: Inner, type: select, proxies: [DIRECT, REJECT]}\nrules: ['DOMAIN-SUFFIX,example.com,Outer', 'IP-CIDR,10.0.0.0/8,REJECT,no-resolve', 'MATCH,Inner']\n").unwrap();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let test = |body: &'static str| api_call(core.clone(), "POST", "/rules/test", body, true);
     let (status, result) = test(r#"{"target":"https://WWW.Example.com/path"}"#).await;
     assert_eq!(status, 200);
@@ -893,7 +893,7 @@ async fn route_test_reports_the_rule_and_the_selected_node() {
     let (_, result) = test(r#"{"target":"192.0.2.1","network":"udp"}"#).await;
     assert_eq!(result["matched"], "Match");
     assert_eq!(result["chain"], serde_json::json!(["Inner", "REJECT"]));
-    core.set_mode(meta_config::Mode::Global);
+    core.set_mode(clyntis_config::Mode::Global);
     let (_, result) = test(r#"{"target":"example.org"}"#).await;
     assert_eq!(
         (result["matched"].as_str(), result["mode"].as_str()),
@@ -923,12 +923,12 @@ async fn adblock_refuses_dns_and_connections_and_counts_them() {
         "payload:\n  - '+.ads.test'\n",
     )
     .unwrap();
-    let mut config = meta_config::Config::parse(
+    let mut config = clyntis_config::Config::parse(
         b"dns: {enhanced-mode: fake-ip}\nadblock:\n  enable: true\n  lists: [{name: test, url: 'https://example.invalid/list.yaml'}]\n  allow: [keep.ads.test]\nrules: ['MATCH,DIRECT']\n",
     )
     .unwrap();
     config.directory = dir.clone();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     core.prepare_resources(false).await.unwrap();
     let query = |name: &str| {
         let mut message = hickory_proto::op::Message::new();
@@ -1021,12 +1021,12 @@ async fn adblock_closes_resolver_bypasses_and_answers_null() {
     )
     .unwrap();
     let parse = |extra: &str| {
-        let mut config = meta_config::Config::parse(
+        let mut config = clyntis_config::Config::parse(
             format!("dns: {{enhanced-mode: fake-ip}}\nadblock:\n  enable: true\n  lists: [{{name: test, url: 'https://example.invalid/list.yaml'}}]\n{extra}rules: ['MATCH,DIRECT']\n").as_bytes(),
         )
         .unwrap();
         config.directory = dir.clone();
-        Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap()
+        Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap()
     };
     let core = parse("  dns-answer: null\n  allow: [dns.google]\n");
     core.prepare_resources(false).await.unwrap();
@@ -1127,12 +1127,12 @@ async fn adblock_closes_resolver_bypasses_and_answers_null() {
 fn saved_profile_is_written_only_after_a_change() {
     let dir = std::env::temp_dir().join(format!("meta-profile-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut config = meta_config::Config::parse(
+    let mut config = clyntis_config::Config::parse(
         b"dns: {enhanced-mode: fake-ip}\nprofile: {store-selected: true, store-fake-ip: true}\nrules: ['MATCH,DIRECT']\n",
     )
     .unwrap();
     config.directory = dir.clone();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let path = dir.join(".meta-profile.json");
     core.save_profile().unwrap();
     assert!(path.exists());
@@ -1156,7 +1156,7 @@ fn saved_profile_is_written_only_after_a_change() {
 async fn a_panicking_packet_loop_stops_the_core() {
     struct Panics;
     #[async_trait::async_trait]
-    impl meta_platform::PacketIo for Panics {
+    impl clyntis_platform::PacketIo for Panics {
         async fn recv(&self, _: &mut [u8]) -> anyhow::Result<usize> {
             panic!("packet source failed");
         }
@@ -1165,7 +1165,7 @@ async fn a_panicking_packet_loop_stops_the_core() {
         }
     }
     let config = Config::parse(b"tun: {enable: true}\nrules: ['MATCH,DIRECT']\n").unwrap();
-    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
     let running = core
         .start_with_packets(Some(Arc::new(Panics)))
         .await

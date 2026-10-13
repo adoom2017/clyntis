@@ -374,8 +374,8 @@ impl Desktop {
         };
         let (targets, skipped) = match &profile {
             Some(profile) => (
-                meta_config::custom::targets(&profile.yaml)?,
-                meta_config::custom::apply(&profile.yaml, &rules)?.skipped,
+                clyntis_config::custom::targets(&profile.yaml)?,
+                clyntis_config::custom::apply(&profile.yaml, &rules)?.skipped,
             ),
             None => (vec!["DIRECT".into(), "REJECT".into()], vec![]),
         };
@@ -503,7 +503,7 @@ pub async fn set_mode(state: State<'_, Desktop>, mode: String) -> Reply<()> {
 pub struct CustomRules {
     rules: Vec<String>,
     targets: Vec<String>,
-    skipped: Vec<meta_config::custom::Skipped>,
+    skipped: Vec<clyntis_config::custom::Skipped>,
     profile: Option<String>,
 }
 #[tauri::command]

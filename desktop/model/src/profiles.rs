@@ -1,6 +1,6 @@
 use crate::{CONFIG_LIMIT, atomic_write, now, private_dir, read_limited, settings::Settings};
 use anyhow::{Context, Result, ensure};
-use meta_config::{Config, ProxyKind};
+use clyntis_config::{Config, ProxyKind};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use std::{
@@ -170,13 +170,13 @@ impl Store {
     }
     pub fn save_custom_rules(&self, rules: &[String]) -> Result<()> {
         ensure!(
-            rules.len() <= meta_config::custom::MAX_RULES,
+            rules.len() <= clyntis_config::custom::MAX_RULES,
             "自定义规则不能超过 {} 条",
-            meta_config::custom::MAX_RULES
+            clyntis_config::custom::MAX_RULES
         );
         let rules: Vec<String> = rules.iter().map(|r| r.trim().to_owned()).collect();
         for (i, rule) in rules.iter().enumerate() {
-            meta_config::custom::validate(rule)
+            clyntis_config::custom::validate(rule)
                 .with_context(|| format!("第 {} 条规则「{rule}」", i + 1))?;
         }
         atomic_write(
@@ -283,7 +283,7 @@ pub fn decrypt_source(source: &str, password: &str) -> Result<String> {
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
     let failed = || anyhow::anyhow!("解密失败，请检查密码");
-    let plaintext = meta_config::crypto::decrypt(&compact, password).map_err(|_| failed())?;
+    let plaintext = clyntis_config::crypto::decrypt(&compact, password).map_err(|_| failed())?;
     let yaml = String::from_utf8(plaintext.to_vec()).map_err(|_| failed())?;
     ensure!(
         matches!(serde_yaml::from_str::<Value>(&yaml), Ok(Value::Mapping(_))),
@@ -294,7 +294,7 @@ pub fn decrypt_source(source: &str, password: &str) -> Result<String> {
 
 pub fn encrypt_yaml(yaml: &str, password: &str) -> Result<String> {
     ensure!(!password.is_empty(), "密码不能为空");
-    meta_config::crypto::encrypt(yaml.as_bytes(), password)
+    clyntis_config::crypto::encrypt(yaml.as_bytes(), password)
 }
 
 /// Decrypts a downloaded subscription when it has a password.
@@ -393,7 +393,7 @@ pub fn runtime_yaml(
 ) -> Result<String> {
     validate(&profile.yaml)?;
     settings.validate()?;
-    let yaml = meta_config::custom::apply(&profile.yaml, custom)?.yaml;
+    let yaml = clyntis_config::custom::apply(&profile.yaml, custom)?.yaml;
     let mut document: Value = serde_yaml::from_str(&yaml)?;
     let map = document.as_mapping_mut().context("配置必须是 YAML 对象")?;
     settings.overrides.apply_to(map)?;
@@ -613,7 +613,7 @@ mod tests {
             validate(&runtime_yaml(&profile, &settings, &"s".repeat(32), &[]).unwrap()).unwrap();
         assert_eq!(config.log.log_level, "info");
         assert!(config.ipv6 && config.dns.ipv6);
-        settings.overrides.adblock = Some(meta_config::adblock::Settings {
+        settings.overrides.adblock = Some(clyntis_config::adblock::Settings {
             enabled: true,
             presets: vec!["awavenue".into()],
             custom: vec![],

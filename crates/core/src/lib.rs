@@ -21,9 +21,9 @@ mod traffic;
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use meta_config::{Config, GroupKind, Mode, ProxyKind, rule::Rule};
-use meta_platform::Hooks;
-use meta_protocol::{BoxStream, Datagram, Target};
+use clyntis_config::{Config, GroupKind, Mode, ProxyKind, rule::Rule};
+use clyntis_platform::Hooks;
+use clyntis_protocol::{BoxStream, Datagram, Target};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -59,10 +59,10 @@ pub struct Core {
     /// What the saved profile last held: the selection and the fake-IP
     /// generation, so an unchanged profile is not exported and written again.
     saved_profile: Mutex<Option<(HashMap<String, String>, u64)>>,
-    clock: Arc<meta_protocol::tls::Clock>,
-    xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<meta_protocol::xudp::Multiplexer>>>,
+    clock: Arc<clyntis_protocol::tls::Clock>,
+    xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<clyntis_protocol::xudp::Multiplexer>>>,
     xudp_key: [u8; 32],
-    tailscale: Mutex<HashMap<String, meta_tailscale::Node>>,
+    tailscale: Mutex<HashMap<String, clyntis_tailscale::Node>>,
     /// Bumped on every network change so url-test groups re-test at once.
     network_epoch: tokio::sync::watch::Sender<u64>,
 }
@@ -284,7 +284,7 @@ impl Core {
         config.validate()?;
         let mut dns = config.dns.clone();
         dns.ipv6 &= config.ipv6;
-        let clock = Arc::new(meta_protocol::tls::Clock::default());
+        let clock = Arc::new(clyntis_protocol::tls::Clock::default());
         let resolver = Arc::new(dns::Resolver::new_with_clock(
             dns,
             hooks.clone(),
@@ -343,13 +343,13 @@ impl Core {
     }
     pub async fn start_with_packets(
         self: &Arc<Self>,
-        packets: Option<Arc<dyn meta_platform::PacketIo>>,
+        packets: Option<Arc<dyn clyntis_platform::PacketIo>>,
     ) -> Result<Running> {
         self.start_with_packets_and_system_dns(packets, None).await
     }
     pub async fn start_with_packets_and_system_dns(
         self: &Arc<Self>,
-        packets: Option<Arc<dyn meta_platform::PacketIo>>,
+        packets: Option<Arc<dyn clyntis_platform::PacketIo>>,
         system_dns: Option<SocketAddr>,
     ) -> Result<Running> {
         ensure!(
@@ -373,7 +373,7 @@ impl Core {
     }
     async fn start_inner(
         self: &Arc<Self>,
-        packets: Option<Arc<dyn meta_platform::PacketIo>>,
+        packets: Option<Arc<dyn clyntis_platform::PacketIo>>,
         system_dns: Option<SocketAddr>,
     ) -> Result<Running> {
         // Hosted packet tunnels get their files from the host's prefetch (see
@@ -872,7 +872,7 @@ impl Core {
                     }
                     let result = tokio::time::timeout(
                         Duration::from_secs(5),
-                        meta_platform::tcp_connect_options(
+                        clyntis_platform::tcp_connect_options(
                             addr,
                             &*self.hooks,
                             self.config.keep_alive_interval,
@@ -903,7 +903,7 @@ impl Core {
         for addr in addresses {
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                meta_platform::tcp_connect_options(
+                clyntis_platform::tcp_connect_options(
                     addr,
                     &*self.hooks,
                     self.config.keep_alive_interval,
@@ -927,7 +927,7 @@ impl Core {
     }
     async fn vless_stream(
         &self,
-        proxy: &meta_config::Proxy,
+        proxy: &clyntis_config::Proxy,
         target: &Target,
         command: u8,
     ) -> Result<BoxStream> {
@@ -958,7 +958,7 @@ impl Core {
                     target
                 );
             }
-            match meta_protocol::vless::connect_with_options(
+            match clyntis_protocol::vless::connect_with_options(
                 socket,
                 proxy,
                 target,
@@ -1182,7 +1182,7 @@ impl Core {
                 "[::]:0"
             }
             .parse()?;
-            let socket = meta_platform::udp_bind_for(bind, Some(remote), &*self.hooks)?;
+            let socket = clyntis_platform::udp_bind_for(bind, Some(remote), &*self.hooks)?;
             socket.connect(remote).await?;
             if let Ok(local) = socket.local_addr() {
                 tracing::info!(
@@ -1217,7 +1217,7 @@ impl Core {
                             mux
                         } else {
                             let stream = self.vless_stream(proxy, target, 3).await?;
-                            let mux = meta_protocol::xudp::Multiplexer::new(stream);
+                            let mux = clyntis_protocol::xudp::Multiplexer::new(stream);
                             pool.insert(name.to_owned(), Arc::downgrade(&mux));
                             mux
                         }
@@ -1225,7 +1225,7 @@ impl Core {
                     Ok(Arc::new(multiplexer.session(target.clone(), global_id)?))
                 } else {
                     let stream = self.vless_stream(proxy, target, 2).await?;
-                    Ok(Arc::new(meta_protocol::vless::UdpSession::new(
+                    Ok(Arc::new(clyntis_protocol::vless::UdpSession::new(
                         stream,
                         target.clone(),
                     )))
@@ -1287,7 +1287,7 @@ impl Core {
     /// Replaces the user's allowlist without restarting; validated like the
     /// configuration's `adblock.allow`.
     pub fn set_adblock_allow(&self, allow: Vec<String>) -> Result<()> {
-        meta_config::adblock::Adblock {
+        clyntis_config::adblock::Adblock {
             allow: allow.clone(),
             ..Default::default()
         }
@@ -1381,7 +1381,7 @@ impl Core {
         self.resolver.clear_cache();
         self.network_epoch
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-        let nodes: Vec<meta_tailscale::Node> =
+        let nodes: Vec<clyntis_tailscale::Node> =
             self.tailscale.lock().unwrap().values().cloned().collect();
         for node in nodes {
             node.network_changed();
@@ -1416,14 +1416,14 @@ impl Core {
             let target = Target::from_uri(&uri, if secure { 443 } else { 80 })?;
             let (stream, _) = self.dial(&target, Some(name)).await?;
             let mut stream: BoxStream = if secure {
-                meta_protocol::tls::SecureConnector::new(self.clock.clone())
+                clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
                     .connect(
                         stream,
-                        &meta_protocol::tls::TlsConnectConfig {
+                        &clyntis_protocol::tls::TlsConnectConfig {
                             server_name: target.host.clone(),
                             alpn: vec!["http/1.1".into()],
                             verify_cert: true,
-                            fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                            fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
                             reality: None,
                         },
                     )

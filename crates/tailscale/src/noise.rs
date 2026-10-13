@@ -8,7 +8,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, KeyInit,
     aead::{Aead, Payload},
 };
-use meta_protocol::BoxStream;
+use clyntis_protocol::BoxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_BLAKE2s";

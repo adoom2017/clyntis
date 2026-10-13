@@ -79,7 +79,7 @@ pub async fn prefetch(store: &Store, profile: &Profile, settings: &Settings) -> 
     let directory = store.runtime_dir(profile.id);
     clyntis_desktop_model::private_dir(&directory)?;
     config.directory = directory;
-    meta_runtime::prefetch_resources(config).await
+    clyntis_runtime::prefetch_resources(config).await
 }
 
 /// Background variant used after importing a subscription; failures are only logged.

@@ -592,15 +592,15 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clyntis"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
- "meta-config",
- "meta-core",
- "meta-platform",
- "meta-runtime",
+ "clyntis-config",
+ "clyntis-core",
+ "clyntis-platform",
+ "clyntis-runtime",
  "rpassword",
  "serde_json",
  "tempfile",
@@ -608,6 +608,193 @@ dependencies = [
  "tokio-util",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "clyntis-config"
+version = "1.0.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64 0.22.1",
+ "cfb-mode",
+ "ipnet",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_yaml",
+ "sha1",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "clyntis-core"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clyntis-config",
+ "clyntis-platform",
+ "clyntis-protocol",
+ "clyntis-tailscale",
+ "futures-util",
+ "hickory-proto",
+ "http",
+ "http-body-util",
+ "httparse",
+ "hyper",
+ "hyper-util",
+ "ipnet",
+ "libc",
+ "maxminddb",
+ "prost",
+ "route_manager",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "smoltcp",
+ "socket2",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "clyntis-ffi"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clyntis-config",
+ "clyntis-core",
+ "clyntis-platform",
+ "clyntis-protocol",
+ "serde_json",
+ "smoltcp",
+ "socket2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "clyntis-platform"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ipnet",
+ "netdev",
+ "route_manager",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
+ "tun-rs",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "clyntis-protocol"
+version = "1.0.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "blake2",
+ "boring",
+ "boring-sys",
+ "brotli",
+ "bytes",
+ "clyntis-config",
+ "clyntis-platform",
+ "flate2",
+ "foreign-types-shared",
+ "futures-util",
+ "h2",
+ "hkdf",
+ "hmac",
+ "http",
+ "httparse",
+ "pem-rfc7468",
+ "rand 0.8.8",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "socket2",
+ "tempfile",
+ "tokio",
+ "tokio-boring",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "webpki-root-certs",
+ "x25519-dalek",
+ "x509-parser",
+ "zeroize",
+ "zstd",
+]
+
+[[package]]
+name = "clyntis-runtime"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clyntis-config",
+ "clyntis-core",
+ "clyntis-platform",
+ "flate2",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "clyntis-tailscale"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "blake2",
+ "boringtun",
+ "bytes",
+ "chacha20poly1305",
+ "clyntis-protocol",
+ "crypto_box",
+ "h2",
+ "hex",
+ "hkdf",
+ "http",
+ "httparse",
+ "ipnet",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "smoltcp",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "x25519-dalek",
+ "zstd",
 ]
 
 [[package]]
@@ -1709,193 +1896,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "meta-config"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "base64 0.22.1",
- "cfb-mode",
- "ipnet",
- "regex",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_yaml",
- "sha1",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "meta-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "hickory-proto",
- "http",
- "http-body-util",
- "httparse",
- "hyper",
- "hyper-util",
- "ipnet",
- "libc",
- "maxminddb",
- "meta-config",
- "meta-platform",
- "meta-protocol",
- "meta-tailscale",
- "prost",
- "route_manager",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "smoltcp",
- "socket2",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "meta-ffi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "meta-config",
- "meta-core",
- "meta-platform",
- "meta-protocol",
- "serde_json",
- "smoltcp",
- "socket2",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "meta-platform"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "ipnet",
- "netdev",
- "route_manager",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tracing",
- "tun-rs",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "meta-protocol"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "blake2",
- "boring",
- "boring-sys",
- "brotli",
- "bytes",
- "flate2",
- "foreign-types-shared",
- "futures-util",
- "h2",
- "hkdf",
- "hmac",
- "http",
- "httparse",
- "meta-config",
- "meta-platform",
- "pem-rfc7468",
- "rand 0.8.8",
- "rcgen",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "socket2",
- "tempfile",
- "tokio",
- "tokio-boring",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "webpki-root-certs",
- "x25519-dalek",
- "x509-parser",
- "zeroize",
- "zstd",
-]
-
-[[package]]
-name = "meta-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "flate2",
- "meta-config",
- "meta-core",
- "meta-platform",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "meta-tailscale"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "blake2",
- "boringtun",
- "bytes",
- "chacha20poly1305",
- "crypto_box",
- "h2",
- "hex",
- "hkdf",
- "http",
- "httparse",
- "ipnet",
- "meta-protocol",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "smoltcp",
- "tokio",
- "tokio-util",
- "tracing",
- "x25519-dalek",
- "zstd",
 ]
 
 [[package]]

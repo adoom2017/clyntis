@@ -1,6 +1,6 @@
 //! Immutable routing snapshots. A failed refresh leaves the active snapshot intact.
 use anyhow::{Context, Result, bail, ensure};
-use meta_config::{
+use clyntis_config::{
     Config, RuleProvider,
     rule::{DomainSetBuilder, IpMatcher, IpSet, Matcher, Rule},
 };
@@ -53,7 +53,7 @@ struct ProviderSource {
 /// One configured list and its contents; `None` when it could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ListSource {
-    list: meta_config::adblock::List,
+    list: clyntis_config::adblock::List,
     stamp: Option<Stamp>,
 }
 impl Resources {
@@ -100,7 +100,7 @@ impl Resources {
     pub async fn load(
         config: &Config,
         resolver: &crate::dns::Resolver,
-        hooks: &meta_platform::Hooks,
+        hooks: &clyntis_platform::Hooks,
         refresh: bool,
         previous: &Resources,
         via: Option<&crate::Core>,
@@ -442,14 +442,14 @@ async fn adblock(
         tracing::debug!("ad blocking lists unchanged; reusing them");
         return (Some(Arc::new(active.with_lists(settings, lists))), sources);
     }
-    let mut block = meta_config::rule::DomainSetBuilder::default();
-    let mut allow = meta_config::rule::DomainSetBuilder::default();
+    let mut block = clyntis_config::rule::DomainSetBuilder::default();
+    let mut allow = clyntis_config::rule::DomainSetBuilder::default();
     let mut addresses = Vec::new();
     let mut lists = Vec::new();
     for (list, resolved) in settings.lists.iter().zip(resolved) {
         let loaded = resolved.data.and_then(|data| {
             let bytes = read_limited(&data)?;
-            meta_config::adblock::parse_list(
+            clyntis_config::adblock::parse_list(
                 &bytes,
                 &list.format,
                 &mut block,
@@ -687,7 +687,7 @@ async fn asset(
 /// How routing resources are fetched: direct first, then through `proxy`.
 struct Fetch<'a> {
     resolver: &'a crate::dns::Resolver,
-    hooks: &'a meta_platform::Hooks,
+    hooks: &'a clyntis_platform::Hooks,
     proxy: Option<(&'a crate::Core, &'a str)>,
 }
 
@@ -893,7 +893,7 @@ const TIMEOUTS: Timeouts = Timeouts {
 pub async fn download(
     url: &str,
     resolver: &crate::dns::Resolver,
-    hooks: &meta_platform::Hooks,
+    hooks: &clyntis_platform::Hooks,
     via: Option<(&crate::Core, &str)>,
     sink: &mut (dyn std::io::Write + Send),
 ) -> Result<usize> {
@@ -902,7 +902,7 @@ pub async fn download(
 async fn download_with(
     url: &str,
     resolver: &crate::dns::Resolver,
-    hooks: &meta_platform::Hooks,
+    hooks: &clyntis_platform::Hooks,
     via: Option<(&crate::Core, &str)>,
     timeouts: Timeouts,
     sink: &mut (dyn std::io::Write + Send),
@@ -918,21 +918,21 @@ async fn download_with(
                 "resource URL must use HTTP(S)"
             );
             let (response, driver) = tokio::time::timeout(timeouts.response, async {
-                let target = meta_protocol::Target::from_uri(
+                let target = clyntis_protocol::Target::from_uri(
                     &uri,
                     if scheme == "https" { 443 } else { 80 },
                 )?;
-                let stream: meta_protocol::BoxStream = if let Some((core, name)) = via {
+                let stream: clyntis_protocol::BoxStream = if let Some((core, name)) = via {
                     let (tunnel, _) = core.dial(&target, Some(name)).await?;
                     if scheme == "https" {
-                        meta_protocol::tls::SecureConnector::new(resolver.clock())
+                        clyntis_protocol::tls::SecureConnector::new(resolver.clock())
                             .connect(
                                 tunnel,
-                                &meta_protocol::tls::TlsConnectConfig {
+                                &clyntis_protocol::tls::TlsConnectConfig {
                                     server_name: target.host.clone(),
                                     alpn: vec!["http/1.1".into()],
                                     verify_cert: true,
-                                    fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                                    fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
                                     reality: None,
                                 },
                             )
@@ -949,19 +949,20 @@ async fn download_with(
                         let attempt = tokio::time::timeout(PER_ADDRESS_TIMEOUT, async {
                             let socket = tokio::time::timeout(
                                 Duration::from_secs(5),
-                                meta_platform::tcp_connect(addr, &**hooks),
+                                clyntis_platform::tcp_connect(addr, &**hooks),
                             )
                             .await
                             .map_err(|_| anyhow::anyhow!("TCP connect to {addr} timed out"))??;
-                            let stream: meta_protocol::BoxStream = if scheme == "https" {
-                                meta_protocol::tls::SecureConnector::new(resolver.clock())
+                            let stream: clyntis_protocol::BoxStream = if scheme == "https" {
+                                clyntis_protocol::tls::SecureConnector::new(resolver.clock())
                                     .connect(
                                         Box::new(socket),
-                                        &meta_protocol::tls::TlsConnectConfig {
+                                        &clyntis_protocol::tls::TlsConnectConfig {
                                             server_name: target.host.clone(),
                                             alpn: vec!["http/1.1".into()],
                                             verify_cert: true,
-                                            fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                                            fingerprint:
+                                                clyntis_protocol::tls::TlsFingerprint::Native,
                                             reality: None,
                                         },
                                     )
@@ -1366,7 +1367,7 @@ mod tests {
         config.geox_url.geosite = format!("http://{address}/geosite.dat");
         (config, attempts)
     }
-    fn domains(resources: &Resources) -> Arc<meta_config::rule::DomainSet> {
+    fn domains(resources: &Resources) -> Arc<clyntis_config::rule::DomainSet> {
         match resources.matchers.get(&("geosite".into(), "test".into())) {
             Some(Matcher::Domains(set)) => set.clone(),
             _ => panic!("geosite matcher missing"),
@@ -1377,8 +1378,8 @@ mod tests {
     async fn unchanged_geo_data_is_reused_and_failed_updates_keep_the_file() {
         let (config, attempts) = expired_geosite(false).await;
         let dns =
-            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let first = Resources::load(&config, &dns, &hooks, false, &Resources::default(), None)
             .await
             .unwrap();
@@ -1410,8 +1411,8 @@ mod tests {
         .unwrap();
         config.directory = dir.clone();
         let dns =
-            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let load = |previous| Resources::load(&config, &dns, &hooks, false, previous, None);
         let provider = |r: &Resources| match &r.providers["ads"].1 {
             Matcher::Or(nodes) => match &nodes[0] {
@@ -1478,8 +1479,8 @@ mod tests {
     async fn hosted_tunnels_refresh_geo_data_only_at_start() {
         let (config, attempts) = expired_geosite(true).await;
         let dns =
-            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         // Start: no previous snapshot, so the expired file is checked (and kept on failure).
         let first = Resources::load(&config, &dns, &hooks, true, &Resources::default(), None)
             .await
@@ -1500,7 +1501,7 @@ mod tests {
             "proxies:\n  - {{name: node, type: vless, server: example.com, port: 443, uuid: 11111111-1111-4111-8111-111111111111, network: tcp}}\nproxy-groups:\n{groups}rules:\n{rules}"
         );
         let config = Config::parse(yaml.as_bytes()).unwrap();
-        crate::Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap()
+        crate::Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap()
     }
 
     #[test]
@@ -1527,8 +1528,8 @@ mod tests {
         );
         let url = slow_server(vec![(0, &b"through-core"[..])]).await;
         let resolver =
-            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let mut data = Vec::new();
         // DIRECT stands in for a proxy here: the request goes through Core::dial.
         download_with(
@@ -1547,8 +1548,8 @@ mod tests {
     #[tokio::test]
     async fn slow_but_steady_download_outlives_the_idle_timeout() {
         let resolver =
-            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         // Takes ~1.5s in total, three times the idle limit, but never pauses for long.
         let url = slow_server((0..6).map(|_| (250, &b"chunk"[..])).collect()).await;
         let mut data = Vec::new();
@@ -1561,8 +1562,8 @@ mod tests {
     #[tokio::test]
     async fn stalled_download_reports_progress_instead_of_a_bare_deadline() {
         let resolver =
-            crate::dns::Resolver::new(Default::default(), Arc::new(meta_platform::DefaultHooks));
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let url = slow_server(vec![(0, b"partial"), (3000, b"rest")]).await;
         let error = download_with(&url, &resolver, &hooks, None, short(), &mut Vec::new())
             .await
@@ -1628,7 +1629,7 @@ mod tests {
                 ..RuleProvider::default()
             },
         );
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let dns = crate::dns::Resolver::new(c.dns.clone(), hooks.clone());
         let resources = Resources::load(&c, &dns, &hooks, false, &Resources::default(), None)
             .await
@@ -1642,7 +1643,7 @@ mod tests {
         core.prepare_resources(false).await.unwrap();
         assert_eq!(
             core.route(
-                &meta_protocol::Target::new("www.example.test", 443).unwrap(),
+                &clyntis_protocol::Target::new("www.example.test", 443).unwrap(),
                 "tcp"
             )
             .await
@@ -1650,14 +1651,17 @@ mod tests {
             "REJECT"
         );
         assert_eq!(
-            core.route(&meta_protocol::Target::new("10.1.1.1", 80).unwrap(), "tcp")
-                .await
-                .unwrap(),
+            core.route(
+                &clyntis_protocol::Target::new("10.1.1.1", 80).unwrap(),
+                "tcp"
+            )
+            .await
+            .unwrap(),
             "DIRECT"
         );
         assert_eq!(
             core.route(
-                &meta_protocol::Target::new("blocked.test", 80).unwrap(),
+                &clyntis_protocol::Target::new("blocked.test", 80).unwrap(),
                 "tcp"
             )
             .await
@@ -1711,10 +1715,10 @@ mod tests {
                 ..RuleProvider::default()
             },
         );
-        let hooks: meta_platform::Hooks = Arc::new(meta_platform::DefaultHooks);
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
         let core = crate::Core::new(c, hooks).unwrap();
         core.prepare_resources(false).await.unwrap();
-        let target = |s| meta_protocol::Target::new(s, 80).unwrap();
+        let target = |s| clyntis_protocol::Target::new(s, 80).unwrap();
         assert_eq!(
             core.route(&target("first.test"), "tcp").await.unwrap(),
             "REJECT"

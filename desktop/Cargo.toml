@@ -4,7 +4,7 @@ default-members = ["model", "runner", "service"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
 rust-version = "1.93"
@@ -18,8 +18,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-meta-config = { path = "../crates/config" }
-meta-runtime = { path = "../crates/runtime" }
+clyntis-config = { path = "../crates/config" }
+clyntis-runtime = { path = "../crates/runtime" }
 clyntis-desktop-model = { path = "model" }
 clyntis-desktop-service = { path = "service" }
 

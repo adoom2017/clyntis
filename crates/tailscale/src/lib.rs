@@ -15,7 +15,7 @@ pub mod tailcfg;
 pub use node::{Node, Options, PeerStatus, Status};
 
 use anyhow::Result;
-use meta_protocol::BoxStream;
+use clyntis_protocol::BoxStream;
 use std::net::IpAddr;
 
 /// How the node reaches the control server and DERP relays. The proxy core

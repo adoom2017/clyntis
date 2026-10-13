@@ -1,10 +1,10 @@
 //! Against the real Tailscale control plane; needs network access.
-//! `cargo test -p meta-tailscale --test live -- --ignored --nocapture`
-use meta_protocol::{
+//! `cargo test -p clyntis-tailscale --test live -- --ignored --nocapture`
+use clyntis_protocol::{
     BoxStream,
     tls::{Clock, SecureConnector, TlsConnectConfig, TlsFingerprint},
 };
-use meta_tailscale::{
+use clyntis_tailscale::{
     Dialer,
     control::{Control, ServerUrl},
     key::{NodeKey, Private},
@@ -86,7 +86,7 @@ async fn noise_and_http2_reach_the_control_server() {
 #[tokio::test]
 #[ignore]
 async fn derp_relays_between_two_keys() {
-    use meta_tailscale::{derp, tailcfg::DerpNode};
+    use clyntis_tailscale::{derp, tailcfg::DerpNode};
     let node = DerpNode {
         name: "1a".into(),
         host_name: "derp1.tailscale.com".into(),

@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, ensure};
+use clyntis_config::Dns;
+use clyntis_platform::Hooks;
+use clyntis_protocol::Target;
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{
@@ -6,9 +9,6 @@ use hickory_proto::{
         rdata::{A, AAAA},
     },
 };
-use meta_config::Dns;
-use meta_platform::Hooks;
-use meta_protocol::Target;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
@@ -162,7 +162,7 @@ impl FakeMap {
 pub struct Resolver {
     pub config: Dns,
     hooks: Hooks,
-    clock: std::sync::Arc<meta_protocol::tls::Clock>,
+    clock: std::sync::Arc<clyntis_protocol::tls::Clock>,
     cache: Mutex<Cache>,
     fake: Mutex<FakeMap>,
     policy: RwLock<DnsPolicy>,
@@ -175,22 +175,22 @@ pub struct Resolver {
 pub type TailnetNames = std::sync::Arc<dyn Fn(&str) -> Option<IpAddr> + Send + Sync>;
 #[derive(Clone, Default)]
 struct DnsPolicy {
-    hosts: std::collections::BTreeMap<String, meta_config::Strings>,
-    nameservers: Vec<(meta_config::rule::Matcher, Vec<String>)>,
-    filters: Vec<meta_config::rule::Matcher>,
+    hosts: std::collections::BTreeMap<String, clyntis_config::Strings>,
+    nameservers: Vec<(clyntis_config::rule::Matcher, Vec<String>)>,
+    filters: Vec<clyntis_config::rule::Matcher>,
 }
 impl Resolver {
     pub fn new(config: Dns, hooks: Hooks) -> Self {
         Self::new_with_clock(
             config,
             hooks,
-            std::sync::Arc::new(meta_protocol::tls::Clock::default()),
+            std::sync::Arc::new(clyntis_protocol::tls::Clock::default()),
         )
     }
     pub fn new_with_clock(
         config: Dns,
         hooks: Hooks,
-        clock: std::sync::Arc<meta_protocol::tls::Clock>,
+        clock: std::sync::Arc<clyntis_protocol::tls::Clock>,
     ) -> Self {
         Self {
             config,
@@ -204,33 +204,33 @@ impl Resolver {
             fake: Mutex::new(FakeMap::new(FAKE_CAPACITY)),
         }
     }
-    pub fn clock(&self) -> std::sync::Arc<meta_protocol::tls::Clock> {
+    pub fn clock(&self) -> std::sync::Arc<clyntis_protocol::tls::Clock> {
         self.clock.clone()
     }
     pub fn configure(
         &self,
-        hosts: &std::collections::BTreeMap<String, meta_config::Strings>,
+        hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>,
         resources: &crate::resources::Resources,
     ) -> Result<()> {
         *self.adblock.write().unwrap() = resources.adblock.clone();
         fn matcher(
             pattern: &str,
             resources: &crate::resources::Resources,
-        ) -> Result<meta_config::rule::Matcher> {
+        ) -> Result<clyntis_config::rule::Matcher> {
             for (prefix, kind) in [("geosite:", "GEOSITE"), ("rule-set:", "RULE-SET")] {
                 if let Some(tags) = pattern.strip_prefix(prefix) {
                     let nodes = tags
                         .split(',')
                         .map(|tag| {
-                            resources.bind(&meta_config::rule::Matcher::parse_condition(&format!(
-                                "{kind},{tag}"
-                            ))?)
+                            resources.bind(&clyntis_config::rule::Matcher::parse_condition(
+                                &format!("{kind},{tag}"),
+                            )?)
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    return Ok(meta_config::rule::Matcher::Or(nodes.into()));
+                    return Ok(clyntis_config::rule::Matcher::Or(nodes.into()));
                 }
             }
-            meta_config::rule::domain_pattern(pattern)
+            clyntis_config::rule::domain_pattern(pattern)
         }
         let mut entries: Vec<_> = self.config.nameserver_policy.iter().collect();
         entries.sort_by_key(|(key, _)| {
@@ -273,7 +273,7 @@ impl Resolver {
     pub(crate) fn adblock(&self) -> Option<std::sync::Arc<crate::adblock::Filter>> {
         self.adblock.read().unwrap().clone()
     }
-    pub fn set_hosts(&self, hosts: &std::collections::BTreeMap<String, meta_config::Strings>) {
+    pub fn set_hosts(&self, hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>) {
         self.policy.write().unwrap().hosts = hosts.clone();
     }
     fn host_values(&self, host: &str) -> Option<Vec<String>> {
@@ -287,7 +287,7 @@ impl Resolver {
             .iter()
             .filter(|(key, _)| key.contains('*') || key.starts_with('+'))
             .filter(|(key, _)| {
-                meta_config::rule::domain_pattern(key)
+                clyntis_config::rule::domain_pattern(key)
                     .is_ok_and(|m| m.evaluate(&host, None, 0, "", false) == Some(true))
             })
             .max_by_key(|(key, _)| key.len())
@@ -673,15 +673,15 @@ impl Resolver {
             let uri: http::Uri = server.parse()?;
             let target = Target::from_uri(&uri, 443)?;
             let addr = self.bootstrap(&target.host, target.port).await?;
-            let socket = meta_platform::tcp_connect(addr, &*self.hooks).await?;
-            let tls = meta_protocol::tls::SecureConnector::new(self.clock.clone())
+            let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
+            let tls = clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
                 .connect(
                     Box::new(socket),
-                    &meta_protocol::tls::TlsConnectConfig {
+                    &clyntis_protocol::tls::TlsConnectConfig {
                         server_name: target.host,
                         alpn: vec!["http/1.1".into()],
                         verify_cert: true,
-                        fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                        fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
                         reality: None,
                     },
                 )
@@ -730,15 +730,15 @@ impl Resolver {
         if let Some(raw) = server.strip_prefix("tls://") {
             let target = parse_server(raw, 853)?;
             let addr = self.bootstrap(&target.host, target.port).await?;
-            let socket = meta_platform::tcp_connect(addr, &*self.hooks).await?;
-            let stream = meta_protocol::tls::SecureConnector::new(self.clock.clone())
+            let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
+            let stream = clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
                 .connect(
                     Box::new(socket),
-                    &meta_protocol::tls::TlsConnectConfig {
+                    &clyntis_protocol::tls::TlsConnectConfig {
                         server_name: target.host,
                         alpn: Vec::new(),
                         verify_cert: true,
-                        fingerprint: meta_protocol::tls::TlsFingerprint::Native,
+                        fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
                         reality: None,
                     },
                 )
@@ -769,7 +769,7 @@ impl Resolver {
             "[::]:0"
         }
         .parse()?;
-        let socket = meta_platform::udp_bind_for(bind, Some(addr), &*self.hooks)?;
+        let socket = clyntis_platform::udp_bind_for(bind, Some(addr), &*self.hooks)?;
         socket.connect(addr).await?;
         let query = request.to_vec()?;
         let mut bytes = vec![0; 65535];
@@ -791,7 +791,7 @@ impl Resolver {
         }
     }
     async fn raw_tcp(&self, addr: SocketAddr, request: &Message) -> Result<Message> {
-        let socket = meta_platform::tcp_connect(addr, &*self.hooks).await?;
+        let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
         Self::exchange_stream(socket, request).await
     }
     async fn exchange_stream<S>(mut socket: S, request: &Message) -> Result<Message>

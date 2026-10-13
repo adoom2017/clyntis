@@ -76,7 +76,7 @@ fn key(
     transport_identity: &str,
     endpoint: &str,
     authority: &str,
-    options: &meta_config::GrpcOptions,
+    options: &clyntis_config::GrpcOptions,
     secure: bool,
 ) -> String {
     format!(
@@ -85,7 +85,11 @@ fn key(
     )
 }
 
-fn reuse_least_loaded(load: usize, connections: usize, options: &meta_config::GrpcOptions) -> bool {
+fn reuse_least_loaded(
+    load: usize,
+    connections: usize,
+    options: &clyntis_config::GrpcOptions,
+) -> bool {
     if load == 0 {
         return true;
     }
@@ -96,7 +100,7 @@ fn reuse_least_loaded(load: usize, connections: usize, options: &meta_config::Gr
     }
 }
 
-fn pooled(key: &str, options: &meta_config::GrpcOptions) -> Option<Physical> {
+fn pooled(key: &str, options: &clyntis_config::GrpcOptions) -> Option<Physical> {
     let pool = POOL.get_or_init(Default::default);
     let map = pool.lock().unwrap();
     let list = map.get(key)?;
@@ -149,7 +153,7 @@ pub async fn connect(
     stream: BoxStream,
     endpoint: &str,
     authority: &str,
-    options: &meta_config::GrpcOptions,
+    options: &clyntis_config::GrpcOptions,
     tls: Option<(crate::tls::TlsConnectConfig, Arc<crate::tls::Clock>)>,
     transport_identity: &str,
 ) -> Result<BoxStream> {
@@ -448,7 +452,7 @@ mod tests {
                 }
             }
         });
-        let options = meta_config::GrpcOptions {
+        let options = clyntis_config::GrpcOptions {
             grpc_service_name: "custom".into(),
             grpc_user_agent: "test-agent".into(),
             ..Default::default()
@@ -478,7 +482,7 @@ mod tests {
 
     #[test]
     fn pool_reuses_idle_and_matches_mihomo_thresholds() {
-        let mut options = meta_config::GrpcOptions {
+        let mut options = clyntis_config::GrpcOptions {
             max_connections: 2,
             min_streams: 2,
             ..Default::default()
@@ -551,7 +555,7 @@ mod tests {
                 }
             }
         });
-        let options = meta_config::GrpcOptions::default();
+        let options = clyntis_config::GrpcOptions::default();
         let mut stream = connect(
             Box::new(client),
             "flow.example:443",

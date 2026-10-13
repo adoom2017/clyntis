@@ -4,7 +4,7 @@ resolver = "2"
 exclude = ["fuzz", "desktop"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.93"
 license = "GPL-3.0-only"
@@ -38,12 +38,12 @@ socket2 = { version = "0.6", features = ["all"] }
 brotli = "8.0.2"
 flate2 = "1.1.9"
 zstd = "0.13.3"
-meta-config = { path = "crates/config" }
-meta-protocol = { path = "crates/protocol" }
-meta-platform = { path = "crates/platform" }
-meta-core = { path = "crates/core" }
-meta-runtime = { path = "crates/runtime" }
-meta-tailscale = { path = "crates/tailscale" }
+clyntis-config = { path = "crates/config" }
+clyntis-protocol = { path = "crates/protocol" }
+clyntis-platform = { path = "crates/platform" }
+clyntis-core = { path = "crates/core" }
+clyntis-runtime = { path = "crates/runtime" }
+clyntis-tailscale = { path = "crates/tailscale" }
 
 [profile.release]
 lto = "thin"

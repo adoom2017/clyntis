@@ -3,8 +3,8 @@
 //! or `dialer-proxy`).
 use crate::Core;
 use anyhow::{Context, Result};
-use meta_config::{Proxy, ProxyKind};
-use meta_protocol::{
+use clyntis_config::{Proxy, ProxyKind};
+use clyntis_protocol::{
     BoxStream, Target,
     tls::{SecureConnector, TlsConnectConfig, TlsFingerprint},
 };
@@ -23,7 +23,7 @@ struct CoreDialer {
 }
 
 #[async_trait::async_trait]
-impl meta_tailscale::Dialer for CoreDialer {
+impl clyntis_tailscale::Dialer for CoreDialer {
     async fn connect_tcp(&self, host: &str, port: u16) -> Result<BoxStream> {
         let core = self.core.upgrade().context("proxy core stopped")?;
         let target = Target::new(host, port)?;
@@ -56,11 +56,11 @@ impl meta_tailscale::Dialer for CoreDialer {
     async fn bind_udp(&self) -> Result<tokio::net::UdpSocket> {
         let core = self.core.upgrade().context("proxy core stopped")?;
         // Bound like the core's own UDP: outside the TUN, on the physical exit.
-        meta_platform::udp_bind_for("0.0.0.0:0".parse()?, Some(PROBE.parse()?), &*core.hooks)
+        clyntis_platform::udp_bind_for("0.0.0.0:0".parse()?, Some(PROBE.parse()?), &*core.hooks)
     }
     async fn local_ipv4(&self) -> Option<IpAddr> {
         let core = self.core.upgrade()?;
-        let socket = meta_platform::udp_bind_for(
+        let socket = clyntis_platform::udp_bind_for(
             "0.0.0.0:0".parse().ok()?,
             PROBE.parse().ok(),
             &*core.hooks,
@@ -96,7 +96,7 @@ fn os() -> &'static str {
     }
 }
 
-fn options(core: &Core, proxy: &Proxy) -> meta_tailscale::Options {
+fn options(core: &Core, proxy: &Proxy) -> clyntis_tailscale::Options {
     let t = &proxy.tailscale;
     let folder: String = proxy
         .name
@@ -113,7 +113,7 @@ fn options(core: &Core, proxy: &Proxy) -> meta_tailscale::Options {
         Some(dir) => core.config.directory.join(dir),
         None => core.config.directory.join("tailscale").join(folder),
     };
-    meta_tailscale::Options {
+    clyntis_tailscale::Options {
         name: proxy.name.clone(),
         auth_key: t.auth_key.clone(),
         hostname: t
@@ -133,7 +133,7 @@ fn options(core: &Core, proxy: &Proxy) -> meta_tailscale::Options {
 }
 
 /// Starts a node for every tailscale proxy; they stop with the core.
-pub(crate) fn start(core: &Arc<Core>) -> Result<HashMap<String, meta_tailscale::Node>> {
+pub(crate) fn start(core: &Arc<Core>) -> Result<HashMap<String, clyntis_tailscale::Node>> {
     let mut nodes = HashMap::new();
     for proxy in core
         .config
@@ -145,12 +145,12 @@ pub(crate) fn start(core: &Arc<Core>) -> Result<HashMap<String, meta_tailscale::
             core: Arc::downgrade(core),
             via: proxy.dialer_proxy.clone(),
         });
-        let node = meta_tailscale::Node::start(options(core, proxy), dialer, core.stop.clone())
+        let node = clyntis_tailscale::Node::start(options(core, proxy), dialer, core.stop.clone())
             .with_context(|| format!("cannot start Tailscale proxy {}", proxy.name))?;
         nodes.insert(proxy.name.clone(), node);
     }
     if !nodes.is_empty() {
-        let names: Vec<meta_tailscale::Node> = nodes.values().cloned().collect();
+        let names: Vec<clyntis_tailscale::Node> = nodes.values().cloned().collect();
         core.resolver
             .set_tailnet_names(Some(Arc::new(move |host: &str| {
                 names.iter().find_map(|n| n.resolve(host))

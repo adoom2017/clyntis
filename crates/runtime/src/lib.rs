@@ -3,11 +3,11 @@ pub mod logging;
 #[cfg(target_os = "macos")]
 use anyhow::ensure;
 use anyhow::{Context, Result};
-use meta_config::Config;
+use clyntis_config::Config;
 #[cfg(target_os = "macos")]
-use meta_config::ProxyKind;
-use meta_core::Core;
-use meta_platform::{
+use clyntis_config::ProxyKind;
+use clyntis_core::Core;
+use clyntis_platform::{
     DefaultHooks,
     desktop::{DesktopTun, Options},
 };
@@ -35,9 +35,9 @@ pub async fn prefetch_resources(mut config: Config) -> Result<()> {
 
 pub fn recover(directory: &std::path::Path) -> Result<()> {
     // Attempt both journals even when one recovery fails.
-    let routes = meta_platform::desktop::recover(directory);
+    let routes = clyntis_platform::desktop::recover(directory);
     #[cfg(target_os = "macos")]
-    let dns = meta_platform::macos_dns::recover(directory);
+    let dns = clyntis_platform::macos_dns::recover(directory);
     routes?;
     #[cfg(target_os = "macos")]
     dns?;
@@ -53,7 +53,7 @@ fn dns_server_ip(server: &str) -> Option<IpAddr> {
         .or_else(|| authority.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
 }
 
-fn physical_dns_upstreams(dns: &meta_config::Dns) -> Vec<IpAddr> {
+fn physical_dns_upstreams(dns: &clyntis_config::Dns) -> Vec<IpAddr> {
     let mut addresses: Vec<_> = dns
         .nameserver
         .iter()
@@ -128,7 +128,7 @@ pub async fn public_egress_targets() -> Vec<SocketAddr> {
 }
 
 #[cfg(target_os = "macos")]
-async fn verify_macos_system_dns(dns: &meta_config::Dns) -> Result<()> {
+async fn verify_macos_system_dns(dns: &clyntis_config::Dns) -> Result<()> {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     if dns.enhanced_mode != "fake-ip" {
@@ -168,7 +168,7 @@ pub async fn detect_macos_egress(
     phase: &str,
     current: Option<&str>,
 ) -> Result<Option<String>> {
-    use meta_platform::desktop::{EgressHooks, Network, ipv4_egress_candidates};
+    use clyntis_platform::desktop::{EgressHooks, Network, ipv4_egress_candidates};
     use std::time::Duration;
 
     if config.tun.interface.is_some() || !config.tun.auto_detect_interface {
@@ -221,7 +221,7 @@ pub async fn detect_macos_egress(
             attempts.spawn(async move {
                 let result = tokio::time::timeout(
                     Duration::from_secs(3),
-                    meta_platform::tcp_connect(target, &*hooks),
+                    clyntis_platform::tcp_connect(target, &*hooks),
                 )
                 .await;
                 (index, public, matches!(result, Ok(Ok(_))))
@@ -251,7 +251,7 @@ pub async fn detect_macos_egress(
     let current = current.and_then(|name| candidates.iter().position(|c| c.name == name));
     let wired: Vec<bool> = candidates
         .iter()
-        .map(|candidate| meta_platform::desktop::is_wired(candidate.index))
+        .map(|candidate| clyntis_platform::desktop::is_wired(candidate.index))
         .collect();
     let selected = best_egress_index(&public_scores, &proxy_scores, &wired, current);
     if let Some(index) = selected {
@@ -353,13 +353,13 @@ pub async fn run(
             );
         }
     }
-    let hooks: meta_platform::Hooks = desktop
+    let hooks: clyntis_platform::Hooks = desktop
         .as_ref()
-        .map(|d| d.hooks.clone() as meta_platform::Hooks)
+        .map(|d| d.hooks.clone() as clyntis_platform::Hooks)
         .unwrap_or_else(|| Arc::new(DefaultHooks));
     let packets = desktop
         .as_ref()
-        .map(|d| d.device.clone() as Arc<dyn meta_platform::PacketIo>);
+        .map(|d| d.device.clone() as Arc<dyn clyntis_platform::PacketIo>);
     let core = Core::new(config, hooks)?;
     logging::init(&core.config.log, &directory, core.events.clone())?;
     if core.config.log.log_path.is_empty() {
@@ -398,7 +398,7 @@ pub async fn run(
             .as_ref()
             .and_then(|tun| tun.hooks.network().ipv4)
             .context("automatic DNS requires an IPv4 physical exit")?;
-        Some(meta_platform::desktop::local_ipv4_address(&interface)?)
+        Some(clyntis_platform::desktop::local_ipv4_address(&interface)?)
     } else {
         None
     };
@@ -426,7 +426,7 @@ pub async fn run(
             .and_then(|tun| tun.hooks.network().ipv4)
             .context("automatic DNS requires an IPv4 physical exit")?;
         let server = system_dns_address.context("automatic DNS address missing")?;
-        let dns = meta_platform::macos_dns::MacDns::start(&directory, &interface.name, server)?;
+        let dns = clyntis_platform::macos_dns::MacDns::start(&directory, &interface.name, server)?;
         tracing::info!(interface = %interface.name, %server, "macOS system DNS configured");
         Some(dns)
     } else {
@@ -488,7 +488,7 @@ pub async fn run(
                     if dns_pending && let Some(dns) = &mut system_dns {
                         let synced = async {
                             let interface = desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).context("no IPv4 physical exit")?;
-                            let address = meta_platform::desktop::local_ipv4_address(&interface)?;
+                            let address = clyntis_platform::desktop::local_ipv4_address(&interface)?;
                             if Some(address) != system_dns_address {
                                 running.rebind_system_dns(std::net::SocketAddr::new(address.into(), 53)).await?;
                                 system_dns_address = Some(address);
@@ -534,15 +534,15 @@ mod dns_route_tests {
 
     #[test]
     fn physical_upstreams_include_literal_public_dns_only() {
-        let mut dns = meta_config::Dns {
+        let mut dns = clyntis_config::Dns {
             nameserver: vec!["223.5.5.5".into(), "udp://119.29.29.29:53".into()],
             default_nameserver: vec!["223.5.5.5".into()],
             proxy_server_nameserver: vec!["https://doh.pub/dns-query".into()],
-            ..meta_config::Dns::default()
+            ..clyntis_config::Dns::default()
         };
         dns.nameserver_policy.insert(
             "*.example.com".into(),
-            meta_config::Strings::Many(vec![
+            clyntis_config::Strings::Many(vec![
                 "https://223.6.6.6/dns-query".into(),
                 "192.168.2.50".into(),
             ]),

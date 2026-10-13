@@ -33,11 +33,11 @@ try {
     if ($explicitTarget) { $buildRoot = Join-Path $buildRoot $Target }
     $buildRoot = Join-Path $buildRoot 'release'
     $artifacts = if ($Target.Contains('windows')) {
-        @('clyntis.exe', 'meta_ffi.dll', 'meta_ffi.dll.lib', 'meta_ffi.lib')
+        @('clyntis.exe', 'clyntis_ffi.dll', 'clyntis_ffi.dll.lib', 'clyntis_ffi.lib')
     } elseif ($Target.Contains('apple')) {
-        @('clyntis', 'libmeta_ffi.dylib', 'libmeta_ffi.a')
+        @('clyntis', 'libclyntis_ffi.dylib', 'libclyntis_ffi.a')
     } else {
-        @('clyntis', 'libmeta_ffi.so', 'libmeta_ffi.a')
+        @('clyntis', 'libclyntis_ffi.so', 'libclyntis_ffi.a')
     }
     foreach ($artifact in $artifacts) {
         Copy-Item -LiteralPath (Join-Path $buildRoot $artifact) -Destination $packageRoot

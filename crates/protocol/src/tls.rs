@@ -440,7 +440,7 @@ pub struct TlsConnectConfig {
     pub alpn: Vec<String>,
     pub verify_cert: bool,
     pub fingerprint: TlsFingerprint,
-    pub reality: Option<meta_config::Reality>,
+    pub reality: Option<clyntis_config::Reality>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -652,7 +652,7 @@ fn configure_ssl(
         ssl.verify_param_mut().set_time(now as _);
     }
     // mihomo's `support-x25519mlkem768: false` asks REALITY not to offer the
-    // hybrid group at all; absent keeps the profile (see meta_config::Reality).
+    // hybrid group at all; absent keeps the profile (see clyntis_config::Reality).
     let without_mlkem = config
         .reality
         .as_ref()
@@ -943,7 +943,7 @@ mod tests {
 
     async fn capture_with_reality(
         fingerprint: TlsFingerprint,
-        reality: Option<meta_config::Reality>,
+        reality: Option<clyntis_config::Reality>,
     ) -> WireHello {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -985,7 +985,7 @@ mod tests {
         for (switch, offered) in [(None, true), (Some(true), true), (Some(false), false)] {
             let hello = capture_with_reality(
                 TlsFingerprint::Chrome,
-                Some(meta_config::Reality {
+                Some(clyntis_config::Reality {
                     public_key: "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM".into(),
                     short_id: String::new(),
                     support_x25519mlkem768: switch,
@@ -1005,7 +1005,7 @@ mod tests {
     async fn reality_reuses_x25519_without_changing_profile_sigalgs() {
         let hello = capture_with_reality(
             TlsFingerprint::Chrome,
-            Some(meta_config::Reality {
+            Some(clyntis_config::Reality {
                 public_key: "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM".into(),
                 short_id: "01020304".into(),
                 support_x25519mlkem768: None,

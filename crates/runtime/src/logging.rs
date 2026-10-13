@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use clyntis_config::Log;
 use flate2::{Compression, write::GzEncoder};
-use meta_config::Log;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
