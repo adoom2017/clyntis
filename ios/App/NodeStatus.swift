@@ -69,6 +69,9 @@ extension NodeStatus {
         return (try? decoder.decode([String: NodeStatus].self, from: data)) ?? [:]
     }
 
+    /// Outbounds the core can delay-test (a Tailscale node has no URL test).
+    var probeable: Bool { type == "VLESS" || type == "Hysteria2" }
+
     /// The last delay test for lists ("85 ms", "超时"), shown apart from
     /// `summary` so it can carry its own colour.
     var delayText: String? {

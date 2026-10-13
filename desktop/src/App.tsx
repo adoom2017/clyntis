@@ -765,7 +765,7 @@ export default function App() {
                 </div>
               )}
               <p className="hint">
-                支持 VLESS 和 Tailscale
+                支持 VLESS、Hysteria2 和 Tailscale
                 节点，导入时会跳过不兼容的项，不会改动原文件。
               </p>
             </>

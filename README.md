@@ -8,9 +8,10 @@ replacement for every protocol or configuration option.
 
 - **Inbound:** HTTP/CONNECT, SOCKS5 and mixed proxy listeners; optional DNS
   listener and desktop TUN. HTTP/SOCKS authentication is supported.
-- **Outbound:** DIRECT, REJECT, VLESS and Tailscale. VLESS runs over TCP,
+- **Outbound:** DIRECT, REJECT, VLESS, Hysteria2 and Tailscale. VLESS runs over TCP,
   WebSocket or gRPC, including TLS, REALITY, XTLS Vision and UDP/XUDP.
-  BoringSSL is the TLS backend. Tailscale is described [below](#tailscale-outbound).
+  BoringSSL is the TLS backend. Hysteria2 and Tailscale are described
+  [below](#hysteria2-outbound).
 - **Routing:** rule/global/direct modes, select and url-test groups (a url-test
   group leaves a member as soon as it fails a round and re-tests right after a
   network change), domain/IP rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
@@ -67,11 +68,32 @@ replacement for every protocol or configuration option.
   configuration, proxy selection, connections, traffic and logs; and a C ABI for
   embedding in mobile or other hosts.
 
-Trojan and Hysteria2 entries can be parsed for configuration compatibility, but
-their outbound protocols are **not implemented**: selecting one fails instead of
-silently using another proxy. Unknown or unsupported configuration fields fail
-validation. `--vless-only` keeps the implemented outbounds (VLESS and Tailscale),
+Trojan entries can be parsed for configuration compatibility, but the outbound
+protocol is **not implemented**: selecting one fails instead of silently using
+another proxy. Unknown or unsupported configuration fields fail validation.
+`--vless-only` keeps the implemented outbounds (VLESS, Hysteria2 and Tailscale),
 removes the others and replaces dangling references with REJECT, not DIRECT.
+
+### Hysteria2 outbound
+
+A `type: hysteria2` (or `hy2`) proxy speaks Hysteria 2 over QUIC: TCP on QUIC
+streams, UDP in QUIC datagrams (fragmented and reassembled when a packet does
+not fit), after authenticating with `password` (or `auth-str`) in an HTTP/3
+request. QUIC uses rustls with the WebPKI roots (`sni`, `alpn` and
+`skip-cert-verify` apply; certificate times use the NTP-corrected clock), since
+the BoringSSL build has no QUIC API. Each proxy keeps one connection for all its
+traffic and reconnects when it closes.
+
+- `obfs: salamander` with `obfs-password` scrambles every packet.
+- `ports: "443,20000-30000"` hops to a random port, with a new local socket,
+  every `hop-interval` (default 30s, at least 5s), as the official client does.
+- `up`/`down` (e.g. `50 mbps`) state our bandwidth: with `up` set and a server
+  that does not ask for BBR, the connection uses Hysteria's Brutal congestion
+  control at the lower of `up` and the server's limit; otherwise BBR.
+
+`crates/protocol/tests/hysteria2_interop.rs` checks all of this against the
+official server; it is ignored by default and runs with `HYSTERIA_BIN` set to
+Hysteria v2.13.0.
 
 ### Tailscale outbound
 

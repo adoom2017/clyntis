@@ -396,9 +396,14 @@ impl Default for Tun {
 }
 
 impl Config {
-    /// Keeps the implemented outbounds (VLESS and Tailscale).
+    /// Keeps the implemented outbounds (VLESS, Hysteria2 and Tailscale).
     pub fn retain_vless(&mut self) -> Result<()> {
-        let supported = |p: &Proxy| matches!(p.kind, ProxyKind::Vless | ProxyKind::Tailscale);
+        let supported = |p: &Proxy| {
+            matches!(
+                p.kind,
+                ProxyKind::Vless | ProxyKind::Hysteria2 | ProxyKind::Tailscale
+            )
+        };
         let removed: HashSet<_> = self
             .proxies
             .iter()

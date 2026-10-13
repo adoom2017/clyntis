@@ -276,7 +276,7 @@ private struct NodesView: View {
             .navigationTitle("节点")
             .toolbar {
                 if shown == "proxies" && model.connected
-                    && model.nodeStatus.values.contains(where: { $0.type == "VLESS" }) {
+                    && model.nodeStatus.values.contains(where: \.probeable) {
                     Button("测速", systemImage: "bolt") { Task { await model.probeAll() } }
                         .disabled(!model.probing.isEmpty)
                 }
@@ -416,7 +416,7 @@ private struct ProxyRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
-            .disabled(status?.type != "VLESS" || !model.connected || model.probing.contains(name))
+            .disabled(status?.probeable != true || !model.connected || model.probing.contains(name))
             .accessibilityHint("测试延迟")
             if status != nil {
                 NavigationLink(value: name) {
@@ -456,7 +456,7 @@ private struct NodeDetailView: View {
                     if let flow = status.flow { LabeledContent("Flow", value: flow) }
                     if let udp = status.udp { LabeledContent("UDP", value: udp ? "开启" : "关闭") }
                 }
-                if status.type == "VLESS" {
+                if status.probeable {
                     Section("延迟") {
                         if let delay = status.delay {
                             LabeledContent("最近一次", value: "\(delay) ms")

@@ -236,8 +236,8 @@ Those require a provisioned device and working server details.
   GeoIP/GeoSite or rule-provider files) are not implemented; routing resources
   are downloaded from the profile's configured sources.
 - Protocol/configuration support is the same focused subset as the Rust core:
-  VLESS and Tailscale outbounds. Unknown fields fail validation;
-  Trojan/Hysteria2 outbounds remain unimplemented. UDP through Tailscale is not
+  VLESS, Hysteria2 and Tailscale outbounds. Unknown fields fail validation;
+  Trojan outbounds remain unimplemented. UDP through Tailscale is not
   supported yet.
 - No per-network on-demand rules (such as skipping a home Wi-Fi), desktop
   system proxy, tray, or local HTTP controller. Node groups, status and statistics are available after

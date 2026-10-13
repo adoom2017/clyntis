@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 /// Fake-IP names kept by the iOS tunnel; apps query again within seconds
 /// (answers have a one-second TTL), so evicted names come back at once.
 const HOSTED_FAKE_CAPACITY: usize = 8192;
+type Hysteria2Slot = Arc<tokio::sync::Mutex<Option<Arc<clyntis_protocol::hysteria2::Client>>>>;
 /// How often the info log summarizes ad blocks.
 const ADBLOCK_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 pub struct Core {
@@ -61,6 +62,9 @@ pub struct Core {
     saved_profile: Mutex<Option<(HashMap<String, String>, u64)>>,
     clock: Arc<clyntis_protocol::tls::Clock>,
     xudp_pool: tokio::sync::Mutex<HashMap<String, Weak<clyntis_protocol::xudp::Multiplexer>>>,
+    /// One authenticated QUIC connection per Hysteria2 proxy, shared by all
+    /// its TCP and UDP traffic; each slot serializes reconnects.
+    hysteria2: Mutex<HashMap<String, Hysteria2Slot>>,
     xudp_key: [u8; 32],
     tailscale: Mutex<HashMap<String, clyntis_tailscale::Node>>,
     /// Bumped on every network change so url-test groups re-test at once.
@@ -267,6 +271,8 @@ impl Running {
             tracing::warn!("cannot save profile");
         }
         self.core.stop.cancel();
+        // Closes the Hysteria2 connections once their streams are gone.
+        self.core.hysteria2.lock().unwrap().clear();
         self.tasks.abort_all();
         self.system_dns_tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
@@ -276,6 +282,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.core.stop.cancel();
+        self.core.hysteria2.lock().unwrap().clear();
         self.tasks.abort_all();
     }
 }
@@ -333,6 +340,7 @@ impl Core {
             resources: RwLock::new(Arc::new(resources::Resources::default())),
             clock,
             xudp_pool: Default::default(),
+            hysteria2: Default::default(),
             xudp_key,
             tailscale: Default::default(),
             network_epoch: tokio::sync::watch::channel(0).0,
@@ -990,6 +998,81 @@ impl Core {
         }
         Err(last)
     }
+    /// The proxy's live Hysteria2 connection, or a new one.
+    async fn hysteria2_client(
+        &self,
+        proxy: &clyntis_config::Proxy,
+        target: &Target,
+    ) -> Result<Arc<clyntis_protocol::hysteria2::Client>> {
+        let slot = self
+            .hysteria2
+            .lock()
+            .unwrap()
+            .entry(proxy.name.clone())
+            .or_default()
+            .clone();
+        let mut slot = slot.lock().await;
+        if let Some(client) = slot.as_ref().filter(|c| c.is_alive()) {
+            return Ok(client.clone());
+        }
+        let mut addresses: Vec<std::net::IpAddr> = self
+            .resolver
+            .lookup_proxy(&proxy.server, proxy.port)
+            .await?
+            .into_iter()
+            .map(|a| a.ip())
+            .collect();
+        match proxy.ip_version.as_str() {
+            "ipv4" => addresses.retain(std::net::IpAddr::is_ipv4),
+            "ipv6" => addresses.retain(std::net::IpAddr::is_ipv6),
+            "ipv6-prefer" => addresses.sort_by_key(std::net::IpAddr::is_ipv4),
+            _ => addresses.sort_by_key(std::net::IpAddr::is_ipv6),
+        }
+        let mut options = clyntis_protocol::hysteria2::Options::from_proxy(proxy, addresses)?;
+        options.compact = self.config.internal_host_packet_io;
+        let hooks = self.hooks.clone();
+        let bind: clyntis_protocol::hysteria2::Binder = Arc::new(move |server: SocketAddr| {
+            let local = if server.is_ipv4() {
+                SocketAddr::from(([0, 0, 0, 0], 0))
+            } else {
+                SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            };
+            clyntis_platform::udp_bind_for(local, Some(server), &*hooks)
+                .and_then(|socket| Ok(socket.into_std()?))
+                .map_err(std::io::Error::other)
+        });
+        let client = Arc::new(
+            clyntis_protocol::hysteria2::Client::connect(&options, bind, self.clock.clone())
+                .await
+                .with_context(|| format!("Hysteria2 {}", proxy.name))?,
+        );
+        tracing::info!(
+            "[OUTBOUND] connected {}({}) for {}",
+            proxy.name,
+            client.remote,
+            target
+        );
+        *slot = Some(client.clone());
+        Ok(client)
+    }
+    async fn hysteria2_stream(
+        &self,
+        proxy: &clyntis_config::Proxy,
+        target: &Target,
+    ) -> Result<BoxStream> {
+        let client = self.hysteria2_client(proxy, target).await?;
+        match client.tcp(target).await {
+            Ok(stream) => Ok(stream),
+            // A connection that died since the last use: one fresh attempt.
+            Err(_) if !client.is_alive() => {
+                self.hysteria2_client(proxy, target)
+                    .await?
+                    .tcp(target)
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub async fn dial(
         &self,
         target: &Target,
@@ -1102,7 +1185,8 @@ impl Core {
                         .context("Tailscale proxy is not running")?;
                     node.dial(&target.host, target.port).await
                 }
-                ProxyKind::Hysteria2 | ProxyKind::Trojan => {
+                ProxyKind::Hysteria2 => self.hysteria2_stream(p, &target).await,
+                ProxyKind::Trojan => {
                     bail!("configured outbound protocol is unavailable in this build")
                 }
             }
@@ -1232,7 +1316,11 @@ impl Core {
                 }
             }
             ProxyKind::Tailscale => bail!("UDP through Tailscale is not supported yet"),
-            ProxyKind::Hysteria2 | ProxyKind::Trojan => {
+            ProxyKind::Hysteria2 => {
+                let client = self.hysteria2_client(proxy, target).await?;
+                Ok(Arc::new(client.udp()?))
+            }
+            ProxyKind::Trojan => {
                 bail!("configured outbound protocol is unavailable in this build")
             }
         }
@@ -1337,6 +1425,17 @@ impl Core {
                         "none"
                     });
                     status["flow"] = json!((!p.flow.is_empty()).then_some(&p.flow));
+                    status["udp"] = json!(p.udp);
+                }
+                ProxyKind::Hysteria2 => {
+                    let ports = p.ports.clone().unwrap_or_else(|| p.port.to_string());
+                    status["server"] = json!(format!("{}:{ports}", p.server));
+                    status["network"] = json!("quic");
+                    status["security"] = json!(if p.obfs.is_some() {
+                        "salamander"
+                    } else {
+                        "tls"
+                    });
                     status["udp"] = json!(p.udp);
                 }
                 ProxyKind::Tailscale => {

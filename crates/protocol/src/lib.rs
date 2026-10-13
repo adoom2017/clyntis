@@ -2,6 +2,7 @@
 #[doc(hidden)]
 pub mod fuzzing;
 pub mod grpc;
+pub mod hysteria2;
 pub mod reality;
 pub mod record;
 pub mod tls;

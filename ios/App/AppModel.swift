@@ -520,16 +520,16 @@ final class AppModel {
 
     /// Tests the delay through `node`; the result lands in `nodeStatus`.
     func probe(_ node: String) async {
-        guard connected, nodeStatus[node]?.type == "VLESS", !probing.contains(node) else { return }
+        guard connected, nodeStatus[node]?.probeable == true, !probing.contains(node) else { return }
         probing.insert(node)
         defer { probing.remove(node) }
         do { try applySnapshot(await send(TunnelMessage(command: "probe", node: node), timeout: 15)) }
         catch { Diagnostics.app.warning("probe \(node): \(Diagnostics.describe(error))") }
     }
 
-    /// Tests every VLESS node, two at a time (the core accepts a few at once).
+    /// Tests every probeable node, two at a time (the core accepts a few at once).
     func probeAll() async {
-        var queue = nodeStatus.filter { $0.value.type == "VLESS" }.map(\.key).sorted()
+        var queue = nodeStatus.filter(\.value.probeable).map(\.key).sorted()
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<2 {
                 guard !queue.isEmpty else { break }
