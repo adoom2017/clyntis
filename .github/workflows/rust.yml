@@ -18,7 +18,14 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - uses: actions/checkout@v6
+      - name: Skip Defender scans of build output
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -39,6 +46,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: rustup toolchain install 1.93.1 --profile minimal --target aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - name: Build iOS arm64 Core and FFI
         shell: bash
@@ -48,6 +58,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: rustup toolchain install 1.93.1 --profile minimal --target aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fetch --locked
       - name: Install pinned Android NDK
         run: |

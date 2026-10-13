@@ -21,6 +21,10 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v6
+      - name: Skip Defender scans of build output
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -28,6 +32,10 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - name: Rust toolchain
         run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - name: Windows native prerequisites
         if: runner.os == 'Windows'
