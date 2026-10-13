@@ -618,6 +618,7 @@ mod tests {
             presets: vec!["awavenue".into()],
             custom: vec![],
             allow: vec!["ok.test".into()],
+            ..Default::default()
         });
         let config =
             validate(&runtime_yaml(&profile, &settings, &"s".repeat(32), &[]).unwrap()).unwrap();
