@@ -1,5 +1,5 @@
 [package]
-name = "meta-protocol-fuzz"
+name = "clyntis-protocol-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -10,10 +10,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-meta-protocol = { path = "../crates/protocol", features = ["fuzzing"] }
+clyntis-protocol = { path = "../crates/protocol", features = ["fuzzing"] }
 
 [workspace]
 members = ["."]
+
+# The protocol crate calls BoringSSL functions only the vendored copy has.
+[patch.crates-io]
+boring-sys = { path = "../third-party/boring-sys" }
 
 [[bin]]
 name = "vless_frames"
