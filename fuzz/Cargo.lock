@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-config"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-platform"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-protocol"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

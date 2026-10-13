@@ -359,6 +359,10 @@ repository.
 
 On Windows, run `cargo fetch --locked` followed by
 `pwsh -File scripts/package-release.ps1`. These scripts do not publish artifacts.
+Pushing a tag `vX.Y.Z` does: the Windows Release workflow builds this package
+and the unsigned desktop installer (NSIS) on Windows and attaches both, with
+SHA-256 files, to the GitHub release for the tag. The tag must match the product
+version, so run `bash scripts/set-version.sh X.Y.Z` and commit before tagging.
 The package contains the CLI, examples, licenses, C libraries and
 `crates/ffi/include/clyntis.h`. Besides creating, starting and driving a core
 (`meta_create_v1`, `meta_create_packet_tunnel_v1`, `meta_snapshot_v1`,
