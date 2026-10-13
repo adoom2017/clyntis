@@ -200,6 +200,8 @@ pub struct Stats {
     connections: AtomicU64,
     domains: Mutex<HashMap<String, u64>>,
     recent: Mutex<VecDeque<Blocked>>,
+    /// Blocks since the last log summary: the total and per-target counts.
+    window: Mutex<(u64, HashMap<String, u64>)>,
 }
 impl Default for Stats {
     fn default() -> Self {
@@ -209,6 +211,7 @@ impl Default for Stats {
             connections: AtomicU64::new(0),
             domains: Mutex::default(),
             recent: Mutex::default(),
+            window: Mutex::default(),
         }
     }
 }
@@ -227,6 +230,15 @@ impl Stats {
         counter.fetch_add(1, Ordering::Relaxed);
         let domain = domain.trim_end_matches('.').to_ascii_lowercase();
         {
+            let mut window = self.window.lock().unwrap();
+            window.0 += 1;
+            if let Some(count) = window.1.get_mut(&domain) {
+                *count += 1;
+            } else if window.1.len() < TRACKED_DOMAINS {
+                window.1.insert(domain.clone(), 1);
+            }
+        }
+        {
             let mut domains = self.domains.lock().unwrap();
             if let Some(count) = domains.get_mut(&domain) {
                 *count += 1;
@@ -243,6 +255,27 @@ impl Stats {
             domain,
             via,
         });
+    }
+
+    /// One line for the blocks since the last call, most blocked targets
+    /// first, so the info log shows ad blocking without a line per block.
+    pub fn take_summary(&self, top: usize) -> Option<String> {
+        let (total, targets) = std::mem::take(&mut *self.window.lock().unwrap());
+        if total == 0 {
+            return None;
+        }
+        let mut targets: Vec<_> = targets.into_iter().collect();
+        targets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut line = targets
+            .iter()
+            .take(top)
+            .map(|(target, count)| format!("{target} ×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if targets.len() > top {
+            line += &format!(" (+{} more)", targets.len() - top);
+        }
+        Some(format!("blocked {total}: {line}"))
     }
 
     /// Totals, the most blocked domains and the latest blocks, newest first.
@@ -304,6 +337,11 @@ mod tests {
         stats.record("x.ads.test", "dns");
         stats.record("x.ads.test.", "connection");
         stats.record("y.ads.test", "dns");
+        assert_eq!(
+            stats.take_summary(1).as_deref(),
+            Some("blocked 3: x.ads.test ×2 (+1 more)")
+        );
+        assert_eq!(stats.take_summary(1), None);
         let snapshot = stats.snapshot(10);
         assert_eq!(snapshot["total"], 3);
         assert_eq!(snapshot["dns"], 2);

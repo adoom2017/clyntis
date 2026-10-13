@@ -827,6 +827,11 @@ impl Resolver {
             && let Some(block) = filter.refuses_name(&host)
         {
             self.adblock_stats.record(&host, "dns");
+            tracing::debug!(
+                host,
+                matched = block.matched(),
+                "[DNS] ad block refused query"
+            );
             let mut response = Message::new();
             response
                 .set_id(request.id())

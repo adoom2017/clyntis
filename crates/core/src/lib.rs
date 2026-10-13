@@ -38,6 +38,8 @@ use tokio_util::sync::CancellationToken;
 /// Fake-IP names kept by the iOS tunnel; apps query again within seconds
 /// (answers have a one-second TTL), so evicted names come back at once.
 const HOSTED_FAKE_CAPACITY: usize = 8192;
+/// How often the info log summarizes ad blocks.
+const ADBLOCK_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 pub struct Core {
     pub config: Config,
     pub resolver: Arc<dns::Resolver>,
@@ -388,6 +390,22 @@ impl Core {
         if self.config.ntp.enable {
             let core = self.clone();
             tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(core.config.ntp.interval.saturating_mul(60)));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}}tokio::select!{_=core.stop.cancelled()=>break,result=core.sync_ntp()=>{if let Err(error)=result {tracing::warn!(%error,"NTP synchronization failed; retaining current clock offset");}}}}});
+        }
+        if self.config.adblock.enable {
+            let core = self.clone();
+            tasks.spawn(async move {
+                let mut interval = tokio::time::interval(ADBLOCK_SUMMARY_EVERY);
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+                    if let Some(summary) = core.resolver.adblock_stats.take_summary(5) {
+                        tracing::info!("[Adblock] {summary} in the last minute");
+                    }
+                }
+            });
         }
         if self.config.profile.store_fake_ip || self.config.profile.store_selected {
             let core = self.clone();
@@ -1020,14 +1038,27 @@ impl Core {
         } else {
             format!("{}[{}]", decision.group, decision.node)
         };
-        tracing::info!(
-            "[{}] {} --> {} match {} using {}",
-            network,
-            source,
-            target,
-            decision.rule,
-            using
-        );
+        // Ad blocks are frequent (an app retries each one), so they go to
+        // debug; info gets a periodic summary instead.
+        if decision.rule.starts_with("Adblock") {
+            tracing::debug!(
+                "[{}] {} --> {} match {} using {}",
+                network,
+                source,
+                target,
+                decision.rule,
+                using
+            );
+        } else {
+            tracing::info!(
+                "[{}] {} --> {} match {} using {}",
+                network,
+                source,
+                target,
+                decision.rule,
+                using
+            );
+        }
     }
     async fn dial_inner(
         &self,
