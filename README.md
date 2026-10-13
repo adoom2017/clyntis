@@ -79,9 +79,11 @@ removes the others and replaces dangling references with REJECT, not DIRECT.
 A `type: hysteria2` (or `hy2`) proxy speaks Hysteria 2 over QUIC: TCP on QUIC
 streams, UDP in QUIC datagrams (fragmented and reassembled when a packet does
 not fit), after authenticating with `password` (or `auth-str`) in an HTTP/3
-request. QUIC uses rustls with the WebPKI roots (`sni`, `alpn` and
-`skip-cert-verify` apply; certificate times use the NTP-corrected clock), since
-the BoringSSL build has no QUIC API. Each proxy keeps one connection for all its
+request. QUIC runs on quinn with its crypto on BoringSSL (`clyntis_protocol::quic`):
+the handshake goes through BoringSSL's QUIC API with the same browser profiles
+as TCP TLS, limited to TLS 1.3 (`client-fingerprint`, else
+`global-client-fingerprint`), the same roots and the NTP-corrected clock; `sni`,
+`alpn` and `skip-cert-verify` apply. Each proxy keeps one connection for all its
 traffic and reconnects when it closes.
 
 - `obfs: salamander` with `obfs-password` scrambles every packet.

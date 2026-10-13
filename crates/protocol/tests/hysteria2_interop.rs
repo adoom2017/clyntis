@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use clyntis_protocol::{
     Datagram, Target,
     hysteria2::{Binder, Client, Options},
-    tls::Clock,
+    tls::{Clock, TlsFingerprint},
 };
 use std::{
     net::{SocketAddr, UdpSocket as StdUdpSocket},
@@ -49,6 +49,7 @@ fn options(port: u16) -> Options {
         down: None,
         obfs: None,
         mtu_discovery: true,
+        fingerprint: TlsFingerprint::Chrome,
         compact: false,
     }
 }
@@ -189,6 +190,41 @@ async fn scenario() -> Result<()> {
         "wrong password: {:?}",
         refused.err()
     );
+    // Verification is on unless asked off: the self-signed certificate fails.
+    let verified = Options {
+        insecure: false,
+        ..options(port)
+    };
+    let untrusted = Client::connect(&verified, binder(), clock.clone()).await;
+    ensure!(
+        untrusted
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("certificate")),
+        "self-signed certificate: {:?}",
+        untrusted.err()
+    );
+    // Every browser profile's QUIC ClientHello completes the handshake.
+    for fingerprint in [
+        TlsFingerprint::Firefox,
+        TlsFingerprint::Safari,
+        TlsFingerprint::Ios,
+        TlsFingerprint::Android,
+        TlsFingerprint::Edge,
+        TlsFingerprint::Randomized,
+    ] {
+        let profiled = Options {
+            fingerprint,
+            ..options(port)
+        };
+        let client = Client::connect(&profiled, binder(), clock.clone())
+            .await
+            .with_context(|| format!("{fingerprint:?}"))?;
+        let mut stream = client.tcp(&Target::new("127.0.0.1", tcp_port)?).await?;
+        stream.write_all(b"ping").await?;
+        let mut pong = [0; 4];
+        stream.read_exact(&mut pong).await?;
+        ensure!(&pong == b"ping", "{fingerprint:?} echo");
+    }
 
     // Salamander: the right password works, a client without it does not.
     let port = free_udp_port()?;

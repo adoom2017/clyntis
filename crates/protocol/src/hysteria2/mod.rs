@@ -5,23 +5,20 @@
 pub mod brutal;
 pub mod socket;
 
-use crate::{BoxStream, Datagram, Target, tls::Clock};
+use crate::{
+    BoxStream, Datagram, Target, quic,
+    tls::{Clock, TlsFingerprint},
+};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use clyntis_config::Proxy;
-use quinn::crypto::rustls::QuicClientConfig;
 use rand::{Rng, distributions::Alphanumeric};
-use rustls::{
-    DigitallySignedStruct, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
-};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU16, AtomicU32, Ordering},
     },
     time::Duration,
@@ -58,12 +55,16 @@ pub struct Options {
     pub down: Option<u64>,
     pub obfs: Option<String>,
     pub mtu_discovery: bool,
+    /// The browser whose QUIC ClientHello the handshake resembles.
+    pub fingerprint: TlsFingerprint,
     /// Smaller QUIC windows for hosts with a tight memory limit (the iOS
     /// packet tunnel is killed above ~50 MiB).
     pub compact: bool,
 }
 impl Options {
-    pub fn from_proxy(proxy: &Proxy, addresses: Vec<IpAddr>) -> Result<Self> {
+    /// `fingerprint` is the profile's `global-client-fingerprint`, which the
+    /// proxy's `client-fingerprint` overrides.
+    pub fn from_proxy(proxy: &Proxy, addresses: Vec<IpAddr>, fingerprint: &str) -> Result<Self> {
         let ports = clyntis_config::port_list(proxy)?;
         let server_name = proxy
             .sni
@@ -98,6 +99,9 @@ impl Options {
                 .transpose()?,
             obfs: proxy.obfs.is_some().then(|| proxy.obfs_password.clone()),
             mtu_discovery: !proxy.disable_mtu_discovery,
+            fingerprint: TlsFingerprint::parse(
+                proxy.client_fingerprint.as_deref().unwrap_or(fingerprint),
+            )?,
             compact: false,
         })
     }
@@ -154,7 +158,7 @@ impl Client {
             bind,
         )?;
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
+            quinn::EndpointConfig::new(Arc::new(quic::ResetKey::random())),
             None,
             Arc::new(transport),
             Arc::new(quinn::TokioRuntime),
@@ -294,23 +298,17 @@ fn client_config(
     clock: Arc<Clock>,
     rate: brutal::Rate,
 ) -> Result<quinn::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Verifier {
-            inner: rustls::client::WebPkiServerVerifier::builder_with_provider(roots(), provider)
-                .build()?,
-            clock,
-            insecure: options.insecure,
-        }))
-        .with_no_client_auth();
-    tls.alpn_protocols = if options.alpn.is_empty() {
-        vec![b"h3".to_vec()]
+    let alpn = if options.alpn.is_empty() {
+        vec!["h3".to_owned()]
     } else {
-        options.alpn.iter().map(|a| a.as_bytes().to_vec()).collect()
+        options.alpn.clone()
     };
-    let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
+    let mut config = quinn::ClientConfig::new(Arc::new(quic::ClientConfig {
+        alpn,
+        verify: !options.insecure,
+        fingerprint: options.fingerprint,
+        clock,
+    }));
     // Hysteria's client defaults; a fraction of them when memory is tight.
     let (stream, connection, datagrams) = if options.compact {
         (1 << 20, 4 << 20, 1 << 20)
@@ -333,74 +331,6 @@ fn client_config(
     }
     config.transport_config(Arc::new(transport));
     Ok(config)
-}
-
-fn roots() -> Arc<rustls::RootCertStore> {
-    static ROOTS: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
-    ROOTS
-        .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.add_parsable_certificates(
-                webpki_root_certs::TLS_SERVER_ROOT_CERTS.iter().cloned(),
-            );
-            Arc::new(roots)
-        })
-        .clone()
-}
-
-/// WebPKI checked against the core's NTP-corrected clock, or nothing at all
-/// with `skip-cert-verify`.
-#[derive(Debug)]
-struct Verifier {
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
-    clock: Arc<Clock>,
-    insecure: bool,
-}
-impl ServerCertVerifier for Verifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        if self.insecure {
-            return Ok(ServerCertVerified::assertion());
-        }
-        let now = self
-            .clock
-            .unix_seconds()
-            .and_then(|s| u64::try_from(s).ok())
-            .map_or(now, |s| UnixTime::since_unix_epoch(Duration::from_secs(s)));
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        if self.insecure {
-            return Ok(HandshakeSignatureValid::assertion());
-        }
-        self.inner.verify_tls12_signature(message, cert, dss)
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        if self.insecure {
-            return Ok(HandshakeSignatureValid::assertion());
-        }
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
 }
 
 /// QUIC variable-length integer (RFC 9000 §16).

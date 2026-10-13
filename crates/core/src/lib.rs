@@ -1028,7 +1028,11 @@ impl Core {
             "ipv6-prefer" => addresses.sort_by_key(std::net::IpAddr::is_ipv4),
             _ => addresses.sort_by_key(std::net::IpAddr::is_ipv6),
         }
-        let mut options = clyntis_protocol::hysteria2::Options::from_proxy(proxy, addresses)?;
+        let mut options = clyntis_protocol::hysteria2::Options::from_proxy(
+            proxy,
+            addresses,
+            &self.config.global_client_fingerprint,
+        )?;
         options.compact = self.config.internal_host_packet_io;
         let hooks = self.hooks.clone();
         let bind: clyntis_protocol::hysteria2::Binder = Arc::new(move |server: SocketAddr| {

@@ -14,7 +14,7 @@ use boring::{
         store::{X509Store, X509StoreBuilder},
     },
 };
-use foreign_types_shared::ForeignType;
+use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use rand::seq::SliceRandom;
 use std::{
     collections::{HashMap, VecDeque},
@@ -689,6 +689,38 @@ fn configure_ssl(
             "cannot configure TLS groups"
         );
     }
+    apply_profile(
+        &mut ssl,
+        &profile,
+        &key_shares,
+        config.reality.is_none(),
+        false,
+    )?;
+    if profile.tls.alps && alpn.iter().any(|value| value == "h2") {
+        // Chromium advertises ALPS for h2. The transport layer owns the
+        // actual HTTP/2 SETTINGS, so the TLS setting payload is empty.
+        unsafe {
+            let _ = boring_sys::SSL_add_application_settings(
+                ssl.as_ptr(),
+                b"h2".as_ptr(),
+                2,
+                std::ptr::null(),
+                0,
+            );
+        }
+    }
+    Ok((ssl, profile))
+}
+
+/// Per-connection parts of a browser profile that the context cannot hold.
+/// QUIC carries no TLS records, so the record size limit stays off there.
+fn apply_profile(
+    ssl: &mut boring::ssl::SslRef,
+    profile: &BrowserProfile,
+    key_shares: &[u16],
+    ech_grease: bool,
+    quic: bool,
+) -> Result<()> {
     // Keep the supported-groups list and emitted key_share entries separate.
     // SAFETY: ssl is valid and the slice lives for the duration of the call.
     unsafe {
@@ -716,7 +748,9 @@ fn configure_ssl(
             ) == 1,
             "cannot configure delegated credential algorithms"
         );
-        boring_sys::SSL_set_record_size_limit(ssl.as_ptr(), profile.tls.record_size_limit);
+        if !quic {
+            boring_sys::SSL_set_record_size_limit(ssl.as_ptr(), profile.tls.record_size_limit);
+        }
         if !profile.tls.extension_order.is_empty() {
             ensure!(
                 boring_sys::SSL_set1_extension_order(
@@ -728,7 +762,7 @@ fn configure_ssl(
             );
         }
     }
-    ssl.set_enable_ech_grease(profile.tls.ech_grease && config.reality.is_none());
+    ssl.set_enable_ech_grease(profile.tls.ech_grease && ech_grease);
     unsafe {
         boring_sys::SSL_set_alps_use_new_codepoint(
             ssl.as_ptr(),
@@ -742,19 +776,36 @@ fn configure_ssl(
             );
         }
     }
-    if profile.tls.alps && alpn.iter().any(|value| value == "h2") {
-        // Chromium advertises ALPS for h2. The transport layer owns the
-        // actual HTTP/2 SETTINGS, so the TLS setting payload is empty.
-        unsafe {
-            let _ = boring_sys::SSL_add_application_settings(
-                ssl.as_ptr(),
-                b"h2".as_ptr(),
-                2,
-                std::ptr::null(),
-                0,
-            );
-        }
+    Ok(())
+}
+
+/// A client `Ssl` for a QUIC handshake: the browser profile's ClientHello
+/// limited to TLS 1.3 (BoringSSL then leaves out the TLS 1.2-only parts, as in
+/// Chromium's own QUIC), the same roots, hostname check and corrected clock
+/// as TCP. The caller installs the QUIC method and transport parameters.
+pub(crate) fn quic_ssl(
+    server_name: &str,
+    alpn: &[String],
+    verify: bool,
+    fingerprint: TlsFingerprint,
+    clock: &Clock,
+) -> Result<(boring::ssl::Ssl, BrowserProfile)> {
+    let selected = fingerprint.resolve();
+    let profile = if selected == TlsFingerprint::Randomized {
+        randomized_profile()
+    } else {
+        profile(selected)
+    };
+    let connector = build_connector(&profile, alpn, verify, false, None)?;
+    let mut configured = connector.configure()?;
+    configured.set_verify_hostname(verify);
+    let mut ssl = configured.into_ssl(server_name)?;
+    ssl.set_min_proto_version(Some(SslVersion::TLS1_3))?;
+    ssl.set_max_proto_version(Some(SslVersion::TLS1_3))?;
+    if let Some(now) = clock.unix_seconds() {
+        ssl.verify_param_mut().set_time(now as _);
     }
+    apply_profile(&mut ssl, &profile, profile.tls.key_shares, true, true)?;
     Ok((ssl, profile))
 }
 

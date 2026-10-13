@@ -40,11 +40,10 @@ foreign-types-shared = "0.3"
 brotli.workspace = true
 flate2.workspace = true
 zstd.workspace = true
-# Hysteria2: QUIC with its own TLS 1.3 (BoringSSL has no QUIC API here) and
-# one HTTP/3 request to authenticate.
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Hysteria2: QUIC (crypto on BoringSSL, see quic.rs) and one HTTP/3 request
+# to authenticate.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
 quinn-proto = { version = "0.11", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", default-features = false }
 
