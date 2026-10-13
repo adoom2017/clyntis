@@ -47,12 +47,16 @@ replacement for every protocol or configuration option.
   built-in HTTPDNS and DoH/DoT endpoints (names at DNS and on connection;
   addresses on ports 80, 443 and 853), and `quic-fallback` (default on)
   rejects UDP 443 whose destination has no name, so the app retries over
-  TCP where TLS sniffing names it. `dns-answer: null` answers listed names
+  TCP where TLS sniffing names it. In TUN mode every rejected UDP flow gets
+  an ICMP port-unreachable at once (and for 10 s of retries), so clients fail
+  over immediately instead of waiting out their handshake timeout. `dns-answer: null` answers listed names
   with 0.0.0.0 / :: instead of NXDOMAIN; endpoint names always get NXDOMAIN,
   which Firefox's DoH canary and iCloud Private Relay require.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
   redir-host modes. Real lookups also resolve Tailscale MagicDNS names; fake-IP
-  answers keep the domain so domain rules still apply.
+  answers keep the domain so domain rules still apply. Upstreams are asked at
+  once and the first answer wins, and a UDP query is resent after 1 s and 2 s,
+  so a silent or lossy server no longer stalls a lookup for its timeout.
 - **Status:** per-proxy status for the apps and the controller (`/proxies`
   carries a `status` object): VLESS server, transport and security; the last
   delay test with its error and time; open connections; and, for Tailscale, the

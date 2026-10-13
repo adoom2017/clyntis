@@ -1114,7 +1114,8 @@ impl Core {
                         let source=source.split_once(':').map(|(_,value)|value).unwrap_or(source);
                         Self::log_connection("UDP",source,&target,&decision);
                     }
-                    bail!("UDP rejected");
+                    // Typed so the TUN can answer the app with an ICMP error.
+                    return Err(Rejected(decision).into());
                 }
                 let inner=self.datagram_inner(&target,&decision.node,global_id).await?;
                 if let Some(source)=source {

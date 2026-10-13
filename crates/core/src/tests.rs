@@ -317,6 +317,81 @@ async fn udp_counters_close_and_core_cancellation_cover_dns_routing() {
     .unwrap();
 }
 
+/// A UDP DNS server answering every A query with 192.0.2.7, after ignoring
+/// the first `drop` datagrams it receives.
+async fn dns_server(drop: usize) -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buffer = [0; 1500];
+        let mut seen = 0;
+        loop {
+            let Ok((n, peer)) = socket.recv_from(&mut buffer).await else {
+                return;
+            };
+            seen += 1;
+            if seen <= drop {
+                continue;
+            }
+            let request = hickory_proto::op::Message::from_vec(&buffer[..n]).unwrap();
+            let mut response = hickory_proto::op::Message::new();
+            response
+                .set_id(request.id())
+                .set_message_type(hickory_proto::op::MessageType::Response)
+                .set_recursion_desired(true)
+                .set_recursion_available(true)
+                .add_query(request.queries()[0].clone());
+            if request.queries()[0].query_type() == hickory_proto::rr::RecordType::A {
+                response.add_answer(hickory_proto::rr::Record::from_rdata(
+                    request.queries()[0].name().clone(),
+                    60,
+                    hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(
+                        std::net::Ipv4Addr::new(192, 0, 2, 7),
+                    )),
+                ));
+            }
+            let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn dns_upstreams_race_and_lost_queries_are_resent() {
+    // A silent upstream listed first no longer delays the answer.
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut config = Config::default();
+    config.dns.nameserver = vec![
+        silent.local_addr().unwrap().to_string(),
+        dns_server(0).await.to_string(),
+    ];
+    config.dns.ipv6 = false;
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let started = std::time::Instant::now();
+    let addresses = core.resolver.lookup("race.test", 80).await.unwrap();
+    assert_eq!(addresses[0].ip().to_string(), "192.0.2.7");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // One lost datagram costs a resend after a second, not the full timeout.
+    let mut config = Config::default();
+    config.dns.nameserver = vec![dns_server(1).await.to_string()];
+    config.dns.ipv6 = false;
+    let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+    let started = std::time::Instant::now();
+    let addresses = core.resolver.lookup("resend.test", 80).await.unwrap();
+    assert_eq!(addresses[0].ip().to_string(), "192.0.2.7");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(2500),
+        "{elapsed:?}"
+    );
+    drop(silent);
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()

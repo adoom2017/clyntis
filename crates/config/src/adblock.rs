@@ -54,11 +54,12 @@ pub const HTTPDNS_PORTS: [u16; 3] = [80, 443, 853];
 pub const HTTPDNS_ADDRESSES: [&str; 17] = [
     // Alibaba Cloud HTTPDNS.
     "203.107.1.0/24",
-    // Tencent Cloud HTTPDNS and DNSPod (HTTP `/d`, DoH, DoT).
-    "119.29.29.29/32",
-    "119.29.29.98/32",
-    "119.29.29.99/32",
+    // Tencent Cloud HTTPDNS and DNSPod (HTTP `/d`, DoH, DoT): Xiaohongshu
+    // asks 119.29.29.88 and .90 over HTTP; Enterprise Edition uses 43.132.x.
+    "119.29.29.0/24",
     "119.28.28.28/32",
+    "43.132.43.43/32",
+    "43.132.55.55/32",
     "1.12.12.12/32",
     "120.53.53.53/32",
     // Baidu HTTPDNS.

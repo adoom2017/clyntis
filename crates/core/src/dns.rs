@@ -600,13 +600,21 @@ impl Resolver {
             .find(|(m, _)| m.evaluate(&host, None, 0, "", false) == Some(true))
             .map(|(_, v)| v.clone())
             .unwrap_or_else(|| self.config.nameserver.clone());
-        for upstream in &servers {
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.query_upstream(upstream, request),
-            )
-            .await
-            {
+        // Ask every upstream at once and take the first answer: trying them
+        // in turn left a lookup waiting out each silent server first.
+        let mut pending: futures_util::stream::FuturesUnordered<_> = servers
+            .iter()
+            .map(|upstream| async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.query_upstream(upstream, request),
+                )
+                .await;
+                (upstream, result)
+            })
+            .collect();
+        while let Some((upstream, result)) = futures_util::StreamExt::next(&mut pending).await {
+            match result {
                 Ok(Ok(response)) => return Ok(response),
                 Ok(Err(e)) => {
                     tracing::debug!(%upstream, error = %e, "DNS upstream failed");
@@ -763,12 +771,24 @@ impl Resolver {
         .parse()?;
         let socket = meta_platform::udp_bind_for(bind, Some(addr), &*self.hooks)?;
         socket.connect(addr).await?;
-        socket.send(&request.to_vec()?).await?;
+        let query = request.to_vec()?;
         let mut bytes = vec![0; 65535];
-        let n = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut bytes)).await??;
-        let response = Message::from_vec(&bytes[..n])?;
-        validate_response(request, &response)?;
-        Ok(response)
+        // A lost datagram is common on mobile networks: resend after 1 s and
+        // 2 s instead of waiting out the whole 3 s on one packet.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            socket.send(&query).await?;
+            let resend = (tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline);
+            match tokio::time::timeout_at(resend, socket.recv(&mut bytes)).await {
+                Ok(n) => {
+                    let response = Message::from_vec(&bytes[..n?])?;
+                    validate_response(request, &response)?;
+                    return Ok(response);
+                }
+                Err(_) if resend < deadline => continue,
+                Err(elapsed) => return Err(elapsed.into()),
+            }
+        }
     }
     async fn raw_tcp(&self, addr: SocketAddr, request: &Message) -> Result<Message> {
         let socket = meta_platform::tcp_connect(addr, &*self.hooks).await?;

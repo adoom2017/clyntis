@@ -422,6 +422,87 @@ fn sniff(bytes: &[u8]) -> Option<(Flow, bool)> {
     ))
 }
 
+/// How long a rejected UDP flow keeps being refused without routing it again.
+const REFUSED_FOR: Duration = Duration::from_secs(10);
+
+/// Tells the app its datagram was refused, as a host would for a closed port.
+/// Dropping it silently left QUIC clients resending until their handshake
+/// timed out (seconds) before they tried TCP; an ICMP error fails a connected
+/// socket at once.
+fn refuse(device: &PacketDevice, flow: &Flow) {
+    if let Some(packet) = port_unreachable(flow) {
+        let _ = device.outgoing.try_send(packet);
+    }
+}
+
+/// An ICMP / ICMPv6 "port unreachable" from the flow's target to the app,
+/// quoting the IP and UDP headers of the refused datagram.
+fn port_unreachable(flow: &Flow) -> Option<Vec<u8>> {
+    let mut udp = Vec::with_capacity(8);
+    udp.extend(flow.source.port.to_be_bytes());
+    udp.extend(flow.target.port.to_be_bytes());
+    udp.extend(8u16.to_be_bytes());
+    udp.extend([0, 0]);
+    match (flow.source.addr, flow.target.addr) {
+        (IpAddress::Ipv4(app), IpAddress::Ipv4(remote)) => {
+            let mut icmp = vec![3, 3, 0, 0, 0, 0, 0, 0];
+            icmp.extend(ipv4_header(app.octets(), remote.octets(), 17, udp.len()));
+            icmp.extend(&udp);
+            let sum = checksum(&icmp, 0);
+            icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut packet = ipv4_header(remote.octets(), app.octets(), 1, icmp.len());
+            packet.extend(icmp);
+            Some(packet)
+        }
+        (IpAddress::Ipv6(app), IpAddress::Ipv6(remote)) => {
+            let mut icmp = vec![1, 4, 0, 0, 0, 0, 0, 0];
+            icmp.extend(ipv6_header(app.octets(), remote.octets(), 17, udp.len()));
+            icmp.extend(&udp);
+            let mut pseudo = Vec::with_capacity(40);
+            pseudo.extend(remote.octets());
+            pseudo.extend(app.octets());
+            pseudo.extend((icmp.len() as u32).to_be_bytes());
+            pseudo.extend([0, 0, 0, 58]);
+            let sum = checksum(&icmp, partial_sum(&pseudo));
+            icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut packet = ipv6_header(remote.octets(), app.octets(), 58, icmp.len());
+            packet.extend(icmp);
+            Some(packet)
+        }
+        _ => None,
+    }
+}
+fn ipv4_header(source: [u8; 4], target: [u8; 4], protocol: u8, payload: usize) -> Vec<u8> {
+    let mut header = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, protocol, 0, 0];
+    header[2..4].copy_from_slice(&((20 + payload) as u16).to_be_bytes());
+    header.extend(source);
+    header.extend(target);
+    let sum = checksum(&header, 0);
+    header[10..12].copy_from_slice(&sum.to_be_bytes());
+    header
+}
+fn ipv6_header(source: [u8; 16], target: [u8; 16], next: u8, payload: usize) -> Vec<u8> {
+    let mut header = vec![0x60, 0, 0, 0];
+    header.extend((payload as u16).to_be_bytes());
+    header.extend([next, 64]);
+    header.extend(source);
+    header.extend(target);
+    header
+}
+fn partial_sum(data: &[u8]) -> u32 {
+    data.chunks(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair.get(1).copied().unwrap_or(0)]) as u32)
+        .sum()
+}
+/// The Internet checksum of `data`, continuing a partial sum.
+fn checksum(data: &[u8], initial: u32) -> u16 {
+    let mut sum = initial + partial_sum(data);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 fn hijack_dns(core: &Core, endpoint: IpEndpoint, tcp: bool) -> bool {
     core.config.tun.dns_hijack.iter().any(|entry| {
         let entry = if let Some(e) = entry.strip_prefix("tcp://") {
@@ -631,6 +712,9 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut ipv6_dropped: u64 = 0;
     let mut fragments = ipv6::Reassembly::default();
     let mut last_expiry = Instant::now();
+    // UDP flows the route rejected: their next datagrams get an ICMP error at
+    // once instead of a new session (and log line) each.
+    let mut refused: HashMap<Flow, Instant> = HashMap::new();
     let mut guard = Guard::new(budget);
     loop {
         tokio::select! {
@@ -688,6 +772,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
             fragments.expire(last_expiry.into());
+            refused.retain(|_, since| since.elapsed() < REFUSED_FOR);
         }
         if guard.due() {
             guard.check(&core, || Load {
@@ -710,6 +795,12 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     }
                 } else {
                     udp_flows.remove(&flow);
+                    if let Err(error) = result
+                        && error.downcast_ref::<crate::Rejected>().is_some()
+                    {
+                        refused.insert(flow, Instant::now());
+                        refuse(&device, &flow);
+                    }
                 }
             }
         }
@@ -787,6 +878,13 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     target: *endpoint,
                     tcp: false,
                 };
+                if refused
+                    .get(&flow)
+                    .is_some_and(|since| since.elapsed() < REFUSED_FOR)
+                {
+                    refuse(&device, &flow);
+                    continue;
+                }
                 if !udp_flows.contains_key(&flow) && udp_flows.len() < budget.max_udp {
                     let (input, receiver) = mpsc::channel(16);
                     let core = core.clone();

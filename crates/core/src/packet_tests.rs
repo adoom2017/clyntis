@@ -475,3 +475,80 @@ async fn tun_download_keeps_up_with_sparse_host_acks() {
     );
     running.shutdown().await;
 }
+
+#[test]
+fn port_unreachable_quotes_the_flow_with_valid_checksums() {
+    use smoltcp::wire::{Icmpv4Packet, Icmpv6Packet};
+    let v4 = Flow {
+        source: IpEndpoint::new("198.18.0.2".parse().unwrap(), 52805),
+        target: IpEndpoint::new("117.88.123.99".parse().unwrap(), 443),
+        tcp: false,
+    };
+    let bytes = port_unreachable(&v4).unwrap();
+    let ip = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    assert!(ip.verify_checksum());
+    assert_eq!(
+        (ip.src_addr().to_string(), ip.dst_addr().to_string()),
+        ("117.88.123.99".into(), "198.18.0.2".into())
+    );
+    assert_eq!(ip.next_header(), IpProtocol::Icmp);
+    let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+    assert!(icmp.verify_checksum());
+    assert_eq!((u8::from(icmp.msg_type()), icmp.msg_code()), (3, 3));
+    let quoted = Ipv4Packet::new_checked(icmp.data()).unwrap();
+    assert!(quoted.verify_checksum());
+    let udp = UdpPacket::new_unchecked(quoted.payload());
+    assert_eq!((udp.src_port(), udp.dst_port()), (52805, 443));
+
+    let v6 = Flow {
+        source: IpEndpoint::new("fdfe:dcba:9876::2".parse().unwrap(), 40000),
+        target: IpEndpoint::new("2001:db8::1".parse().unwrap(), 443),
+        tcp: false,
+    };
+    let bytes = port_unreachable(&v6).unwrap();
+    let ip = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+    assert_eq!(ip.next_header(), IpProtocol::Icmpv6);
+    let icmp = Icmpv6Packet::new_checked(ip.payload()).unwrap();
+    assert!(icmp.verify_checksum(&ip.src_addr(), &ip.dst_addr()));
+    assert_eq!((u8::from(icmp.msg_type()), icmp.msg_code()), (1, 4));
+}
+
+#[tokio::test]
+async fn rejected_udp_gets_port_unreachable_at_once() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (device, host_io) = pair();
+        let mut config = CoreConfig::default();
+        config.tun.enable = true;
+        config.rules = vec!["DST-PORT,443,REJECT".into(), "MATCH,DIRECT".into()];
+        let core = Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap();
+        let running = core.start_with_packets(Some(device)).await.unwrap();
+        let app = [10, 0, 0, 2];
+        let remote = [203, 0, 113, 9];
+        let datagram = |port: u16| {
+            let mut udp = Vec::new();
+            udp.extend(port.to_be_bytes());
+            udp.extend(443u16.to_be_bytes());
+            udp.extend(12u16.to_be_bytes());
+            udp.extend([0, 0]);
+            udp.extend(b"quic");
+            let mut packet = ipv4_header(app, remote, 17, udp.len());
+            packet.extend(udp);
+            packet
+        };
+        // The first datagram is routed and rejected; a retry is refused at
+        // once, without routing it again.
+        for _ in 0..2 {
+            host_io.send(&datagram(50000)).await.unwrap();
+            let mut reply = vec![0; 1500];
+            let n = host_io.recv(&mut reply).await.unwrap();
+            let ip = Ipv4Packet::new_checked(&reply[..n]).unwrap();
+            assert_eq!(ip.next_header(), IpProtocol::Icmp);
+            assert_eq!(ip.src_addr().octets(), remote);
+            let icmp = smoltcp::wire::Icmpv4Packet::new_checked(ip.payload()).unwrap();
+            assert_eq!((u8::from(icmp.msg_type()), icmp.msg_code()), (3, 3));
+        }
+        running.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
