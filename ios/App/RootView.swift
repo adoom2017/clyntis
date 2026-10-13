@@ -242,58 +242,75 @@ private struct ProfilesView: View {
 
 private struct NodesView: View {
     @Bindable var model: AppModel
+    /// Groups switch, proxies are probed; remembered across launches.
+    @AppStorage("nodes-view") private var view = "groups"
     private func isPolicy(_ name: String) -> Bool {
         BuiltinOutbound(name) != nil || model.groups.contains { $0.name == name }
     }
+    private var shown: String { model.groups.isEmpty ? "proxies" : view }
     var body: some View {
         NavigationStack {
             List {
-                if model.groups.isEmpty && model.ungrouped.isEmpty {
+                if !model.groups.isEmpty {
+                    Picker("视图", selection: $view) {
+                        Text("代理组 \(model.groups.count)").tag("groups")
+                        Text("节点 \(model.proxies.count)").tag("proxies")
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+                }
+                if model.groups.isEmpty && model.proxies.isEmpty {
                     ContentUnavailableView(model.connected ? "没有节点" : "未连接", systemImage: "network",
                         description: Text(model.connected ? "当前配置未定义节点" : "连接后可选择节点"))
-                }
-                ForEach(model.groups) { group in
-                    // Groups and built-in outbounds route traffic; proxies carry it.
-                    let policies = group.nodes.filter(isPolicy)
-                    let proxies = group.nodes.filter { !isPolicy($0) }
+                } else if shown == "groups" {
+                    groupSections
+                } else {
                     Section {
-                        if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "策略", count: policies.count) }
-                        ForEach(policies, id: \.self) { node in
-                            PolicyRow(model: model, name: node, group: model.groups.first { $0.name == node },
-                                      selected: group.selected == node) {
-                                Task { await model.select(group: group.name, node: node) }
-                            }
-                        }
-                        if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "节点", count: proxies.count) }
-                        ForEach(proxies, id: \.self) { node in
-                            NodeRow(model: model, name: node, selected: group.selected == node) {
-                                Task { await model.select(group: group.name, node: node) }
-                            }
-                        }
-                    } header: {
-                        HStack {
-                            Text(group.name)
-                            Spacer()
-                            Text(group.typeText)
-                        }
+                        ForEach(model.proxies, id: \.self) { ProxyRow(model: model, name: $0) }
+                    } footer: {
+                        Text("点按节点测试延迟。")
                     }
-                }
-                if !model.ungrouped.isEmpty {
-                    Section {
-                        ForEach(model.ungrouped, id: \.self) { node in
-                            NodeRow(model: model, name: node, selected: false, select: nil)
-                        }
-                    } header: { Text("其他节点") } footer: { Text("未放入代理组，由规则直接使用") }
                 }
             }
             .navigationTitle("节点")
             .toolbar {
-                if model.connected && model.nodeStatus.values.contains(where: { $0.type == "VLESS" }) {
+                if shown == "proxies" && model.connected
+                    && model.nodeStatus.values.contains(where: { $0.type == "VLESS" }) {
                     Button("测速", systemImage: "bolt") { Task { await model.probeAll() } }
                         .disabled(!model.probing.isEmpty)
                 }
             }
             .navigationDestination(for: String.self) { NodeDetailView(model: model, name: $0) }
+        }
+    }
+
+    @ViewBuilder private var groupSections: some View {
+        ForEach(model.groups) { group in
+            // Groups and built-in outbounds route traffic; proxies carry it.
+            let policies = group.nodes.filter(isPolicy)
+            let proxies = group.nodes.filter { !isPolicy($0) }
+            Section {
+                if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "策略", count: policies.count) }
+                ForEach(policies, id: \.self) { node in
+                    PolicyRow(model: model, name: node, group: model.groups.first { $0.name == node },
+                              selected: group.selected == node) {
+                        Task { await model.select(group: group.name, node: node) }
+                    }
+                }
+                if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "节点", count: proxies.count) }
+                ForEach(proxies, id: \.self) { node in
+                    MemberRow(model: model, name: node, selected: group.selected == node) {
+                        Task { await model.select(group: group.name, node: node) }
+                    }
+                }
+            } header: {
+                HStack {
+                    Text(group.name)
+                    Spacer()
+                    Text(group.typeText)
+                }
+            }
         }
     }
 }
@@ -346,36 +363,62 @@ private struct PolicyRow: View {
     }
 }
 
-private struct NodeRow: View {
+/// A proxy inside a group: tapping switches to it; probing lives on the
+/// proxies view.
+private struct MemberRow: View {
     @Bindable var model: AppModel
     let name: String
     let selected: Bool
-    let select: (() -> Void)?
+    let select: () -> Void
     var body: some View {
+        Button(action: select) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name).foregroundStyle(.primary)
+                    if let status = model.nodeStatus[name] {
+                        Text(status.summary).font(.caption).foregroundStyle(NodeTone.summary(status))
+                    }
+                }
+                Spacer()
+                Image(systemName: "checkmark").foregroundStyle(.tint).opacity(selected ? 1 : 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .disabled(model.busy || !model.connected)
+    }
+}
+
+/// A proxy server: tapping probes it, and its delay and details show.
+private struct ProxyRow: View {
+    @Bindable var model: AppModel
+    let name: String
+    var body: some View {
+        let status = model.nodeStatus[name]
         HStack(spacing: 12) {
             Button {
-                select?()
+                Task { await model.probe(name) }
             } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(name).foregroundStyle(.primary)
-                        if let status = model.nodeStatus[name] {
-                            Text(status.summary).font(.caption).foregroundStyle(tone(status))
+                        if let status {
+                            Text(status.summary).font(.caption).foregroundStyle(NodeTone.summary(status))
                         }
                     }
                     Spacer()
                     if model.probing.contains(name) {
                         ProgressView().controlSize(.small)
-                    } else if let status = model.nodeStatus[name], let delay = status.delayText {
-                        Text(delay).font(.caption.monospacedDigit()).foregroundStyle(delayTone(status))
+                    } else if let status, let delay = status.delayText {
+                        Text(delay).font(.caption.monospacedDigit()).foregroundStyle(NodeTone.delay(status))
                     }
-                    Image(systemName: "checkmark").foregroundStyle(.tint).opacity(selected ? 1 : 0)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.borderless)
-            .disabled(select == nil || model.busy || !model.connected)
-            if model.nodeStatus[name] != nil {
+            .disabled(status?.type != "VLESS" || !model.connected || model.probing.contains(name))
+            .accessibilityHint("测试延迟")
+            if status != nil {
                 NavigationLink(value: name) {
                     Image(systemName: "info.circle").foregroundStyle(.tint)
                 }
@@ -384,12 +427,15 @@ private struct NodeRow: View {
             }
         }
     }
-    private func tone(_ status: NodeStatus) -> Color {
+}
+
+private enum NodeTone {
+    static func summary(_ status: NodeStatus) -> Color {
         if let tailscale = status.tailscale { return tailscale.state == "error" ? .red : .secondary }
         return .secondary
     }
     /// The desktop's tiers: under 150 ms good, under 300 ms fair, else slow.
-    private func delayTone(_ status: NodeStatus) -> Color {
+    static func delay(_ status: NodeStatus) -> Color {
         guard let delay = status.delay else { return .red }
         return delay < 150 ? .green : delay < 300 ? .orange : .red
     }

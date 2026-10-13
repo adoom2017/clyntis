@@ -571,6 +571,11 @@ main {
   color: var(--muted);
   border-radius: 5px;
 }
+.segment-count {
+  margin-left: 5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 .segmented button.selected {
   color: var(--text);
   font-weight: 500;
@@ -944,6 +949,9 @@ textarea::placeholder {
   padding: 4px 16px 16px;
   margin-bottom: 12px;
 }
+.proxy-list {
+  padding: 16px;
+}
 .proxy-group.folded {
   padding-bottom: 4px;
 }
@@ -1023,7 +1031,7 @@ textarea::placeholder {
 .node-select:disabled {
   opacity: 1;
 }
-.node-select > span:nth-child(2) {
+.node-select > span:not(.node-icon) {
   flex: 1;
   min-width: 0;
 }

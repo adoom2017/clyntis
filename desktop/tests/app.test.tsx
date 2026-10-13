@@ -5,6 +5,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App, { Modal } from "../src/App";
@@ -459,6 +460,66 @@ describe("desktop workflows", () => {
     expect(await screen.findByText("198.51.100.53")).toBeInTheDocument();
     expect(screen.getByText("未发现泄露")).toBeInTheDocument();
     expect(screen.getByText("本地解析由这些服务器完成")).toBeInTheDocument();
+  });
+  it("switches in proxy groups and probes only proxies", async () => {
+    const proxy = (name: string) => ({ name, type: "VLESS", history: [] });
+    const proxies = {
+      Proxy: {
+        name: "Proxy",
+        type: "Selector",
+        all: ["Auto", "DIRECT", "HK 01"],
+        now: "Auto",
+        history: [],
+      },
+      Auto: {
+        name: "Auto",
+        type: "URLTest",
+        all: ["HK 01", "JP 01"],
+        now: "HK 01",
+        history: [],
+      },
+      DIRECT: { name: "DIRECT", type: "Direct", history: [] },
+      "HK 01": proxy("HK 01"),
+      "JP 01": proxy("JP 01"),
+    };
+    invoke.mockImplementation(async (command) => {
+      if (command === "proxies") return { proxies };
+      if (command === "probe_proxy") return { delay: 88 };
+      if (command === "select_proxy") return null;
+      return { ...structuredClone(initial), status: "running" };
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "节点" }));
+    const views = within(
+      await screen.findByRole("group", { name: "节点视图" }),
+    );
+    const groupView = views.getByRole("button", { name: /代理组/ });
+    if (groupView.getAttribute("aria-pressed") !== "true")
+      fireEvent.click(groupView);
+    expect(await screen.findAllByText("JP 01")).not.toHaveLength(0);
+    expect(screen.queryByRole("button", { name: /延迟/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "测速" })).toBeNull();
+    fireEvent.click(screen.getAllByRole("button", { name: /^HK 01/ })[0]);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("select_proxy", {
+        group: "Proxy",
+        name: "HK 01",
+      }),
+    );
+
+    fireEvent.click(views.getByRole("button", { name: /节点/ }));
+    expect(
+      await screen.findByRole("button", { name: "测试 HK 01 延迟" }),
+    ).toBeInTheDocument();
+    // Groups and built-in outbounds are not listed with the proxies.
+    expect(screen.queryByText("Auto")).toBeNull();
+    expect(screen.queryByText("DIRECT")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "测速" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("probe_proxy", { name: "JP 01" }),
+    );
+    expect(invoke).not.toHaveBeenCalledWith("probe_proxy", { name: "Auto" });
+    expect(await screen.findAllByText("88 ms")).toHaveLength(2);
   });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");

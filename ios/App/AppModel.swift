@@ -19,7 +19,8 @@ final class AppModel {
     var mode = "rule"
     var groups: [ProxyGroup] = []
     /// Proxies outside every group (for example a Tailscale node used only by rules).
-    var ungrouped: [String] = []
+    /// The profile's `proxies`, in profile order: the servers that carry traffic.
+    var proxies: [String] = []
     var nodeStatus: [String: NodeStatus] = [:]
     /// Open connections from the core snapshot, newest first.
     var connections: [ConnectionInfo] = []
@@ -94,7 +95,7 @@ final class AppModel {
                         }
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
-                            self.ungrouped = []; self.nodeStatus = [:]; self.connections = []
+                            self.proxies = []; self.nodeStatus = [:]; self.connections = []
                             self.adblock = nil
                         }
                     }
@@ -603,10 +604,7 @@ final class AppModel {
                 return ProxyGroup(name: name, type: group["type"] as? String ?? "", nodes: nodes,
                                   selected: selections[name])
             }
-            let grouped = Set(groups.flatMap(\.nodes))
-            ungrouped = (config["proxies"] as? [[String: Any]] ?? [])
-                .compactMap { $0["name"] as? String }
-                .filter { !grouped.contains($0) }
+            proxies = (config["proxies"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
         }
         nodeStatus = NodeStatus.decode(object["proxies"])
     }

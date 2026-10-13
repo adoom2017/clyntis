@@ -837,6 +837,19 @@ function loadCollapsed(): string[] {
   }
 }
 
+/** Which half of the nodes page is shown; a per-viewer convenience. */
+type NodesView = "groups" | "proxies";
+const nodesViewKey = "clyntis.nodes-view";
+function loadNodesView(): NodesView {
+  try {
+    return localStorage.getItem(nodesViewKey) === "proxies"
+      ? "proxies"
+      : "groups";
+  } catch {
+    return "groups";
+  }
+}
+
 type Perform = (
   action: () => Promise<unknown>,
   success?: string,
@@ -1783,6 +1796,16 @@ function Proxies({
   const [delays, setDelays] = useState<Record<string, number | null>>({});
   const [detail, setDetail] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(loadCollapsed);
+  const [view, setView] = useState(loadNodesView);
+  const chooseView = (next: NodesView) => {
+    setView(next);
+    setQuery("");
+    try {
+      localStorage.setItem(nodesViewKey, next);
+    } catch {
+      // The choice still holds for this session.
+    }
+  };
   const toggleGroup = (name: string) =>
     setCollapsed((current) => {
       const next = current.includes(name)
@@ -1826,7 +1849,7 @@ function Proxies({
   // pool keeps a large subscription from opening hundreds of probes at once.
   const probeAll = async () => {
     const queue = Object.values(nodes)
-      .filter((p) => p.type === "VLESS")
+      .filter((p) => !isPolicy(p.name, p) && p.type !== "Tailscale")
       .map((p) => p.name);
     setProbing([...queue]);
     const worker = async () => {
@@ -1843,136 +1866,203 @@ function Proxies({
   const groups = Object.values(nodes).filter(
     (p) => p.all && (p.name !== "GLOBAL" || mode === "global"),
   );
+  const matches = (name: string) =>
+    name.toLowerCase().includes(query.toLowerCase());
+  // The profile's `proxies`: servers that carry traffic and can be probed.
+  const servers = Object.values(nodes).filter((p) => !isPolicy(p.name, p));
+  const shown = groups.length ? view : "proxies";
+  const icon = (name: string) => {
+    const builtin = builtinOutbound(name, nodes[name]);
+    return nodes[name]?.all ? (
+      <span className="node-icon" title="代理组">
+        <Layers3 size={16} />
+      </span>
+    ) : builtin === "reject" ? (
+      <span className="node-icon reject" title="拒绝">
+        <Ban size={16} />
+      </span>
+    ) : builtin === "direct" ? (
+      <span className="node-icon" title="直连">
+        <ArrowRight size={16} />
+      </span>
+    ) : null;
+  };
+  const summary = (name: string) => {
+    const node = nodes[name];
+    const builtin = builtinOutbound(name, node);
+    if (node?.all)
+      return `代理组 · ${groupTypeText[node.type] ?? node.type}${node.now ? ` · 当前 ${node.now}` : ""}`;
+    if (builtin === "direct") return "直连，不经过代理";
+    if (builtin === "reject") return "拒绝连接";
+    return nodeSummary(node?.status, node?.type);
+  };
+  const label = (name: string) => (
+    <span>
+      <strong>{name}</strong>
+      <small
+        className={
+          nodes[name]?.status?.tailscale?.state === "error" ? "danger-text" : ""
+        }
+      >
+        {summary(name)}
+      </small>
+    </span>
+  );
   return (
     <>
       <div className="toolbar">
-        <label className="search">
-          <Search size={16} />
-          <input
-            aria-label="搜索节点"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="搜索节点"
-          />
-        </label>
-        <button
-          className="button secondary"
-          disabled={busy || !!probing.length}
-          onClick={() => void probeAll()}
-        >
-          <Zap size={16} />
-          测速
-        </button>
-      </div>
-      {(groups.length
-        ? groups
-        : [
-            {
-              name: "全部节点",
-              type: "readOnly",
-              all: Object.keys(nodes),
-              history: [],
-            } as Proxy,
-          ]
-      ).map((group) => {
-        // A search shows matches in every group, folded or not.
-        const folded = !query && collapsed.includes(group.name);
-        return (
-          <section
-            className={`panel proxy-group ${folded ? "folded" : ""}`}
-            key={group.name}
+        <div>
+          {groups.length > 0 && (
+            <div className="segmented" role="group" aria-label="节点视图">
+              {(["groups", "proxies"] as NodesView[]).map((v) => (
+                <button
+                  key={v}
+                  aria-pressed={shown === v}
+                  className={shown === v ? "selected" : ""}
+                  onClick={() => chooseView(v)}
+                >
+                  {v === "groups" ? "代理组" : "节点"}
+                  <span className="segment-count">
+                    {v === "groups" ? groups.length : servers.length}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+          <label className="search">
+            <Search size={16} />
+            <input
+              aria-label="搜索节点"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={shown === "groups" ? "搜索代理组或成员" : "搜索节点"}
+            />
+          </label>
+        </div>
+        {shown === "proxies" && (
+          <button
+            className="button secondary"
+            disabled={busy || !!probing.length}
+            onClick={() => void probeAll()}
           >
-            <button
-              className="group-header"
-              aria-expanded={!folded}
-              onClick={() => toggleGroup(group.name)}
+            <Zap size={16} />
+            测速
+          </button>
+        )}
+      </div>
+      {shown === "groups" &&
+        groups.map((group) => {
+          // A search shows matches in every group, folded or not.
+          const folded = !query && collapsed.includes(group.name);
+          const members = (group.all ?? []).filter(
+            (name) => matches(name) || matches(group.name),
+          );
+          if (query && !members.length) return null;
+          // Groups and built-in outbounds route traffic; proxies carry it.
+          const policies = members.filter((name) =>
+            isPolicy(name, nodes[name]),
+          );
+          const proxies = members.filter(
+            (name) => !isPolicy(name, nodes[name]),
+          );
+          const card = (name: string) => (
+            <div
+              className={`node-card ${isPolicy(name, nodes[name]) ? "policy" : ""} ${group.now === name ? "selected" : ""}`}
+              key={name}
             >
-              <ChevronDown size={16} className="group-chevron" />
-              <h3>
-                {group.name}
-                <span className="count-tag">{group.all?.length}</span>
-              </h3>
-              {folded && group.now && (
-                <span className="group-now">{group.now}</span>
+              <button
+                className="node-select"
+                disabled={busy || group.type !== "Selector"}
+                onClick={() =>
+                  void perform(async () => {
+                    await invoke("select_proxy", { group: group.name, name });
+                    await refresh();
+                  })
+                }
+              >
+                {icon(name)}
+                {label(name)}
+                {group.now === name && <Check size={16} className="accent" />}
+              </button>
+            </div>
+          );
+          return (
+            <section
+              className={`panel proxy-group ${folded ? "folded" : ""}`}
+              key={group.name}
+            >
+              <button
+                className="group-header"
+                aria-expanded={!folded}
+                onClick={() => toggleGroup(group.name)}
+              >
+                <ChevronDown size={16} className="group-chevron" />
+                <h3>
+                  {group.name}
+                  <span className="count-tag">{group.all?.length}</span>
+                </h3>
+                {folded && group.now && (
+                  <span className="group-now">{group.now}</span>
+                )}
+                <span className="muted small">
+                  {groupTypeText[group.type] ?? ""}
+                </span>
+              </button>
+              {!folded && (
+                <>
+                  {policies.length > 0 && (
+                    <>
+                      <div className="member-label">
+                        策略<span>{policies.length}</span>
+                      </div>
+                      <div className="node-grid">{policies.map(card)}</div>
+                    </>
+                  )}
+                  {proxies.length > 0 && (
+                    <>
+                      {policies.length > 0 && (
+                        <div className="member-label">
+                          节点<span>{proxies.length}</span>
+                        </div>
+                      )}
+                      <div className="node-grid">{proxies.map(card)}</div>
+                    </>
+                  )}
+                </>
               )}
-              <span className="muted small">
-                {groupTypeText[group.type] ?? ""}
-              </span>
-            </button>
-            {!folded &&
-              (() => {
-                const members = (group.all ?? []).filter((name) =>
-                  name.toLowerCase().includes(query.toLowerCase()),
-                );
-                // Groups and built-in outbounds route traffic; proxies carry it.
-                const policies = members.filter((name) =>
-                  isPolicy(name, nodes[name]),
-                );
-                const proxies = members.filter(
-                  (name) => !isPolicy(name, nodes[name]),
-                );
-                const card = (name: string) => {
+            </section>
+          );
+        })}
+      {shown === "proxies" &&
+        (() => {
+          const list = servers.filter((p) => matches(p.name));
+          if (!servers.length)
+            return (
+              <Empty
+                icon={<Globe2 />}
+                title="没有节点"
+                text="当前配置没有代理节点。"
+              />
+            );
+          if (!list.length)
+            return (
+              <Empty
+                icon={<Search />}
+                title="没有匹配的节点"
+                text="换个关键词试试。"
+              />
+            );
+          return (
+            <section className="panel proxy-list">
+              <div className="node-grid">
+                {list.map(({ name }) => {
                   const delay =
                     name in delays
                       ? delays[name]
                       : nodes[name]?.history.at(-1)?.delay;
-                  const builtin = builtinOutbound(name, nodes[name]);
                   return (
-                    <div
-                      className={`node-card ${isPolicy(name, nodes[name]) ? "policy" : ""} ${group.now === name ? "selected" : ""}`}
-                      key={name}
-                    >
-                      <button
-                        className="node-select"
-                        disabled={busy || group.type !== "Selector"}
-                        onClick={() =>
-                          void perform(async () => {
-                            await invoke("select_proxy", {
-                              group: group.name,
-                              name,
-                            });
-                            await refresh();
-                          })
-                        }
-                      >
-                        {nodes[name]?.all ? (
-                          <span className="node-icon" title="代理组">
-                            <Layers3 size={16} />
-                          </span>
-                        ) : builtin === "reject" ? (
-                          <span className="node-icon reject" title="拒绝">
-                            <Ban size={16} />
-                          </span>
-                        ) : builtin === "direct" ? (
-                          <span className="node-icon" title="直连">
-                            <ArrowRight size={16} />
-                          </span>
-                        ) : null}
-                        <span>
-                          <strong>{name}</strong>
-                          <small
-                            className={
-                              nodes[name]?.status?.tailscale?.state === "error"
-                                ? "danger-text"
-                                : ""
-                            }
-                          >
-                            {nodes[name]?.all
-                              ? `代理组 · ${groupTypeText[nodes[name].type] ?? nodes[name].type}${nodes[name].now ? ` · 当前 ${nodes[name].now}` : ""}`
-                              : builtin === "direct"
-                                ? "直连，不经过代理"
-                                : builtin === "reject"
-                                  ? "拒绝连接"
-                                  : nodeSummary(
-                                      nodes[name]?.status,
-                                      nodes[name]?.type,
-                                    )}
-                          </small>
-                        </span>
-                        {group.now === name && (
-                          <Check size={16} className="accent" />
-                        )}
-                      </button>
+                    <div className="node-card" key={name}>
+                      <div className="node-select">{label(name)}</div>
                       {nodes[name]?.status && (
                         <button
                           className="node-info"
@@ -1982,7 +2072,7 @@ function Proxies({
                           <Info size={15} />
                         </button>
                       )}
-                      {nodes[name]?.type === "Tailscale" || builtin ? null : (
+                      {nodes[name]?.type !== "Tailscale" && (
                         <button
                           className={`delay ${delayTone(delay)}`}
                           aria-label={`测试 ${name} 延迟`}
@@ -2002,33 +2092,11 @@ function Proxies({
                       )}
                     </div>
                   );
-                };
-                return (
-                  <>
-                    {policies.length > 0 && (
-                      <>
-                        <div className="member-label">
-                          策略<span>{policies.length}</span>
-                        </div>
-                        <div className="node-grid">{policies.map(card)}</div>
-                      </>
-                    )}
-                    {proxies.length > 0 && (
-                      <>
-                        {policies.length > 0 && (
-                          <div className="member-label">
-                            节点<span>{proxies.length}</span>
-                          </div>
-                        )}
-                        <div className="node-grid">{proxies.map(card)}</div>
-                      </>
-                    )}
-                  </>
-                );
-              })()}
-          </section>
-        );
-      })}
+                })}
+              </div>
+            </section>
+          );
+        })()}
       {detail && nodes[detail]?.status && (
         <Modal title={detail} onClose={() => setDetail(null)} wide>
           <NodeDetail
