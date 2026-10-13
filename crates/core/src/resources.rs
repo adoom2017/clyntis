@@ -381,7 +381,8 @@ async fn adblock(
     previous: &Resources,
 ) -> (Option<Arc<crate::adblock::Filter>>, Vec<ListSource>) {
     let settings = &config.adblock;
-    if !settings.enable || settings.lists.is_empty() {
+    // Without lists the built-in endpoints and QUIC fallback still apply.
+    if !settings.enable {
         return (None, vec![]);
     }
     struct Resolved {
@@ -439,18 +440,22 @@ async fn adblock(
             })
             .collect();
         tracing::debug!("ad blocking lists unchanged; reusing them");
-        return (
-            Some(Arc::new(active.with_lists(&settings.allow, lists))),
-            sources,
-        );
+        return (Some(Arc::new(active.with_lists(settings, lists))), sources);
     }
     let mut block = meta_config::rule::DomainSetBuilder::default();
     let mut allow = meta_config::rule::DomainSetBuilder::default();
+    let mut addresses = Vec::new();
     let mut lists = Vec::new();
     for (list, resolved) in settings.lists.iter().zip(resolved) {
         let loaded = resolved.data.and_then(|data| {
             let bytes = read_limited(&data)?;
-            meta_config::adblock::parse_list(&bytes, &list.format, &mut block, &mut allow)
+            meta_config::adblock::parse_list(
+                &bytes,
+                &list.format,
+                &mut block,
+                &mut allow,
+                &mut addresses,
+            )
         });
         let info = match loaded {
             Ok(entries) => crate::adblock::ListInfo {
@@ -471,7 +476,8 @@ async fn adblock(
         };
         lists.push(info);
     }
-    let filter = crate::adblock::Filter::new(block.build(), allow.build(), &settings.allow, lists);
+    let filter =
+        crate::adblock::Filter::new(block.build(), allow.build(), addresses, settings, lists);
     tracing::info!(
         entries = filter.entries(),
         lists = filter.lists.len(),

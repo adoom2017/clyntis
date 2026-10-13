@@ -118,6 +118,9 @@ private struct RouteTestSection: View {
 
     private static let matchText = [
         "Adblock": "去广告拦截（优先于所有规则）",
+        "Adblock(HTTPDNS)": "去广告：HTTPDNS / 加密 DNS 入口",
+        "Adblock(IP)": "去广告：列表中的 IP",
+        "Adblock(QUIC)": "去广告：没有域名的 QUIC，回退到 TCP",
         "Mode(Global)": "全局模式",
         "Mode(Direct)": "直连模式",
         "Fallback": "没有规则匹配，默认直连",

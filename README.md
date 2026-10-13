@@ -41,7 +41,15 @@ replacement for every protocol or configuration option.
   while running (`PATCH /configs` with `adblock-allow`). Counters cover DNS and
   connection blocks, the most blocked domains and the latest blocks
   (`GET /adblock`; the FFI snapshot's `adblock`). Presets: AWAvenue-Ads,
-  anti-AD and AdGuard DNS filter.
+  anti-AD and AdGuard DNS filter. Clash lists may also carry `IP-CIDR` /
+  `IP-CIDR6` lines or bare networks, refused on connection. Against apps
+  that bypass the system resolver: `block-httpdns` (default on) refuses
+  built-in HTTPDNS and DoH/DoT endpoints (names at DNS and on connection;
+  addresses on ports 80, 443 and 853), and `quic-fallback` (default on)
+  rejects UDP 443 whose destination has no name, so the app retries over
+  TCP where TLS sniffing names it. `dns-answer: null` answers listed names
+  with 0.0.0.0 / :: instead of NXDOMAIN; endpoint names always get NXDOMAIN,
+  which Firefox's DoH canary and iCloud Private Relay require.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
   redir-host modes. Real lookups also resolve Tailscale MagicDNS names; fake-IP
   answers keep the domain so domain rules still apply.

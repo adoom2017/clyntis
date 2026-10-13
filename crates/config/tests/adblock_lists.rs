@@ -11,7 +11,7 @@ fn parses_real_lists() {
         let data = std::fs::read(path).unwrap();
         let started = std::time::Instant::now();
         let (mut block, mut allow) = (DomainSetBuilder::default(), DomainSetBuilder::default());
-        let taken = parse_list(&data, format, &mut block, &mut allow).unwrap();
+        let taken = parse_list(&data, format, &mut block, &mut allow, &mut Vec::new()).unwrap();
         let (block, allow) = (block.build(), allow.build());
         println!(
             "{path}: {} KB, {taken} rules -> {} block / {} allow entries in {:?}",

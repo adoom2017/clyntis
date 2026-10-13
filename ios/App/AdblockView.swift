@@ -88,6 +88,42 @@ struct AdblockView: View {
                     Button("添加列表", systemImage: "plus") { addingList = true }
                 }
                 Section {
+                    Toggle(isOn: Binding(get: { settings.blockHttpdns ?? true }, set: { on in
+                        var next = settings
+                        next.blockHttpdns = on
+                        save(next)
+                    })) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("拦截 HTTPDNS 和加密 DNS")
+                            Text("App 自带的 HTTPDNS、DoH 会绕过 DNS 过滤，拦截后退回系统 DNS")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Toggle(isOn: Binding(get: { settings.quicFallback ?? true }, set: { on in
+                        var next = settings
+                        next.quicFallback = on
+                        save(next)
+                    })) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("QUIC 回退到 TCP")
+                            Text("拒绝不知道域名的 QUIC，App 改用 TCP 后即可按域名拦截")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Picker("拦截应答", selection: Binding(get: { settings.dnsAnswer ?? "nxdomain" }, set: { answer in
+                        var next = settings
+                        next.dnsAnswer = answer
+                        save(next)
+                    })) {
+                        Text("域名不存在").tag("nxdomain")
+                        Text("0.0.0.0").tag("null")
+                    }
+                } header: {
+                    Text("防绕过")
+                } footer: {
+                    Text("个别 App 收到「域名不存在」会反复重试，可把拦截应答改为 0.0.0.0。")
+                }
+                Section {
                     ForEach(settings.allow, id: \.self) { domain in
                         Text(domain).font(.body.monospaced())
                             .swipeActions {

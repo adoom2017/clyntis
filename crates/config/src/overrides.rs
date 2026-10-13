@@ -118,6 +118,7 @@ mod tests {
                 presets: vec!["awavenue".into()],
                 custom: vec![],
                 allow: vec!["ok.test".into()],
+                ..Default::default()
             }),
         };
         let config = crate::Config::parse(overrides.apply(PROFILE).unwrap().as_bytes()).unwrap();

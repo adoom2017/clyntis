@@ -804,7 +804,7 @@ impl Resolver {
             .to_ascii_lowercase();
         // Ad blocking answers first: the app fails at once instead of connecting.
         if let Some(filter) = self.adblock()
-            && filter.blocks(&host)
+            && let Some(block) = filter.refuses_name(&host)
         {
             self.adblock_stats.record(&host, "dns");
             let mut response = Message::new();
@@ -813,8 +813,20 @@ impl Resolver {
                 .set_message_type(MessageType::Response)
                 .set_recursion_desired(request.recursion_desired())
                 .set_recursion_available(true)
-                .set_response_code(ResponseCode::NXDomain)
                 .add_query(query.clone());
+            // `null` answers an unroutable address (other types get no data):
+            // some apps retry an NXDOMAIN at once, but give up on 0.0.0.0.
+            // Endpoint names stay NXDOMAIN: Firefox's canary and iCloud
+            // Private Relay only stand down on a negative answer.
+            if !filter.null_answer || block != crate::adblock::Block::List {
+                response.set_response_code(ResponseCode::NXDomain);
+            } else if let Some(data) = match query.query_type() {
+                RecordType::A => Some(RData::A(A(std::net::Ipv4Addr::UNSPECIFIED))),
+                RecordType::AAAA => Some(RData::AAAA(AAAA(std::net::Ipv6Addr::UNSPECIFIED))),
+                _ => None,
+            } {
+                response.add_answer(Record::from_rdata(query.name().clone(), 300, data));
+            }
             return Ok(response.to_vec()?);
         }
         let excluded = self

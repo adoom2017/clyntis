@@ -48,6 +48,11 @@ struct AdblockSettings: Codable, Equatable {
     var presets = ["awavenue"]
     var custom: [List] = []
     var allow: [String] = []
+    /// `nil` takes the core's default (on, on, nxdomain); optional so settings
+    /// saved before these options still decode.
+    var blockHttpdns: Bool?
+    var quicFallback: Bool?
+    var dnsAnswer: String?
 
     /// Everything except the allowlist, which the running core takes live.
     var withoutAllow: AdblockSettings {

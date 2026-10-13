@@ -936,6 +936,118 @@ async fn adblock_refuses_dns_and_connections_and_counts_them() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[tokio::test]
+async fn adblock_closes_resolver_bypasses_and_answers_null() {
+    let dir = std::env::temp_dir().join(format!("meta-adblock-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("adblock")).unwrap();
+    std::fs::write(
+        dir.join("adblock/test.list"),
+        "payload:\n  - '+.ads.test'\n  - IP-CIDR,198.51.100.0/24,no-resolve\n",
+    )
+    .unwrap();
+    let parse = |extra: &str| {
+        let mut config = meta_config::Config::parse(
+            format!("dns: {{enhanced-mode: fake-ip}}\nadblock:\n  enable: true\n  lists: [{{name: test, url: 'https://example.invalid/list.yaml'}}]\n{extra}rules: ['MATCH,DIRECT']\n").as_bytes(),
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        Core::new(config, Arc::new(meta_platform::DefaultHooks)).unwrap()
+    };
+    let core = parse("  dns-answer: null\n  allow: [dns.google]\n");
+    core.prepare_resources(false).await.unwrap();
+    let route = |host: &str, port: u16, network: &'static str| {
+        let core = core.clone();
+        let target = Target::new(host, port).unwrap();
+        async move {
+            let decision = core.route_decision(&target, network).await.unwrap();
+            (decision.node, decision.rule)
+        }
+    };
+    let rejected = |rule: &str| ("REJECT".to_string(), rule.to_string());
+    // HTTPDNS addresses on their service ports, but not on plain DNS.
+    assert_eq!(
+        route("203.107.1.1", 80, "tcp").await,
+        rejected("Adblock(HTTPDNS)")
+    );
+    assert_eq!(
+        route("8.8.8.8", 853, "tcp").await,
+        rejected("Adblock(HTTPDNS)")
+    );
+    assert_eq!(route("8.8.8.8", 53, "udp").await.0, "DIRECT");
+    // Encrypted-DNS names, unless the user allows them.
+    assert_eq!(
+        route("doh.pub", 443, "tcp").await,
+        rejected("Adblock(HTTPDNS)")
+    );
+    assert_eq!(route("dns.google", 443, "tcp").await.0, "DIRECT");
+    // Listed addresses, and QUIC only when the destination has no name.
+    assert_eq!(
+        route("198.51.100.7", 443, "tcp").await,
+        rejected("Adblock(IP)")
+    );
+    assert_eq!(
+        route("203.0.113.9", 443, "udp").await,
+        rejected("Adblock(QUIC)")
+    );
+    assert_eq!(route("203.0.113.9", 443, "tcp").await.0, "DIRECT");
+    assert_eq!(route("www.example.com", 443, "udp").await.0, "DIRECT");
+    assert_eq!(core.adblock_status()["entries"], 2);
+
+    let answer = |core: &Arc<Core>, name: &str| {
+        let core = core.clone();
+        let mut message = hickory_proto::op::Message::new();
+        message.set_id(7).add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii(name).unwrap(),
+            hickory_proto::rr::RecordType::A,
+        ));
+        async move {
+            let bytes = core
+                .resolver
+                .answer(&message.to_vec().unwrap())
+                .await
+                .unwrap();
+            hickory_proto::op::Message::from_vec(&bytes).unwrap()
+        }
+    };
+    // `null` answers listed names with 0.0.0.0 …
+    let listed = answer(&core, "x.ads.test.").await;
+    assert_eq!(
+        listed.response_code(),
+        hickory_proto::op::ResponseCode::NoError
+    );
+    assert_eq!(
+        listed.answers()[0].data().ip_addr(),
+        Some(std::net::Ipv4Addr::UNSPECIFIED.into())
+    );
+    // … but endpoint names stay negative, as Firefox and Private Relay need.
+    assert_eq!(
+        answer(&core, "use-application-dns.net.")
+            .await
+            .response_code(),
+        hickory_proto::op::ResponseCode::NXDomain
+    );
+
+    // Both bypass defences can be turned off.
+    let core = parse("  block-httpdns: false\n  quic-fallback: false\n");
+    core.prepare_resources(false).await.unwrap();
+    for (host, port, network) in [
+        ("203.107.1.1", 80, "tcp"),
+        ("doh.pub", 443, "tcp"),
+        ("203.0.113.9", 443, "udp"),
+    ] {
+        let decision = core
+            .route_decision(&Target::new(host, port).unwrap(), network)
+            .await
+            .unwrap();
+        assert_eq!(decision.node, "DIRECT", "{host}:{port}/{network}");
+    }
+    assert_eq!(
+        answer(&core, "x.ads.test.").await.response_code(),
+        hickory_proto::op::ResponseCode::NXDomain
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn saved_profile_is_written_only_after_a_change() {
     let dir = std::env::temp_dir().join(format!("meta-profile-{}", uuid::Uuid::new_v4()));

@@ -1541,8 +1541,45 @@ function AdblockSettingsSection({
             </Setting>
           ))}
           <Setting
+            label="拦截 HTTPDNS 和加密 DNS"
+            text="不少 App 自带 HTTPDNS 或 DoH，绕过了 DNS 过滤；拦截后它们会退回系统 DNS"
+          >
+            <Toggle
+              checked={adblock.blockHttpdns ?? true}
+              onChange={(blockHttpdns) => update({ blockHttpdns })}
+              label="拦截 HTTPDNS 和加密 DNS"
+            />
+          </Setting>
+          <Setting
+            label="QUIC 回退到 TCP"
+            text="拒绝不知道域名的 QUIC 连接，App 改用 TCP 后即可按域名拦截"
+          >
+            <Toggle
+              checked={adblock.quicFallback ?? true}
+              onChange={(quicFallback) => update({ quicFallback })}
+              label="QUIC 回退到 TCP"
+            />
+          </Setting>
+          <Setting
+            label="拦截应答"
+            text="个别 App 收到「域名不存在」会反复重试，可改为返回 0.0.0.0"
+          >
+            <select
+              aria-label="拦截应答"
+              value={adblock.dnsAnswer ?? "nxdomain"}
+              onChange={(e) =>
+                update({
+                  dnsAnswer: e.target.value as AdblockSettings["dnsAnswer"],
+                })
+              }
+            >
+              <option value="nxdomain">域名不存在</option>
+              <option value="null">0.0.0.0</option>
+            </select>
+          </Setting>
+          <Setting
             label="自定义列表"
-            text="Clash 规则集、hosts 或 AdGuard 格式的链接"
+            text="Clash 规则集（域名或 IP）、hosts 或 AdGuard 格式的链接"
           >
             <button
               className="button secondary"
@@ -2465,6 +2502,9 @@ function RulesPage({
 }
 const routeMatchText: Record<string, string> = {
   Adblock: "去广告拦截（优先于所有规则）",
+  "Adblock(HTTPDNS)": "去广告：HTTPDNS / 加密 DNS 入口",
+  "Adblock(IP)": "去广告：列表中的 IP",
+  "Adblock(QUIC)": "去广告：没有域名的 QUIC，回退到 TCP",
   "Mode(Global)": "全局模式",
   "Mode(Direct)": "直连模式",
   Fallback: "没有规则匹配，默认直连",

@@ -658,18 +658,19 @@ impl Core {
     /// Routes `target` like a connection would. `record` counts an ad block
     /// hit; route tests leave the counters alone.
     async fn trace_route(&self, target: &Target, network: &str, record: bool) -> Result<Trace> {
-        // Ad blocking precedes every rule and mode; DNS already refused these
-        // names, so this catches apps that resolved them some other way.
-        if target.ip().is_none()
-            && let Some(filter) = self.resolver.adblock()
-            && filter.blocks(&target.host)
+        // Ad blocking precedes every rule and mode. DNS already refused the
+        // listed names, so this catches apps that resolved them some other
+        // way, plus HTTPDNS endpoints, listed addresses and QUIC to bare
+        // addresses (fake IPs are restored to names before routing).
+        if let Some(filter) = self.resolver.adblock()
+            && let Some(block) = filter.refuses(&target.host, target.port, network)
         {
             if record {
                 self.resolver
                     .adblock_stats
                     .record(&target.host, "connection");
             }
-            return Ok(Trace::new("REJECT", "REJECT", "Adblock", None));
+            return Ok(Trace::new("REJECT", "REJECT", block.matched(), None));
         }
         let (mode, rules, raw_rules) = {
             let p = self.policy.read().unwrap();

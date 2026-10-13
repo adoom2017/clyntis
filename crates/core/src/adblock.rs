@@ -1,8 +1,14 @@
-//! Ad blocking at run time: the compiled lists, the allowlist and counters.
-use meta_config::rule::{DomainSet, DomainSetBuilder};
+//! Ad blocking at run time: the compiled lists, the allowlist, the endpoints
+//! of resolvers that bypass DNS filtering, and counters.
+use ipnet::IpNet;
+use meta_config::{
+    adblock::{Adblock, HTTPDNS_ADDRESSES, HTTPDNS_DOMAINS, HTTPDNS_PORTS},
+    rule::{DomainSet, DomainSetBuilder},
+};
 use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
+    net::IpAddr,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -19,43 +25,141 @@ pub struct ListInfo {
     pub error: Option<String>,
 }
 
+/// Why a connection was refused, as the route trace and log show it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Block {
+    /// A listed domain.
+    List,
+    /// An HTTPDNS or encrypted-DNS endpoint.
+    Endpoint,
+    /// A listed address.
+    Address,
+    /// QUIC to an address without a name, so the app retries over TCP.
+    Quic,
+}
+impl Block {
+    pub fn matched(self) -> &'static str {
+        match self {
+            Block::List => "Adblock",
+            Block::Endpoint => "Adblock(HTTPDNS)",
+            Block::Address => "Adblock(IP)",
+            Block::Quic => "Adblock(QUIC)",
+        }
+    }
+}
+
 /// Compiled block and allow sets. The user's allowlist can change while
 /// running; the lists' own exceptions come with them.
 pub struct Filter {
     block: Arc<DomainSet>,
     list_allow: Arc<DomainSet>,
     user_allow: RwLock<DomainSet>,
+    /// Addresses from the lists.
+    addresses: Arc<Vec<IpNet>>,
+    endpoints: Arc<Endpoints>,
+    block_httpdns: bool,
+    quic_fallback: bool,
+    /// Answer blocked names with 0.0.0.0 / :: instead of NXDOMAIN.
+    pub null_answer: bool,
     pub lists: Vec<ListInfo>,
+}
+/// The built-in HTTPDNS and encrypted-DNS endpoints.
+struct Endpoints {
+    domains: DomainSet,
+    addresses: Vec<IpNet>,
+}
+impl Endpoints {
+    fn new() -> Self {
+        let mut domains = DomainSetBuilder::default();
+        for domain in HTTPDNS_DOMAINS {
+            domains.suffix(domain);
+        }
+        Self {
+            domains: domains.build(),
+            // Checked by meta-config's tests.
+            addresses: HTTPDNS_ADDRESSES
+                .iter()
+                .filter_map(|net| net.parse().ok())
+                .collect(),
+        }
+    }
 }
 impl Filter {
     pub fn new(
         block: DomainSet,
         list_allow: DomainSet,
-        user_allow: &[String],
+        addresses: Vec<IpNet>,
+        settings: &Adblock,
         lists: Vec<ListInfo>,
     ) -> Self {
         Self {
             block: Arc::new(block),
             list_allow: Arc::new(list_allow),
-            user_allow: RwLock::new(allow_set(user_allow)),
+            user_allow: RwLock::new(allow_set(&settings.allow)),
+            addresses: Arc::new(addresses),
+            endpoints: Arc::new(Endpoints::new()),
+            block_httpdns: settings.block_httpdns,
+            quic_fallback: settings.quic_fallback,
+            null_answer: settings.dns_answer == "null",
             lists,
         }
     }
-    /// The same compiled lists with new status and allowlist.
-    pub fn with_lists(&self, user_allow: &[String], lists: Vec<ListInfo>) -> Self {
+    /// The same compiled lists with new status, allowlist and options.
+    pub fn with_lists(&self, settings: &Adblock, lists: Vec<ListInfo>) -> Self {
         Self {
             block: self.block.clone(),
             list_allow: self.list_allow.clone(),
-            user_allow: RwLock::new(allow_set(user_allow)),
+            user_allow: RwLock::new(allow_set(&settings.allow)),
+            addresses: self.addresses.clone(),
+            endpoints: self.endpoints.clone(),
+            block_httpdns: settings.block_httpdns,
+            quic_fallback: settings.quic_fallback,
+            null_answer: settings.dns_answer == "null",
             lists,
         }
     }
+    /// Whether a listed domain is blocked.
     pub fn blocks(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.');
-        if host.parse::<std::net::IpAddr>().is_ok() || !self.block.matches(host) {
+        if host.parse::<IpAddr>().is_ok() || !self.block.matches(host) {
             return false;
         }
         !(self.list_allow.matches(host) || self.user_allow.read().unwrap().matches(host))
+    }
+    /// Whether DNS refuses `host`: a listed domain or an encrypted-DNS name.
+    pub fn refuses_name(&self, host: &str) -> Option<Block> {
+        if self.blocks(host) {
+            return Some(Block::List);
+        }
+        self.endpoint_name(host).then_some(Block::Endpoint)
+    }
+    fn endpoint_name(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.');
+        self.block_httpdns
+            && self.endpoints.domains.matches(host)
+            && !self.user_allow.read().unwrap().matches(host)
+    }
+    /// Whether a connection to `host` (a name, or an address the core could
+    /// not name) is refused, and why. Names are never resolved here.
+    pub fn refuses(&self, host: &str, port: u16, network: &str) -> Option<Block> {
+        let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        else {
+            return self.refuses_name(host);
+        };
+        let ip = ip.to_canonical();
+        if self.block_httpdns
+            && HTTPDNS_PORTS.contains(&port)
+            && self.endpoints.addresses.iter().any(|net| net.contains(&ip))
+        {
+            return Some(Block::Endpoint);
+        }
+        if self.addresses.iter().any(|net| net.contains(&ip)) {
+            return Some(Block::Address);
+        }
+        (self.quic_fallback && network == "udp" && port == 443).then_some(Block::Quic)
     }
     pub fn set_allow(&self, patterns: &[String]) {
         *self.user_allow.write().unwrap() = allow_set(patterns);
@@ -64,8 +168,9 @@ impl Filter {
     pub fn shares_lists(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.block, &other.block)
     }
+    /// Listed domains and addresses.
     pub fn entries(&self) -> usize {
-        self.block.len()
+        self.block.len() + self.addresses.len()
     }
 }
 fn allow_set(patterns: &[String]) -> DomainSet {
@@ -180,7 +285,11 @@ mod tests {
         let filter = Filter::new(
             block.build(),
             list_allow.build(),
-            &["keep.ads.test".into()],
+            vec![],
+            &Adblock {
+                allow: vec!["keep.ads.test".into()],
+                ..Adblock::default()
+            },
             vec![],
         );
         assert!(

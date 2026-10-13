@@ -39,6 +39,12 @@ export interface AdblockSettings {
   presets: string[];
   custom: AdList[];
   allow: string[];
+  /** Refuse HTTPDNS and encrypted-DNS endpoints that bypass DNS filtering. */
+  blockHttpdns?: boolean;
+  /** Reject QUIC to an address without a name, so apps retry over TCP. */
+  quicFallback?: boolean;
+  /** How DNS refuses a blocked name. */
+  dnsAnswer?: "nxdomain" | "null";
 }
 export const adblockPresets = [
   {
@@ -62,6 +68,9 @@ export const defaultAdblock: AdblockSettings = {
   presets: ["awavenue"],
   custom: [],
   allow: [],
+  blockHttpdns: true,
+  quicFallback: true,
+  dnsAnswer: "nxdomain",
 };
 export interface AdblockStatus {
   enabled: boolean;
