@@ -274,6 +274,26 @@ pub unsafe extern "C" fn meta_overrides_apply_v1(
     })
 }
 
+/// Check the YAML syntax of `config` for an editor. Writes JSON `null`, or
+/// `{"line","column","message"}` (1-based) for the first error.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_yaml_check_v1(
+    config: *const u8,
+    len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let error = clyntis_config::syntax::check(yaml);
+        unsafe { output(&serde_json::to_vec(&error)?, buffer, capacity, length) }
+    })
+}
+
 /// Move buffered core log lines into `buffer` as newline-separated JSON objects
 /// (`time` in Unix seconds, `type` debug/info/warning/error, `payload`). Lines
 /// are removed only when they fit; otherwise `length` reports the size needed.

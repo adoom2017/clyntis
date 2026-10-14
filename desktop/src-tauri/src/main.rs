@@ -39,6 +39,7 @@ fn main() {
             app::add_subscription,
             app::read_profile,
             app::save_profile,
+            app::check_yaml,
             app::select_profile,
             app::delete_profile,
             app::update_subscription,

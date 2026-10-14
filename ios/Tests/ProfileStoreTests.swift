@@ -22,6 +22,13 @@ final class ProfileStoreTests: XCTestCase {
         try store.remove(profile)
         XCTAssertTrue(try store.profiles().isEmpty)
     }
+    func testYAMLCheckPointsAtTheFirstError() {
+        XCTAssertNil(CoreSession.yamlProblem(in: "mode: rule\nrules: ['MATCH,DIRECT']\n"))
+        let problem = CoreSession.yamlProblem(in: "mode: rule\nmode: global\n")
+        XCTAssertEqual(problem?.line, 2)
+        XCTAssertEqual(problem?.message.hasPrefix("键重复"), true)
+    }
+
     func testEditingValidatesAndKeepsTheOldConfigurationOnFailure() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

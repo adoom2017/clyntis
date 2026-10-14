@@ -75,6 +75,11 @@ int32_t meta_custom_rules_apply_v1(const uint8_t *config, size_t length,
 int32_t meta_overrides_apply_v1(const uint8_t *config, size_t length,
     const uint8_t *overrides, size_t overrides_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* YAML syntax of config for an editor: writes JSON null, or
+ * {"line":n,"column":n,"message":"..."} (1-based) for the first error.
+ * Follows the caller-buffer/size-query contract. */
+int32_t meta_yaml_check_v1(const uint8_t *config, size_t length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 /* Drain buffered core logs (all cores in this process) as newline-separated
  * JSON objects {"time":unix_seconds,"type":"info|warning|error|debug",
  * "payload":"..."}. Lines are removed only when they fit; otherwise
