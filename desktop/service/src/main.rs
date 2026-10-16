@@ -45,10 +45,12 @@ fn main() {
 fn data_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        Ok(std::env::current_exe()?
-            .parent()
-            .context("missing install directory")?
-            .join("service-data"))
+        Ok(
+            clyntis_desktop_service::windows_security::local_path(&std::env::current_exe()?)?
+                .parent()
+                .context("missing install directory")?
+                .join("service-data"),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -58,7 +60,10 @@ fn data_dir() -> Result<PathBuf> {
     }
 }
 
-async fn serve(stop: CancellationToken) -> Result<()> {
+async fn serve(
+    stop: CancellationToken,
+    #[cfg(windows)] ready: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let root = data_dir()?;
     private_dir(&root)?;
     #[cfg(windows)]
@@ -74,6 +79,8 @@ async fn serve(stop: CancellationToken) -> Result<()> {
     }
     let _ = ProxyGuard::recover(root.join("system-proxy.json"))?;
     let listener = transport::Listener::bind()?;
+    #[cfg(windows)]
+    ready()?;
     loop {
         let stream = tokio::select! { _ = stop.cancelled() => break, result = listener.accept() => match result { Ok(s) => s, Err(e) => { eprintln!("client rejected: {e}"); continue; } } };
         // Only one authenticated desktop session can own network changes at a time.

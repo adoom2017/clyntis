@@ -5,6 +5,8 @@ mod engine;
 mod platform;
 #[cfg(target_os = "macos")]
 mod tray;
+#[cfg(windows)]
+mod windows_diagnostics;
 
 use app::Desktop;
 use tauri::{
@@ -19,6 +21,10 @@ const TRAY_ICON: &[u8] = include_bytes!("../icons/clyntis-v3/tray-template.png")
 const TRAY_ICON: &[u8] = include_bytes!("../icons/clyntis-v3/64x64.png");
 
 fn main() {
+    #[cfg(windows)]
+    if let Some(code) = windows_diagnostics::run_if_requested() {
+        std::process::exit(code);
+    }
     let autostart = tauri_plugin_autostart::Builder::new();
     #[cfg(target_os = "macos")]
     let autostart = autostart.macos_launcher(tauri_plugin_autostart::MacosLauncher::LaunchAgent);
@@ -84,7 +90,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_tray_icon_event(|tray, event| {
-                    if matches!(event, TrayIconEvent::Click { .. }) {
+                    if tray_click_shows_window(&event) {
                         show(tray.app_handle());
                     }
                 })
@@ -142,10 +148,61 @@ fn main() {
         });
 }
 
+#[cfg(windows)]
+fn tray_click_shows_window(event: &TrayIconEvent) -> bool {
+    matches!(
+        event,
+        TrayIconEvent::Click {
+            button: tauri::tray::MouseButton::Left,
+            button_state: tauri::tray::MouseButtonState::Up,
+            ..
+        }
+    )
+}
+
+#[cfg(not(windows))]
+fn tray_click_shows_window(event: &TrayIconEvent) -> bool {
+    matches!(event, TrayIconEvent::Click { .. })
+}
+
 fn show(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tray_tests {
+    use super::*;
+    use tauri::tray::{MouseButton, MouseButtonState};
+
+    fn click(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: "test-tray".into(),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect {
+                position: tauri::PhysicalPosition::new(0, 0).into(),
+                size: tauri::PhysicalSize::new(16, 16).into(),
+            },
+            button,
+            button_state,
+        }
+    }
+
+    #[test]
+    fn right_click_never_focuses_window_or_dismisses_native_menu() {
+        for state in [MouseButtonState::Down, MouseButtonState::Up] {
+            assert!(!tray_click_shows_window(&click(MouseButton::Right, state)));
+        }
+        assert!(!tray_click_shows_window(&click(
+            MouseButton::Left,
+            MouseButtonState::Down
+        )));
+        assert!(tray_click_shows_window(&click(
+            MouseButton::Left,
+            MouseButtonState::Up
+        )));
     }
 }

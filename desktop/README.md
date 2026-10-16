@@ -83,7 +83,7 @@ React → Tauri commands/events → Rust desktop host
 
 服务 IPC v1 提供状态、心跳、停止、启动、代理接管和受限资源传输。
 Windows 使用拒绝远程客户端的命名管道，仅允许交互用户/管理员/System 连接，
-并要求调用进程来自 Program Files 下同一安装目录的桌面程序。
+并要求调用进程来自同一受管理员权限保护的安装目录中的桌面程序。
 macOS 使用 Unix socket，要求调用者为当前桌面用户，且其**运行中进程**通过同 Team ID、
 指定 bundle identifier 的 Apple 代码签名校验。服务不接受任意可执行文件或任意文件路径。
 服务单会话持有网络状态，独立心跳每 5 秒发送；30 秒失联或连接关闭即清理。
@@ -116,7 +116,21 @@ npm run desktop:build -- --app-version 1.0.0 --build-number 17
 `npm run desktop:build -- --target <target>`，辅助程序和主应用会使用同一目标架构。
 推荐按平台/架构分别使用本机构建机器。
 
-Windows 安装到 Program Files；首次在设置页安装服务时触发 UAC。
+Windows 支持本地 NTFS/ReFS 磁盘上的自定义目录（例如 `D:\Clyntis`，支持空格和中文），
+不再要求位于 Program Files。安装器将安装目录及程序文件的所有者设置为 Administrators，
+只允许 Administrators/System 修改，普通用户仅有读取和执行权限；服务数据目录仅限
+Administrators/System 访问。父目录必须已存在且不能被普通用户修改或替换；不支持磁盘根目录、
+网络共享、目录联接或符号链接。安装器不修改父目录的权限，避免影响其他文件或应用。
+首次在设置页安装服务时触发 UAC，授权前和服务启动时均检查目录与程序文件权限。
+Windows 服务注册使用普通本地磁盘路径，并兼容系统返回的 `\\?\D:\...` 扩展路径。
+服务完成目录保护和恢复检查后才报告运行就绪；启动失败写入安装目录中的
+`clyntis-service.log` 并立即反馈，避免继续等待已停止的服务。
+服务未注册时升级/卸载跳过服务清理，不会因为旧版本的安装路径限制中止。
+普通权限的桌面进程通过 SCM 注册的服务 PID、安装路径和构建指纹验证服务身份，
+不要求查询 SYSTEM 进程的句柄权限。Windows 可运行
+`clyntis-desktop.exe --check-service <诊断 JSON 的绝对路径>`，以当前用户身份验证
+双向身份校验、状态响应、构建版本和心跳；该检查不启动内核或修改网络配置。
+这些目录权限规则及安装钩子仅用于 Windows，macOS/iOS 的路径、权限与构建行为不变。
 打包脚本下载固定版本官方 Wintun 0.14.1，校验 SHA-256，并附带其许可证。
 升级/卸载钩子先停止和卸载服务，网络恢复失败时中止操作。
 NSIS 使用 Tauri 的 `bundle.windows` 签名配置（证书、时间戳或 `signCommand`）；凭据由发布环境注入。

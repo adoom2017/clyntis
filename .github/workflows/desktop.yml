@@ -37,6 +37,10 @@ jobs:
           workspaces: desktop -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
+      - name: Windows installation security regression tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tests/windows-install-security.ps1
       - name: Windows native prerequisites
         if: runner.os == 'Windows'
         shell: pwsh

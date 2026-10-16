@@ -345,6 +345,15 @@ impl RouteSpec {
             && route.if_index() == Some(self.interface.index)
             && route.gateway().filter(|ip| !ip.is_unspecified()) == self.interface.gateway
     }
+    #[cfg(windows)]
+    fn matches_existing_windows_route(&self, route: &Route) -> bool {
+        // Windows keys routes by prefix, interface and next hop, not metric.
+        // Reuse an OS/third-party route without claiming it for cleanup.
+        self.network.network() == route.network()
+            && self.network.prefix_len() == route.prefix()
+            && route.if_index() == Some(self.interface.index)
+            && route.gateway().filter(|ip| !ip.is_unspecified()) == self.interface.gateway
+    }
 }
 
 trait Routes {
@@ -450,7 +459,16 @@ impl Transaction {
             self.remove(&old, backend)?;
         }
         let present = backend.list()?;
+        #[cfg(windows)]
+        let mut present = present;
         for spec in &desired {
+            #[cfg(windows)]
+            if present
+                .iter()
+                .any(|route| spec.matches_existing_windows_route(route))
+            {
+                continue;
+            }
             if present.iter().any(|r| spec.matches(r)) {
                 continue;
             }
@@ -462,6 +480,8 @@ impl Transaction {
             backend
                 .add(&spec.route())
                 .with_context(|| format!("cannot add TUN route {}", spec.network))?;
+            #[cfg(windows)]
+            present.push(spec.route());
         }
         let obsolete: Vec<_> = self
             .journal
@@ -884,6 +904,75 @@ mod tests {
             self.routes.retain(|r| r != route);
             Ok(())
         }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_reuses_existing_route_without_owning_or_removing_it() {
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-existing-route-{}", uuid::Uuid::new_v4()));
+        let spec = RouteSpec {
+            network: "192.168.2.0/24".parse().unwrap(),
+            interface: ExitInterface {
+                index: 10,
+                name: "Ethernet".into(),
+                gateway: None,
+            },
+        };
+        let connected = Route::new("192.168.2.0".parse().unwrap(), 24)
+            .with_if_index(10)
+            .with_gateway("0.0.0.0".parse().unwrap())
+            .with_metric(256);
+        let mut backend = MemoryRoutes {
+            routes: vec![connected.clone()],
+            fail_after: 1,
+        };
+        let mut transaction = Transaction::open(&directory).unwrap();
+        transaction.apply(vec![spec.clone()], &mut backend).unwrap();
+        assert!(transaction.journal.routes.is_empty());
+        assert_eq!(backend.routes, vec![connected.clone()]);
+        // A prior failed add can have left a journal entry. Its metric guard
+        // must still protect the connected route during recovery.
+        transaction.journal.routes.push(spec);
+        transaction.save().unwrap();
+        transaction.restore(&mut backend).unwrap();
+        assert_eq!(backend.routes, vec![connected]);
+        drop(transaction);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_does_not_reuse_another_interface_or_next_hop() {
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-distinct-route-{}", uuid::Uuid::new_v4()));
+        let spec = RouteSpec {
+            network: "192.168.2.0/24".parse().unwrap(),
+            interface: ExitInterface {
+                index: 10,
+                name: "Ethernet".into(),
+                gateway: None,
+            },
+        };
+        let other_interface = Route::new("192.168.2.0".parse().unwrap(), 24)
+            .with_if_index(3)
+            .with_metric(256);
+        let other_gateway = Route::new("192.168.2.0".parse().unwrap(), 24)
+            .with_if_index(10)
+            .with_gateway("192.168.2.1".parse().unwrap())
+            .with_metric(256);
+        let mut backend = MemoryRoutes {
+            routes: vec![other_interface.clone(), other_gateway.clone()],
+            fail_after: usize::MAX,
+        };
+        let mut transaction = Transaction::open(&directory).unwrap();
+        transaction
+            .apply(vec![spec.clone(), spec.clone()], &mut backend)
+            .unwrap();
+        assert_eq!(backend.routes.len(), 3);
+        assert_eq!(transaction.journal.routes, vec![spec]);
+        transaction.restore(&mut backend).unwrap();
+        assert_eq!(backend.routes, vec![other_interface, other_gateway]);
+        drop(transaction);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn replacing_owned_egress_routes_does_not_add_duplicate_prefixes() {

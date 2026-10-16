@@ -28,59 +28,14 @@ pub fn entry() {
     }
 }
 fn trusted_install_path() -> Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::{
-        System::Com::CoTaskMemFree,
-        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath},
-    };
-    let path = std::env::current_exe()?.canonicalize()?;
-    // Elevated processes may inherit user-controlled environment variables.
-    let mut pointer = std::ptr::null_mut();
-    let program_files = unsafe {
-        ensure!(
-            SHGetKnownFolderPath(
-                &FOLDERID_ProgramFiles,
-                0,
-                std::ptr::null_mut(),
-                &mut pointer
-            ) >= 0,
-            "cannot resolve Program Files"
-        );
-        let mut length = 0;
-        while *pointer.add(length) != 0 {
-            length += 1;
-        }
-        let directory = PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
-            pointer, length,
-        )));
-        CoTaskMemFree(pointer.cast());
-        directory.canonicalize()?
-    };
-    ensure!(
-        path.starts_with(program_files),
-        "辅助服务必须从 Program Files 下的已安装应用注册"
-    );
+    let path = clyntis_desktop_service::windows_security::local_path(&std::env::current_exe()?)?;
+    // Keep a DOS path in SCM. canonicalize() adds \\?\, which PowerShell 5 cannot
+    // consistently handle. The policy checks junctions on the original path.
+    clyntis_desktop_service::windows_security::verify_installation(&path)?;
     Ok(path)
 }
 pub fn protect_data(directory: &std::path::Path) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    trusted_install_path()?;
-    let status = std::process::Command::new("icacls.exe")
-        .arg(directory)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)F",
-            "*S-1-5-32-544:(OI)(CI)F",
-            "/T",
-            "/Q",
-        ])
-        .creation_flags(0x08000000)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    ensure!(status.success(), "cannot protect service data directory");
-    Ok(())
+    clyntis_desktop_service::windows_security::protect_data(directory)
 }
 fn install(restart: bool) -> Result<()> {
     let path = trusted_install_path()?;
@@ -130,10 +85,29 @@ fn install(restart: bool) -> Result<()> {
     if service.query_status()?.current_state != ServiceState::Running {
         service.start::<&str>(&[])?;
     }
+    // SCM registration/start success is not readiness. Report immediate startup
+    // failures instead of letting the desktop poll an already stopped service.
+    let deadline = std::time::Instant::now() + Duration::from_secs(75);
+    loop {
+        let status = service.query_status()?;
+        match status.current_state {
+            ServiceState::Running => break,
+            ServiceState::Stopped => {
+                return Err(clyntis_desktop_service::windows_security::stopped_error(
+                    status.exit_code,
+                ));
+            }
+            _ => {}
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "Windows 辅助服务启动超时，请检查安装目录中的 clyntis-service.log"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     Ok(())
 }
 fn uninstall() -> Result<()> {
-    trusted_install_path()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = match manager.open_service(
         NAME,
@@ -145,6 +119,8 @@ fn uninstall() -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
+    // A failed first installation has no service to clean up, regardless of its directory.
+    trusted_install_path()?;
     if service.query_status()?.current_state != ServiceState::Stopped {
         service.stop()?;
         for _ in 0..120 {
@@ -196,11 +172,30 @@ fn service_main(_: Vec<OsString>) {
         },
         exit_code,
         checkpoint: 0,
-        wait_hint: Duration::default(),
+        wait_hint: if current_state == ServiceState::StartPending {
+            Duration::from_secs(75)
+        } else {
+            Duration::default()
+        },
         process_id: None,
     };
-    let _ = handle.set_service_status(status(ServiceState::Running, ServiceExitCode::Win32(0)));
-    let result = runtime.block_on(serve(stop));
+    if let Ok(path) = clyntis_desktop_service::windows_security::startup_log() {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = handle.set_service_status(status(
+        ServiceState::StartPending,
+        ServiceExitCode::Win32(0),
+    ));
+    let result = runtime.block_on(serve(stop, || {
+        handle.set_service_status(status(ServiceState::Running, ServiceExitCode::Win32(0)))?;
+        Ok(())
+    }));
+    if let Err(error) = &result {
+        let message = clyntis_desktop_model::redact(&format!("{error:#}"));
+        if let Ok(path) = clyntis_desktop_service::windows_security::startup_log() {
+            let _ = std::fs::write(path, message);
+        }
+    }
     let _ = handle.set_service_status(status(
         ServiceState::Stopped,
         ServiceExitCode::Win32(if result.is_ok() { 0 } else { 1 }),

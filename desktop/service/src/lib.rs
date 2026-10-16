@@ -4,6 +4,8 @@ pub mod system_proxy;
 pub mod transport;
 pub mod trusted;
 pub mod update;
+#[cfg(windows)]
+pub mod windows_security;
 
 pub const SERVICE_NAME: &str = "org.clyntis.desktop.service";
 pub const PIPE_NAME: &str = r"\\.\pipe\org.clyntis.desktop.service.v1";
