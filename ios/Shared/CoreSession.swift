@@ -78,6 +78,23 @@ final class CoreSession {
         return try JSONDecoder().decode([String].self, from: data)
     }
 
+    /// The first YAML syntax error in an edited configuration (1-based position).
+    struct YAMLProblem: Decodable, Equatable {
+        let line: Int
+        let column: Int
+        let message: String
+    }
+
+    /// Nil when `text` parses as a YAML mapping; a failed check counts as none,
+    /// since saving validates again.
+    static func yamlProblem(in text: String) -> YAMLProblem? {
+        let bytes = Data(text.utf8)
+        guard let data = try? bytes.withUnsafeBytes({ config in
+            try read { meta_yaml_check_v1(config.bindMemory(to: UInt8.self).baseAddress, config.count, $0, $1, $2) }
+        }) else { return nil }
+        return try? JSONDecoder().decode(YAMLProblem?.self, from: data)
+    }
+
     struct SkippedRule: Decodable, Hashable {
         let rule: String
         let reason: String

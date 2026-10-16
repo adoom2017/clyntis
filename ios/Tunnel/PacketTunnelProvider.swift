@@ -25,11 +25,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// fill the log.
     private var droppedPackets = 0
 
+    /// Open descriptors allowed; see `Diagnostics.raiseFileLimit`.
+    private static let fileLimit = 4096
+
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         // The app passes "source"; iOS starts the tunnel without options when
         // connect-on-demand brings it back (after a crash, a kill or a reboot).
         let source = (options?["source"] as? String) ?? "system (on demand)"
-        log.info("start: begin source=\(source) memory=\(memory())")
+        let files = Diagnostics.raiseFileLimit(to: Self.fileLimit)
+        log.info("start: begin source=\(source) memory=\(memory()) fileLimit=\(files)")
         watchdog.reportPreviousSession()
         watchdog.start(watching: queue)
         queue.async {
@@ -377,7 +381,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 ticks += 1
                 if ticks % 6 == 0 {
                     let connections = (state?["connections"] as? NSNumber)?.intValue ?? 0
-                    log.info("running: memory=\(memory()) connections=\(connections)")
+                    let files = Diagnostics.openFileDescriptors()
+                    let limit = Diagnostics.fileLimit()
+                    let line = "running: memory=\(memory()) connections=\(connections) files=\(files)/\(limit)"
+                    // Near the limit new sockets fail; say so above the routine line.
+                    if limit > 0, files * 10 >= limit * 8 { log.warning(line) } else { log.info(line) }
                 }
             } catch { self.fail(error) }
         }

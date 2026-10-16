@@ -8,7 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App, { Modal } from "../src/App";
+import App, { Editor, Modal } from "../src/App";
 import { useState } from "react";
 import { bytes, initial } from "../src/types";
 
@@ -563,5 +563,53 @@ describe("Modal", () => {
         .dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(document.activeElement).not.toBe(screen.getByRole("dialog"));
+  });
+});
+
+describe("Editor", () => {
+  it("marks YAML syntax errors while typing and blocks saving", async () => {
+    invoke.mockImplementation(async (command, args) =>
+      command === "check_yaml" && args.yaml.includes("[a")
+        ? { line: 2, column: 8, message: "方括号列表缺少「,」或「]」" }
+        : null,
+    );
+    const onSave = vi.fn().mockResolvedValue(true);
+    render(
+      <Editor
+        profile={{
+          id: "p",
+          name: "测试",
+          yaml: "mode: rule\n",
+          pending: null,
+          previous: null,
+          url: null,
+          mode: "rule",
+          lastChecked: 0,
+          lastError: null,
+        }}
+        onClose={vi.fn()}
+        onSave={onSave}
+      />,
+    );
+    const editor = screen.getByRole("textbox", { name: "YAML 配置" });
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("check_yaml", {
+        yaml: "mode: rule\n",
+      }),
+    );
+    expect(editor).not.toHaveAttribute("aria-invalid");
+    fireEvent.change(editor, { target: { value: "mode: rule\nrules: [a\n" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "第 2 行第 8 列：方括号列表缺少「,」或「]」",
+    );
+    expect(editor).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "第 2 行第 8 列" }));
+    expect(editor).toHaveFocus();
+    expect((editor as HTMLTextAreaElement).selectionStart).toBe(18);
+
+    fireEvent.change(editor, { target: { value: "mode: rule\nrules: []\n" } });
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
   });
 });

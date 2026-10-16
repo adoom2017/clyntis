@@ -621,6 +621,31 @@ fn overrides_replace_profile_settings() {
 }
 
 #[test]
+fn yaml_check_reports_the_first_error() {
+    let check = |config: &[u8]| {
+        let mut buffer = vec![0u8; 4096];
+        let mut length = 0;
+        assert_eq!(
+            unsafe {
+                meta_yaml_check_v1(
+                    config.as_ptr(),
+                    config.len(),
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut length,
+                )
+            },
+            OK
+        );
+        serde_json::from_slice::<serde_json::Value>(&buffer[..length]).unwrap()
+    };
+    assert!(check(b"mode: rule\n").is_null());
+    let error = check(b"mode: rule\nrules: [a\n");
+    assert!(error["line"].as_u64().unwrap() >= 2, "{error}");
+    assert!(error["message"].is_string(), "{error}");
+}
+
+#[test]
 fn resource_state_reports_missing_files_without_parsing_them() {
     let dir = std::env::temp_dir().join(format!("clyntis-ffi-state-{}", uuid_for_test()));
     std::fs::create_dir_all(&dir).unwrap();

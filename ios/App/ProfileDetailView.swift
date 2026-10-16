@@ -110,7 +110,8 @@ struct ProfileDetailView: View {
     }
 }
 
-/// Plain-text YAML editor; saving validates with the core and keeps the old file on failure.
+/// Plain-text YAML editor. The core checks the syntax while typing and the
+/// error line turns red; saving validates fully and keeps the old file on failure.
 struct ConfigEditorView: View {
     @Bindable var model: AppModel
     let profile: Profile
@@ -120,6 +121,8 @@ struct ConfigEditorView: View {
     @State private var saving = false
     @State private var failure: String?
     @State private var saved = false
+    @State private var problem: CoreSession.YAMLProblem?
+    @State private var reveal = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -128,12 +131,32 @@ struct ConfigEditorView: View {
                     .frame(maxWidth: .infinity, alignment: .leading).padding(12)
                     .background(Color.red.opacity(0.08))
             }
-            TextEditor(text: $text)
-                .font(.system(.footnote, design: .monospaced))
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .scrollContentBackground(.hidden)
-                .padding(.horizontal, 8)
+            YAMLTextView(text: $text, errorLine: problem?.line, revealRequest: reveal)
+                .padding(.horizontal, 4)
+            if let problem {
+                Button { reveal += 1 } label: {
+                    Label {
+                        Text("第 \(problem.line) 行第 \(problem.column) 列：\(problem.message)")
+                            .multilineTextAlignment(.leading)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.footnote).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
+                .background(Color.red.opacity(0.08))
+                .accessibilityHint("移到出错位置")
+            }
+        }
+        .task(id: text) {
+            // Check after a pause in typing; a newer edit cancels this one.
+            guard loaded else { return }
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            let snapshot = text
+            let found = await Task.detached { CoreSession.yamlProblem(in: snapshot) }.value
+            if !Task.isCancelled { problem = found }
         }
         .background(Color(.systemBackground))
         .navigationTitle("配置内容")
@@ -144,7 +167,7 @@ struct ConfigEditorView: View {
                     ProgressView()
                 } else {
                     Button(saved && text == original ? "已保存" : "保存") { save() }
-                        .disabled(!loaded || text == original)
+                        .disabled(!loaded || text == original || problem != nil)
                 }
             }
         }

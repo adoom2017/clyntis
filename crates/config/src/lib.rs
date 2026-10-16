@@ -5,6 +5,7 @@ pub mod custom;
 pub mod overrides;
 pub use compat::*;
 pub mod rule;
+pub mod syntax;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};

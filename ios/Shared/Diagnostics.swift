@@ -44,6 +44,37 @@ enum Diagnostics {
         }
         return result == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
     }
+
+    /// Soft limit on open file descriptors (sockets included).
+    static func fileLimit() -> Int {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return -1 }
+        // Unlimited reads as a huge value; Darwin allows OPEN_MAX at most.
+        return Int(min(limit.rlim_cur, rlim_t(OPEN_MAX)))
+    }
+
+    /// Raises the soft descriptor limit to `wanted` (capped by the hard limit).
+    /// iOS starts processes at 256, which a proxy carrying every connection
+    /// of the device can exhaust: then no new socket opens and the network
+    /// looks down while the VPN stays up. Returns the limit in effect.
+    @discardableResult
+    static func raiseFileLimit(to wanted: Int) -> Int {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return -1 }
+        let target = min(rlim_t(wanted), limit.rlim_max)
+        if limit.rlim_cur < target {
+            limit.rlim_cur = target
+            _ = setrlimit(RLIMIT_NOFILE, &limit)
+        }
+        return fileLimit()
+    }
+
+    /// Descriptors open in this process, counted up to the soft limit.
+    static func openFileDescriptors() -> Int {
+        let limit = fileLimit()
+        guard limit > 0 else { return -1 }
+        return (0..<Int32(limit)).reduce(0) { $0 + (fcntl($1, F_GETFD) != -1 ? 1 : 0) }
+    }
 }
 
 struct DiagnosticLog {

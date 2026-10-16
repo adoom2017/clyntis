@@ -1713,6 +1713,52 @@ td.num {
   line-height: 1.6;
   tab-size: 2;
 }
+.yaml-field {
+  position: relative;
+  margin-top: 12px;
+  overflow: hidden;
+  border-radius: 7px;
+}
+.yaml-field .yaml-editor {
+  display: block;
+  margin-top: 0;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.yaml-field.invalid .yaml-editor {
+  border-color: var(--danger);
+}
+.yaml-field .yaml-editor:focus-visible {
+  /* Inside the field, which clips. */
+  outline-offset: -2px;
+}
+.yaml-field.invalid .yaml-editor:focus-visible {
+  outline-color: var(--danger);
+}
+/* Drawn over the text, which stays readable through the tint. */
+.yaml-error-line {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  z-index: 1;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+.yaml-problem {
+  margin-top: 8px;
+}
+.link-button {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
 .connection-copy,
 .profile-card-top > div {
   min-width: 0;

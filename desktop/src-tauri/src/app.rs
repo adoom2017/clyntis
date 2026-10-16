@@ -506,6 +506,11 @@ pub struct CustomRules {
     skipped: Vec<clyntis_config::custom::Skipped>,
     profile: Option<String>,
 }
+/// The first YAML syntax error, for marking it while the profile is edited.
+#[tauri::command]
+pub fn check_yaml(yaml: String) -> Option<clyntis_config::syntax::SyntaxError> {
+    clyntis_config::syntax::check(&yaml)
+}
 #[tauri::command]
 pub fn custom_rules(state: State<'_, Desktop>) -> Reply<CustomRules> {
     state.custom_rules_view().map_err(error)
