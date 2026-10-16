@@ -998,7 +998,7 @@ mod tests {
             fingerprint,
             &Clock::default(),
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{fingerprint:?} QUIC TLS setup failed: {error:#}"));
         // initial_max_data = 1 MiB; BoringSSL refuses empty parameters.
         let encoded = [0x04, 0x04, 0x80, 0x10, 0x00, 0x00];
         let params = TransportParameters::read(Side::Server, &mut &encoded[..]).unwrap();

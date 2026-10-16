@@ -2,11 +2,31 @@ use super::*;
 use tokio::io::AsyncReadExt;
 use tower::ServiceExt;
 
+async fn reserve_dns_test_port() -> (tokio::net::TcpListener, tokio::net::UdpSocket) {
+    // Windows can reserve a UDP port independently of the TCP port selected by
+    // bind(:0). Verify both transports before testing DNS startup/TCP conflicts.
+    for _ in 0..32 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        match tokio::net::UdpSocket::bind(address).await {
+            Ok(udp) => return (tcp, udp),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ),
+                "cannot reserve DNS test port {address}: {error}"
+            ),
+        }
+    }
+    panic!("cannot reserve a DNS test port for both TCP and UDP");
+}
+
 #[tokio::test]
 async fn additional_system_dns_listener_answers_local_queries() {
-    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reservation, udp_reservation) = reserve_dns_test_port().await;
     let address = reservation.local_addr().unwrap();
-    drop(reservation);
+    drop((reservation, udp_reservation));
     let mut config = Config::default();
     config.dns.enable = true;
     config.dns.listen = "127.0.0.1:0".into();
@@ -37,9 +57,9 @@ async fn additional_system_dns_listener_answers_local_queries() {
     let answer = hickory_proto::op::Message::from_vec(&buffer[..size]).unwrap();
     assert_eq!(answer.id(), 79);
     assert_eq!(answer.answers().len(), 1);
-    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (reservation, udp_reservation) = reserve_dns_test_port().await;
     let replacement = reservation.local_addr().unwrap();
-    drop(reservation);
+    drop((reservation, udp_reservation));
     running.rebind_system_dns(replacement).await.unwrap();
     socket
         .send_to(&query.to_vec().unwrap(), replacement)
@@ -72,8 +92,9 @@ async fn listener_conflicts_identify_service_transport_and_address() {
         "DNS",
         "controller",
     ] {
-        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (blocker, udp_reservation) = reserve_dns_test_port().await;
         let address = blocker.local_addr().unwrap();
+        drop(udp_reservation);
         let mut config = Config::default();
         match label {
             "HTTP proxy" => config.port = address.port(),
@@ -94,7 +115,8 @@ async fn listener_conflicts_identify_service_transport_and_address() {
         assert!(
             error
                 .to_string()
-                .contains(&format!("cannot bind {label} TCP listener at {address}"))
+                .contains(&format!("cannot bind {label} TCP listener at {address}")),
+            "{label}: {error:#}"
         );
         assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert!(core.stop.is_cancelled());

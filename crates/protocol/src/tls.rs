@@ -186,6 +186,7 @@ const X25519: u16 = 29;
 const KEY_SHARES_CHROME: &[u16] = &[0x11ec, 29];
 const KEY_SHARES_FIREFOX: &[u16] = &[0x11ec, 29, 23];
 const KEY_SHARES_CLASSIC: &[u16] = &[29, 23];
+const KEY_SHARES_P256_FIRST: &[u16] = &[23, 29];
 const KEY_SHARE_X25519: &[u16] = &[29];
 const FIREFOX_EXTENSIONS: &[u16] = &[
     0, 23, 65281, 10, 11, 35, 16, 5, 34, 18, 51, 43, 13, 45, 28, 27, 65037,
@@ -417,20 +418,23 @@ fn profile(kind: TlsFingerprint) -> BrowserProfile {
 }
 
 fn randomized_profile() -> BrowserProfile {
+    randomized_profile_with_rng(&mut rand::thread_rng())
+}
+
+fn randomized_profile_with_rng(rng: &mut impl rand::Rng) -> BrowserProfile {
     let mut selected = profile(TlsFingerprint::Randomized);
-    selected.tls.cipher_list = *[CHROMIUM_CIPHERS, FIREFOX_CIPHERS]
-        .choose(&mut rand::thread_rng())
-        .unwrap();
-    selected.tls.curves = *[
-        "X25519:P-256:P-384",
-        "X25519:P-384:P-256",
-        "P-256:X25519:P-384",
+    selected.tls.cipher_list = *[CHROMIUM_CIPHERS, FIREFOX_CIPHERS].choose(rng).unwrap();
+    // Key shares must be an ordered subsequence of the supported groups.
+    // Keep each randomized group order paired with its two-share order.
+    let (curves, shares) = *[
+        ("X25519:P-256:P-384", KEY_SHARES_CLASSIC),
+        ("X25519:P-384:P-256", KEY_SHARES_CLASSIC),
+        ("P-256:X25519:P-384", KEY_SHARES_P256_FIRST),
     ]
-    .choose(&mut rand::thread_rng())
+    .choose(rng)
     .unwrap();
-    selected.tls.key_shares = *[KEY_SHARES_CLASSIC, KEY_SHARE_X25519]
-        .choose(&mut rand::thread_rng())
-        .unwrap();
+    selected.tls.curves = curves;
+    selected.tls.key_shares = *[shares, KEY_SHARE_X25519].choose(rng).unwrap();
     selected
 }
 
@@ -1080,6 +1084,42 @@ mod tests {
             offset += len;
         }
         assert_eq!(hybrid.unwrap(), classic.unwrap());
+    }
+
+    #[test]
+    fn randomized_profiles_configure_key_shares_in_supported_group_order() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let mut combinations = std::collections::BTreeSet::new();
+        for _ in 0..128 {
+            let selected = randomized_profile_with_rng(&mut rng);
+            combinations.insert((selected.tls.curves, selected.tls.key_shares));
+            for quic in [false, true] {
+                let connector =
+                    build_connector(&selected, &["h3".into()], false, false, None).unwrap();
+                let mut ssl = connector
+                    .configure()
+                    .unwrap()
+                    .into_ssl("example.com")
+                    .unwrap();
+                if quic {
+                    ssl.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+                    ssl.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+                }
+                apply_profile(&mut ssl, &selected, selected.tls.key_shares, true, quic)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "curves={}, key_shares={:?}, quic={quic}: {error:#}",
+                            selected.tls.curves, selected.tls.key_shares
+                        )
+                    });
+            }
+        }
+        assert_eq!(
+            combinations.len(),
+            6,
+            "exercise all three group orders and both share choices"
+        );
     }
 
     #[test]
