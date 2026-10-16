@@ -22,6 +22,18 @@ final class ProfileStoreTests: XCTestCase {
         try store.remove(profile)
         XCTAssertTrue(try store.profiles().isEmpty)
     }
+    func testTunnelCanOpenMoreThanTheDefaultDescriptors() {
+        XCTAssertGreaterThanOrEqual(Diagnostics.raiseFileLimit(to: 4096), 1024)
+        let before = Diagnostics.openFileDescriptors()
+        let pipes = (0..<300).compactMap { _ -> [Int32]? in
+            var fds: [Int32] = [0, 0]
+            return pipe(&fds) == 0 ? fds : nil
+        }
+        defer { pipes.joined().forEach { close($0) } }
+        XCTAssertEqual(pipes.count, 300, "the default limit of 256 would refuse these")
+        XCTAssertEqual(Diagnostics.openFileDescriptors(), before + 600)
+    }
+
     func testYAMLCheckPointsAtTheFirstError() {
         XCTAssertNil(CoreSession.yamlProblem(in: "mode: rule\nrules: ['MATCH,DIRECT']\n"))
         let problem = CoreSession.yamlProblem(in: "mode: rule\nmode: global\n")
