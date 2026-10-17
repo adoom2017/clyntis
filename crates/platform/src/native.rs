@@ -7,6 +7,20 @@ use async_trait::async_trait;
 pub struct NativeTun {
     device: tun_rs::AsyncDevice,
 }
+
+#[cfg(windows)]
+fn windows_local_discovery_packet(packet: &[u8]) -> bool {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let destination =
+                std::net::Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            destination.is_multicast() || destination.is_broadcast()
+        }
+        Some(6) if packet.len() >= 40 => packet[24] == 0xff,
+        _ => false,
+    }
+}
+
 impl NativeTun {
     #[cfg(not(target_os = "android"))]
     pub fn open(name: &str, mtu: u16, ipv6: bool) -> Result<Self> {
@@ -53,7 +67,21 @@ impl NativeTun {
 #[async_trait]
 impl PacketIo for NativeTun {
     async fn recv(&self, packet: &mut [u8]) -> Result<usize> {
-        Ok(self.device.recv(packet).await?)
+        #[cfg(windows)]
+        loop {
+            let size = self.device.recv(packet).await?;
+            // Apps also advertise on the Wintun interface (e.g. Steam's
+            // ff02::1:27036 discovery). This is local-link traffic, not a
+            // proxy flow. Re-sending it can select Wintun again and recurse;
+            // IP_UNICAST_IF does not select the multicast interface.
+            if !windows_local_discovery_packet(&packet[..size]) {
+                return Ok(size);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(self.device.recv(packet).await?)
+        }
     }
     async fn send(&self, packet: &[u8]) -> Result<()> {
         ensure!(
@@ -61,5 +89,57 @@ impl PacketIo for NativeTun {
             "short TUN packet write"
         );
         Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::windows_local_discovery_packet;
+
+    fn ipv4(destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0; 28];
+        packet[0] = 0x45;
+        packet[9] = 17;
+        packet[16..20].copy_from_slice(&destination);
+        packet[22..24].copy_from_slice(&27036u16.to_be_bytes());
+        packet
+    }
+
+    fn ipv6(destination: &str) -> Vec<u8> {
+        let mut packet = vec![0; 48];
+        packet[0] = 0x60;
+        packet[6] = 17;
+        packet[24..40]
+            .copy_from_slice(&destination.parse::<std::net::Ipv6Addr>().unwrap().octets());
+        packet[42..44].copy_from_slice(&27036u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn steam_discovery_and_mdns_stay_out_of_windows_proxy_flows() {
+        for packet in [
+            ipv4([255, 255, 255, 255]),
+            ipv4([224, 0, 0, 251]),
+            ipv6("ff02::1"),
+            ipv6("ff02::fb"),
+        ] {
+            assert!(windows_local_discovery_packet(&packet));
+        }
+    }
+
+    #[test]
+    fn unicast_steam_dns_and_fake_ip_traffic_reaches_the_core() {
+        for packet in [
+            ipv4([103, 28, 54, 101]),
+            ipv4([192, 168, 2, 1]),
+            ipv4([28, 0, 0, 2]),
+            ipv6("2404:3fc0:a:100::4"),
+            ipv6("fdfe:dcba:9876::2"),
+        ] {
+            assert!(!windows_local_discovery_packet(&packet));
+        }
+        for packet in [vec![], vec![0x45; 19], vec![0x60; 39], vec![0xff; 40]] {
+            assert!(!windows_local_discovery_packet(&packet));
+        }
     }
 }
