@@ -98,7 +98,13 @@ try {
 
     $junction = Join-Path $directory 'junction'
     $null = New-Item -ItemType Junction -Path $junction -Target $unicode
-    try { Expect-Rejected { Get-InstallPath (Join-Path $junction 'Clyntis') } 'junction ancestor' }
+    try {
+        Expect-Rejected { Get-InstallPath (Join-Path $junction 'Clyntis') } 'junction ancestor'
+        # A user-writable existing installation is never adopted (its files
+        # would become trusted); the scan reports it without following links.
+        if ((Find-UntrustedItem $directory) -ne $directory) { throw 'User-writable installation was trusted.' }
+        $script:Checks++
+    }
     finally { [IO.Directory]::Delete($junction) }
 }
 finally {

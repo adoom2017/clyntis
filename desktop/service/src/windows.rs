@@ -119,8 +119,9 @@ fn uninstall() -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
-    // A failed first installation has no service to clean up, regardless of its directory.
-    trusted_install_path()?;
+    // No installation policy check here: this process already runs elevated,
+    // so the check would protect nothing, and a failing check (changed ACLs, a
+    // broken PowerShell) must not leave a service that can never be removed.
     if service.query_status()?.current_state != ServiceState::Stopped {
         service.stop()?;
         for _ in 0..120 {

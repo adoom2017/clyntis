@@ -53,20 +53,28 @@ pub async fn service(action: &str) -> Result<String> {
             }
         }
         let service_exe = clyntis_desktop_service::sibling("clyntis-service")?;
-        let path = service_exe.clone();
-        tokio::task::spawn_blocking(move || {
-            clyntis_desktop_service::windows_security::verify_installation(&path)
-        })
-        .await??;
+        // Only installing or updating hands this directory to SYSTEM; removal
+        // must stay possible even if the directory no longer passes.
+        if action != "uninstall" {
+            let path = service_exe.clone();
+            tokio::task::spawn_blocking(move || {
+                clyntis_desktop_service::windows_security::verify_installation(&path)
+            })
+            .await??;
+        }
         // Script text is constant; the executable path is passed through an environment variable.
+        // Windows PowerShell writes redirected errors in the OEM code page (GBK on
+        // Chinese systems): switch to UTF-8 and print only the message.
+        const ELEVATE: &str = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; try { $p = Start-Process -FilePath $env:CLYNTIS_SERVICE_EXE -ArgumentList $env:CLYNTIS_SERVICE_ACTION -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }";
         let mut command = tokio::process::Command::new(
             clyntis_desktop_service::windows_security::powershell_exe()?,
         );
-        command.args(["-NoProfile", "-NonInteractive", "-Command",
-            "$ErrorActionPreference='Stop'; $p = Start-Process -FilePath $env:CLYNTIS_SERVICE_EXE -ArgumentList $env:CLYNTIS_SERVICE_ACTION -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode"])
+        command
+            .args(["-NoProfile", "-NonInteractive", "-Command", ELEVATE])
             .env("CLYNTIS_SERVICE_EXE", service_exe)
             .env("CLYNTIS_SERVICE_ACTION", format!("--{action}"))
-            .creation_flags(0x08000000).kill_on_drop(true);
+            .creation_flags(0x08000000)
+            .kill_on_drop(true);
         let output = tokio::time::timeout(std::time::Duration::from_secs(180), command.output())
             .await
             .map_err(|_| {

@@ -46,32 +46,43 @@ pub fn powershell_exe() -> Result<std::path::PathBuf> {
 }
 
 fn run(directory: &Path, action: &str) -> Result<()> {
-    use std::os::windows::process::CommandExt;
+    use std::{io::Read, os::windows::process::CommandExt};
     let directory = local_path(directory)?;
+    // The policy writes only errors, to stderr. Read it while waiting: a full
+    // pipe would block PowerShell until the timeout below.
     let mut child = Command::new(powershell_exe()?)
         .args(["-NoProfile", "-NonInteractive", "-Command", POLICY])
         .env("CLYNTIS_INSTALL_DIRECTORY", directory)
         .env("CLYNTIS_INSTALL_SECURITY_ACTION", action)
         .creation_flags(0x08000000)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("无法检查 Windows 安装目录权限")?;
+    let mut stderr = child.stderr.take().context("missing PowerShell stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        text
+    });
     let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait()?.is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("Windows 安装目录权限检查超时，请检查系统 PowerShell 是否可用");
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-    let output = child.wait_with_output()?;
+    };
+    let stderr = reader.join().unwrap_or_default();
     ensure!(
-        output.status.success(),
+        status.success(),
         "Windows 安装目录权限检查失败：{}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        String::from_utf8_lossy(&stderr).trim()
     );
     Ok(())
 }

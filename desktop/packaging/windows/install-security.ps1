@@ -123,6 +123,24 @@ function Assert-Installation([string]$Directory) {
     }
 }
 
+# The first item under $Directory (itself included) that an ordinary user
+# could have created or changed, or $null. Links are never followed.
+function Find-UntrustedItem([string]$Directory) {
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($Directory)
+    while ($pending.Count -gt 0) {
+        $path = $pending.Pop()
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $path }
+        try { Assert-SecureAcl (Get-Acl -LiteralPath $path) $path $script:MutationRights }
+        catch { return $path }
+        if ($item.PSIsContainer) {
+            foreach ($child in Get-ChildItem -LiteralPath $path -Force) { $pending.Push($child.FullName) }
+        }
+    }
+    return $null
+}
+
 # Dot-sourcing exposes policy functions to the Windows regression tests without changing files.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
@@ -132,9 +150,19 @@ try {
         'Prepare' {
             Assert-SecureParents $directory
             if (Test-Path -LiteralPath $directory) {
-                if ((Get-ChildItem -LiteralPath $directory -Force | Select-Object -First 1) -and
+                $existing = Get-ChildItem -LiteralPath $directory -Force | Select-Object -First 1
+                if ($existing -and
                     -not (Test-Path -LiteralPath (Join-Path $directory 'clyntis-desktop.exe') -PathType Leaf)) {
                     throw 'Select an empty directory or an existing Clyntis installation directory.'
+                }
+                # Protecting the tree below would make anything an ordinary user
+                # left here (for example a DLL next to the SYSTEM service) look
+                # trusted. Only adopt contents nobody else could have touched.
+                if ($existing) {
+                    $untrusted = Find-UntrustedItem $directory
+                    if ($untrusted) {
+                        throw "Ordinary users could have changed this existing installation: $untrusted. Uninstall Clyntis and delete the directory, or choose a new empty directory."
+                    }
                 }
                 if ((Test-Path -LiteralPath (Join-Path $directory 'clyntis-service.exe')) -and
                     (Get-Service -Name 'org.clyntis.desktop.service' -ErrorAction SilentlyContinue)) {
@@ -151,8 +179,13 @@ try {
                 $acl.SetSecurityDescriptorSddlForm($script:ProgramSddl)
                 # Windows PowerShell/.NET Framework creates with the final ACL atomically.
                 $null = [IO.Directory]::CreateDirectory($directory, $acl)
+                $existing = $null
             }
             Set-ProtectedAcl $directory $false
+            # An empty directory could gain entries until its ACL was replaced.
+            if (-not $existing -and (Get-ChildItem -LiteralPath $directory -Force | Select-Object -First 1)) {
+                throw 'Files appeared in the installation directory while it was being protected. Choose a new empty directory.'
+            }
             foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
                 if ($item.PSIsContainer) { Set-ProtectedTree $item.FullName ($item.Name -eq 'service-data') }
                 else { Set-ProtectedAcl $item.FullName $false }
