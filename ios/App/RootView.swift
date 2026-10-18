@@ -36,7 +36,7 @@ private struct ConnectionView: View {
                         } label: {
                             ZStack {
                                 Circle().fill(model.connected ? Color.brand : Color(.tertiarySystemFill))
-                                if model.busy || (model.active && !model.connected) {
+                                if model.busy || model.startPending || (model.active && !model.connected) {
                                     ProgressView().controlSize(.large)
                                         .tint(model.connected ? .white : .secondary)
                                 } else {
@@ -47,13 +47,14 @@ private struct ConnectionView: View {
                             .frame(width: 104, height: 104)
                         }
                         .buttonStyle(.plain)
-                        .disabled(model.busy || (!model.active && model.selected == nil))
+                        .disabled(model.busy || model.startPending || (!model.active && model.selected == nil))
                         .accessibilityLabel(model.active ? "断开 VPN" : "连接 VPN")
                         .sensoryFeedback(.impact, trigger: model.connected)
                         VStack(spacing: 4) {
                             Text(model.statusText).font(.title3.weight(.semibold))
                                 .foregroundStyle(model.connected ? Color.connected : Color.primary)
-                            Text(model.phase ?? model.selected?.name ?? "未选择配置")
+                            Text(model.phase ?? (model.startPending ? "正在等待系统启动 VPN…" : nil)
+                                 ?? model.selected?.name ?? "未选择配置")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }

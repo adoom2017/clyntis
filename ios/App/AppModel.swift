@@ -10,6 +10,8 @@ final class AppModel {
     }
     var status: NEVPNStatus = .disconnected
     var busy = false
+    /// A start was requested and iOS has not reacted yet (see `awaitSystemStart`).
+    private(set) var startPending = false
     /// Shown under the status while a slow connect step runs.
     var phase: String?
     var error: String?
@@ -37,6 +39,9 @@ final class AppModel {
     private static let autoReconnectKey = "autoReconnect"
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
+    /// The background refresh of expired routing files, if one is running.
+    private var resourceRefresh: Task<Void, Never>?
+    private var startTimeout: Task<Void, Never>?
     private var store: ProfileStore?
     private var requestInFlight = false
 
@@ -83,6 +88,7 @@ final class AppModel {
                         guard let self, let connection = notification.object as? NEVPNConnection,
                               connection === self.manager?.connection else { return }
                         self.status = connection.status
+                        if connection.status != .disconnected { self.endStartWait() }
                         Diagnostics.app.info("vpn status -> \(connection.status.rawValue)")
                         if connection.status == .disconnected {
                             self.stopRetryingFailedStarts()
@@ -112,7 +118,7 @@ final class AppModel {
     }
 
     func toggleConnection() async {
-        guard !busy, let store else { return }
+        guard !busy, !startPending, let store else { return }
         if active { await disconnect(); return }
         #if targetEnvironment(simulator)
         error = "模拟器不支持 VPN，请在已签名的真机上运行。"
@@ -184,12 +190,39 @@ final class AppModel {
             try manager.connection.startVPNTunnel(options: ["source": "app" as NSString])
             status = manager.connection.status
             log.info("connect: start requested, status=\(self.status.rawValue)")
+            if !active { awaitSystemStart() }
             if resources == .expired { refreshResources(bytes, directory: directory) }
         } catch {
             log.error("connect: failed at \(step): \(Diagnostics.describe(error))")
             self.error = error.localizedDescription
         }
         #endif
+    }
+
+    /// iOS may take minutes to launch the extension, with no error and no
+    /// status change meanwhile: after an app update it ignored every start
+    /// for about five minutes. Further taps would only save the configuration
+    /// again, so they wait; after 10 s the user is told what is happening.
+    private func awaitSystemStart() {
+        startPending = true
+        startTimeout?.cancel()
+        startTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            guard let self, !Task.isCancelled, self.startPending else { return }
+            self.startPending = false
+            Diagnostics.app.warning("connect: iOS has not started the tunnel 10 s after the request")
+            self.error = Self.startWaitMessage
+        }
+    }
+
+    private static let startWaitMessage = "系统还没有启动 VPN。应用刚更新时 iOS 可能要几分钟后才会启动，请稍候，或在「设置 > VPN」中打开 Clyntis。"
+
+    private func endStartWait() {
+        // The VPN came up after all: the explanation no longer applies.
+        if error == Self.startWaitMessage { error = nil }
+        startPending = false
+        startTimeout?.cancel()
+        startTimeout = nil
     }
 
     /// Stops the tunnel. Connect-on-demand goes off first: left on, iOS would
@@ -334,8 +367,12 @@ final class AppModel {
     }
 
     /// Downloads expired routing files in the background for the next connect.
+    /// One at a time: each connect attempt would otherwise start another
+    /// download of the same files (geoip.dat alone is 16 MiB).
     private func refreshResources(_ configuration: Data, directory: URL) {
-        Task.detached(priority: .utility) {
+        guard resourceRefresh == nil else { return }
+        resourceRefresh = Task.detached(priority: .utility) { [weak self] in
+            defer { Task { @MainActor in self?.resourceRefresh = nil } }
             let started = Date()
             do {
                 try CoreSession.prefetchResources(configuration: configuration, directory: directory)
