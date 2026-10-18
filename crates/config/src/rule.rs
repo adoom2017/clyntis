@@ -35,64 +35,142 @@ pub fn compile_regex(pattern: &str) -> Result<regex::Regex> {
         .size_limit(2 * 1024 * 1024)
         .build()?)
 }
-/// Sorted, deduplicated domains packed into one byte buffer and looked up by
-/// binary search: about 4 bytes of overhead per entry, instead of a `String`
-/// plus a hash-table slot (~80 bytes for a typical domain). Large geosite and
-/// rule-provider sets dominate memory inside the iOS tunnel extension.
+/// Keyed 64-bit hash of a domain. One random key per process: sets are built
+/// and searched in the same process, a hash is computed once per label for all
+/// lists, and nobody can craft a name that collides with a listed one.
+fn domain_hash(domain: &str) -> u64 {
+    use std::{hash::BuildHasher, sync::OnceLock};
+    static KEY: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+    KEY.get_or_init(Default::default)
+        .hash_one(domain.as_bytes())
+}
+
+/// Sorted, deduplicated domain hashes, looked up by binary search: 8 bytes per
+/// entry whatever the domain's length, against ~24 for the packed strings this
+/// replaces. Large geosite, rule-provider and ad-blocking sets dominate memory
+/// inside the iOS tunnel extension. With a 64-bit keyed hash a lookup of a few
+/// labels against a million entries wrongly matches about once in 10^12.
 #[derive(Clone, Default)]
 struct DomainList {
-    bytes: Box<[u8]>,
-    ends: Box<[u32]>,
+    hashes: Box<[u64]>,
 }
 impl DomainList {
-    fn get(&self, index: usize) -> &[u8] {
-        let start = index.checked_sub(1).map_or(0, |i| self.ends[i] as usize);
-        &self.bytes[start..self.ends[index] as usize]
-    }
-    fn contains(&self, domain: &str) -> bool {
-        let (mut low, mut high) = (0, self.ends.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            match self.get(middle).cmp(domain.as_bytes()) {
-                std::cmp::Ordering::Less => low = middle + 1,
-                std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => return true,
-            }
-        }
-        false
+    fn contains(&self, hash: u64) -> bool {
+        self.hashes.binary_search(&hash).is_ok()
     }
     fn len(&self) -> usize {
-        self.ends.len()
+        self.hashes.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
     }
 }
 #[derive(Default)]
 struct ListBuilder {
-    bytes: Vec<u8>,
-    spans: Vec<(u32, u32)>,
+    hashes: Vec<u64>,
 }
 impl ListBuilder {
     fn push(&mut self, domain: &str) {
-        let start = self.bytes.len();
-        self.bytes.extend_from_slice(domain.as_bytes());
-        // Sets are bounded far below 4 GiB by the 128 MiB resource limit.
-        self.spans.push((start as u32, domain.len() as u32));
+        self.hashes.push(domain_hash(domain));
     }
-    fn build(self) -> DomainList {
-        let Self { bytes, mut spans } = self;
-        let text = |&(start, len): &(u32, u32)| &bytes[start as usize..(start + len) as usize];
-        spans.sort_unstable_by(|a, b| text(a).cmp(text(b)));
-        spans.dedup_by(|a, b| text(a) == text(b));
-        let mut packed = Vec::with_capacity(spans.iter().map(|s| s.1 as usize).sum());
-        let mut ends = Vec::with_capacity(spans.len());
-        for span in &spans {
-            packed.extend_from_slice(text(span));
-            ends.push(packed.len() as u32);
-        }
+    fn build(mut self) -> DomainList {
+        self.hashes.sort_unstable();
+        self.hashes.dedup();
         DomainList {
-            bytes: packed.into_boxed_slice(),
-            ends: ends.into_boxed_slice(),
+            hashes: self.hashes.into_boxed_slice(),
         }
     }
+}
+
+/// Domain patterns with `*` (one label, or part of one: `*` never spans a
+/// dot), indexed by the hash of the labels after the last `*`, so a lookup
+/// only tries the patterns that end like the host. The index narrows
+/// candidates; every candidate is still matched in full, so a hash collision
+/// costs one extra comparison, never a wrong match.
+#[derive(Clone, Default)]
+struct Globs {
+    /// (suffix hash, label count, pattern), sorted. A pattern only matches a
+    /// host with as many labels: a cheap check before the glob.
+    anchored: Box<[(u64, usize, Box<str>)]>,
+    /// Patterns whose last label has a `*`: tried for every host.
+    loose: Box<[Box<str>]>,
+}
+impl Globs {
+    fn new(patterns: Vec<Box<str>>) -> Self {
+        let mut anchored = Vec::new();
+        let mut loose = Vec::new();
+        for pattern in patterns {
+            match fixed_suffix(&pattern) {
+                Some(suffix) => {
+                    let labels = pattern.split('.').count();
+                    anchored.push((domain_hash(suffix), labels, pattern));
+                }
+                None => loose.push(pattern),
+            }
+        }
+        anchored.sort_unstable();
+        anchored.dedup();
+        loose.sort_unstable();
+        loose.dedup();
+        Self {
+            anchored: anchored.into_boxed_slice(),
+            loose: loose.into_boxed_slice(),
+        }
+    }
+    /// Patterns whose fixed suffix hashes to `suffix`, against `host` of `labels` labels.
+    fn anchored_at(&self, suffix: u64, labels: usize, host: &str) -> bool {
+        let start = self.anchored.partition_point(|(hash, ..)| *hash < suffix);
+        self.anchored[start..]
+            .iter()
+            .take_while(|(hash, ..)| *hash == suffix)
+            .any(|(_, count, pattern)| *count == labels && glob_matches(pattern, host))
+    }
+    fn loose_matches(&self, host: &str) -> bool {
+        self.loose.iter().any(|pattern| glob_matches(pattern, host))
+    }
+    fn len(&self) -> usize {
+        self.anchored.len() + self.loose.len()
+    }
+}
+/// The labels after the last one that holds a `*`, if any.
+fn fixed_suffix(pattern: &str) -> Option<&str> {
+    let star = pattern.rfind('*')?;
+    let dot = star + pattern[star..].find('.')?;
+    Some(&pattern[dot + 1..])
+}
+/// `pattern` against the whole host, label by label; `*` matches any run of
+/// characters within a label (the `[^.]*` of [`domain_pattern`]).
+fn glob_matches(pattern: &str, host: &str) -> bool {
+    let mut labels = host.split('.');
+    for part in pattern.split('.') {
+        match labels.next() {
+            Some(label) if label_matches(part.as_bytes(), label.as_bytes()) => {}
+            _ => return false,
+        }
+    }
+    labels.next().is_none()
+}
+fn label_matches(pattern: &[u8], label: &[u8]) -> bool {
+    // Greedy match with backtracking to the last `*`: linear for one `*`,
+    // O(n·m) at worst, on labels of at most 63 bytes.
+    let (mut p, mut l) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while l < label.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, l));
+            p += 1;
+        } else if p < pattern.len() && pattern[p].eq_ignore_ascii_case(&label[l]) {
+            p += 1;
+            l += 1;
+        } else if let Some((sp, sl)) = star {
+            p = sp + 1;
+            l = sl + 1;
+            star = Some((sp, sl + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'*')
 }
 
 /// Immutable set of domain conditions, built with [`DomainSetBuilder`].
@@ -101,29 +179,40 @@ pub struct DomainSet {
     exact: DomainList,
     suffix: DomainList,
     subdomain: DomainList,
-    /// Patterns whose `*` labels each match exactly one label.
-    wildcard: Box<[Box<str>]>,
+    globs: Globs,
     keywords: Box<[Box<str>]>,
     regex: Box<[regex::Regex]>,
 }
 impl DomainSet {
     pub fn matches(&self, host: &str) -> bool {
-        if self.exact.contains(host) {
-            return true;
-        }
-        let mut label = host;
-        let mut first = true;
-        loop {
-            if self.suffix.contains(label) || (!first && self.subdomain.contains(label)) {
-                return true;
+        let lists = !(self.exact.is_empty() && self.suffix.is_empty() && self.subdomain.is_empty());
+        let globs = !self.globs.anchored.is_empty();
+        if lists || globs {
+            // One hash per label serves every list and the glob index.
+            let labels = if globs { host.split('.').count() } else { 0 };
+            let mut label = host;
+            let mut first = true;
+            loop {
+                let hash = domain_hash(label);
+                if lists
+                    && ((first && self.exact.contains(hash))
+                        || self.suffix.contains(hash)
+                        || (!first && self.subdomain.contains(hash)))
+                {
+                    return true;
+                }
+                // A glob has a `*` label before its suffix: never the whole host.
+                if globs && !first && self.globs.anchored_at(hash, labels, host) {
+                    return true;
+                }
+                match label.split_once('.') {
+                    Some((_, rest)) => label = rest,
+                    None => break,
+                }
+                first = false;
             }
-            match label.split_once('.') {
-                Some((_, rest)) => label = rest,
-                None => break,
-            }
-            first = false;
         }
-        self.wildcard.iter().any(|p| wildcard_matches(p, host))
+        self.globs.loose_matches(host)
             || self.keywords.iter().any(|v| host.contains(&**v))
             || self.regex.iter().any(|r| r.is_match(host))
     }
@@ -132,7 +221,7 @@ impl DomainSet {
         self.exact.len()
             + self.suffix.len()
             + self.subdomain.len()
-            + self.wildcard.len()
+            + self.globs.len()
             + self.keywords.len()
             + self.regex.len()
     }
@@ -146,24 +235,13 @@ impl std::fmt::Debug for DomainSet {
     }
 }
 
-fn wildcard_matches(pattern: &str, host: &str) -> bool {
-    let mut labels = host.rsplit('.');
-    for part in pattern.rsplit('.') {
-        match labels.next() {
-            Some(label) if part == "*" || part == label => {}
-            _ => return false,
-        }
-    }
-    labels.next().is_none()
-}
-
 /// Collects domain conditions, then packs them into a [`DomainSet`].
 #[derive(Default)]
 pub struct DomainSetBuilder {
     exact: ListBuilder,
     suffix: ListBuilder,
     subdomain: ListBuilder,
-    wildcard: Vec<Box<str>>,
+    globs: Vec<Box<str>>,
     keywords: Vec<Box<str>>,
     /// Sources only; compiled once in `build` (see `compile_regexes`).
     regex: Vec<String>,
@@ -190,23 +268,14 @@ impl DomainSetBuilder {
         Ok(())
     }
     /// Adds a Clash-style pattern: `+.x` (x and subdomains), `.x` (subdomains),
-    /// `*` labels (one label each), or a plain domain.
+    /// `*` within labels (never across a dot), or a plain domain.
     pub fn pattern(&mut self, pattern: &str) -> Result<()> {
         match domain_pattern(pattern)? {
             Matcher::Domain(d) => self.exact.push(&d),
             Matcher::Suffix(d) => self.suffix.push(&d),
             Matcher::Subdomain(d) => self.subdomain.push(&d),
-            Matcher::Regex(r) => {
-                let p = pattern.trim().to_ascii_lowercase();
-                if p.split('.')
-                    .all(|label| label == "*" || !label.contains('*'))
-                {
-                    self.wildcard.push(p.into());
-                } else {
-                    // `*` inside a label: keep the existing glob behaviour.
-                    self.regex.push(r.as_str().to_owned());
-                }
-            }
+            // Validated by `domain_pattern`; matched as a glob, not a regex.
+            Matcher::Regex(_) => self.globs.push(pattern.trim().to_ascii_lowercase().into()),
             _ => unreachable!("domain_pattern returns only domain matchers"),
         }
         Ok(())
@@ -228,7 +297,7 @@ impl DomainSetBuilder {
             exact: self.exact.build(),
             suffix: self.suffix.build(),
             subdomain: self.subdomain.build(),
-            wildcard: self.wildcard.into_boxed_slice(),
+            globs: Globs::new(self.globs),
             keywords: self.keywords.into_boxed_slice(),
             regex: compile_regexes(self.regex),
         }
@@ -596,7 +665,7 @@ mod tests {
         b.keyword("KeyWord");
         b.regex("^re[0-9]+\\.test$").unwrap();
         let set = b.build();
-        assert_eq!(set.len(), 7); // the glob and the regex share one alternation
+        assert_eq!(set.len(), 8);
         for (host, expected) in [
             ("exact.test", true),
             ("a.exact.test", false),
@@ -617,6 +686,138 @@ mod tests {
             assert_eq!(set.matches(host), expected, "{host}");
         }
         assert!(DomainSetBuilder::default().build().is_empty());
+    }
+
+    #[test]
+    fn glob_index_narrows_candidates_without_changing_matches() {
+        assert_eq!(
+            fixed_suffix("ad-host-backup-*.aliyuncs.com"),
+            Some("aliyuncs.com")
+        );
+        assert_eq!(
+            fixed_suffix("reachableads-av.*.amazonaws.com"),
+            Some("amazonaws.com")
+        );
+        assert_eq!(fixed_suffix("ads.livetv*.me"), Some("me"));
+        assert_eq!(fixed_suffix("ads.example.*"), None);
+        assert_eq!(fixed_suffix("*.*"), None);
+        let patterns = [
+            "ad-host-backup-*.aliyuncs.com",
+            "reachableads-av.*.amazonaws.com",
+            "ads.livetv*.me",
+            "st-n.ads*-adnow.com",
+            "counter*.stat.ovh",
+            "*.one.test",
+            "*.*.two.test",
+            "a*b*c.test",
+            "*x*.test",
+            "ads.example.*",
+            "*.ads.*",
+            "**.test",
+        ];
+        let mut builder = DomainSetBuilder::default();
+        for pattern in patterns {
+            builder.pattern(pattern).unwrap();
+        }
+        let set = builder.build();
+        let reference: Vec<_> = patterns
+            .iter()
+            .map(|p| domain_pattern(p).unwrap())
+            .collect();
+        let labels = [
+            "ad-host-backup-3",
+            "ad-host-backup-",
+            "oss-cn-hangzhou",
+            "reachableads-av",
+            "eu",
+            "ads",
+            "livetv7",
+            "livetv",
+            "st-n",
+            "ads1-adnow",
+            "adsx-adnow",
+            "counter",
+            "counter9",
+            "stat",
+            "ovh",
+            "aliyuncs",
+            "amazonaws",
+            "com",
+            "me",
+            "test",
+            "one",
+            "two",
+            "a",
+            "b",
+            "abc",
+            "aXbYc",
+            "acb",
+            "x",
+            "yxy",
+            "example",
+            "net",
+            "",
+        ];
+        // Every host of up to four labels drawn from the list above.
+        let mut hosts = Vec::new();
+        for a in labels {
+            for b in labels {
+                hosts.push(format!("{a}.{b}"));
+                for c in [
+                    "com",
+                    "test",
+                    "me",
+                    "ovh",
+                    "aliyuncs.com",
+                    "amazonaws.com",
+                    "x.test",
+                ] {
+                    hosts.push(format!("{a}.{b}.{c}"));
+                }
+            }
+        }
+        let mut matched = 0;
+        for host in &hosts {
+            let expected = reference
+                .iter()
+                .any(|m| m.evaluate(host, None, 0, "", false) == Some(true));
+            assert_eq!(set.matches(host), expected, "{host}");
+            matched += expected as usize;
+        }
+        assert!(matched > 50, "the hosts exercise the patterns ({matched})");
+        // The suffix alone never matches: the rest of the pattern still has to.
+        assert!(set.matches("ad-host-backup-3.aliyuncs.com"));
+        assert!(!set.matches("oss-cn-hangzhou.aliyuncs.com"));
+        assert!(!set.matches("x.ad-host-backup-3.aliyuncs.com"));
+        assert!(set.matches("AD-HOST-BACKUP-3.aliyuncs.com"));
+    }
+
+    #[test]
+    fn hashed_lists_keep_exact_suffix_and_subdomain_semantics() {
+        let mut b = DomainSetBuilder::default();
+        b.exact("only.test");
+        b.suffix("tree.test");
+        b.subdomain("kids.test");
+        for i in 0..10_000 {
+            b.suffix(&format!("filler{i}.example"));
+        }
+        let set = b.build();
+        assert_eq!(set.len(), 10_003);
+        for (host, expected) in [
+            ("only.test", true),
+            ("a.only.test", false),
+            ("tree.test", true),
+            ("a.b.tree.test", true),
+            ("atree.test", false),
+            ("kids.test", false),
+            ("a.kids.test", true),
+            ("filler9999.example", true),
+            ("x.filler0.example", true),
+            ("filler10000.example", false),
+            ("test", false),
+        ] {
+            assert_eq!(set.matches(host), expected, "{host}");
+        }
     }
 
     #[test]
