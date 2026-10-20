@@ -295,7 +295,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         appliedNetwork = snapshot
-        log.info("network changed: \(changes.joined(separator: ", ")) (\(ignoredPathUpdates) unchanged updates ignored) \(snapshot)")
+        let line = "network changed: \(changes.joined(separator: ", ")) (\(ignoredPathUpdates) unchanged updates ignored) \(snapshot)"
+        // Nothing gets through while iOS reports the network unusable.
+        if snapshot.usable { log.info(line) } else { log.warning(line) }
         ignoredPathUpdates = 0
         // Returns at once; fails only when the core already stopped, which
         // the health check reports.
@@ -472,7 +474,10 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
     let addresses: [String]
 
     init(_ path: Network.NWPath) {
-        status = "\(path.status)"
+        // iOS says why a path is unusable: cellular data turned off for the
+        // app, no network at all, ...; part of the status so a new reason is
+        // logged as a change.
+        status = path.status == .satisfied ? "satisfied" : "\(path.status)(\(Self.reason(path.unsatisfiedReason)))"
         // availableInterfaces still lists this tunnel (utun, `.other`) and may
         // repeat an interface; only distinct physical ones matter.
         var seen = Set<String>()
@@ -498,6 +503,19 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
 
     var description: String {
         "status=\(status) interfaces=\(interfaces) ipv4=\(ipv4) ipv6=\(ipv6) addresses=\(addresses)"
+    }
+
+    var usable: Bool { status == "satisfied" }
+
+    private static func reason(_ reason: Network.NWPath.UnsatisfiedReason) -> String {
+        switch reason {
+        case .notAvailable: "no-network"
+        case .cellularDenied: "cellular-denied"
+        case .wifiDenied: "wifi-denied"
+        case .localNetworkDenied: "local-network-denied"
+        case .vpnInactive: "vpn-inactive"
+        @unknown default: "unknown"
+        }
     }
 
     private static func kind(_ type: NWInterface.InterfaceType) -> String {

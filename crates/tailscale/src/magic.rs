@@ -32,6 +32,11 @@ const ACTIVE: Duration = Duration::from_secs(45);
 const DISCOVERY: Duration = Duration::from_secs(5);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const STUN_INTERVAL: Duration = Duration::from_secs(23);
+/// Wait after a failed DERP connection, doubling per failure up to the
+/// maximum: without a network every region was retried every 5 s, each with
+/// fresh DNS lookups. A network change retries at once.
+const DERP_RETRY: Duration = Duration::from_secs(5);
+const DERP_RETRY_MAX: Duration = Duration::from_secs(60);
 const MAX_ENDPOINTS: usize = 8;
 /// DERP-relayed pongs report this as the source (tailcfg.DerpMagicIP).
 const DERP_MAGIC_IP: Ipv4Addr = Ipv4Addr::new(127, 3, 3, 40);
@@ -120,6 +125,8 @@ struct Router {
     dialer: Arc<dyn Dialer>,
     routes: watch::Receiver<Routes>,
     regions: HashMap<u32, Region>,
+    /// Regions whose last connection failed: when to retry, and the wait so far.
+    derp_retry: HashMap<u32, (Instant, Duration)>,
     tunnels: HashMap<Public, Tunn>,
     states: HashMap<Public, PeerState>,
     by_addr: HashMap<SocketAddr, Public>,
@@ -178,6 +185,7 @@ impl Router {
                 return;
             }
         };
+        let waiting = self.derp_waiting(region);
         match self.regions.get_mut(&region) {
             Some(Region::Up(link)) if !link.is_closed() => {
                 link.send(*peer, packet);
@@ -186,6 +194,12 @@ impl Router {
                 if queue.len() < PENDING_PER_REGION {
                     queue.push_back((*peer, packet));
                 }
+            }
+            _ if waiting => {
+                tracing::debug!(
+                    region,
+                    "Tailscale DERP region failed recently; dropping packet"
+                );
             }
             _ => {
                 self.regions.insert(
@@ -360,6 +374,31 @@ impl Router {
                 }
             }
         }
+    }
+
+    /// Whether `region` failed recently and must not be retried yet.
+    fn derp_waiting(&self, region: u32) -> bool {
+        self.derp_retry
+            .get(&region)
+            .is_some_and(|(at, _)| Instant::now() < *at)
+    }
+
+    fn derp_result(&mut self, region: u32, connected: bool) {
+        if connected {
+            self.derp_retry.remove(&region);
+            return;
+        }
+        let wait = self
+            .derp_retry
+            .get(&region)
+            .map_or(DERP_RETRY, |(_, wait)| (*wait * 2).min(DERP_RETRY_MAX));
+        self.derp_retry
+            .insert(region, (Instant::now() + wait, wait));
+        tracing::debug!(
+            region,
+            wait_s = wait.as_secs(),
+            "Tailscale DERP retry delayed"
+        );
     }
 
     fn connect(&self, region: u32) {
@@ -561,6 +600,7 @@ impl Router {
     /// candidates. WireGuard sessions survive; only their transport changes.
     fn network_changed(&mut self) {
         self.regions.clear();
+        self.derp_retry.clear();
         self.by_addr.clear();
         for state in self.states.values_mut() {
             state.best = None;
@@ -745,6 +785,7 @@ pub async fn run(
         dialer,
         routes: routes.clone(),
         regions: HashMap::new(),
+        derp_retry: HashMap::new(),
         tunnels: HashMap::new(),
         states: HashMap::new(),
         by_addr: HashMap::new(),
@@ -774,6 +815,7 @@ pub async fn run(
             biased;
             _ = stop.cancelled() => break,
             Some((region, link)) = links_rx.recv() => {
+                router.derp_result(region, link.is_some());
                 match (router.regions.remove(&region), link) {
                     (Some(Region::Connecting(queue)), Some(link)) => {
                         for (peer, packet) in queue {
@@ -816,7 +858,7 @@ pub async fn run(
                 let home = router.routes.borrow().home;
                 let up = matches!(router.regions.get(&home), Some(Region::Up(link)) if !link.is_closed())
                     || matches!(router.regions.get(&home), Some(Region::Connecting(_)));
-                if home != 0 && !up {
+                if home != 0 && !up && !router.derp_waiting(home) {
                     router.regions.insert(home, Region::Connecting(VecDeque::new()));
                     router.connect(home);
                 }

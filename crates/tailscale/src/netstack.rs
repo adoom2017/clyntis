@@ -31,6 +31,8 @@ const CHUNK: usize = 8192;
 const BUFFER: usize = 64 * 1024;
 const QUEUE: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Retry interval while packets wait for room in a full router queue.
+const BACKLOG_RETRY: Duration = Duration::from_millis(10);
 
 pub enum Command {
     Connect(SocketAddr, oneshot::Sender<Result<BoxStream>>),
@@ -152,6 +154,12 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(()))
     }
 }
+impl Drop for Stream {
+    // The stack only runs when woken: let it see the closed channels.
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
 
 struct Flow {
     handle: SocketHandle,
@@ -200,9 +208,17 @@ pub async fn run(
     let mut flows: Vec<Flow> = Vec::new();
     let mut next_port: u16 = 49152;
     let wake = Arc::new(Notify::new());
-    let mut tick = tokio::time::interval(Duration::from_millis(10));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // When smoltcp next needs to run (retransmits, keep-alives, timeouts) or
+    // a pending connect expires; otherwise the stack sleeps until woken. A
+    // fixed 10 ms tick woke an idle node 100 times a second.
+    let mut next: Option<Instant> = None;
     loop {
+        let timer = async {
+            match next {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             biased;
             _ = stop.cancelled() => break,
@@ -267,7 +283,7 @@ pub async fn run(
                 }
             },
             _ = wake.notified() => {},
-            _ = tick.tick() => {},
+            _ = timer => {},
         }
         poll(&mut iface, now(), &mut device, &mut sockets);
         flows.retain_mut(|flow| {
@@ -342,7 +358,33 @@ pub async fn run(
             }
         });
         poll(&mut iface, now(), &mut device, &mut sockets);
+        next = next_poll(&mut iface, now(), &device, &sockets, &flows);
     }
+}
+
+/// When the loop must run again without being woken: smoltcp's own timers,
+/// the earliest connect deadline, and soon while packets wait for queue room.
+fn next_poll(
+    iface: &mut Interface,
+    now: NetInstant,
+    device: &PacketDevice,
+    sockets: &SocketSet<'_>,
+    flows: &[Flow],
+) -> Option<Instant> {
+    let start = Instant::now();
+    let mut next = iface
+        .poll_delay(now, sockets)
+        .map(|delay| start + Duration::from_micros(delay.total_micros()));
+    let mut earliest = |at: Instant| next = Some(next.map_or(at, |n| n.min(at)));
+    for flow in flows {
+        if let Some((_, deadline, _)) = &flow.connecting {
+            earliest(*deadline);
+        }
+    }
+    if !device.incoming.is_empty() || device.outgoing.capacity() == 0 {
+        earliest(start + BACKLOG_RETRY);
+    }
+    next
 }
 
 /// Handle used by the node to open connections.
@@ -364,5 +406,88 @@ impl Handle {
         result
             .await
             .map_err(|_| anyhow::anyhow!("Tailscale node stopped"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A peer stack listening on 100.64.0.2:80 that echoes what it receives,
+    /// fed by `run`'s outgoing packets and answering into its incoming ones.
+    async fn echo_peer(mut from: mpsc::Receiver<Vec<u8>>, to: mpsc::Sender<Vec<u8>>) {
+        let (sink, mut sent) = mpsc::channel(256);
+        let mut device = PacketDevice {
+            incoming: VecDeque::new(),
+            outgoing: sink,
+        };
+        let started = Instant::now();
+        let now = || NetInstant::from_millis(started.elapsed().as_millis() as i64);
+        let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now());
+        iface.update_ip_addrs(|list| {
+            let _ = list.push(IpCidr::new(IpAddress::v4(100, 64, 0, 2), 32));
+        });
+        let mut sockets = SocketSet::new(vec![]);
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; BUFFER]),
+            tcp::SocketBuffer::new(vec![0; BUFFER]),
+        );
+        socket.listen(80).unwrap();
+        let handle = sockets.add(socket);
+        loop {
+            while let Ok(packet) = from.try_recv() {
+                device.incoming.push_back(packet);
+            }
+            poll(&mut iface, now(), &mut device, &mut sockets);
+            let socket = sockets.get_mut::<tcp::Socket>(handle);
+            if socket.can_recv() && socket.can_send() {
+                let data = socket.recv(|b| (b.len(), b.to_vec())).unwrap();
+                socket.send_slice(&data).unwrap();
+            }
+            poll(&mut iface, now(), &mut device, &mut sockets);
+            while let Ok(packet) = sent.try_recv() {
+                if to.send(packet).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connects_and_carries_data_without_a_periodic_tick() {
+        let (commands, command_rx) = mpsc::channel(4);
+        let (to_stack, incoming) = mpsc::channel(256);
+        let (outgoing, from_stack) = mpsc::channel(256);
+        let stop = CancellationToken::new();
+        tokio::spawn(run(command_rx, incoming, outgoing, stop.clone()));
+        tokio::spawn(echo_peer(from_stack, to_stack));
+        commands
+            .send(Command::Addresses(vec!["100.64.0.1/32".parse().unwrap()]))
+            .await
+            .unwrap();
+        let handle = Handle { commands };
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.connect("100.64.0.2:80".parse().unwrap()),
+        )
+        .await
+        .expect("connect timed out")
+        .unwrap();
+        for round in 0..2 {
+            let message = format!("hello {round}");
+            stream.write_all(message.as_bytes()).await.unwrap();
+            let mut reply = vec![0; message.len()];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
+                .await
+                .expect("echo timed out")
+                .unwrap();
+            assert_eq!(reply, message.as_bytes());
+            // Idle past smoltcp's delayed timers: the next round must still
+            // be carried although nothing ticks the stack in between.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        stop.cancel();
     }
 }
