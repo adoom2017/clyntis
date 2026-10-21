@@ -111,6 +111,12 @@ export interface ProfileSummary {
   lastChecked: number;
   lastError: string | null;
 }
+/** A Tencent COS object a profile is published to. */
+export interface PublishTarget {
+  bucket: string;
+  region: string;
+  key: string;
+}
 export interface ImportResult {
   profile: ProfileSummary;
   warnings: { path: string; reason: string }[];

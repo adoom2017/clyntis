@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		06C343A948EDEB8F8D486E61 /* ClyntisApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D3D68422415E8BCBCE97E2 /* ClyntisApp.swift */; };
 		08B50211ED35EA3A230E46A4 /* ConfigCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB7D433CDDDC87472A885903 /* ConfigCrypto.swift */; };
+		D59DBE8973551DE6875B1222 /* CosPublishView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 038DE7AF877B4DEEBACCD389 /* CosPublishView.swift */; };
 		08F02BD4E7230F4A8BB2B37A /* LogFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4CFA8CA230BCAFD5DF0AA60 /* LogFile.swift */; };
 		257A1AA8013F7B9FCA085EDC /* CoreSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85C0453CF264DA14FB00CEC0 /* CoreSession.swift */; };
 		2D8481EB52250EB33070F77B /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16E5C6B7DCB40C68F7211D86 /* AppModel.swift */; };
@@ -116,6 +117,7 @@
 		D53C30959E430B69A3A758F0 /* LogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogView.swift; sourceTree = "<group>"; };
 		DC3C90397AC4E4D034C0E577 /* ProfileDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDetailView.swift; sourceTree = "<group>"; };
 		EB7D433CDDDC87472A885903 /* ConfigCrypto.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigCrypto.swift; sourceTree = "<group>"; };
+		038DE7AF877B4DEEBACCD389 /* CosPublishView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CosPublishView.swift; sourceTree = "<group>"; };
 		FD817C6A169F8DFC4183D3B4 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -159,6 +161,7 @@
 				62DC05775423F8BC051EDCE0 /* Clyntis.entitlements */,
 				52D3D68422415E8BCBCE97E2 /* ClyntisApp.swift */,
 				EB7D433CDDDC87472A885903 /* ConfigCrypto.swift */,
+				038DE7AF877B4DEEBACCD389 /* CosPublishView.swift */,
 				238BD3B82B99BE112B4D3D83 /* ConfigPasswordView.swift */,
 				B9B50CF2014E240A4478F055 /* Info.plist */,
 				D53C30959E430B69A3A758F0 /* LogView.swift */,
@@ -371,6 +374,7 @@
 				2D8481EB52250EB33070F77B /* AppModel.swift in Sources */,
 				06C343A948EDEB8F8D486E61 /* ClyntisApp.swift in Sources */,
 				08B50211ED35EA3A230E46A4 /* ConfigCrypto.swift in Sources */,
+				D59DBE8973551DE6875B1222 /* CosPublishView.swift in Sources */,
 				E2CAD0490779F962B383B8A9 /* ConfigPasswordView.swift in Sources */,
 				62FE4B2352CD402A466015B3 /* CoreSession.swift in Sources */,
 				8110D1AB67EEF33506E470AC /* CustomRules.swift in Sources */,

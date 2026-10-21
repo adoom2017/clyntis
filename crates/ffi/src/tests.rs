@@ -814,3 +814,52 @@ fn the_reported_network_selects_overrides_and_shows_in_the_snapshot() {
     );
     assert_eq!(meta_destroy_v1(id), OK);
 }
+
+#[test]
+fn cos_targets_come_from_cos_urls_and_uploads_need_credentials() {
+    let url = b"https://image-1308520206.cos.ap-shanghai.myqcloud.com/config-enc.txt";
+    let mut bytes = vec![0; 512];
+    let mut length = 0;
+    assert_eq!(
+        unsafe {
+            meta_cos_target_v1(
+                url.as_ptr(),
+                url.len(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    let target: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+    assert_eq!(
+        target,
+        serde_json::json!({"bucket": "image-1308520206", "region": "ap-shanghai", "key": "config-enc.txt"})
+    );
+    let other = b"https://example.com/config.txt";
+    assert_eq!(
+        unsafe {
+            meta_cos_target_v1(
+                other.as_ptr(),
+                other.len(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                &mut length,
+            )
+        },
+        OK
+    );
+    assert_eq!(&bytes[..length], b"null");
+    // Refused before any network access.
+    let request = serde_json::to_vec(&serde_json::json!({
+        "target": target,
+        "credentials": {"secret_id": "", "secret_key": ""},
+    }))
+    .unwrap();
+    let data = b"encrypted";
+    assert_eq!(
+        unsafe { meta_cos_put_v1(request.as_ptr(), request.len(), data.as_ptr(), data.len()) },
+        ERROR
+    );
+}

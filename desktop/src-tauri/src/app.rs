@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use clyntis_desktop_model::{
-    profiles::{self, Profile, ProfileSummary, Store},
+    profiles::{self, Profile, ProfileSummary, PublishTarget, Store},
     settings::{Capture, Settings},
 };
 use serde::Serialize;
@@ -600,6 +600,104 @@ pub fn export_encrypted(
     std::fs::write(&path, encrypted)
         .context("无法写入导出文件")
         .map_err(error)
+}
+/// The saved COS SecretId, or None without saved keys. The SecretKey never
+/// leaves the keychain.
+#[tauri::command]
+pub async fn cos_credentials() -> Reply<Option<String>> {
+    tokio::task::spawn_blocking(crate::keychain::load)
+        .await
+        .map_err(|e| error(e.into()))?
+        .map(|keys| keys.map(|keys| keys.secret_id))
+        .map_err(error)
+}
+/// Saves COS keys; an empty `secret_key` keeps the saved one.
+#[tauri::command]
+pub async fn save_cos_credentials(secret_id: String, secret_key: String) -> Reply<()> {
+    tokio::task::spawn_blocking(move || {
+        let secret_id = secret_id.trim().to_owned();
+        ensure!(!secret_id.is_empty(), "SecretId 不能为空");
+        let secret_key = match secret_key.trim() {
+            "" => {
+                crate::keychain::load()?
+                    .context("请填写 SecretKey")?
+                    .secret_key
+            }
+            key => key.to_owned(),
+        };
+        crate::keychain::store(&clyntis_core::cos::CosCredentials {
+            secret_id,
+            secret_key,
+        })
+    })
+    .await
+    .map_err(|e| error(e.into()))?
+    .map_err(error)
+}
+#[tauri::command]
+pub async fn delete_cos_credentials() -> Reply<()> {
+    tokio::task::spawn_blocking(crate::keychain::delete)
+        .await
+        .map_err(|e| error(e.into()))?
+        .map_err(error)
+}
+/// Where to publish `id`: where it was published last, else its subscription
+/// URL when that is a COS object (publishing then replaces the subscription).
+#[tauri::command]
+pub fn publish_target(state: State<'_, Desktop>, id: Uuid) -> Reply<Option<PublishTarget>> {
+    let profile = state.store.get(id).map_err(error)?;
+    Ok(profile.publish.or_else(|| {
+        let target = clyntis_core::cos::CosTarget::from_url(profile.url.as_deref()?)?;
+        Some(PublishTarget {
+            bucket: target.bucket,
+            region: target.region,
+            key: target.key,
+        })
+    }))
+}
+/// Encrypts `id` like `export_encrypted` and uploads it to Tencent COS;
+/// returns the object's URL and remembers the target for the profile.
+#[tauri::command]
+pub async fn publish_encrypted(
+    state: State<'_, Desktop>,
+    id: Uuid,
+    password: String,
+    target: PublishTarget,
+) -> Reply<String> {
+    let cos = clyntis_core::cos::CosTarget {
+        bucket: target.bucket.trim().to_owned(),
+        region: target.region.trim().to_owned(),
+        key: target.key.trim().trim_start_matches('/').to_owned(),
+    };
+    cos.validate().map_err(error)?;
+    let profile = state.store.get(id).map_err(error)?;
+    let encrypted = profiles::encrypt_yaml(&profile.yaml, &password).map_err(error)?;
+    let credentials = tokio::task::spawn_blocking(crate::keychain::load)
+        .await
+        .map_err(|e| error(e.into()))?
+        .map_err(error)?
+        .ok_or_else(|| {
+            "请先在「设置 → 远程发布」中填写腾讯云 COS 的 SecretId 和 SecretKey".to_owned()
+        })?;
+    clyntis_core::cos::put_object(
+        &cos,
+        &credentials,
+        encrypted.into_bytes(),
+        "text/plain; charset=utf-8",
+    )
+    .await
+    .map_err(error)?;
+    {
+        let _guard = state.operation.lock().await;
+        let mut profile = state.store.get(id).map_err(error)?;
+        profile.publish = Some(PublishTarget {
+            bucket: cos.bucket.clone(),
+            region: cos.region.clone(),
+            key: cos.key.clone(),
+        });
+        state.store.save(&profile).map_err(error)?;
+    }
+    Ok(cos.url())
 }
 #[tauri::command]
 pub async fn save_profile(state: State<'_, Desktop>, id: Uuid, yaml: String) -> Reply<()> {

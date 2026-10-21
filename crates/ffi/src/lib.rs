@@ -294,6 +294,62 @@ pub unsafe extern "C" fn meta_yaml_check_v1(
     })
 }
 
+/// The Tencent COS target behind `url` as JSON `{"bucket", "region", "key"}`,
+/// or `null` when it is not a COS object URL.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_cos_target_v1(
+    url: *const u8,
+    len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let url = std::str::from_utf8(unsafe { input(url, len)? })?;
+        let target = clyntis_core::cos::CosTarget::from_url(url);
+        unsafe { output(&serde_json::to_vec(&target)?, buffer, capacity, length) }
+    })
+}
+
+/// Uploads `data` to Tencent COS, replacing the object. `request` is JSON:
+/// `{"target": {"bucket", "region", "key"}, "credentials": {"secret_id",
+/// "secret_key"}, "content_type": "text/plain"}`. Blocks until COS answers
+/// (at most 30 s); the error text says why it failed.
+///
+/// # Safety
+/// `request` and `data` must be readable for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_cos_put_v1(
+    request: *const u8,
+    request_len: usize,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        target: clyntis_core::cos::CosTarget,
+        credentials: clyntis_core::cos::CosCredentials,
+        content_type: Option<String>,
+    }
+    boundary(|| {
+        let request: Request = serde_json::from_slice(unsafe { input(request, request_len)? })?;
+        let body = unsafe { input(data, len)? }.to_vec();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(clyntis_core::cos::put_object(
+                &request.target,
+                &request.credentials,
+                body,
+                request.content_type.as_deref().unwrap_or("text/plain"),
+            ))?;
+        Ok(OK)
+    })
+}
+
 /// Move buffered core log lines into `buffer` as newline-separated JSON objects
 /// (`time` in Unix seconds, `type` debug/info/warning/error, `payload`). Lines
 /// are removed only when they fit; otherwise `length` reports the size needed.

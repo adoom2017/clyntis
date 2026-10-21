@@ -30,6 +30,17 @@ pub struct Profile {
     /// Password for encrypted subscriptions, kept so scheduled updates can decrypt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Where encrypted exports of this profile were last published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<PublishTarget>,
+}
+
+/// A Tencent COS object: `https://<bucket>.cos.<region>.myqcloud.com/<key>`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishTarget {
+    pub bucket: String,
+    pub region: String,
+    pub key: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -132,6 +143,7 @@ impl Store {
                 .unwrap_or("rule")
                 .into(),
             password,
+            publish: None,
         };
         self.save(&profile)?;
         private_dir(&self.runtime_dir(profile.id))?;

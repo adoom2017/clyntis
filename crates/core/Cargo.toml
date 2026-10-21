@@ -32,6 +32,8 @@ prost = "0.14"
 maxminddb = "0.26"
 socket2.workspace = true
 sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
 smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-tcp-cubic", "socket-tcp-reno", "socket-udp", "socket-icmp"] }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"

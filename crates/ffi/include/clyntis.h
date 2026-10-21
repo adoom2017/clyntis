@@ -80,6 +80,16 @@ int32_t meta_overrides_apply_v1(const uint8_t *config, size_t length,
  * Follows the caller-buffer/size-query contract. */
 int32_t meta_yaml_check_v1(const uint8_t *config, size_t length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* The Tencent COS target behind a URL: writes JSON {"bucket","region","key"},
+ * or null when url is not a COS object URL. Caller-buffer contract. */
+int32_t meta_cos_target_v1(const uint8_t *url, size_t length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Upload data to Tencent COS, replacing the object. request is JSON:
+ * {"target":{"bucket","region","key"},"credentials":{"secret_id","secret_key"},
+ * "content_type":"text/plain"}. Blocks until COS answers (at most 30 s);
+ * meta_error_v1 says why it failed. */
+int32_t meta_cos_put_v1(const uint8_t *request, size_t request_length,
+    const uint8_t *data, size_t length);
 /* Drain buffered core logs (all cores in this process) as newline-separated
  * JSON objects {"time":unix_seconds,"type":"info|warning|error|debug",
  * "payload":"..."}. Lines are removed only when they fit; otherwise

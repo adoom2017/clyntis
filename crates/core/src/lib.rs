@@ -1,6 +1,7 @@
 //! Embeddable proxy core. Runtime and OS policy belong to the host.
 mod adblock;
 mod api;
+pub mod cos;
 pub mod dns;
 mod inbound;
 mod memory;

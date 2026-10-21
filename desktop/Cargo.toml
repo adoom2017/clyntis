@@ -20,6 +20,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 clyntis-config = { path = "../crates/config" }
 clyntis-runtime = { path = "../crates/runtime" }
+clyntis-core = { path = "../crates/core" }
 clyntis-desktop-model = { path = "model" }
 clyntis-desktop-service = { path = "service" }
 

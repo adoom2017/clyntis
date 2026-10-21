@@ -136,6 +136,35 @@ final class CoreSession {
         }
     }
 
+    /// The Tencent COS object behind `url` (a subscription link, say), or nil.
+    static func cosTarget(url: String) -> CosTarget? {
+        let bytes = Data(url.utf8)
+        guard let data = try? bytes.withUnsafeBytes({ url in
+            try read { meta_cos_target_v1(url.bindMemory(to: UInt8.self).baseAddress, url.count, $0, $1, $2) }
+        }) else { return nil }
+        return try? JSONDecoder().decode(CosTarget?.self, from: data)
+    }
+
+    /// Uploads `data` to Tencent COS, replacing the object. Blocks up to 30 s.
+    static func cosPut(_ data: Data, to target: CosTarget, secretID: String, secretKey: String) throws {
+        struct Request: Encodable {
+            struct Credentials: Encodable { let secretId: String; let secretKey: String }
+            let target: CosTarget
+            let credentials: Credentials
+            let contentType = "text/plain; charset=utf-8"
+        }
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let request = try encoder.encode(Request(
+            target: target, credentials: .init(secretId: secretID, secretKey: secretKey)))
+        try check(request.withUnsafeBytes { request in
+            data.withUnsafeBytes { body in
+                meta_cos_put_v1(request.bindMemory(to: UInt8.self).baseAddress, request.count,
+                                body.bindMemory(to: UInt8.self).baseAddress, body.count)
+            }
+        })
+    }
+
     /// Buffered core log lines of this process (newline-separated JSON), removed once read.
     static func drainLogs() throws -> Data {
         try read { meta_drain_logs_v1($0, $1, $2) }
@@ -251,4 +280,25 @@ final class CoreSession {
         }
         throw ClientError.message("内核结果变化过快，请重试。")
     }
+}
+
+/// A Tencent COS object: `https://<bucket>.cos.<region>.myqcloud.com/<key>`.
+struct CosTarget: Codable, Equatable {
+    var bucket: String
+    var region: String
+    var key: String
+
+    var url: String? {
+        guard !bucket.isEmpty, !region.isEmpty, !key.isEmpty else { return nil }
+        let path = key.split(separator: "/", omittingEmptySubsequences: false)
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlUnreserved) ?? String($0) }
+            .joined(separator: "/")
+        return "https://\(bucket).cos.\(region).myqcloud.com/\(path)"
+    }
+}
+
+private extension CharacterSet {
+    /// RFC 3986 unreserved characters, as COS encodes object keys.
+    static let urlUnreserved = CharacterSet(charactersIn:
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 }

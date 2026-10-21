@@ -42,6 +42,7 @@ import {
   ShieldCheck,
   Terminal,
   Trash2,
+  CloudUpload,
   Undo2,
   ListFilter,
   ChevronUp,
@@ -75,6 +76,7 @@ import {
   type AdblockSettings,
   type AdblockStatus,
   type NetworkStatus,
+  type PublishTarget,
   type AdListFormat,
   adblockPresets,
   defaultAdblock,
@@ -318,6 +320,17 @@ export default function App() {
           } catch (e) {
             return String(e);
           }
+        }}
+      />,
+    );
+  const publishEncrypted = (profile: ProfileSummary) =>
+    setModal(
+      <PublishForm
+        profile={profile}
+        onClose={() => setModal(null)}
+        onPublished={(url) => {
+          setModal(null);
+          setNotice(`已发布到 ${url}`);
         }}
       />,
     );
@@ -735,6 +748,15 @@ export default function App() {
                         >
                           <FileLock2 size={14} />
                           加密导出
+                        </button>
+                        <button
+                          className="action-button"
+                          disabled={disabled}
+                          aria-label={`发布 ${profile.name} 到 COS`}
+                          onClick={() => publishEncrypted(profile)}
+                        >
+                          <CloudUpload size={14} />
+                          发布
                         </button>
                         <button
                           className="icon-button danger"
@@ -1182,6 +1204,212 @@ function PasswordForm({
         </div>
       </form>
     </Modal>
+  );
+}
+/** Encrypts a profile and uploads it to Tencent COS, replacing the object. */
+function PublishForm({
+  profile,
+  onClose,
+  onPublished,
+}: {
+  profile: ProfileSummary;
+  onClose: () => void;
+  onPublished: (url: string) => void;
+}) {
+  const [target, setTarget] = useState<PublishTarget>({
+    bucket: "",
+    region: "",
+    key: "",
+  });
+  const [secretId, setSecretId] = useState<string | null | undefined>();
+  const [password, setPassword] = useState("");
+  const [repeat, setRepeat] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => {
+    void invoke<PublishTarget | null>("publish_target", { id: profile.id })
+      .then((saved) => saved && setTarget(saved))
+      .catch(() => {});
+    void invoke<string | null>("cos_credentials")
+      .then(setSecretId)
+      .catch(() => setSecretId(null));
+  }, [profile.id]);
+  const field = (key: keyof PublishTarget) => (value: string) =>
+    setTarget((current) => ({ ...current, [key]: value }));
+  const url =
+    target.bucket && target.region && target.key
+      ? `https://${target.bucket}.cos.${target.region}.myqcloud.com/${target.key.replace(/^\/+/, "")}`
+      : null;
+  return (
+    <Modal title={`发布「${profile.name}」到腾讯云 COS`} onClose={onClose}>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          setSaving(true);
+          setFailure(null);
+          void invoke<string>("publish_encrypted", {
+            id: profile.id,
+            password,
+            target,
+          })
+            .then(onPublished)
+            .catch((e) => setFailure(String(e)))
+            .finally(() => setSaving(false));
+        }}
+      >
+        <p className="small muted">
+          加密后上传并覆盖同名文件，订阅了该地址的设备下次更新即拿到新配置。
+        </p>
+        {secretId === null && (
+          <p className="inline-error">
+            尚未保存 COS 密钥，请先在「设置 → 远程发布」中填写。
+          </p>
+        )}
+        <label className="field">
+          存储桶
+          <input
+            required
+            placeholder="examplebucket-1250000000"
+            value={target.bucket}
+            onChange={(e) => field("bucket")(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          地域
+          <input
+            required
+            placeholder="ap-shanghai"
+            value={target.region}
+            onChange={(e) => field("region")(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          文件路径
+          <input
+            required
+            placeholder="config/home.txt"
+            value={target.key}
+            onChange={(e) => field("key")(e.target.value)}
+          />
+        </label>
+        {url && <p className="small muted publish-url">{url}</p>}
+        <label className="field">
+          加密密码
+          <input
+            required
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        <label className="field">
+          确认密码
+          <input
+            required
+            type="password"
+            value={repeat}
+            onChange={(e) => setRepeat(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        {repeat !== "" && repeat !== password && (
+          <p className="inline-error">两次输入的密码不一致</p>
+        )}
+        {failure && (
+          <p role="alert" className="inline-error">
+            {failure}
+          </p>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="button primary"
+            disabled={
+              saving || !password || repeat !== password || secretId === null
+            }
+          >
+            {saving && <LoaderCircle className="spin" size={16} />}
+            加密并发布
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+/** COS keys, kept in the system keychain; the SecretKey is never shown. */
+function CosSettingsSection({ perform }: { perform: Perform }) {
+  const [saved, setSaved] = useState<string | null>(null);
+  const [secretId, setSecretId] = useState("");
+  const [secretKey, setSecretKey] = useState("");
+  const load = () =>
+    void invoke<string | null>("cos_credentials")
+      .then((id) => {
+        setSaved(id);
+        setSecretId(id ?? "");
+        setSecretKey("");
+      })
+      .catch(() => setSaved(null));
+  useEffect(load, []);
+  return (
+    <>
+      <Setting
+        label="腾讯云 COS 密钥"
+        text="用于「发布」配置。建议使用只授予该存储桶 PutObject 权限的子用户密钥，密钥保存在系统钥匙串中。"
+      >
+        <span className="tiny-tag">{saved ? "已保存" : "未设置"}</span>
+      </Setting>
+      <div className="cos-keys">
+        <label className="field">
+          SecretId
+          <input
+            value={secretId}
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(e) => setSecretId(e.target.value)}
+          />
+        </label>
+        <label className="field">
+          SecretKey
+          <input
+            type="password"
+            value={secretKey}
+            autoComplete="off"
+            placeholder={saved ? "已保存，留空则不修改" : ""}
+            onChange={(e) => setSecretKey(e.target.value)}
+          />
+        </label>
+        <div className="service-actions">
+          <button
+            className="button secondary"
+            disabled={!secretId.trim() || (!saved && !secretKey.trim())}
+            onClick={() =>
+              void perform(
+                () => invoke("save_cos_credentials", { secretId, secretKey }),
+                "COS 密钥已保存",
+              ).then(load)
+            }
+          >
+            保存密钥
+          </button>
+          {saved && (
+            <button
+              className="text-button danger"
+              onClick={() =>
+                void perform(
+                  () => invoke("delete_cos_credentials"),
+                  "COS 密钥已删除",
+                ).then(load)
+              }
+            >
+              删除
+            </button>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
 function SubscriptionForm({
@@ -3327,6 +3555,10 @@ function SettingsPage({
             卸载
           </button>
         </div>
+      </section>
+      <h3 className="settings-heading">远程发布</h3>
+      <section className="panel settings-section">
+        <CosSettingsSection perform={perform} />
       </section>
       <h3 className="settings-heading">通用</h3>
       <section className="panel settings-section">

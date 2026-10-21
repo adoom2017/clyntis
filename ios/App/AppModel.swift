@@ -332,6 +332,26 @@ final class AppModel {
         }.value
     }
 
+    /// Encrypts `profile` like `exportEncrypted` and uploads it to Tencent COS;
+    /// returns the object's URL and remembers the target for the profile.
+    func publish(_ profile: Profile, password: String, to target: CosTarget) async throws -> String {
+        guard let store else { throw ClientError.message("配置存储不可用。") }
+        var target = target
+        target.bucket = target.bucket.trimmingCharacters(in: .whitespaces)
+        target.region = target.region.trimmingCharacters(in: .whitespaces)
+        target.key = target.key.trimmingCharacters(in: CharacterSet(charactersIn: " /"))
+        guard let keys = try CosKeychain.load() else {
+            throw ClientError.message("请先在「配置 → 远程发布」中填写腾讯云 COS 的 SecretId 和 SecretKey。")
+        }
+        let destination = target
+        try await Task.detached {
+            let encrypted = try ConfigCrypto.encrypt(store.configuration(for: profile.id), password: password)
+            try CoreSession.cosPut(encrypted, to: destination, secretID: keys.secretID, secretKey: keys.secretKey)
+        }.value
+        PublishTargets.set(target, for: profile.id)
+        return target.url ?? ""
+    }
+
     private func add(name: String, configuration: Data, in store: ProfileStore) async throws {
         let profile = try await Task.detached {
             try store.add(name: name, configuration: configuration) { bytes, directory in

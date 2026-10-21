@@ -2,6 +2,7 @@
 
 mod app;
 mod engine;
+mod keychain;
 mod platform;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -42,6 +43,11 @@ fn main() {
             app::inspect_profile_file,
             app::import_profile,
             app::export_encrypted,
+            app::cos_credentials,
+            app::save_cos_credentials,
+            app::delete_cos_credentials,
+            app::publish_target,
+            app::publish_encrypted,
             app::add_subscription,
             app::read_profile,
             app::save_profile,

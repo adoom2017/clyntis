@@ -11,6 +11,7 @@ struct ProfileDetailView: View {
     @State private var failure: String?
     @State private var askPassword = false
     @State private var exporting = false
+    @State private var publishing = false
     @State private var confirmDelete = false
 
     private var profile: Profile? { model.profiles.first { $0.id == id } }
@@ -48,6 +49,7 @@ struct ProfileDetailView: View {
                     Button("使用此配置") { model.selectedID = id }
                         .disabled(model.selectedID == id || model.active || model.busy)
                     Button("加密导出") { exporting = true }
+                    Button("发布到 COS") { publishing = true }
                 } footer: {
                     if inUse { Text("连接中修改的内容会在重新连接后生效") }
                 }
@@ -75,6 +77,9 @@ struct ProfileDetailView: View {
         }
         .sheet(isPresented: $exporting) {
             if let profile { EncryptedExportView(model: model, profile: profile) }
+        }
+        .sheet(isPresented: $publishing) {
+            if let profile { CosPublishView(model: model, profile: profile) }
         }
         .confirmationDialog("删除「\(profile?.name ?? "")」？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("删除", role: .destructive) {

@@ -134,6 +134,7 @@ private struct ProfilesView: View {
     @State private var importing = false
     @State private var importingLink = false
     @State private var exporting: Profile?
+    @State private var publishing: Profile?
     @State private var detail: Profile?
     var body: some View {
         NavigationStack {
@@ -168,6 +169,15 @@ private struct ProfilesView: View {
                     }
                 } footer: {
                     Text("对所有配置生效，优先于配置文件自身的规则和设置")
+                }
+                Section {
+                    NavigationLink {
+                        CosSettingsView()
+                    } label: {
+                        Label("远程发布", systemImage: "icloud.and.arrow.up")
+                    }
+                } footer: {
+                    Text("「发布」把加密后的配置上传到腾讯云 COS")
                 }
                 Section {
                     Toggle(isOn: Binding(get: { model.autoReconnect },
@@ -211,9 +221,11 @@ private struct ProfilesView: View {
                     .swipeActions {
                         Button("删除", role: .destructive) { model.remove(profile) }.disabled(model.active || model.busy)
                         Button("加密导出", systemImage: "lock.doc") { exporting = profile }.tint(.brand)
+                        Button("发布", systemImage: "icloud.and.arrow.up") { publishing = profile }.tint(.blue)
                     }
                     .contextMenu {
                         Button("加密导出", systemImage: "lock.doc") { exporting = profile }
+                        Button("发布到 COS", systemImage: "icloud.and.arrow.up") { publishing = profile }
                     }
                 }
                 if model.active && !model.profiles.isEmpty {
@@ -240,6 +252,7 @@ private struct ProfilesView: View {
             }
             .sheet(isPresented: $importingLink) { RemoteImportView(model: model) }
             .sheet(item: $exporting) { EncryptedExportView(model: model, profile: $0) }
+            .sheet(item: $publishing) { CosPublishView(model: model, profile: $0) }
             .sheet(isPresented: Binding(get: { model.pendingEncryptedImport != nil },
                                         set: { if !$0 { model.pendingEncryptedImport = nil } })) {
                 ConfigPasswordView(title: "导入加密配置", message: "此文件已加密，输入密码后导入。",

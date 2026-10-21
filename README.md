@@ -462,6 +462,29 @@ Outputs are written to `config-encrypt.yaml` or `config-decrypt.yaml` by default
 and never overwrite existing files. This legacy format is **not authenticated**;
 do not treat it as a modern secret-storage format.
 
+### Publishing encrypted profiles to Tencent COS
+
+Besides saving an encrypted export to a file, the desktop app and the iOS app
+can publish it to Tencent Cloud COS, replacing the object there, so devices
+subscribed to that URL get the new profile at their next update.
+
+1. Create API keys for a sub-user allowed only `cos:PutObject` on the bucket,
+   and enter the SecretId and SecretKey once: desktop **设置 → 远程发布**, iOS
+   **配置 → 远程发布**. They are kept in the system keychain (macOS Keychain,
+   Windows Credential Manager, iOS Keychain on this device only), never in the
+   app's files; the SecretKey is not shown again.
+2. Choose **发布** on a profile, give the bucket (with its APPID, e.g.
+   `examplebucket-1250000000`), region (e.g. `ap-shanghai`) and file path, and
+   the encryption password. When the profile's subscription URL is a COS
+   object (`https://<bucket>.cos.<region>.myqcloud.com/<path>`), these are
+   filled in from it; afterwards the profile remembers where it was published.
+
+The upload is a single PUT Object request signed with COS's
+`q-sign-algorithm=sha1` scheme (`crates/core/src/cos.rs`), valid for ten
+minutes, so the device clock must be roughly right. Errors name the cause:
+wrong keys, missing PutObject permission, unknown bucket or a skewed clock.
+Embedding hosts can use `meta_cos_target_v1` and `meta_cos_put_v1`.
+
 ## Packages and embedding
 
 After fetching locked dependencies, the local packaging scripts build offline
