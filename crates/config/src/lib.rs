@@ -98,7 +98,9 @@ impl Default for Config {
             tcp_concurrent: false,
             external_ui: String::new(),
             find_process_mode: "strict".into(),
-            keep_alive_interval: 30,
+            // Each probe of an idle connection wakes an iPhone's radio;
+            // overnight a few idle connections cost noticeable battery.
+            keep_alive_interval: if cfg!(target_os = "ios") { 300 } else { 30 },
             global_client_fingerprint: "chrome".into(),
             hosts: Default::default(),
             profile: Profile::default(),

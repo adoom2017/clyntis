@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::{Notify, mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot, watch},
     time::Instant,
 };
 use tokio_util::sync::{CancellationToken, PollSender};
@@ -163,6 +163,7 @@ impl Drop for Stream {
 
 struct Flow {
     handle: SocketHandle,
+    remote: IpAddr,
     input: Option<mpsc::Sender<Vec<u8>>>,
     output: mpsc::Receiver<Vec<u8>>,
     pending: Option<(Vec<u8>, usize)>,
@@ -189,10 +190,13 @@ fn poll(
 
 /// Runs the stack until `stop`: `commands` opens connections, `incoming`
 /// carries decrypted packets from peers, `outgoing` takes packets to encrypt.
+/// `open` lists the peer addresses with open connections, so the router
+/// keeps only their paths alive.
 pub async fn run(
     mut commands: mpsc::Receiver<Command>,
     mut incoming: mpsc::Receiver<Vec<u8>>,
     outgoing: mpsc::Sender<Vec<u8>>,
+    open: watch::Sender<Vec<IpAddr>>,
     stop: CancellationToken,
 ) {
     let started = Instant::now();
@@ -268,7 +272,7 @@ pub async fn run(
                     let (input, receiver) = mpsc::channel(QUEUE);
                     let (sender, output) = mpsc::channel(QUEUE);
                     let stream = Stream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
-                    flows.push(Flow { handle, input: Some(input), output, pending: None, eof: false,
+                    flows.push(Flow { handle, remote: remote.ip(), input: Some(input), output, pending: None, eof: false,
                         connecting: Some((reply, Instant::now() + CONNECT_TIMEOUT, Some(stream))) });
                 }
             },
@@ -358,6 +362,16 @@ pub async fn run(
             }
         });
         poll(&mut iface, now(), &mut device, &mut sockets);
+        let mut remotes: Vec<IpAddr> = flows.iter().map(|flow| flow.remote).collect();
+        remotes.sort();
+        remotes.dedup();
+        open.send_if_modified(|current| {
+            let changed = *current != remotes;
+            if changed {
+                *current = remotes;
+            }
+            changed
+        });
         next = next_poll(&mut iface, now(), &device, &sockets, &flows);
     }
 }
@@ -445,6 +459,9 @@ mod tests {
                 let data = socket.recv(|b| (b.len(), b.to_vec())).unwrap();
                 socket.send_slice(&data).unwrap();
             }
+            if socket.state() == tcp::State::CloseWait {
+                socket.close();
+            }
             poll(&mut iface, now(), &mut device, &mut sockets);
             while let Ok(packet) = sent.try_recv() {
                 if to.send(packet).await.is_err() {
@@ -460,8 +477,9 @@ mod tests {
         let (commands, command_rx) = mpsc::channel(4);
         let (to_stack, incoming) = mpsc::channel(256);
         let (outgoing, from_stack) = mpsc::channel(256);
+        let (open, mut open_rx) = watch::channel(Vec::new());
         let stop = CancellationToken::new();
-        tokio::spawn(run(command_rx, incoming, outgoing, stop.clone()));
+        tokio::spawn(run(command_rx, incoming, outgoing, open, stop.clone()));
         tokio::spawn(echo_peer(from_stack, to_stack));
         commands
             .send(Command::Addresses(vec!["100.64.0.1/32".parse().unwrap()]))
@@ -488,6 +506,17 @@ mod tests {
             // be carried although nothing ticks the stack in between.
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
+        let peer: IpAddr = "100.64.0.2".parse().unwrap();
+        assert_eq!(*open_rx.borrow_and_update(), vec![peer]);
+        // Once closed, the peer no longer counts as in use.
+        drop(stream);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            open_rx.wait_for(|open| open.is_empty()),
+        )
+        .await
+        .expect("closed connection still listed")
+        .unwrap();
         stop.cancel();
     }
 }

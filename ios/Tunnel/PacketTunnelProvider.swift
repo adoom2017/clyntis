@@ -129,11 +129,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Moves core logs into the shared log file every second while a core exists.
+    /// Moves core logs into the shared log file every 5 s while a core exists.
+    /// The core buffers 2000 lines; collecting every second kept the tunnel
+    /// waking up for little more than a few lines. The leeway lets iOS
+    /// coalesce it with other wakeups.
     private func collectLogs() {
         logTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
         timer.setEventHandler { [watchdog] in watchdog.track("collect logs") { Diagnostics.collectCoreLogs() } }
         logTimer = timer
         timer.resume()

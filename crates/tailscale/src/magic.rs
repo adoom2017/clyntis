@@ -25,13 +25,22 @@ use tokio_util::sync::CancellationToken;
 const BUFFER: usize = 65536 + 256;
 const PENDING_PER_REGION: usize = 64;
 /// magicsock's timings: a direct path is trusted for 6.5 s after a pong,
-/// refreshed by heartbeats every 3 s while the peer is in use (45 s).
+/// refreshed by heartbeats every 3 s while the peer is in use.
 const TRUST: Duration = Duration::from_millis(6500);
 const HEARTBEAT: Duration = Duration::from_secs(3);
-const ACTIVE: Duration = Duration::from_secs(45);
+/// A peer is in use while a connection to it is open, and this long after
+/// our last packet to it. magicsock's 45 s made a url-test probe every 30 s
+/// keep heartbeats and discovery running all night.
+const LINGER: Duration = Duration::from_secs(10);
 const DISCOVERY: Duration = Duration::from_secs(5);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const STUN_INTERVAL: Duration = Duration::from_secs(23);
+/// STUN interval while no peer is in use: our endpoints matter only once a
+/// connection starts, which refreshes them first if they are stale.
+const STUN_IDLE: Duration = Duration::from_secs(300);
+/// WireGuard timers while a peer is in use, and while none is.
+const TICK: Duration = Duration::from_millis(250);
+const IDLE_TICK: Duration = Duration::from_secs(5);
 /// Wait after a failed DERP connection, doubling per failure up to the
 /// maximum: without a network every region was retried every 5 s, each with
 /// fresh DNS lookups. A network change retries at once.
@@ -124,6 +133,8 @@ struct Router {
     disco: Private,
     dialer: Arc<dyn Dialer>,
     routes: watch::Receiver<Routes>,
+    /// Peer addresses with open netstack connections.
+    open: watch::Receiver<Vec<IpAddr>>,
     regions: HashMap<u32, Region>,
     /// Regions whose last connection failed: when to retry, and the wait so far.
     derp_retry: HashMap<u32, (Instant, Duration)>,
@@ -138,6 +149,7 @@ struct Router {
     udp_stop: CancellationToken,
     local_ip: Option<IpAddr>,
     stun_pending: HashMap<[u8; 12], Instant>,
+    last_stun: Option<Instant>,
     /// Published STUN-mapped addresses, and those seen in the current round:
     /// NATs whose mapping varies by destination answer each server differently.
     stun_addrs: Vec<SocketAddr>,
@@ -526,7 +538,34 @@ impl Router {
         }
     }
 
-    fn timers(&mut self) {
+    /// Peers with an open connection, or sent to within [`LINGER`]. Only
+    /// their paths are kept alive.
+    fn in_use(&self, now: Instant) -> Vec<Public> {
+        let routes = self.routes.borrow();
+        let mut keys: Vec<Public> = self
+            .open
+            .borrow()
+            .iter()
+            .filter_map(|ip| routes.lookup(*ip).map(|p| p.key))
+            .collect();
+        for (key, state) in &self.states {
+            if state.last_send.is_some_and(|t| now - t < LINGER) && !keys.contains(key) {
+                keys.push(*key);
+            }
+        }
+        keys
+    }
+
+    /// A connection starts after an idle period: refresh our endpoints if
+    /// the idle STUN rounds left them stale.
+    fn resume(&mut self) {
+        if self.last_stun.is_none_or(|t| t.elapsed() >= STUN_INTERVAL) {
+            self.stun();
+        }
+    }
+
+    /// Runs WireGuard timers and heartbeats; whether any peer is in use.
+    fn timers(&mut self) -> bool {
         let now = Instant::now();
         let mut buf = std::mem::take(&mut self.buf);
         let mut out = Vec::new();
@@ -534,6 +573,7 @@ impl Router {
         self.tunnels.retain(|key, _| known.contains(key));
         self.states.retain(|key, _| known.contains(key));
         self.by_addr.retain(|_, key| known.contains(key));
+        let in_use = self.in_use(now);
         for (peer, tunnel) in &mut self.tunnels {
             if let TunnResult::WriteToNetwork(data) = tunnel.update_timers(&mut buf) {
                 out.push((*peer, data.to_vec()));
@@ -550,8 +590,7 @@ impl Router {
             state
                 .pings
                 .retain(|_, (_, sent)| now - *sent < PING_TIMEOUT);
-            let active = state.last_send.is_some_and(|t| now - t < ACTIVE);
-            if !active {
+            if !in_use.contains(key) {
                 continue;
             }
             match state.best.as_ref().map(|p| p.addr) {
@@ -575,7 +614,8 @@ impl Router {
             self.discover(&key, false);
         }
         self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks.is_multiple_of(4) {
+        let busy = !in_use.is_empty();
+        if self.ticks.is_multiple_of(4) || !busy {
             let snapshot = self
                 .states
                 .iter()
@@ -586,13 +626,14 @@ impl Router {
                         rtt_ms: trusted
                             .and(state.best.as_ref())
                             .map(|p| p.rtt.as_millis() as u64),
-                        active: state.last_send.is_some_and(|t| now - t < ACTIVE),
+                        active: in_use.contains(key),
                     };
                     (*key, status)
                 })
                 .collect();
             *self.paths.lock().unwrap() = snapshot;
         }
+        busy
     }
 
     /// Forgets what belonged to the previous network: DERP links (they
@@ -638,6 +679,7 @@ impl Router {
         }
         let Some(udp) = &self.udp else { return };
         let now = Instant::now();
+        self.last_stun = Some(now);
         self.stun_pending
             .retain(|_, sent| now - *sent < PING_TIMEOUT);
         let routes = self.routes.borrow();
@@ -767,6 +809,7 @@ pub async fn run(
     disco: Private,
     dialer: Arc<dyn Dialer>,
     routes: watch::Receiver<Routes>,
+    open: watch::Receiver<Vec<IpAddr>>,
     mut from_stack: mpsc::Receiver<Vec<u8>>,
     to_stack: mpsc::Sender<Vec<u8>>,
     endpoints: watch::Sender<Endpoints>,
@@ -784,6 +827,7 @@ pub async fn run(
         disco,
         dialer,
         routes: routes.clone(),
+        open,
         regions: HashMap::new(),
         derp_retry: HashMap::new(),
         tunnels: HashMap::new(),
@@ -797,6 +841,7 @@ pub async fn run(
         udp_stop,
         local_ip,
         stun_pending: HashMap::new(),
+        last_stun: None,
         stun_addrs: Vec::new(),
         stun_round: Vec::new(),
         endpoints,
@@ -806,7 +851,9 @@ pub async fn run(
     };
     router.publish();
     let mut routes = routes;
-    let mut timer = tokio::time::interval(Duration::from_millis(250));
+    // WireGuard timers run every 250 ms only while a peer is in use.
+    let mut busy = true;
+    let mut tick = Instant::now();
     let mut home_check = tokio::time::interval(Duration::from_secs(5));
     let mut stun_timer = tokio::time::interval(STUN_INTERVAL);
     let mut watching_network = true;
@@ -830,7 +877,14 @@ pub async fn run(
             Some((src, packet)) = udp_rx.recv() => router.on_udp(src, &packet),
             Some((peer, packet)) = derp_rx.recv() => router.on_derp(peer, &packet),
             packet = from_stack.recv() => match packet {
-                Some(packet) => router.outbound(packet),
+                Some(packet) => {
+                    if !busy {
+                        busy = true;
+                        tick = tick.min(Instant::now() + TICK);
+                        router.resume();
+                    }
+                    router.outbound(packet);
+                }
                 None => break,
             },
             changed = routes.changed() => {
@@ -851,8 +905,15 @@ pub async fn run(
                 router.local_ip = router.dialer.local_ipv4().await;
                 router.network_changed();
             }
-            _ = timer.tick() => router.timers(),
-            _ = stun_timer.tick() => router.stun(),
+            _ = tokio::time::sleep_until(tick) => {
+                busy = router.timers();
+                tick = Instant::now() + if busy { TICK } else { IDLE_TICK };
+            }
+            _ = stun_timer.tick() => {
+                if busy || router.last_stun.is_none_or(|t| t.elapsed() >= STUN_IDLE) {
+                    router.stun();
+                }
+            }
             // Peers reach us only through the home region: keep it connected.
             _ = home_check.tick() => {
                 let home = router.routes.borrow().home;
@@ -953,6 +1014,7 @@ mod tests {
             our_disco.clone(),
             Arc::new(Loopback),
             routes_rx,
+            watch::channel(Vec::new()).1,
             from_stack,
             to_stack,
             endpoints,

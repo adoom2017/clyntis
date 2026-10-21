@@ -208,10 +208,12 @@ impl Node {
         let (commands, commands_rx) = mpsc::channel(64);
         let (to_router, from_stack) = mpsc::channel(1024);
         let (to_stack, from_router) = mpsc::channel(1024);
+        let (open, open_rx) = watch::channel(Vec::new());
         tokio::spawn(netstack::run(
             commands_rx,
             from_router,
             to_router,
+            open,
             stop.clone(),
         ));
         // One disco key for the node's lifetime: peers learn it from the map.
@@ -224,6 +226,7 @@ impl Node {
             disco.clone(),
             dialer.clone(),
             routes_rx,
+            open_rx,
             from_stack,
             to_stack,
             endpoints,
