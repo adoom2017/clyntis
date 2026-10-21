@@ -115,6 +115,12 @@ int32_t meta_close_connections_v1(meta_handle handle);
  * relays and paths in the background; changes in quick succession are
  * handled together). Fails only for an unknown or stopped core. */
 int32_t meta_network_changed_v1(meta_handle handle);
+/* What the host knows of the device network, as UTF-8 JSON:
+ * {"type":"wifi"|"cellular"|"wired","ssid":"...","addresses":["192.168.2.7"],
+ * "gateways":["192.168.2.1"]}, every field optional. The configuration's
+ * network-overrides entry for it applies before this returns. Report it once
+ * the network is known and before each meta_network_changed_v1. */
+int32_t meta_set_network_v1(meta_handle handle, const uint8_t *network, size_t length);
 #ifdef __ANDROID__
 /* Before start, duplicates a configured TUN fd. The host keeps its original fd.
  * Once set, meta_read/write_packet_v1 return META_ERROR; use fd packet I/O. */

@@ -82,6 +82,16 @@ private struct ConnectionView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    if model.connected, let networks = model.currentNetworks {
+                        HStack {
+                            Label("当前网络", systemImage: "wifi").foregroundStyle(.secondary)
+                            Spacer()
+                            Text(networks.isEmpty ? "未匹配" : networks.joined(separator: "、"))
+                        }
+                        .font(.subheadline)
+                        .padding(14)
+                        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 14))
+                    }
                     VStack(alignment: .leading, spacing: 10) {
                         Text("路由模式").font(.subheadline).foregroundStyle(.secondary)
                         Picker("路由模式", selection: Binding(get: { model.mode }, set: { value in

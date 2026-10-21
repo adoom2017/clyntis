@@ -2,6 +2,7 @@ pub mod adblock;
 pub mod compat;
 pub mod crypto;
 pub mod custom;
+pub mod network;
 pub mod overrides;
 pub use compat::*;
 pub mod rule;
@@ -57,6 +58,9 @@ pub struct Config {
     pub keep_alive_interval: u64,
     pub global_client_fingerprint: String,
     pub hosts: std::collections::BTreeMap<String, Strings>,
+    /// Networks by name, and the hosts and DNS policy applied on them.
+    pub networks: std::collections::BTreeMap<String, network::Network>,
+    pub network_overrides: Vec<network::NetworkOverride>,
     pub profile: Profile,
     pub ntp: Ntp,
     pub sniffer: Sniffer,
@@ -103,6 +107,8 @@ impl Default for Config {
             keep_alive_interval: if cfg!(target_os = "ios") { 300 } else { 30 },
             global_client_fingerprint: "chrome".into(),
             hosts: Default::default(),
+            networks: Default::default(),
+            network_overrides: vec![],
             profile: Profile::default(),
             ntp: Ntp::default(),
             sniffer: Sniffer::default(),
@@ -726,6 +732,15 @@ impl Config {
                 "rules[{i}]: unknown target {}",
                 rule.target
             );
+            let mut unknown = None;
+            rule.matcher.networks(&mut |network| {
+                if !self.networks.contains_key(&network.name) {
+                    unknown = Some(network.name.clone());
+                }
+            });
+            if let Some(name) = unknown {
+                bail!("rules[{i}]: NETWORK-NAME {name:?} is not defined in networks");
+            }
             let mut refs = vec![];
             rule.matcher.references(&mut refs);
             for (kind, name) in refs {
@@ -798,6 +813,32 @@ impl Config {
                 value.values().iter().all(|server| dns_upstream(server)),
                 "unsupported DNS policy upstream"
             );
+        }
+        for (name, network) in &self.networks {
+            network.validate(name)?;
+        }
+        for (index, entry) in self.network_overrides.iter().enumerate() {
+            let (name, _) = entry.target();
+            ensure!(
+                self.networks.contains_key(name),
+                "network-overrides[{index}].network: no network named {name:?} in networks"
+            );
+            for value in entry.nameserver_policy.values() {
+                ensure!(
+                    !value.values().is_empty(),
+                    "network-overrides[{index}].nameserver-policy: empty upstreams"
+                );
+                ensure!(
+                    value.values().iter().all(|server| dns_upstream(server)),
+                    "network-overrides[{index}].nameserver-policy: unsupported upstream"
+                );
+            }
+            for (host, value) in &entry.hosts {
+                ensure!(
+                    !value.values().is_empty(),
+                    "network-overrides[{index}].hosts.{host} is empty"
+                );
+            }
         }
         ensure!(
             ["fake-ip", "redir-host"].contains(&self.dns.enhanced_mode.as_str()),

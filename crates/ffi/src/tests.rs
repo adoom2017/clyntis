@@ -780,3 +780,37 @@ fn network_changes_never_block_or_fail_on_a_busy_worker() {
     assert_eq!(meta_destroy_v1(id), OK);
     assert_eq!(meta_network_changed_v1(id), ERROR);
 }
+
+#[test]
+fn the_reported_network_selects_overrides_and_shows_in_the_snapshot() {
+    let id = create(
+        concat!(
+            "networks: {home: {ssid: Home}}\n",
+            "network-overrides: [{network: home, hosts: {nas.example: 192.168.2.10}}]\n",
+            "rules: ['MATCH,DIRECT']\n",
+        )
+        .as_bytes(),
+        std::ptr::null(),
+    );
+    let network =
+        br#"{"type":"wifi","ssid":"Home","addresses":["192.168.2.7"],"gateways":["192.168.2.1"]}"#;
+    assert_eq!(
+        unsafe { meta_set_network_v1(id, network.as_ptr(), network.len()) },
+        OK
+    );
+    let mut bytes = vec![0; 1 << 20];
+    let mut length = 0;
+    assert_eq!(
+        unsafe { meta_snapshot_v1(id, bytes.as_mut_ptr(), bytes.len(), &mut length) },
+        OK
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
+    assert_eq!(snapshot["network"]["networks"], serde_json::json!(["home"]));
+    assert_eq!(snapshot["network"]["override"], "home");
+    let invalid = b"{\"addresses\":[\"not an address\"]}";
+    assert_eq!(
+        unsafe { meta_set_network_v1(id, invalid.as_ptr(), invalid.len()) },
+        ERROR
+    );
+    assert_eq!(meta_destroy_v1(id), OK);
+}

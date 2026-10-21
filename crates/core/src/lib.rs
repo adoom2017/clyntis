@@ -69,6 +69,9 @@ pub struct Core {
     tailscale: Mutex<HashMap<String, clyntis_tailscale::Node>>,
     /// Bumped on every network change so url-test groups re-test at once.
     network_epoch: tokio::sync::watch::Sender<u64>,
+    /// The device network as the host last reported it, and the index of the
+    /// network-overrides entry applied for it.
+    network: RwLock<(clyntis_config::network::NetworkInfo, Option<usize>)>,
 }
 struct Policy {
     mode: Mode,
@@ -191,6 +194,7 @@ fn describe_rule(raw: &str, target: &str) -> String {
         "RULE-SET" => "RuleSet",
         "DST-PORT" => "DstPort",
         "NETWORK" => "Network",
+        "NETWORK-NAME" => "NetworkName",
         "AND" => "And",
         "OR" => "Or",
         "NOT" => "Not",
@@ -344,6 +348,7 @@ impl Core {
             xudp_key,
             tailscale: Default::default(),
             network_epoch: tokio::sync::watch::channel(0).0,
+            network: Default::default(),
         }))
     }
     pub async fn start(self: &Arc<Self>) -> Result<Running> {
@@ -664,12 +669,18 @@ impl Core {
         let mut resources = self.resources.write().unwrap();
         let mut policy = self.policy.write().unwrap();
         let rules = next.rules(&policy.raw_rules)?;
-        self.resolver.configure(&config.hosts, &next)?;
+        let network = self.network.read().unwrap().1;
+        self.resolver.configure(
+            &config.hosts,
+            network.map(|index| &config.network_overrides[index]),
+            &next,
+        )?;
         // Read after the new lists are live, so a concurrent change of the
         // allowlist reaches them either here or in set_adblock_allow.
         if let Some(filter) = &next.adblock {
             filter.set_allow(&self.adblock_allow.read().unwrap());
         }
+        self.mark_networks(&rules);
         policy.rules = rules;
         *resources = next;
         Ok(())
@@ -825,6 +836,7 @@ impl Core {
         let rules = self.resources.read().unwrap().rules(&cfg.rules)?;
         let mut policy = self.policy.write().unwrap();
         if update_rules {
+            self.mark_networks(&rules);
             policy.rules = rules;
             policy.raw_rules = cfg.rules;
         }
@@ -1476,6 +1488,74 @@ impl Core {
         if let Some(c) = self.connections.lock().unwrap().get(id) {
             c.snapshot().cancel.cancel();
         }
+    }
+    /// Records the device network reported by the host and applies the
+    /// hosts and DNS policy of the network-overrides entry for it. Hosts
+    /// report it before [`Core::network_changed`].
+    pub fn set_network(&self, info: clyntis_config::network::NetworkInfo) -> Result<()> {
+        let active = clyntis_config::network::active_override(
+            &self.config.networks,
+            &self.config.network_overrides,
+            &info,
+        );
+        let matched: Vec<String> = clyntis_config::network::matching(&self.config.networks, &info)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let previous = {
+            let mut network = self.network.write().unwrap();
+            let previous = network.1;
+            *network = (info, active);
+            previous
+        };
+        if self.config.networks.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            networks = ?matched,
+            r#override = ?active.map(|index| &self.config.network_overrides[index].network),
+            "[NETWORK] current network"
+        );
+        // Rules compiled from here on read the stored network; these are set
+        // after it is stored, so neither misses the change.
+        self.mark_networks(&self.policy.read().unwrap().rules);
+        if previous != active {
+            // Resources hold the GEOSITE/RULE-SET data policy keys may use.
+            // The write lock orders this with resource refreshes and other
+            // reports, and the override is read under it: the last applied
+            // is always the current one.
+            #[allow(clippy::readonly_write_lock)]
+            let resources = self.resources.write().unwrap();
+            let active = self.network.read().unwrap().1;
+            self.resolver.configure(
+                &self.config.hosts,
+                active.map(|index| &self.config.network_overrides[index]),
+                &resources,
+            )?;
+        }
+        Ok(())
+    }
+    /// Turns every `NETWORK-NAME` condition in `rules` on or off for the
+    /// current network.
+    fn mark_networks(&self, rules: &[Rule]) {
+        let network = self.network.read().unwrap();
+        let matched = clyntis_config::network::matching(&self.config.networks, &network.0);
+        for rule in rules {
+            rule.matcher.networks(&mut |condition| {
+                condition.set(matched.contains(&condition.name.as_str()))
+            });
+        }
+    }
+    /// The reported network, the configured networks it matches and the
+    /// override in effect.
+    pub fn network_status(&self) -> serde_json::Value {
+        let (info, active) = self.network.read().unwrap().clone();
+        serde_json::json!({
+            "defined": !self.config.networks.is_empty(),
+            "info": info,
+            "networks": clyntis_config::network::matching(&self.config.networks, &info),
+            "override": active.map(|index| &self.config.network_overrides[index].network),
+        })
     }
     pub async fn network_changed(&self) {
         for connection in self.connections() {

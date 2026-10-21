@@ -304,8 +304,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ignoredPathUpdates = 0
         // Returns at once; fails only when the core already stopped, which
         // the health check reports.
-        do { try core.networkChanged() } catch {
-            log.warning("network change not delivered: \(Diagnostics.describe(error))")
+        reportNetwork(path) { core in
+            do { try core.networkChanged() } catch {
+                log.warning("network change not delivered: \(Diagnostics.describe(error))")
+            }
         }
         let ipv6 = profileIPv6 && path.supportsIPv6
         guard let routed = routesIPv6, routed != ipv6 else { return }
@@ -320,6 +322,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// Tells the core which network the device is on, for the profile's
+    /// network-overrides, then calls `then` on the tunnel queue. The Wi-Fi
+    /// name needs the wifi-info entitlement; iOS gives it to a provider whose
+    /// VPN configuration is enabled.
+    private func reportNetwork(_ path: Network.NWPath, then: @escaping (CoreSession) -> Void) {
+        let epoch = self.epoch
+        let deliver: (String?) -> Void = { ssid in
+            self.queue.async {
+                guard self.epoch == epoch, let core = self.core else { return }
+                do { try core.setNetwork(NetworkSnapshot.info(path, ssid: ssid)) } catch {
+                    log.warning("network not reported: \(Diagnostics.describe(error))")
+                }
+                then(core)
+            }
+        }
+        guard path.usesInterfaceType(.wifi) else { return deliver(nil) }
+        NEHotspotNetwork.fetchCurrent { network in deliver(network?.ssid) }
+    }
+
     /// Calls `ready` with the first device path, then reacts to changes. Only
     /// physical interfaces count: this tunnel and other VPNs are `.other`, and
     /// our own IPv6 route must not look like IPv6 connectivity.
@@ -330,6 +351,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard self.receivedInitialPath else {
                 self.receivedInitialPath = true
                 self.appliedNetwork = NetworkSnapshot(path)
+                self.reportNetwork(path) { _ in }
                 ready(path)
                 return
             }
@@ -509,6 +531,36 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
     }
 
     var usable: Bool { status == "satisfied" }
+
+    /// The network as `meta_set_network_v1` takes it: the preferred physical
+    /// interface's type, its IPv4 addresses and the gateways.
+    static func info(_ path: Network.NWPath, ssid: String?) throws -> Data {
+        let snapshot = NetworkSnapshot(path)
+        let kind = path.availableInterfaces.first { $0.type != .other }.flatMap { interface -> String? in
+            switch interface.type {
+            case .wifi: "wifi"
+            case .cellular: "cellular"
+            case .wiredEthernet: "wired"
+            default: nil
+            }
+        }
+        let gateways: [String] = path.gateways.compactMap { endpoint in
+            guard case let .hostPort(host, _) = endpoint else { return nil }
+            switch host {
+            // Scoped IPv6 (fe80::1%en0) is not an address the core parses.
+            case let .ipv4(address): return "\(address)"
+            case let .ipv6(address): return "\(address)".split(separator: "%").first.map(String.init)
+            default: return nil
+            }
+        }
+        var info: [String: Any] = [
+            "addresses": snapshot.addresses.compactMap { $0.split(separator: "=").last.map(String.init) },
+            "gateways": gateways,
+        ]
+        info["type"] = kind
+        info["ssid"] = ssid
+        return try JSONSerialization.data(withJSONObject: info)
+    }
 
     private static func reason(_ reason: Network.NWPath.UnsatisfiedReason) -> String {
         switch reason {

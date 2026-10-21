@@ -214,9 +214,12 @@ impl Resolver {
     pub fn clock(&self) -> std::sync::Arc<clyntis_protocol::tls::Clock> {
         self.clock.clone()
     }
+    /// Applies hosts and nameserver-policy, with `network`'s (the override
+    /// for the current network) taking precedence over the global ones.
     pub fn configure(
         &self,
         hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>,
+        network: Option<&clyntis_config::network::NetworkOverride>,
         resources: &crate::resources::Resources,
     ) -> Result<()> {
         *self.adblock.write().unwrap() = resources.adblock.clone();
@@ -239,25 +242,38 @@ impl Resolver {
             }
             clyntis_config::rule::domain_pattern(pattern)
         }
-        let mut entries: Vec<_> = self.config.nameserver_policy.iter().collect();
-        entries.sort_by_key(|(key, _)| {
-            std::cmp::Reverse(
-                if key.starts_with("geosite:") || key.starts_with("rule-set:") {
-                    0
-                } else {
-                    key.len()
-                        + if key.contains('*') || key.starts_with('+') || key.starts_with('.') {
-                            0
-                        } else {
-                            65536
-                        }
-                },
-            )
-        });
-        let nameservers = entries
+        // Most specific first: exact names, then longer patterns, then sets.
+        fn ordered(
+            policy: &std::collections::BTreeMap<String, clyntis_config::Strings>,
+        ) -> Vec<(&String, &clyntis_config::Strings)> {
+            let mut entries: Vec<_> = policy.iter().collect();
+            entries.sort_by_key(|(key, _)| {
+                std::cmp::Reverse(
+                    if key.starts_with("geosite:") || key.starts_with("rule-set:") {
+                        0
+                    } else {
+                        key.len()
+                            + if key.contains('*') || key.starts_with('+') || key.starts_with('.') {
+                                0
+                            } else {
+                                65536
+                            }
+                    },
+                )
+            });
+            entries
+        }
+        let nameservers = network
+            .map(|network| ordered(&network.nameserver_policy))
+            .unwrap_or_default()
             .into_iter()
+            .chain(ordered(&self.config.nameserver_policy))
             .map(|(key, value)| Ok((matcher(key, resources)?, value.values())))
             .collect::<Result<Vec<_>>>()?;
+        let mut hosts = hosts.clone();
+        if let Some(network) = network {
+            hosts.extend(network.hosts.clone());
+        }
         let filters = self
             .config
             .fake_ip_filter
@@ -265,7 +281,7 @@ impl Resolver {
             .map(|p| matcher(p, resources))
             .collect::<Result<Vec<_>>>()?;
         *self.policy.write().unwrap() = DnsPolicy {
-            hosts: hosts.clone(),
+            hosts,
             nameservers,
             filters,
         };

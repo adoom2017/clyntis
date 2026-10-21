@@ -59,6 +59,7 @@ fn main() {
             app::dns_leak_test,
             app::proxies,
             app::adblock_status,
+            app::network_status,
             app::select_proxy,
             app::probe_proxy,
             app::connections,

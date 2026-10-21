@@ -72,6 +72,18 @@ export const defaultAdblock: AdblockSettings = {
   quicFallback: true,
   dnsAnswer: "nxdomain",
 };
+/** The core's `/network`: the profile's networks the device is on. */
+export interface NetworkStatus {
+  defined: boolean;
+  networks: string[];
+  override: string | null;
+  info: {
+    type?: string;
+    ssid?: string;
+    addresses: string[];
+    gateways: string[];
+  };
+}
 export interface AdblockStatus {
   enabled: boolean;
   entries: number;
@@ -282,6 +294,11 @@ export const ruleTypes: { type: string; label: string; placeholder: string }[] =
     { type: "GEOSITE", label: "GeoSite", placeholder: "cn" },
     { type: "GEOIP", label: "GeoIP", placeholder: "CN" },
     { type: "DST-PORT", label: "目标端口", placeholder: "443 或 8000-9000" },
+    {
+      type: "NETWORK-NAME",
+      label: "所在网络",
+      placeholder: "配置 networks 中的名称，如 home",
+    },
   ];
 /** Splits `TYPE,VALUE,TARGET[,no-resolve]` for display; logical rules stay whole. */
 export function splitRule(rule: string) {

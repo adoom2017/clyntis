@@ -26,6 +26,62 @@ pub struct Network {
     pub local_networks: Vec<IpNet>,
 }
 
+/// What identifies the network behind an interface, for `networks`
+/// conditions: its type (`wifi`, `wired`, `cellular`), addresses and gateway.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkFacts {
+    pub kind: Option<&'static str>,
+    pub addresses: Vec<IpAddr>,
+    pub gateways: Vec<IpAddr>,
+}
+
+/// Facts about `exit`, or the system's default interface without one.
+pub fn network_facts(exit: Option<&ExitInterface>) -> NetworkFacts {
+    use netdev::prelude::InterfaceType;
+    let device = match exit {
+        Some(exit) => netdev::get_interfaces()
+            .into_iter()
+            .find(|device| device.index == exit.index),
+        None => netdev::get_default_interface().ok(),
+    };
+    let Some(device) = device else {
+        return NetworkFacts::default();
+    };
+    let kind = match device.if_type {
+        InterfaceType::Wireless80211 => Some("wifi"),
+        InterfaceType::Wwanpp | InterfaceType::Wwanpp2 | InterfaceType::Wwan => Some("cellular"),
+        InterfaceType::Ethernet
+        | InterfaceType::FastEthernetT
+        | InterfaceType::FastEthernetFx
+        | InterfaceType::GigabitEthernet => Some("wired"),
+        _ => None,
+    };
+    let addresses = device
+        .ipv4
+        .iter()
+        .map(|net| IpAddr::V4(net.addr()))
+        .chain(device.ipv6.iter().map(|net| IpAddr::V6(net.addr())))
+        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        .collect();
+    let mut gateways: Vec<IpAddr> = exit.and_then(|exit| exit.gateway).into_iter().collect();
+    for gateway in device.gateway.iter().flat_map(|gateway| {
+        gateway
+            .ipv4
+            .iter()
+            .map(|ip| IpAddr::V4(*ip))
+            .chain(gateway.ipv6.iter().map(|ip| IpAddr::V6(*ip)))
+    }) {
+        if !gateways.contains(&gateway) {
+            gateways.push(gateway);
+        }
+    }
+    NetworkFacts {
+        kind,
+        addresses,
+        gateways,
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn local_ipv4_address(interface: &ExitInterface) -> Result<std::net::Ipv4Addr> {
     let device = netdev::get_interfaces()
@@ -766,6 +822,21 @@ pub fn recover(directory: &Path) -> Result<()> {
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
+    /// Prints what this machine reports, for checking `networks` conditions.
+    #[test]
+    #[ignore = "depends on the machine's network"]
+    fn reports_the_default_network() {
+        println!("default: {:?}", network_facts(None));
+        for device in netdev::get_interfaces() {
+            let exit = ExitInterface {
+                index: device.index,
+                name: device.name.clone(),
+                gateway: None,
+            };
+            println!("{}: {:?}", device.name, network_facts(Some(&exit)));
+        }
+    }
+
     #[test]
     fn darwin_capture_preserves_default_route_keys_and_has_no_gaps() {
         let prefixes = tun_capture_prefixes(true).unwrap();

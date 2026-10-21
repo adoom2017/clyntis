@@ -99,7 +99,11 @@ async fn silent_policy_nameserver_falls_back_without_waiting_it_out() {
         );
         let resolver = Resolver::new(config, Arc::new(clyntis_platform::DefaultHooks));
         resolver
-            .configure(&Default::default(), &crate::resources::Resources::default())
+            .configure(
+                &Default::default(),
+                None,
+                &crate::resources::Resources::default(),
+            )
             .unwrap();
         tokio::spawn(async move {
             let mut b = [0u8; 4096];
@@ -170,7 +174,7 @@ async fn policy_proxy_resolver_hosts_and_fake_persistence() {
             clyntis_config::Strings::One("local.test".into()),
         );
         resolver
-            .configure(&hosts, &crate::resources::Resources::default())
+            .configure(&hosts, None, &crate::resources::Resources::default())
             .unwrap();
         let server = tokio::spawn(async move {
             let mut b = [0u8; 4096];

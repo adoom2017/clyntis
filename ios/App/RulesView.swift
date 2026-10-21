@@ -10,6 +10,7 @@ private let ruleTypes: [(type: String, label: String, placeholder: String)] = [
     ("GEOSITE", "GeoSite", "cn"),
     ("GEOIP", "GeoIP", "CN"),
     ("DST-PORT", "目标端口", "443 或 8000-9000"),
+    ("NETWORK-NAME", "所在网络", "配置 networks 中的名称，如 home"),
 ]
 
 /// `TYPE,VALUE,TARGET[,no-resolve]` split for display; logical rules stay whole.

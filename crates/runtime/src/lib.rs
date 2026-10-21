@@ -53,7 +53,38 @@ fn dns_server_ip(server: &str) -> Option<IpAddr> {
         .or_else(|| authority.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
 }
 
-fn physical_dns_upstreams(dns: &clyntis_config::Dns) -> Vec<IpAddr> {
+/// Reports the network behind the physical exit (the default interface
+/// without a TUN) to the core for its `network-overrides`, when it differs
+/// from the last report. The Wi-Fi name is not read on desktops: macOS and
+/// Windows only give it to apps with location access.
+fn report_network(
+    core: &Core,
+    exit: Option<&clyntis_platform::desktop::ExitInterface>,
+    last: &mut Option<clyntis_platform::desktop::NetworkFacts>,
+) {
+    if core.config.networks.is_empty() {
+        return;
+    }
+    let facts = clyntis_platform::desktop::network_facts(exit);
+    if last.as_ref() == Some(&facts) {
+        return;
+    }
+    let info = clyntis_config::network::NetworkInfo {
+        kind: facts.kind.map(Into::into),
+        ssid: None,
+        addresses: facts.addresses.clone(),
+        gateways: facts.gateways.clone(),
+    };
+    *last = Some(facts);
+    if let Err(error) = core.set_network(info) {
+        tracing::warn!(error = %format!("{error:#}"), "network overrides not applied");
+    }
+}
+
+fn physical_dns_upstreams(
+    dns: &clyntis_config::Dns,
+    overrides: &[clyntis_config::network::NetworkOverride],
+) -> Vec<IpAddr> {
     let mut addresses: Vec<_> = dns
         .nameserver
         .iter()
@@ -63,6 +94,7 @@ fn physical_dns_upstreams(dns: &clyntis_config::Dns) -> Vec<IpAddr> {
         .chain(
             dns.nameserver_policy
                 .values()
+                .chain(overrides.iter().flat_map(|o| o.nameserver_policy.values()))
                 .flat_map(|servers| servers.values()),
         )
         .filter_map(|server| dns_server_ip(&server))
@@ -196,7 +228,7 @@ pub async fn detect_macos_egress(
     proxy_targets.dedup();
     proxy_targets.truncate(8);
     if proxy_targets.is_empty() {
-        proxy_targets = physical_dns_upstreams(&config.dns)
+        proxy_targets = physical_dns_upstreams(&config.dns, &config.network_overrides)
             .into_iter()
             .map(|ip| SocketAddr::new(ip, 53))
             .take(4)
@@ -287,7 +319,7 @@ pub async fn run(
     #[cfg(target_os = "macos")]
     let automatic_dns = config.tun.auto_route && config.tun.auto_dns && config.dns.enable;
     let upstream_dns = if config.dns.enable {
-        physical_dns_upstreams(&config.dns)
+        physical_dns_upstreams(&config.dns, &config.network_overrides)
     } else {
         Vec::new()
     };
@@ -443,6 +475,15 @@ pub async fn run(
         });
     }
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(3));
+    let mut reported = None;
+    report_network(
+        &core,
+        desktop
+            .as_ref()
+            .and_then(|tun| tun.hooks.network().ipv4)
+            .as_ref(),
+        &mut reported,
+    );
     #[cfg(target_os = "macos")]
     let mut next_egress_probe = tokio::time::Instant::now();
     #[cfg(target_os = "macos")]
@@ -451,7 +492,11 @@ pub async fn run(
             tokio::select! {
                 _ = stop.cancelled() => break Ok(()),
                 _ = core.stop.cancelled() => break Err(anyhow::anyhow!("proxy core stopped unexpectedly")),
-                _ = refresh.tick(), if desktop.is_some() => {
+                _ = refresh.tick(), if desktop.is_some() || !core.config.networks.is_empty() => {
+                    if desktop.is_none() {
+                        report_network(&core, None, &mut reported);
+                        continue;
+                    }
                     #[cfg(target_os = "macos")]
                     let selected = if tokio::time::Instant::now() >= next_egress_probe {
                         next_egress_probe = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -468,6 +513,9 @@ pub async fn run(
                     } else {
                         desktop.as_mut().unwrap().refresh()
                     };
+                    // Also when only the address or gateway behind the same
+                    // exit changed (another Wi-Fi on the same interface).
+                    report_network(&core, desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).as_ref(), &mut reported);
                     match changed {
                         Ok(true) => {
                             #[cfg(target_os = "macos")]
@@ -548,7 +596,7 @@ mod dns_route_tests {
             ]),
         );
         assert_eq!(
-            physical_dns_upstreams(&dns),
+            physical_dns_upstreams(&dns, &[]),
             vec![
                 "119.29.29.29".parse::<IpAddr>().unwrap(),
                 "223.5.5.5".parse::<IpAddr>().unwrap(),

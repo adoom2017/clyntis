@@ -212,7 +212,17 @@ impl Core {
             .nameserver
             .iter()
             .cloned()
-            .chain(dns.nameserver_policy.values().flat_map(|v| v.values()))
+            .chain(
+                dns.nameserver_policy
+                    .values()
+                    .chain(
+                        self.config
+                            .network_overrides
+                            .iter()
+                            .flat_map(|o| o.nameserver_policy.values()),
+                    )
+                    .flat_map(|v| v.values()),
+            )
             .filter(|server| plain_server(server))
             .collect();
         plain.sort();

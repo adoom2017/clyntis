@@ -28,6 +28,9 @@ final class AppModel {
     var connections: [ConnectionInfo] = []
     /// Ad blocking state and counters from the snapshot.
     var adblock: AdblockStatus?
+    /// The profile's networks the device is on, while the profile defines
+    /// any (see `networks` and `network-overrides`); nil otherwise.
+    var currentNetworks: [String]?
     var probing: Set<String> = []
     /// Rules matched before every profile's own (see CustomRules).
     var customRules: [String] = []
@@ -102,7 +105,7 @@ final class AppModel {
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
                             self.proxies = []; self.nodeStatus = [:]; self.connections = []
-                            self.adblock = nil
+                            self.adblock = nil; self.currentNetworks = nil
                         }
                     }
                 }
@@ -644,6 +647,8 @@ final class AppModel {
             proxies = (config["proxies"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
         }
         nodeStatus = NodeStatus.decode(object["proxies"])
+        let defined = ((object["config"] as? [String: Any])?["networks"] as? [String: Any])?.isEmpty == false
+        currentNetworks = defined ? ((object["network"] as? [String: Any])?["networks"] as? [String] ?? []) : nil
     }
 }
 

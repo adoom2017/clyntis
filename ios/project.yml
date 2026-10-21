@@ -71,6 +71,8 @@ targets:
       properties:
         com.apple.security.application-groups: ["$(CLYNTIS_APP_GROUP)"]
         com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        # The Wi-Fi name for network-overrides (NEHotspotNetwork.fetchCurrent).
+        com.apple.developer.networking.wifi-info: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: "$(CLYNTIS_TUNNEL_ID)"

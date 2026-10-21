@@ -20,6 +20,10 @@ final class CoreSession {
     deinit { close() }
     func start() throws { try Self.check(meta_start_v1(handle)) }
     func networkChanged() throws { try Self.check(meta_network_changed_v1(handle)) }
+    /// What is known of the device network, as the JSON `meta_set_network_v1` takes.
+    func setNetwork(_ json: Data) throws {
+        try Self.check(json.withUnsafeBytes { meta_set_network_v1(handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count) })
+    }
     func close() {
         guard handle != 0 else { return }
         _ = meta_destroy_v1(handle) // Stops workers and joins callbacks before invalidating context.

@@ -58,6 +58,9 @@ replacement for every protocol or configuration option.
   answers keep the domain so domain rules still apply. Upstreams are asked at
   once and the first answer wins, and a UDP query is resent after 1 s and 2 s,
   so a silent or lossy server no longer stalls a lookup for its timeout.
+  When the servers of a `nameserver-policy` entry do not answer (a home LAN
+  resolver away from home), `nameserver` answers instead; once they are known
+  to be silent on the current network both are asked at once.
 - **Status:** per-proxy status for the apps and the controller (`/proxies`
   carries a `status` object): VLESS server, transport and security; the last
   delay test with its error and time; open connections; and, for Tailscale, the
@@ -153,6 +156,148 @@ rules:
   auth key only (an interactive login URL is logged but not awaited); node-key
   expiry is not renewed automatically; no peer relays, port mapping or
   Tailscale SSH/Funnel/Serve.
+
+### Per-network hosts, DNS and rules
+
+The same name can need different answers on different networks: a NAS's LAN
+address at home and its public one elsewhere, or a home DNS server that only
+answers on the home LAN. Three additions handle this; they are not part of the
+mihomo format, and profiles without them behave as before.
+
+| Key | Where | Purpose |
+| --- | --- | --- |
+| `networks` | top level | Names networks by what the device sees |
+| `network-overrides` | top level | Hosts and `nameserver-policy` for a network, over the global ones |
+| `NETWORK-NAME,<name>` | rule condition | Holds while the device is on that network |
+
+#### `networks`
+
+Each entry names a network and lists conditions. Every condition given must
+hold; a condition with several values (a list) holds when any of them matches.
+
+| Condition | Value | Matches when |
+| --- | --- | --- |
+| `type` | `wifi`, `cellular` or `wired` | the device's preferred interface is of that type |
+| `ssid` | Wi-Fi name, exact and case-sensitive | the device is on that Wi-Fi |
+| `subnet` | CIDR (`192.168.2.0/24`) or one address | one of the device's addresses on that network is inside it |
+| `gateway` | address | the network's gateway is that address |
+
+```yaml
+networks:
+  home:
+    ssid: [Home, Home-5G]       # either Wi-Fi name...
+    subnet: 192.168.2.0/24      # ...and an address in the home subnet
+  office:
+    gateway: 10.0.12.1
+  phone:
+    type: cellular
+```
+
+A fact the platform does not report never matches, so a condition on it keeps
+the network from matching:
+
+| Platform | `type` | `ssid` | `subnet` | `gateway` |
+| --- | --- | --- | --- | --- |
+| iOS | yes | yes (needs the Access WiFi Information capability on the tunnel's App ID) | yes | yes |
+| macOS, Windows | yes | no (the system gives it only to apps with location access) | yes | yes |
+
+On desktops, describe a network with `subnet` and `gateway`. Common subnets
+such as `192.168.1.0/24` exist on many networks; add the gateway or prefer an
+uncommon subnet at home. Names may not start with `!`; at least one condition
+is required, and unknown types, malformed subnets or gateways and unknown keys
+are rejected when the profile loads.
+
+#### `network-overrides`
+
+A list of entries, each with a `network` and any of `hosts` and
+`nameserver-policy` (same syntax as the global `hosts` and
+`dns.nameserver-policy`). `network: '!home'` applies on any network except
+`home`, including one whose facts are unknown. Before the host has reported
+any network (the first moments after start), no entry applies.
+
+- The **first** entry whose `network` applies is used; later ones are ignored.
+  With none applying, only the global settings are used.
+- The entry's `hosts` are added to the global `hosts`; for the same name the
+  entry wins.
+- The entry's `nameserver-policy` is consulted before the global
+  `dns.nameserver-policy`, whatever the patterns' specificity.
+- An entry must name a network defined in `networks`.
+
+```yaml
+network-overrides:
+  - network: home
+    nameserver-policy:
+      '*.example.home': 192.168.2.50      # the LAN resolver, at home only
+    hosts:
+      nas.example.home: 192.168.2.10
+  - network: '!home'
+    hosts:
+      nas.example.home: 203.0.113.7       # the public address elsewhere
+```
+
+When the servers of a `nameserver-policy` entry do not answer (a LAN resolver
+away from home, or a network that is not matched as expected), `nameserver`
+answers instead. While the core does not yet know whether they answer on the
+current network they get 500 ms before `nameserver` is asked too; once they
+are known to be silent both are asked at once and the first answer wins. A
+reply from them, even NXDOMAIN, is final.
+
+#### `NETWORK-NAME` rules
+
+`NETWORK-NAME,<name>` is a rule condition that holds while the device is on
+that network. Combine it with `AND`, `OR` and `NOT`. A home subnet can then go
+direct at home and through Tailscale elsewhere, without a `url-test` group
+probing the LAN all day:
+
+```yaml
+rules:
+  - AND,((NETWORK-NAME,home),(IP-CIDR,192.168.2.0/24)),DIRECT
+  - IP-CIDR,192.168.2.0/24,Tailscale,no-resolve
+```
+
+The name must be defined in `networks`. Until the host first reports the
+network, the condition does not hold. Write it in the profile's `rules` or the
+apps' custom rules; inside a rule provider it never holds.
+
+#### When it applies
+
+- iOS reports the network when the tunnel starts and after each network change;
+  desktops check the physical exit (the default interface without TUN) every
+  3 s. Each report re-evaluates `networks`, applies the override and rules,
+  and clears the DNS cache when the override changes.
+- The log records `[NETWORK] current network` with the matching networks and
+  the override in effect. The apps show **当前网络** on the home page while the
+  profile defines `networks`, and the controller has `GET /network`.
+- Names in `fake-ip-filter` reach apps as real addresses, which apps may cache
+  for the answer's TTL after a network change. Names answered with fake IPs
+  are resolved when connecting, so they switch at once.
+- Embedding hosts report the network with `meta_set_network_v1` (JSON:
+  `{"type": "wifi", "ssid": "Home", "addresses": ["192.168.2.7"],
+  "gateways": ["192.168.2.1"]}`, every field optional) before each
+  `meta_network_changed_v1`.
+
+#### Example: a home server reached by name everywhere
+
+```yaml
+networks:
+  home:
+    ssid: Home
+    subnet: 192.168.2.0/24
+dns:
+  enhanced-mode: fake-ip
+  nameserver: [223.5.5.5, 119.29.29.29]
+network-overrides:
+  - network: home
+    nameserver-policy:
+      '*.example.home': 192.168.2.50     # answers with LAN addresses
+  - network: '!home'
+    hosts:
+      nas.example.home: 203.0.113.7      # or omit: public DNS answers
+rules:
+  - AND,((NETWORK-NAME,home),(IP-CIDR,192.168.2.0/24)),DIRECT
+  - IP-CIDR,192.168.2.0/24,Tailscale,no-resolve
+  - MATCH,DIRECT
+```
 
 ## Requirements
 

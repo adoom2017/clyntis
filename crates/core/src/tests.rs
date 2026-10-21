@@ -1197,3 +1197,94 @@ async fn a_panicking_packet_loop_stops_the_core() {
         .expect("the core kept running after its packet loop panicked");
     drop(running);
 }
+
+/// The same name resolves to its LAN address at home and its public one
+/// elsewhere, as the network the host reports changes.
+#[tokio::test]
+async fn network_overrides_switch_hosts_with_the_reported_network() {
+    let config = Config::parse(
+        concat!(
+            "networks:\n",
+            "  home:\n",
+            "    ssid: Home\n",
+            "    subnet: 192.168.2.0/24\n",
+            "network-overrides:\n",
+            "- network: home\n",
+            "  hosts: {nas.example: 192.168.2.10}\n",
+            "- network: '!home'\n",
+            "  hosts: {nas.example: 203.0.113.7}\n",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+    let home = clyntis_config::network::NetworkInfo {
+        kind: Some("wifi".into()),
+        ssid: Some("Home".into()),
+        addresses: vec!["192.168.2.241".parse().unwrap()],
+        gateways: vec!["192.168.2.1".parse().unwrap()],
+    };
+    let away = clyntis_config::network::NetworkInfo {
+        kind: Some("cellular".into()),
+        addresses: vec!["10.88.1.2".parse().unwrap()],
+        ..Default::default()
+    };
+    let resolve = |core: &Arc<Core>| {
+        let core = core.clone();
+        async move { core.resolver.lookup("nas.example", 443).await.unwrap()[0] }
+    };
+    core.set_network(home.clone()).unwrap();
+    assert_eq!(resolve(&core).await, "192.168.2.10:443".parse().unwrap());
+    assert_eq!(
+        core.network_status()["networks"],
+        serde_json::json!(["home"])
+    );
+    core.set_network(away).unwrap();
+    assert_eq!(resolve(&core).await, "203.0.113.7:443".parse().unwrap());
+    assert_eq!(core.network_status()["override"], "!home");
+    core.set_network(home).unwrap();
+    assert_eq!(resolve(&core).await, "192.168.2.10:443".parse().unwrap());
+}
+
+/// `NETWORK-NAME` follows the reported network, in rules compiled before and
+/// after the change.
+#[tokio::test]
+async fn network_name_rules_follow_the_reported_network() {
+    let config = Config::parse(
+        concat!(
+            "networks:\n",
+            "  home:\n",
+            "    subnet: 192.168.2.0/24\n",
+            "rules:\n",
+            "- AND,((NETWORK-NAME,home),(DOMAIN,nas.example)),DIRECT\n",
+            "- DOMAIN,nas.example,REJECT\n",
+            "- MATCH,DIRECT\n",
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+    let route = |core: &Arc<Core>| {
+        let core = core.clone();
+        async move {
+            core.route_decision(&Target::new("nas.example", 443).unwrap(), "tcp")
+                .await
+                .unwrap()
+                .node
+        }
+    };
+    let on = |address: &str| clyntis_config::network::NetworkInfo {
+        addresses: vec![address.parse().unwrap()],
+        ..Default::default()
+    };
+    // Unknown network: not home.
+    assert_eq!(route(&core).await, "REJECT");
+    core.set_network(on("192.168.2.241")).unwrap();
+    assert_eq!(route(&core).await, "DIRECT");
+    // Recompiled rules start from the current network.
+    let rules = core.policy.read().unwrap().raw_rules.clone();
+    core.replace_rules(rules).unwrap();
+    assert_eq!(route(&core).await, "DIRECT");
+    core.set_network(on("10.88.1.2")).unwrap();
+    assert_eq!(route(&core).await, "REJECT");
+}

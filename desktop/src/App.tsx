@@ -34,6 +34,7 @@ import {
   Plus,
   Ban,
   Power,
+  Wifi,
   RefreshCw,
   Route,
   Search,
@@ -73,6 +74,7 @@ import {
   type Overrides,
   type AdblockSettings,
   type AdblockStatus,
+  type NetworkStatus,
   type AdListFormat,
   adblockPresets,
   defaultAdblock,
@@ -539,6 +541,7 @@ export default function App() {
                   ))}
                 </section>
               </div>
+              {running && <NetworkPanel />}
               {running && (
                 <AdblockPanel settings={state.settings} perform={perform} />
               )}
@@ -1373,6 +1376,43 @@ export function Editor({
         </button>
       </div>
     </Modal>
+  );
+}
+
+/** The profile's networks the device is on, while the profile defines any. */
+function NetworkPanel() {
+  const [status, setStatus] = useState<NetworkStatus | null>(null);
+  useEffect(() => {
+    const load = () =>
+      void invoke<NetworkStatus>("network_status")
+        .then(setStatus)
+        .catch(() => setStatus(null));
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+  if (!status?.defined) return null;
+  const facts = [
+    status.info.type &&
+      { wifi: "Wi-Fi", wired: "有线", cellular: "蜂窝" }[status.info.type],
+    status.info.addresses.find((address) => !address.includes(":")),
+    status.info.gateways.length > 0 && `网关 ${status.info.gateways[0]}`,
+  ].filter(Boolean);
+  return (
+    <section className="panel network-panel">
+      <div className="panel-title">
+        <h3>
+          <Wifi size={15} /> 当前网络
+        </h3>
+        <strong>
+          {status.networks.length ? status.networks.join("、") : "未匹配"}
+        </strong>
+      </div>
+      <p className="muted small">
+        {facts.join(" · ")}
+        {status.override && ` · 生效的覆盖：${status.override}`}
+      </p>
+    </section>
   );
 }
 

@@ -31,6 +31,7 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/configs", get(config).patch(update))
         .route("/proxies", get(proxies))
         .route("/adblock", get(adblock))
+        .route("/network", get(network))
         .route("/rules/test", post(test_route))
         .route("/dns/leak", get(dns_leak_audit))
         .route("/dns/leak/test", post(dns_leak_test))
@@ -72,6 +73,9 @@ async fn authorize(
         }
     }
     next.run(request).await
+}
+async fn network(State(core): State<Arc<Core>>) -> Json<Value> {
+    Json(core.network_status())
 }
 async fn ui_index(State(core): State<Arc<Core>>) -> Response {
     serve_ui(core, "index.html".into()).await

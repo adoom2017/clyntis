@@ -1,5 +1,11 @@
 use anyhow::{Result, bail, ensure};
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 #[derive(Clone, Debug)]
 pub enum Matcher {
@@ -14,6 +20,8 @@ pub enum Matcher {
     Port(u16),
     Ports(Vec<(u16, u16)>),
     Network(String),
+    /// `NETWORK-NAME,home`: the device is on that `networks` entry.
+    OnNetwork(Arc<OnNetwork>),
     GeoIp(String),
     GeoSite(String),
     RuleSet(String),
@@ -25,6 +33,21 @@ pub enum Matcher {
     Nets(Arc<IpSet>),
     ExternalIp(Arc<dyn IpMatcher>),
     All,
+}
+/// A named network's state, set by the core as the device network changes
+/// (see [`Matcher::networks`]); off until then.
+#[derive(Debug)]
+pub struct OnNetwork {
+    pub name: String,
+    on: AtomicBool,
+}
+impl OnNetwork {
+    pub fn set(&self, on: bool) {
+        self.on.store(on, Ordering::Relaxed);
+    }
+    pub fn get(&self) -> bool {
+        self.on.load(Ordering::Relaxed)
+    }
 }
 pub trait IpMatcher: std::fmt::Debug + Send + Sync {
     fn matches(&self, ip: IpAddr) -> bool;
@@ -481,6 +504,11 @@ impl Matcher {
                 ensure!(value == "tcp" || value == "udp", "invalid network");
                 Self::Network(value)
             }
+            // Names in `networks` are case-sensitive.
+            "NETWORK-NAME" => Self::OnNetwork(Arc::new(OnNetwork {
+                name: f[1].into(),
+                on: AtomicBool::new(false),
+            })),
             _ => bail!("unsupported rule type {kind}"),
         };
         if no_resolve {
@@ -523,6 +551,19 @@ impl Matcher {
             _ => {}
         }
     }
+    /// Every `NETWORK-NAME` condition inside, for the core to set.
+    pub fn networks(&self, out: &mut impl FnMut(&OnNetwork)) {
+        match self {
+            Self::OnNetwork(network) => out(network),
+            Self::And(v) | Self::Or(v) => {
+                for m in v.iter() {
+                    m.networks(out)
+                }
+            }
+            Self::Not(v) | Self::NoResolve(v) => v.networks(out),
+            _ => {}
+        }
+    }
     /// None requests DNS only when a still-relevant IP condition needs it.
     pub fn evaluate(
         &self,
@@ -559,6 +600,7 @@ impl Matcher {
             Self::Port(p) => *p == port,
             Self::Ports(r) => r.iter().any(|(a, b)| *a <= port && port <= *b),
             Self::Network(n) => n == network,
+            Self::OnNetwork(n) => n.get(),
             Self::All => true,
             Self::Not(m) => return m.evaluate(host, ip, port, network, can_resolve).map(|v| !v),
             Self::NoResolve(m) => return m.evaluate(host, ip, port, network, false),

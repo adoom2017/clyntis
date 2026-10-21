@@ -496,6 +496,23 @@ pub extern "C" fn meta_network_changed_v1(id: u64) -> i32 {
         Ok(OK)
     })
 }
+/// What the host knows of the device network, as UTF-8 JSON: `{"type":
+/// "wifi"|"cellular"|"wired", "ssid": "...", "addresses": ["192.168.2.7"],
+/// "gateways": ["192.168.2.1"]}`, every field optional. The configuration's
+/// `network-overrides` entry for it applies before this returns. Report it
+/// once the network is known and before each `meta_network_changed_v1`.
+///
+/// # Safety
+/// Data must be readable for len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_set_network_v1(id: u64, data: *const u8, len: usize) -> i32 {
+    boundary(|| {
+        let info: clyntis_config::network::NetworkInfo =
+            serde_json::from_slice(unsafe { input(data, len)? })?;
+        handle(id)?.core.set_network(info)?;
+        Ok(OK)
+    })
+}
 /// # Safety
 /// fd must be a live configured Android TUN descriptor. This function duplicates
 /// it before return; the caller keeps ownership of the original descriptor.
@@ -534,7 +551,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
 ) -> i32 {
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "network":handle.core.network_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }
