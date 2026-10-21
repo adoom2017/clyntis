@@ -79,6 +79,70 @@ async fn dot_uses_dns_tcp_framing_inside_tls_stream() {
     task.await.unwrap();
 }
 
+/// A policy server reachable only at home (a LAN resolver) must not make
+/// its names unresolvable elsewhere, nor slow every lookup by its timeout:
+/// the plain nameservers answer, after a short head start the first time and
+/// at once once the server is known to be silent on this network.
+#[tokio::test]
+async fn silent_policy_nameserver_falls_back_without_waiting_it_out() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Dns {
+            ipv6: false,
+            nameserver: vec![udp.local_addr().unwrap().to_string()],
+            ..Dns::default()
+        };
+        config.nameserver_policy.insert(
+            "*.home.test".into(),
+            clyntis_config::Strings::One(silent.local_addr().unwrap().to_string()),
+        );
+        let resolver = Resolver::new(config, Arc::new(clyntis_platform::DefaultHooks));
+        resolver
+            .configure(&Default::default(), &crate::resources::Resources::default())
+            .unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 4096];
+            loop {
+                let (n, peer) = udp.recv_from(&mut b).await.unwrap();
+                let mut reply = Message::from_vec(&b[..n]).unwrap();
+                let name = reply.queries()[0].name().clone();
+                reply.set_message_type(MessageType::Response);
+                reply.add_answer(Record::from_rdata(
+                    name,
+                    60,
+                    RData::A(A("192.0.2.10".parse().unwrap())),
+                ));
+                udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+            }
+        });
+        let expected: SocketAddr = "192.0.2.10:1443".parse().unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            resolver.lookup("bit.home.test", 1443).await.unwrap()[0],
+            expected
+        );
+        let first = started.elapsed();
+        assert!(
+            first < Duration::from_secs(2),
+            "first lookup took {first:?}"
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            resolver.lookup("nas.home.test", 1443).await.unwrap()[0],
+            expected
+        );
+        let second = started.elapsed();
+        assert!(
+            second < Duration::from_millis(300),
+            "second lookup took {second:?}"
+        );
+        drop(silent);
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn policy_proxy_resolver_hosts_and_fake_persistence() {
     tokio::time::timeout(Duration::from_secs(5), async {

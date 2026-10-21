@@ -32,6 +32,9 @@ const CACHE_ENTRIES: usize = 4096;
 const CACHE_BYTES: usize = 1024 * 1024;
 /// Per-entry allocator and table overhead beyond the key and response bytes.
 const CACHE_OVERHEAD: usize = 256;
+/// How long nameserver-policy servers not yet heard from on this network
+/// answer alone before the plain nameservers are asked too.
+const POLICY_HEAD_START: Duration = Duration::from_millis(500);
 #[derive(Default)]
 struct Cache {
     entries: HashMap<Vec<u8>, CacheEntry>,
@@ -166,6 +169,9 @@ pub struct Resolver {
     cache: Mutex<Cache>,
     fake: Mutex<FakeMap>,
     policy: RwLock<DnsPolicy>,
+    /// Whether each nameserver-policy server list answered on this network;
+    /// forgotten with the cache when the network changes.
+    reachable: Mutex<HashMap<Vec<String>, bool>>,
     tailnet: RwLock<Option<TailnetNames>>,
     adblock: RwLock<Option<std::sync::Arc<crate::adblock::Filter>>>,
     /// Kept across resource refreshes so counts survive list updates.
@@ -197,6 +203,7 @@ impl Resolver {
             hooks,
             clock,
             policy: RwLock::new(DnsPolicy::default()),
+            reachable: Mutex::new(HashMap::new()),
             tailnet: RwLock::new(None),
             adblock: RwLock::new(None),
             adblock_stats: Default::default(),
@@ -396,6 +403,7 @@ impl Resolver {
     }
     pub fn clear_cache(&self) {
         *self.cache.lock().unwrap() = Cache::default();
+        self.reachable.lock().unwrap().clear();
     }
     pub async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         let mut host = host.trim_end_matches('.').to_ascii_lowercase();
@@ -580,7 +588,6 @@ impl Resolver {
         Ok(response)
     }
     async fn exchange(&self, request: &Message) -> Result<Message> {
-        let mut error = anyhow::anyhow!("no DNS upstream");
         let host = request
             .queries()
             .first()
@@ -591,17 +598,98 @@ impl Resolver {
                     .to_ascii_lowercase()
             })
             .unwrap_or_default();
-        let servers = self
+        let policy = self
             .policy
             .read()
             .unwrap()
             .nameservers
             .iter()
             .find(|(m, _)| m.evaluate(&host, None, 0, "", false) == Some(true))
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| self.config.nameserver.clone());
-        // Ask every upstream at once and take the first answer: trying them
-        // in turn left a lookup waiting out each silent server first.
+            .map(|(_, v)| v.clone());
+        let Some(servers) = policy else {
+            return self.race(&self.config.nameserver, request).await;
+        };
+        self.exchange_policy(&host, &servers, request).await
+    }
+    /// A policy server is often only reachable on one network (a home LAN
+    /// resolver): away from it its names must still resolve, through the
+    /// plain nameservers, without waiting out its timeout on every lookup.
+    /// Servers that answered on this network are waited for; unknown ones get
+    /// a head start; unreachable ones race the nameservers, so they take over
+    /// again as soon as they answer first. A reply, even NXDOMAIN, is final.
+    async fn exchange_policy(
+        &self,
+        host: &str,
+        servers: &[String],
+        request: &Message,
+    ) -> Result<Message> {
+        let mark = |reachable: bool| {
+            let previous = self
+                .reachable
+                .lock()
+                .unwrap()
+                .insert(servers.to_vec(), reachable);
+            if !reachable && previous != Some(false) {
+                tracing::info!(
+                    host,
+                    servers = ?servers,
+                    "[DNS] policy nameservers unreachable on this network; nameserver answers too"
+                );
+            }
+        };
+        let head_start = match self.reachable.lock().unwrap().get(servers) {
+            Some(true) => None,
+            None => Some(POLICY_HEAD_START),
+            Some(false) => Some(Duration::ZERO),
+        };
+        let policy = self.race(servers, request);
+        tokio::pin!(policy);
+        let early = match head_start {
+            None => Some(policy.as_mut().await),
+            Some(wait) => tokio::time::timeout(wait, policy.as_mut()).await.ok(),
+        };
+        let fallback = self.race(&self.config.nameserver, request);
+        match early {
+            Some(Ok(response)) => {
+                mark(true);
+                return Ok(response);
+            }
+            Some(Err(error)) => {
+                mark(false);
+                return fallback.await.map_err(|fallback| fallback.context(error));
+            }
+            None => {}
+        }
+        tokio::pin!(fallback);
+        tokio::select! {
+            biased;
+            result = &mut policy => match result {
+                Ok(response) => {
+                    mark(true);
+                    Ok(response)
+                }
+                Err(error) => {
+                    mark(false);
+                    fallback.await.map_err(|fallback| fallback.context(error))
+                }
+            },
+            result = &mut fallback => match result {
+                Ok(response) => {
+                    mark(false);
+                    Ok(response)
+                }
+                Err(fallback) => {
+                    let result = policy.await;
+                    mark(result.is_ok());
+                    result.map_err(|error| error.context(fallback))
+                }
+            },
+        }
+    }
+    /// Asks every upstream at once and takes the first answer: trying them
+    /// in turn left a lookup waiting out each silent server first.
+    async fn race(&self, servers: &[String], request: &Message) -> Result<Message> {
+        let mut error = anyhow::anyhow!("no DNS upstream");
         let mut pending: futures_util::stream::FuturesUnordered<_> = servers
             .iter()
             .map(|upstream| async move {
