@@ -288,7 +288,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// every ~25 s on some Wi-Fi networks); each closed every connection,
     /// re-tested url-test groups and reconnected Tailscale's DERP relay.
     private func pathSettled(_ path: Network.NWPath) {
-        guard let core, receivedInitialPath else { return }
+        guard core != nil, receivedInitialPath else { return }
         watchdog.begin("network change")
         defer { watchdog.end() }
         let snapshot = NetworkSnapshot(path)
