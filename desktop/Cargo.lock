@@ -814,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-config"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop-model"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clyntis-config",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop-runner"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "clyntis-config",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-desktop-service"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-platform"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-runtime"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-tailscale"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
