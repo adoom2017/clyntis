@@ -838,13 +838,15 @@ mod tests {
     }
 
     #[test]
-    fn darwin_capture_preserves_default_route_keys_and_has_no_gaps() {
+    fn capture_preserves_platform_route_keys_and_has_no_gaps() {
         let prefixes = tun_capture_prefixes(true).unwrap();
-        assert!(
-            prefixes
-                .iter()
-                .all(|prefix| !prefix.network().is_unspecified())
-        );
+        if cfg!(target_os = "macos") {
+            assert!(
+                prefixes
+                    .iter()
+                    .all(|prefix| !prefix.network().is_unspecified())
+            );
+        }
         let v4: Vec<_> = prefixes
             .iter()
             .filter_map(|prefix| match prefix {
@@ -854,7 +856,11 @@ mod tests {
             .collect();
         assert_eq!(
             v4.first().unwrap().network(),
-            "1.0.0.0".parse::<std::net::Ipv4Addr>().unwrap()
+            if cfg!(target_os = "macos") {
+                std::net::Ipv4Addr::new(1, 0, 0, 0)
+            } else {
+                std::net::Ipv4Addr::UNSPECIFIED
+            }
         );
         assert_eq!(
             v4.last().unwrap().broadcast(),
@@ -875,7 +881,11 @@ mod tests {
             .collect();
         assert_eq!(
             v6.first().unwrap().network(),
-            "100::".parse::<std::net::Ipv6Addr>().unwrap()
+            if cfg!(target_os = "macos") {
+                "100::".parse::<std::net::Ipv6Addr>().unwrap()
+            } else {
+                std::net::Ipv6Addr::UNSPECIFIED
+            }
         );
         assert_eq!(u128::from(v6.last().unwrap().broadcast()), u128::MAX);
         for pair in v6.windows(2) {
@@ -886,6 +896,7 @@ mod tests {
         }
         let v4_only = tun_capture_prefixes(false).unwrap();
         assert_eq!(v4_only.len(), v4.len());
+        assert!(v4_only.iter().all(|prefix| prefix.addr().is_ipv4()));
         for target in [
             "17.137.162.3",
             "173.242.123.155",
