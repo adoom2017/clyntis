@@ -10,7 +10,10 @@ use std::{collections::BTreeMap, net::IpAddr};
 pub const KINDS: [&str; 3] = ["wifi", "cellular", "wired"];
 
 /// What identifies a network. Every condition given must hold; a condition
-/// with several values holds when any of them matches.
+/// with several values holds when any of them matches. A condition on a fact
+/// the platform did not report (the Wi-Fi name on desktops or on a wired
+/// link) is skipped, so `ssid` plus `subnet` still matches there by subnet;
+/// at least one condition must be checked.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Network {
@@ -39,7 +42,7 @@ pub struct NetworkOverride {
 }
 
 /// The network the device is on, as the platform reports it. Unknown facts
-/// are left empty: a condition on them never holds.
+/// are left empty: conditions on them are skipped.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct NetworkInfo {
@@ -95,22 +98,31 @@ impl Network {
     }
 
     pub fn matches(&self, info: &NetworkInfo) -> bool {
-        let any = |values: &Option<Strings>, test: &dyn Fn(&str) -> bool| {
+        // None when the condition is absent or its fact unknown.
+        let check = |values: &Option<Strings>, known: bool, test: &dyn Fn(&str) -> bool| {
             values
                 .as_ref()
-                .is_none_or(|values| values.values().iter().any(|v| test(v)))
+                .filter(|_| known)
+                .map(|values| values.values().iter().any(|v| test(v)))
         };
-        any(&self.kind, &|kind| info.kind.as_deref() == Some(kind))
-            && any(&self.ssid, &|ssid| info.ssid.as_deref() == Some(ssid))
-            && any(&self.subnet, &|subnet| {
+        let checks = [
+            check(&self.kind, info.kind.is_some(), &|kind| {
+                info.kind.as_deref() == Some(kind)
+            }),
+            check(&self.ssid, info.ssid.is_some(), &|ssid| {
+                info.ssid.as_deref() == Some(ssid)
+            }),
+            check(&self.subnet, !info.addresses.is_empty(), &|subnet| {
                 parse_subnet(subnet)
                     .is_ok_and(|net| info.addresses.iter().any(|ip| net.contains(ip)))
-            })
-            && any(&self.gateway, &|gateway| {
+            }),
+            check(&self.gateway, !info.gateways.is_empty(), &|gateway| {
                 gateway
                     .parse::<IpAddr>()
                     .is_ok_and(|gateway| info.gateways.contains(&gateway))
-            })
+            }),
+        ];
+        checks.iter().any(Option::is_some) && checks.iter().all(|check| check.unwrap_or(true))
     }
 }
 
@@ -184,9 +196,18 @@ mod tests {
         // Right Wi-Fi name, other subnet: not home.
         let guest = info("wifi", Some("Home"), "192.168.9.3", "192.168.9.1");
         assert!(matching(&networks, &guest).is_empty());
-        // An unknown Wi-Fi name never matches an ssid condition.
+        // A Wi-Fi name the platform does not report (desktops) or that does
+        // not exist (wired) is skipped: the subnet decides.
         let unknown = info("wifi", None, "192.168.2.241", "192.168.2.1");
-        assert!(matching(&networks, &unknown).is_empty());
+        assert_eq!(matching(&networks, &unknown), ["home"]);
+        let wired = info("wired", None, "192.168.2.128", "192.168.2.1");
+        assert_eq!(matching(&networks, &wired), ["home"]);
+        // Nothing reported at all: no network matches.
+        assert!(matching(&networks, &NetworkInfo::default()).is_empty());
+        // Only conditions on unknown facts: not checked, so no match.
+        let ssid_only: BTreeMap<String, Network> =
+            serde_yaml::from_str("cafe:\n  ssid: Cafe\n").unwrap();
+        assert!(matching(&ssid_only, &wired).is_empty());
         let cellular = info("cellular", None, "10.88.1.2", "10.88.1.1");
         assert_eq!(matching(&networks, &cellular), ["phone"]);
         let office = info("wired", None, "10.0.12.122", "10.0.12.1");

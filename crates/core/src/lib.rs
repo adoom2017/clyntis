@@ -1512,9 +1512,14 @@ impl Core {
         if self.config.networks.is_empty() {
             return Ok(());
         }
+        let reported = self.network.read().unwrap().0.clone();
         tracing::info!(
             networks = ?matched,
             r#override = ?active.map(|index| &self.config.network_overrides[index].network),
+            r#type = reported.kind.as_deref().unwrap_or("unknown"),
+            ssid = reported.ssid.as_deref().unwrap_or("unknown"),
+            addresses = ?reported.addresses.iter().filter(|ip| ip.is_ipv4()).collect::<Vec<_>>(),
+            gateways = ?reported.gateways,
             "[NETWORK] current network"
         );
         // Rules compiled from here on read the stored network; these are set

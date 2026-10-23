@@ -174,6 +174,8 @@ mihomo format, and profiles without them behave as before.
 
 Each entry names a network and lists conditions. Every condition given must
 hold; a condition with several values (a list) holds when any of them matches.
+A condition on a fact the platform does not report is skipped, as long as at
+least one other condition is checked (see the table below).
 
 | Condition | Value | Matches when |
 | --- | --- | --- |
@@ -185,7 +187,7 @@ hold; a condition with several values (a list) holds when any of them matches.
 ```yaml
 networks:
   home:
-    ssid: [Home, Home-5G]       # either Wi-Fi name...
+    ssid: [Home, Home-5G]       # either Wi-Fi name (where it is known)...
     subnet: 192.168.2.0/24      # ...and an address in the home subnet
   office:
     gateway: 10.0.12.1
@@ -193,17 +195,20 @@ networks:
     type: cellular
 ```
 
-A fact the platform does not report never matches, so a condition on it keeps
-the network from matching:
+Which facts each platform reports. A condition on a fact that is not reported
+(the Wi-Fi name on desktops, on a wired link or on cellular) is skipped, so
+`ssid` plus `subnet` matches by subnet alone there; a network whose every
+condition is skipped does not match:
 
 | Platform | `type` | `ssid` | `subnet` | `gateway` |
 | --- | --- | --- | --- | --- |
 | iOS | yes | yes (needs the Access WiFi Information capability on the tunnel's App ID) | yes | yes |
 | macOS, Windows | yes | no (the system gives it only to apps with location access) | yes | yes |
 
-On desktops, describe a network with `subnet` and `gateway`. Common subnets
+On desktops, a network is told apart by `subnet` and `gateway`. Common subnets
 such as `192.168.1.0/24` exist on many networks; add the gateway or prefer an
-uncommon subnet at home. Names may not start with `!`; at least one condition
+uncommon subnet at home. The `[NETWORK] current network` log line shows the
+facts reported and the networks they matched. Names may not start with `!`; at least one condition
 is required, and unknown types, malformed subnets or gateways and unknown keys
 are rejected when the profile loads.
 

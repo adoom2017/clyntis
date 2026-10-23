@@ -42,7 +42,10 @@ pub fn network_facts(exit: Option<&ExitInterface>) -> NetworkFacts {
         Some(exit) => netdev::get_interfaces()
             .into_iter()
             .find(|device| device.index == exit.index),
-        None => netdev::get_default_interface().ok(),
+        // With no physical exit the default interface is our own TUN.
+        None => netdev::get_default_interface()
+            .ok()
+            .filter(|device| !device.is_tun()),
     };
     let Some(device) = device else {
         return NetworkFacts::default();
