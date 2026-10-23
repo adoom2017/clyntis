@@ -368,6 +368,43 @@ impl Default for Dns {
         }
     }
 }
+impl Dns {
+    /// Fake-IP ranges in use that Chrome counts as the local network (Local
+    /// Network Access, Chromium's ip_address_space_util.cc): a public page
+    /// fetching a name answered from them is blocked unless the user allows
+    /// local access, which App Store Connect's login, for one, never asks.
+    pub fn browser_local_fake_ranges(&self, ipv6: bool) -> Vec<ipnet::IpNet> {
+        const LOCAL: [&str; 13] = [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10",
+            "fec0::/10",
+            "2001:db8::/32",
+            "3fff::/20",
+        ];
+        if !self.enable || self.enhanced_mode != "fake-ip" {
+            return Vec::new();
+        }
+        let mut ranges = vec![ipnet::IpNet::V4(self.fake_ip_range)];
+        if ipv6 && self.ipv6 {
+            ranges.push(ipnet::IpNet::V6(self.fake_ip_range6));
+        }
+        ranges.retain(|range| {
+            LOCAL.iter().any(|local| {
+                let local: ipnet::IpNet = local.parse().unwrap();
+                local.contains(&range.network()) || range.contains(&local.network())
+            })
+        });
+        ranges
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Tun {
@@ -982,6 +1019,33 @@ pub fn port_list(proxy: &Proxy) -> Result<Vec<u16>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flags_fake_ip_ranges_chrome_treats_as_local() {
+        let parse = |yaml: &str| super::Config::parse(yaml.as_bytes()).unwrap();
+        let local = |config: &super::Config| {
+            config
+                .dns
+                .browser_local_fake_ranges(config.ipv6)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        // The default IPv6 range is a unique local address.
+        let config = parse("dns: {enable: true}\n");
+        assert_eq!(local(&config), ["fdfe:dcba:9876::/64"]);
+        // Answered only when IPv6 is on.
+        assert!(local(&parse("ipv6: false\ndns: {enable: true}\n")).is_empty());
+        assert!(local(&parse("dns: {enable: true, ipv6: false}\n")).is_empty());
+        let config = parse(
+            "dns: {enable: true, fake-ip-range: 28.0.0.1/8, fake-ip-range6: '2001:2::/48'}\n",
+        );
+        assert!(local(&config).is_empty());
+        let config = parse("dns: {enable: true, ipv6: false, fake-ip-range: 100.64.0.0/16}\n");
+        assert_eq!(local(&config), ["100.64.0.0/16"]);
+        // Not in fake-ip mode: no fake addresses at all.
+        assert!(local(&parse("dns: {enable: true, enhanced-mode: redir-host}\n")).is_empty());
+    }
+
     #[test]
     fn accepts_mihomo_1_19_31_and_1_19_32_options() {
         let yaml = br#"

@@ -396,6 +396,14 @@ impl Core {
             .await
             .context("cannot prepare routing resources")?;
         self.load_profile().context("cannot load saved profile")?;
+        for range in self.config.dns.browser_local_fake_ranges(self.config.ipv6) {
+            tracing::warn!(
+                %range,
+                "fake-IP range is local network space to Chrome: public pages loading names \
+                 answered from it are blocked (Local Network Access); set dns.fake-ip-range \
+                 or fake-ip-range6 outside it, such as 28.0.0.1/8 and 2001:2::/48"
+            );
+        }
         *self.tailscale.lock().unwrap() = tailscale::start(self)?;
         let mut tasks = JoinSet::new();
         let mut system_dns_tasks = JoinSet::new();

@@ -453,6 +453,28 @@ On Windows, run the corresponding `.exe` in an elevated shell. Before upgrading
 from an older binary after an interrupted session, recover with that binary
 first because the journal filename changed with the project name.
 
+#### Fake-IP ranges and Chrome
+
+Chrome treats some address ranges as the local network (Local Network Access):
+a public page that fetches a name whose fake IP falls in them is blocked with
+`Permission was denied for this request to access the 'local' address space`,
+and pages such as the App Store Connect login hang. The local ranges are
+`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
+`100.64.0.0/10`, `0.0.0.0/8`, `fc00::/7` (including the default
+`fake-ip-range6`, `fdfe:dcba:9876::/64`), `fe80::/10`, `fec0::/10`,
+`2001:db8::/32` and `3fff::/20`. With IPv6 enabled, move the IPv6 range out of
+them; Clyntis logs a warning at start while a fake-IP range in use overlaps one:
+
+```yaml
+dns:
+  enhanced-mode: fake-ip
+  fake-ip-range: 28.0.0.1/8         # or the default 198.18.0.0/16
+  fake-ip-range6: 2001:2::/48       # benchmarking prefix, never routed publicly
+```
+
+After changing a range, reconnect and clear Chrome's host cache
+(`chrome://net-internals/#dns`) or restart Chrome.
+
 ### Legacy configuration encryption
 
 The CLI retains the previous AES-CFB128/Base64 configuration format:
