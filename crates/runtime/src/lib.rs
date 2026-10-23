@@ -144,6 +144,42 @@ fn best_egress_index(
     }
 }
 
+/// Interfaces that recently lost their default route, kept out of egress
+/// probes for a while: a flapping cable or dock must not pull every session
+/// back onto it each time it comes up. Repeated losses double the wait.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct EgressCooldowns(
+    std::collections::HashMap<String, (std::time::Instant, std::time::Duration)>,
+);
+
+#[cfg(target_os = "macos")]
+impl EgressCooldowns {
+    const FIRST: std::time::Duration = std::time::Duration::from_secs(30);
+    const LONGEST: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Records a loss and returns how long the interface stays out.
+    fn lost(&mut self, interface: &str, now: std::time::Instant) -> std::time::Duration {
+        let period = match self.0.get(interface) {
+            // Lost again soon after it was allowed back: it is still flapping.
+            Some(&(until, period)) if now < until + period * 2 => (period * 2).min(Self::LONGEST),
+            _ => Self::FIRST,
+        };
+        self.0.insert(interface.to_owned(), (now + period, period));
+        period
+    }
+
+    fn active(&mut self, now: std::time::Instant) -> Vec<String> {
+        self.0
+            .retain(|_, (until, period)| now < *until + *period * 2);
+        self.0
+            .iter()
+            .filter(|(_, (until, _))| now < *until)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub async fn public_egress_targets() -> Vec<SocketAddr> {
     use std::time::Duration;
@@ -199,6 +235,7 @@ pub async fn detect_macos_egress(
     public_targets: &[SocketAddr],
     phase: &str,
     current: Option<&str>,
+    avoid: &[String],
 ) -> Result<Option<String>> {
     use clyntis_platform::desktop::{EgressHooks, Network, ipv4_egress_candidates};
     use std::time::Duration;
@@ -206,7 +243,11 @@ pub async fn detect_macos_egress(
     if config.tun.interface.is_some() || !config.tun.auto_detect_interface {
         return Ok(None);
     }
-    let candidates = ipv4_egress_candidates()?;
+    let mut candidates = ipv4_egress_candidates()?;
+    // Interfaces that just went away stay out while another one is up.
+    if candidates.iter().any(|c| !avoid.contains(&c.name)) {
+        candidates.retain(|c| !avoid.contains(&c.name));
+    }
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -331,7 +372,7 @@ pub async fn run(
     };
     #[cfg(target_os = "macos")]
     let detected_interface = if config.tun.enable {
-        detect_macos_egress(&config, &public_targets, "before TUN", None).await?
+        detect_macos_egress(&config, &public_targets, "before TUN", None, &[]).await?
     } else {
         None
     };
@@ -349,6 +390,7 @@ pub async fn run(
             ipv6: config.ipv6,
             auto_route: config.tun.auto_route,
             interface,
+            replaceable_interface: config.tun.interface.is_none(),
             exclusions: &config.tun.route_exclude_address,
             capture_dns: !cfg!(target_os = "macos") && !config.tun.dns_hijack.is_empty(),
             upstream_dns: &upstream_dns,
@@ -362,7 +404,7 @@ pub async fn run(
     };
     #[cfg(target_os = "macos")]
     if config.tun.enable && config.tun.auto_detect_interface && config.tun.interface.is_none() {
-        let after = detect_macos_egress(&config, &public_targets, "after TUN", None)
+        let after = detect_macos_egress(&config, &public_targets, "after TUN", None, &[])
             .await?
             .context(
                 "no physical egress reachable after TUN routing; set tun.interface explicitly",
@@ -377,7 +419,7 @@ pub async fn run(
             drop(previous);
             desktop = Some(open_tun(Some(&after))?);
             let verified =
-                detect_macos_egress(&config, &public_targets, "after TUN reselection", None)
+                detect_macos_egress(&config, &public_targets, "after TUN reselection", None, &[])
                     .await?;
             ensure!(
                 verified.as_deref() == Some(after.as_str()),
@@ -488,6 +530,8 @@ pub async fn run(
     let mut next_egress_probe = tokio::time::Instant::now();
     #[cfg(target_os = "macos")]
     let (mut dns_pending, mut dns_waiting) = (false, false);
+    #[cfg(target_os = "macos")]
+    let mut cooldowns = EgressCooldowns::default();
     let result: Result<()> = async { loop {
             tokio::select! {
                 _ = stop.cancelled() => break Ok(()),
@@ -501,7 +545,8 @@ pub async fn run(
                     let selected = if tokio::time::Instant::now() >= next_egress_probe {
                         next_egress_probe = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
                         let current = desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).map(|exit| exit.name);
-                        match detect_macos_egress(&core.config, &public_targets, "network refresh", current.as_deref()).await {
+                        let avoid = cooldowns.active(std::time::Instant::now());
+                        match detect_macos_egress(&core.config, &public_targets, "network refresh", current.as_deref(), &avoid).await {
                             Ok(selected) => selected,
                             Err(error) => { tracing::warn!(%error, "physical egress detection failed; retrying"); None }
                         }
@@ -513,6 +558,18 @@ pub async fn run(
                     } else {
                         desktop.as_mut().unwrap().refresh()
                     };
+                    #[cfg(target_os = "macos")]
+                    if let Some(lost) = desktop.as_mut().unwrap().take_lost_interface() {
+                        let period = cooldowns.lost(&lost, std::time::Instant::now());
+                        // Probe the replacement on the next tick, not in 15 s.
+                        next_egress_probe = tokio::time::Instant::now();
+                        tracing::warn!(
+                            interface = %lost,
+                            replacement = ?desktop.as_ref().unwrap().hooks.network().ipv4.map(|exit| exit.name),
+                            cooldown_secs = period.as_secs(),
+                            "egress interface went away; using the current system exit"
+                        );
+                    }
                     // Also when only the address or gateway behind the same
                     // exit changed (another Wi-Fi on the same interface).
                     report_network(&core, desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).as_ref(), &mut reported);
@@ -663,6 +720,30 @@ mod dns_route_tests {
         );
         // A vanished current interface falls back to the best candidate.
         assert_eq!(best_egress_index(&[2], &[1], &[false], Some(3)), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_flapping_interface_stays_out_longer_each_time() {
+        use std::time::{Duration, Instant};
+        let mut cooldowns = EgressCooldowns::default();
+        let start = Instant::now();
+        assert_eq!(cooldowns.lost("en7", start), Duration::from_secs(30));
+        assert_eq!(cooldowns.active(start + Duration::from_secs(29)), ["en7"]);
+        assert!(cooldowns.active(start + Duration::from_secs(31)).is_empty());
+        // Lost again soon after coming back: twice as long.
+        let again = start + Duration::from_secs(40);
+        assert_eq!(cooldowns.lost("en7", again), Duration::from_secs(60));
+        let mut at = again;
+        for _ in 0..5 {
+            at += Duration::from_secs(1);
+            cooldowns.lost("en7", at);
+        }
+        assert_eq!(cooldowns.lost("en7", at), Duration::from_secs(300));
+        // Stable for long enough: forgotten, the next loss starts over.
+        let later = at + Duration::from_secs(300 * 3 + 1);
+        assert!(cooldowns.active(later).is_empty());
+        assert_eq!(cooldowns.lost("en7", later), Duration::from_secs(30));
     }
 }
 

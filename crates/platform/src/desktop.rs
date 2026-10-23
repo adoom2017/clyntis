@@ -578,6 +578,8 @@ pub struct DesktopTun {
     transaction: Transaction,
     tunnel: ExitInterface,
     selected_interface: Option<String>,
+    replaceable_interface: bool,
+    lost_interface: Option<String>,
     exclusions: Vec<IpNet>,
     auto_route: bool,
     ipv6: bool,
@@ -591,6 +593,9 @@ pub struct Options<'a> {
     pub ipv6: bool,
     pub auto_route: bool,
     pub interface: Option<&'a str>,
+    /// `interface` was detected rather than set in `tun.interface`: when it
+    /// loses its default route the system's current exit takes over.
+    pub replaceable_interface: bool,
     pub exclusions: &'a [IpNet],
     pub capture_dns: bool,
     pub upstream_dns: &'a [IpAddr],
@@ -683,6 +688,8 @@ impl DesktopTun {
                 gateway: None,
             },
             selected_interface: options.interface.map(str::to_owned),
+            replaceable_interface: options.replaceable_interface,
+            lost_interface: None,
             exclusions: options.exclusions.to_vec(),
             auto_route: options.auto_route,
             ipv6: options.ipv6,
@@ -774,6 +781,18 @@ impl DesktopTun {
     }
     pub fn refresh(&mut self) -> Result<bool> {
         let mut network = discover(self.selected_interface.as_deref(), Some(self.tunnel.index))?;
+        // An unplugged or flapping detected interface would otherwise leave
+        // no egress until the next probe, although another exit is up. Keep
+        // the replacement selected so the lost one coming back does not
+        // switch straight back; only a probe moves off it again.
+        if network.ipv4.is_none()
+            && self.replaceable_interface
+            && let Some(lost) = self.selected_interface.take()
+        {
+            network = discover(None, Some(self.tunnel.index))?;
+            self.selected_interface = network.ipv4.as_ref().map(|exit| exit.name.clone());
+            self.lost_interface = Some(lost);
+        }
         let previous = self.hooks.network();
         // DNS settings may change when the macOS service is pointed at our
         // local listener. Without DNS host routes this is not an egress change.
@@ -788,6 +807,10 @@ impl DesktopTun {
         self.transaction
             .apply(self.desired_routes()?, &mut RouteManager::new()?)?;
         Ok(true)
+    }
+    /// The selected interface that `refresh` last replaced because it went away.
+    pub fn take_lost_interface(&mut self) -> Option<String> {
+        self.lost_interface.take()
     }
     pub fn select_interface(&mut self, interface: &str) -> Result<bool> {
         self.selected_interface = Some(interface.to_owned());
