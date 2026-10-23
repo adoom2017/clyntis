@@ -366,22 +366,31 @@ impl Resolver {
         let capacity = self.fake.lock().unwrap().capacity;
         let mut map = FakeMap::new(capacity);
         let mut skipped = 0usize;
+        let mut outside = 0usize;
         for (name, ip) in entries {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
+            // Saved under an earlier fake-ip-range or fake-ip-range6. They
+            // cannot collide with the current pool, so nothing to advance past.
+            let in_pool = match ip {
+                IpAddr::V4(ip) => {
+                    let net = self.config.fake_ip_range;
+                    net.contains(ip) && *ip != net.broadcast()
+                }
+                IpAddr::V6(ip) => self.config.fake_ip_range6.contains(ip),
+            };
+            if !in_pool {
+                outside += 1;
+                continue;
+            }
             match ip {
                 IpAddr::V4(ip) => {
                     let net = self.config.fake_ip_range;
-                    ensure!(
-                        net.contains(ip) && *ip != net.broadcast(),
-                        "saved fake-IP outside pool"
-                    );
                     let n = u64::from(u32::from(*ip)) - u64::from(u32::from(net.network()));
                     ensure!(n >= 2, "reserved fake-IP");
                     map.next4 = map.next4.max(n + 1);
                 }
                 IpAddr::V6(ip) => {
                     let net = self.config.fake_ip_range6;
-                    ensure!(net.contains(ip), "saved fake-IP outside pool");
                     let n = u128::from(*ip) - u128::from(net.network());
                     ensure!(n >= 2, "reserved fake-IP");
                     map.next6 = map
@@ -413,6 +422,12 @@ impl Resolver {
             tracing::warn!(
                 skipped,
                 "ignored unsupported hostnames in saved fake-IP cache; valid mappings retained"
+            );
+        }
+        if outside != 0 {
+            tracing::info!(
+                dropped = outside,
+                "dropped saved fake-IP mappings outside the configured fake-IP ranges"
             );
         }
         Ok(())

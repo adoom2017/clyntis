@@ -221,10 +221,16 @@ async fn policy_proxy_resolver_hosts_and_fake_persistence() {
         assert_eq!(next.original(fake).as_deref(), Some("persist.test"));
         assert_eq!(next.fake_address("persist.test", false).unwrap(), fake);
         assert_ne!(next.fake_address("new.test", false).unwrap(), fake);
-        assert!(
-            next.import_fake(&[("bad.test".into(), "8.8.8.8".parse().unwrap())])
-                .is_err()
-        );
+        // Saved under another fake-ip-range (or fake-ip-range6): dropped, and
+        // the rest still restored, so changing a range does not stop the core.
+        next.import_fake(&[
+            ("old.test".into(), "8.8.8.8".parse().unwrap()),
+            ("old6.test".into(), "fdfe:dcba:9875::5".parse().unwrap()),
+            ("persist.test".into(), fake),
+        ])
+        .unwrap();
+        assert_eq!(next.original("8.8.8.8".parse().unwrap()), None);
+        assert_eq!(next.original(fake).as_deref(), Some("persist.test"));
         server.await.unwrap();
     })
     .await
