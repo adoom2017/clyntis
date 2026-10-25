@@ -111,7 +111,7 @@ proxies:
   - name: Tailscale
     type: tailscale
     auth-key: tskey-auth-...      # required for the first login
-    hostname: my-mac              # optional; default clyntis-<os>
+    hostname: '{device}-clyntis'  # optional; default clyntis-{os}
     ephemeral: false              # optional
     accept-routes: true           # optional: use peers' advertised subnet routes
     exit-node: us-exit            # optional: node name or 100.x address
@@ -125,6 +125,11 @@ rules:
 
 - Fields follow mihomo's; `exit-node-allow-lan-access` is accepted for
   compatibility and has no effect in a proxy. `dialer-proxy` is an addition.
+- `hostname` may contain `{os}` (`macos`, `ios`, `windows`, `linux`) and
+  `{device}` (the device's host name, lowercased; the OS when the system
+  reports none or `localhost`). A profile shared by several devices needs one of them: with a
+  fixed name the control server numbers the copies (`name-1`, `name-2`). A
+  node already numbered may need renaming once in the admin console.
 - Control: the ts2021 Noise transport (HTTP upgrade, then HTTP/2) registers the
   node with the auth key and streams the network map. Machine and node keys
   persist in `state-dir` (default `tailscale/<proxy name>/state.json`, mode

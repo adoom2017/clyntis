@@ -704,13 +704,15 @@ impl Config {
                         );
                     }
                     if let Some(hostname) = &t.hostname {
+                        // {os} and {device} are filled in on each device.
+                        let literal = hostname.replace("{os}", "os").replace("{device}", "device");
                         ensure!(
-                            !hostname.is_empty()
-                                && hostname.len() <= 63
-                                && hostname
+                            !literal.is_empty()
+                                && literal.len() <= 63
+                                && literal
                                     .bytes()
                                     .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-                            "proxy {}: hostname must be a DNS label",
+                            "proxy {}: hostname must be a DNS label (with optional {{os}} and {{device}})",
                             p.name
                         );
                     }
