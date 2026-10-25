@@ -13,6 +13,7 @@ use the `crypto_box` crate. No external proxy kernel, Tailscale daemon or Go
 Local foundation patches:
 
 - `boring-sys/`: see `BORINGSSL-PATCH.md` for ClientHello ordering and REALITY hooks.
+- `netdev/`: see `NETDEV-PATCH.md` for the macOS SystemConfiguration crash.
 - `route_manager/`: see `ROUTE-MANAGER-PATCH.md` for complete Linux route dumps.
 
 Original upstream licenses are preserved in each directory. `Cargo.lock` pins

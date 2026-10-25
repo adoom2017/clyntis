@@ -26,6 +26,7 @@ clyntis-desktop-service = { path = "service" }
 
 [patch.crates-io]
 boring-sys = { path = "../third-party/boring-sys" }
+netdev = { path = "../third-party/netdev" }
 route_manager = { path = "../third-party/route_manager" }
 
 [profile.release]

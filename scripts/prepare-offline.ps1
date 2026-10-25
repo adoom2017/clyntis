@@ -56,7 +56,7 @@ offline = true
             license = $package.license
             license_file = if ($package.license_file) { Split-Path $package.license_file -Leaf } else { $null }
             sha256 = $checksum
-            local_patch = $package.name -in @('boring-sys', 'route_manager') -and -not $package.source
+            local_patch = $package.name -in @('boring-sys', 'netdev', 'route_manager') -and -not $package.source
         }
     }
     $revision = git rev-parse HEAD

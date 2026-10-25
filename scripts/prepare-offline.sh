@@ -75,7 +75,7 @@ for package in sorted(packages, key=lambda value: (value["name"], value["version
                           source=source, license=package.get("license"),
                           license_file=pathlib.Path(package["license_file"]).name if package.get("license_file") else None,
                           sha256=checksum,
-                          local_patch=package["name"] in ("boring-sys", "route_manager") and not source))
+                          local_patch=package["name"] in ("boring-sys", "netdev", "route_manager") and not source))
 
 revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=workspace, text=True, capture_output=True)
 dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=workspace)
