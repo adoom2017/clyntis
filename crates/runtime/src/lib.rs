@@ -342,11 +342,46 @@ pub async fn detect_macos_egress(
     Ok(selected.map(|index| candidates[index].name.clone()))
 }
 
+/// Descriptors a proxy carrying every connection of the machine may hold open.
+#[cfg(unix)]
+const FILE_LIMIT: libc::rlim_t = 10240;
+
+/// Raises the soft descriptor limit, which launchd daemons start at 256.
+/// Busy UDP traffic exhausts that: sockets stop opening, and macOS
+/// SystemConfiguration crashes the process when it cannot open its own files.
+#[cfg(unix)]
+fn raise_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    let wanted = FILE_LIMIT.min(limit.rlim_max);
+    if limit.rlim_cur >= wanted {
+        return;
+    }
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = wanted;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } == 0 {
+        eprintln!("Open file limit raised from {previous} to {wanted}");
+    } else {
+        eprintln!(
+            "cannot raise open file limit from {previous}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 pub async fn run(
     config: Config,
     stop: CancellationToken,
     ready: Option<oneshot::Sender<RuntimeReady>>,
 ) -> Result<()> {
+    #[cfg(unix)]
+    raise_file_limit();
     let directory = config.directory.clone();
     eprintln!(
         "TLS backend: BoringSSL; default client fingerprint: {}",

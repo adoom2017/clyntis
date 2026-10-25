@@ -777,6 +777,7 @@ dependencies = [
  "clyntis-core",
  "clyntis-platform",
  "flate2",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",
