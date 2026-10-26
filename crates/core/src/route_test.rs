@@ -94,7 +94,7 @@ impl Core {
             ip,
             index,
             looked_up,
-        } = self.trace_route(&target, network, false).await?;
+        } = self.trace_route(&target, None, network, false).await?;
         let rule = index.and_then(|i| self.policy.read().unwrap().raw_rules.get(i).cloned());
         let chain = self.chain(&decision.group)?;
         Ok(RouteTest {

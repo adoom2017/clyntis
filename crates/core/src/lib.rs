@@ -699,11 +699,22 @@ impl Core {
         target: &Target,
         network: &str,
     ) -> Result<RouteDecision> {
-        Ok(self.trace_route(target, network, true).await?.decision)
+        Ok(self
+            .trace_route(target, None, network, true)
+            .await?
+            .decision)
     }
-    /// Routes `target` like a connection would. `record` counts an ad block
-    /// hit; route tests leave the counters alone.
-    async fn trace_route(&self, target: &Target, network: &str, record: bool) -> Result<Trace> {
+    /// Routes `target` like a connection would. `address` is the IP the client
+    /// dialed when `target` names a sniffed domain instead: IP rules still
+    /// match it, as in mihomo. `record` counts an ad block hit; route tests
+    /// leave the counters alone.
+    async fn trace_route(
+        &self,
+        target: &Target,
+        address: Option<std::net::IpAddr>,
+        network: &str,
+        record: bool,
+    ) -> Result<Trace> {
         // Ad blocking precedes every rule and mode. DNS already refused the
         // listed names, so this catches apps that resolved them some other
         // way, plus HTTPDNS endpoints, listed addresses and QUIC to bare
@@ -733,7 +744,7 @@ impl Core {
                 None,
             ));
         }
-        let mut ip = target.ip();
+        let mut ip = target.ip().or(address);
         let mut resolved = ip.is_some();
         let mut looked_up = false;
         let host = target.host.trim_end_matches('.').to_ascii_lowercase();

@@ -545,7 +545,9 @@ async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> 
     let source = flow.source.to_string();
     if core.wants_sniff(&core.restore_target(&target)) {
         let (route, destination, prefix) = core.sniff_target(&mut stream, &target).await?;
-        let (mut outbound, name) = core.dial_sniffed(&route, &destination, &source).await?;
+        let (mut outbound, name) = core
+            .dial_sniffed(&route, &destination, &target, &source)
+            .await?;
         outbound.write_all(&prefix).await?;
         return core.relay(Box::new(stream), route, outbound, name).await;
     }

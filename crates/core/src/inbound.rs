@@ -141,7 +141,7 @@ async fn socks_connection(core: Arc<Core>, mut stream: TcpStream, peer: SocketAd
         stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
         let (route, destination, prefix) = core.sniff_target(&mut stream, &target).await?;
         let (mut outbound, name) = core
-            .dial_sniffed(&route, &destination, &peer.to_string())
+            .dial_sniffed(&route, &destination, &target, &peer.to_string())
             .await?;
         outbound.write_all(&prefix).await?;
         return core.relay(Box::new(stream), route, outbound, name).await;
@@ -281,7 +281,7 @@ async fn http_connection(core: Arc<Core>, stream: &mut TcpStream, peer: SocketAd
             .await?;
         let (route, destination, prefix) = core.sniff_target(stream, &target).await?;
         let (mut outbound, node) = core
-            .dial_sniffed(&route, &destination, &peer.to_string())
+            .dial_sniffed(&route, &destination, &target, &peer.to_string())
             .await?;
         outbound.write_all(&prefix).await?;
         return core.relay_io(stream, route, outbound, node).await;

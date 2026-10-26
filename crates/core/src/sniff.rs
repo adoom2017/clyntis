@@ -184,13 +184,21 @@ impl crate::Core {
         }
         Ok((route, destination, prefix))
     }
+    /// Dials a sniffed connection. `dialed` is the target the client asked
+    /// for, whose address IP rules keep matching after the sniffed domain
+    /// replaced it for routing.
     pub(crate) async fn dial_sniffed(
         &self,
         route: &Target,
         destination: &Target,
+        dialed: &Target,
         source: &str,
     ) -> anyhow::Result<(clyntis_protocol::BoxStream, String)> {
-        let decision = self.route_decision(route, "tcp").await?;
+        let address = self.restore_target(dialed).ip();
+        let decision = self
+            .trace_route(route, address, "tcp", true)
+            .await?
+            .decision;
         if decision.node == "REJECT" {
             Self::log_connection("TCP", source, route, &decision);
             anyhow::bail!(crate::Rejected(decision));
@@ -243,6 +251,36 @@ mod tests {
             .expect("stale fake-IP must not dial");
         assert!(format!("{error:#}").contains("has no domain"), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A sniffed domain routes the connection, but IP rules still see the
+    /// address the client dialed (hosts entries, LAN services behind a VPN).
+    #[tokio::test]
+    async fn ip_rules_match_the_dialed_address_after_sniffing() {
+        let config = clyntis_config::Config::parse(
+            concat!(
+                "rules:\n",
+                "- IP-CIDR,192.168.2.0/24,REJECT,no-resolve\n",
+                "- MATCH,DIRECT\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let core =
+            crate::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let dialed = Target::new("192.168.2.181", 443).unwrap();
+        let sniffed = Target::new("nas.example", 443).unwrap();
+        for destination in [&dialed, &sniffed] {
+            let error = core
+                .dial_sniffed(&sniffed, destination, &dialed, "test")
+                .await
+                .err()
+                .expect("the IP rule must reject");
+            assert!(
+                error.downcast_ref::<crate::Rejected>().is_some(),
+                "{error:#}"
+            );
+        }
     }
 
     #[tokio::test]
