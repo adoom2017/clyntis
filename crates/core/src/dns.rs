@@ -289,7 +289,8 @@ impl Resolver {
         Ok(())
     }
     /// Real lookups (DIRECT dials, non-fake-ip answers) resolve tailnet names
-    /// to their 100.x addresses; fake-ip answers keep the domain for rules.
+    /// to their 100.x addresses unless hosts names the host; fake-ip answers
+    /// keep the domain for rules.
     pub fn set_tailnet_names(&self, names: Option<TailnetNames>) {
         *self.tailnet.write().unwrap() = names;
     }
@@ -438,10 +439,8 @@ impl Resolver {
     }
     pub async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         let mut host = host.trim_end_matches('.').to_ascii_lowercase();
-        let tailnet = self.tailnet.read().unwrap().clone();
-        if let Some(ip) = tailnet.and_then(|names| names(&host)) {
-            return Ok(vec![SocketAddr::new(ip, port)]);
-        }
+        // hosts entries come first: a device's LAN address configured for one
+        // network wins over its tailnet name (same short name in MagicDNS).
         for depth in 0..16 {
             let Some(values) = self.host_values(&host) else {
                 break;
@@ -460,6 +459,10 @@ impl Resolver {
                 "invalid or cyclic hosts alias"
             );
             host = values[0].trim_end_matches('.').to_ascii_lowercase();
+        }
+        let tailnet = self.tailnet.read().unwrap().clone();
+        if let Some(ip) = tailnet.and_then(|names| names(&host)) {
+            return Ok(vec![SocketAddr::new(ip, port)]);
         }
         let host = host.as_str();
         if let Ok(ip) = host.parse::<IpAddr>() {

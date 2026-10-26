@@ -471,3 +471,32 @@ fn fake_ip_capacity_evicts_the_least_recently_queried_without_reusing_addresses(
     let kept: Vec<_> = next.export_fake().into_iter().map(|e| e.0).collect();
     assert_eq!(kept, ["n48.test", "n49.test"]);
 }
+
+/// A hosts entry (a LAN address for one network) wins over the same short
+/// name in the tailnet; other tailnet names still resolve to 100.x.
+#[tokio::test]
+async fn hosts_entries_win_over_tailnet_names() {
+    let resolver = Resolver::new(
+        Dns::default(),
+        std::sync::Arc::new(clyntis_platform::DefaultHooks),
+    );
+    resolver.set_tailnet_names(Some(Arc::new(|host: &str| {
+        matches!(host, "pi5" | "nas").then(|| "100.104.16.87".parse().unwrap())
+    })));
+    let mut hosts = std::collections::BTreeMap::new();
+    hosts.insert(
+        "pi5".into(),
+        clyntis_config::Strings::One("192.168.2.99".into()),
+    );
+    resolver
+        .configure(&hosts, None, &crate::resources::Resources::default())
+        .unwrap();
+    assert_eq!(
+        resolver.lookup("PI5.", 22).await.unwrap(),
+        vec!["192.168.2.99:22".parse().unwrap()]
+    );
+    assert_eq!(
+        resolver.lookup("nas", 22).await.unwrap(),
+        vec!["100.104.16.87:22".parse().unwrap()]
+    );
+}
