@@ -181,6 +181,16 @@ fn options(core: &Core, proxy: &Proxy) -> clyntis_tailscale::Options {
         accept_routes: t.accept_routes.unwrap_or(false),
         exit_node: t.exit_node.clone(),
         os: os().into(),
+        serve: t
+            .serve
+            .iter()
+            .flatten()
+            .map(|rule| clyntis_tailscale::ServeRule {
+                port: rule.port,
+                to: rule.to,
+                allow: rule.allow.clone(),
+            })
+            .collect(),
     }
 }
 

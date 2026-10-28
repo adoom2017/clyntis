@@ -1,5 +1,5 @@
-//! Userspace TCP/IP for outbound connections from this node's tailnet
-//! addresses. IP packets go to and come from the WireGuard router.
+//! Userspace TCP/IP for connections from this node's tailnet addresses, and
+//! to its `serve` ports. IP packets go to and come from the WireGuard router.
 use anyhow::{Result, bail};
 use clyntis_protocol::BoxStream;
 use smoltcp::{
@@ -10,11 +10,14 @@ use smoltcp::{
     wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint},
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -34,9 +37,86 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Retry interval while packets wait for room in a full router queue.
 const BACKLOG_RETRY: Duration = Duration::from_millis(10);
 
+/// First local port of outbound connections; `serve` ports stay below it.
+const FIRST_PORT: u16 = 49152;
+const LAST_PORT: u16 = 65000;
+
 pub enum Command {
     Connect(SocketAddr, oneshot::Sender<Result<BoxStream>>),
     Addresses(Vec<ipnet::IpNet>),
+}
+
+/// The `serve` ports and the peer addresses allowed on each (`None`: every
+/// peer in the network map, which the router already enforces).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Gate {
+    pub ports: BTreeMap<u16, Option<Vec<IpAddr>>>,
+}
+impl Gate {
+    /// Whether a decrypted packet may enter the stack. Only TCP to a `serve`
+    /// port is checked; everything else is the stack's own traffic. Denied
+    /// packets vanish without a RST, so probes cannot tell the port is open.
+    fn admits(&self, packet: &[u8]) -> Admission {
+        if self.ports.is_empty() {
+            return Admission::Pass;
+        }
+        let (source, tcp) = match packet.first().map(|b| b >> 4) {
+            Some(4) if packet.len() >= 20 => {
+                let header = usize::from(packet[0] & 0x0f) * 4;
+                if packet[9] != 6 || header < 20 {
+                    return Admission::Pass;
+                }
+                let source: [u8; 4] = packet[12..16].try_into().unwrap();
+                (IpAddr::from(source), packet.get(header..))
+            }
+            Some(6) if packet.len() >= 40 => {
+                match packet[6] {
+                    6 => {}
+                    // Extension headers could carry TCP past this check.
+                    0 | 43 | 44 | 60 => return Admission::Denied { syn: false },
+                    _ => return Admission::Pass,
+                }
+                let source: [u8; 16] = packet[8..24].try_into().unwrap();
+                (IpAddr::from(source), packet.get(40..))
+            }
+            _ => return Admission::Pass,
+        };
+        let Some(tcp) = tcp.filter(|tcp| tcp.len() >= 14) else {
+            return Admission::Denied { syn: false };
+        };
+        let port = u16::from_be_bytes([tcp[2], tcp[3]]);
+        match self.ports.get(&port) {
+            None => Admission::Pass,
+            Some(None) => Admission::Pass,
+            Some(Some(allowed)) if allowed.contains(&source) => Admission::Pass,
+            Some(Some(_)) => Admission::Denied {
+                syn: tcp[13] & 0x12 == 0x02,
+            },
+        }
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Pass,
+    /// `syn`: a connection attempt, counted once.
+    Denied {
+        syn: bool,
+    },
+}
+
+/// A connection a peer opened to a `serve` port.
+pub struct Accepted {
+    pub remote: SocketAddr,
+    pub port: u16,
+    pub stream: BoxStream,
+}
+
+/// Inbound counters for status displays.
+#[derive(Debug, Default)]
+pub struct ServeStats {
+    pub active: AtomicUsize,
+    pub accepted: AtomicU64,
+    pub denied: AtomicU64,
 }
 
 struct PacketDevice {
@@ -161,6 +241,13 @@ impl Drop for Stream {
     }
 }
 
+/// Who receives a connection once it is established.
+enum Waiter {
+    Dial(oneshot::Sender<Result<BoxStream>>),
+    /// Accepted on this `serve` port.
+    Accept(u16),
+}
+
 struct Flow {
     handle: SocketHandle,
     remote: IpAddr,
@@ -169,7 +256,73 @@ struct Flow {
     pending: Option<(Vec<u8>, usize)>,
     eof: bool,
     /// Until established: where to hand the stream, and when to give up.
-    connecting: Option<(oneshot::Sender<Result<BoxStream>>, Instant, Option<Stream>)>,
+    connecting: Option<(Waiter, Instant, Option<Stream>)>,
+    inbound: bool,
+}
+impl Flow {
+    fn new(handle: SocketHandle, remote: IpAddr, waiter: Waiter, wake: &Arc<Notify>) -> Self {
+        let (input, receiver) = mpsc::channel(QUEUE);
+        let (sender, output) = mpsc::channel(QUEUE);
+        let stream = Stream {
+            input: receiver,
+            pending: None,
+            output: Some(PollSender::new(sender)),
+            wake: wake.clone(),
+        };
+        Self {
+            handle,
+            remote,
+            input: Some(input),
+            output,
+            pending: None,
+            eof: false,
+            inbound: matches!(waiter, Waiter::Accept(_)),
+            connecting: Some((waiter, Instant::now() + CONNECT_TIMEOUT, Some(stream))),
+        }
+    }
+}
+
+fn tcp_socket() -> tcp::Socket<'static> {
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; BUFFER]),
+        tcp::SocketBuffer::new(vec![0; BUFFER]),
+    );
+    socket.set_nagle_enabled(false);
+    socket.set_ack_delay(None);
+    socket.set_keep_alive(Some(NetDuration::from_secs(30)));
+    socket.set_timeout(Some(NetDuration::from_secs(300)));
+    socket
+}
+
+/// Keeps one listening socket per `serve` port once the node has addresses.
+fn sync_listeners(
+    listeners: &mut BTreeMap<u16, SocketHandle>,
+    sockets: &mut SocketSet<'static>,
+    gate: &Gate,
+    addressed: bool,
+) {
+    listeners.retain(|port, handle| {
+        let keep = addressed && gate.ports.contains_key(port);
+        if !keep {
+            sockets.remove(*handle);
+        }
+        keep
+    });
+    if !addressed {
+        return;
+    }
+    for &port in gate.ports.keys() {
+        if listeners.contains_key(&port) {
+            continue;
+        }
+        let mut socket = tcp_socket();
+        match socket.listen(port) {
+            Ok(()) => {
+                listeners.insert(port, sockets.add(socket));
+            }
+            Err(error) => tracing::warn!(port, %error, "Tailscale serve cannot listen"),
+        }
+    }
 }
 
 /// smoltcp sends one segment per socket per egress pass; keep transmitting
@@ -188,6 +341,24 @@ fn poll(
     }
 }
 
+fn admit(gate: &Gate, stats: &ServeStats, queue: &mut VecDeque<Vec<u8>>, packet: Vec<u8>) {
+    match gate.admits(&packet) {
+        Admission::Pass => queue.push_back(packet),
+        Admission::Denied { syn: true } => {
+            stats.denied.fetch_add(1, Ordering::Relaxed);
+        }
+        Admission::Denied { syn: false } => {}
+    }
+}
+
+/// The inbound side of [`run`]: which ports to serve, where accepted
+/// connections go, and the counters to update.
+pub struct Inbound {
+    pub gate: watch::Receiver<Gate>,
+    pub accepted: mpsc::Sender<Accepted>,
+    pub stats: Arc<ServeStats>,
+}
+
 /// Runs the stack until `stop`: `commands` opens connections, `incoming`
 /// carries decrypted packets from peers, `outgoing` takes packets to encrypt.
 /// `open` lists the peer addresses with open connections, so the router
@@ -197,8 +368,17 @@ pub async fn run(
     mut incoming: mpsc::Receiver<Vec<u8>>,
     outgoing: mpsc::Sender<Vec<u8>>,
     open: watch::Sender<Vec<IpAddr>>,
+    inbound: Inbound,
     stop: CancellationToken,
 ) {
+    let Inbound {
+        mut gate,
+        accepted,
+        stats,
+    } = inbound;
+    let mut current = gate.borrow_and_update().clone();
+    let mut gate_open = true;
+    let mut listeners: BTreeMap<u16, SocketHandle> = BTreeMap::new();
     let started = Instant::now();
     let now = || NetInstant::from_millis(started.elapsed().as_millis() as i64);
     let mut device = PacketDevice {
@@ -210,7 +390,7 @@ pub async fn run(
     let mut iface = Interface::new(config, &mut device, now());
     let mut sockets = SocketSet::new(vec![]);
     let mut flows: Vec<Flow> = Vec::new();
-    let mut next_port: u16 = 49152;
+    let mut next_port: u16 = FIRST_PORT;
     let wake = Arc::new(Notify::new());
     // When smoltcp next needs to run (retransmits, keep-alives, timeouts) or
     // a pending connect expires; otherwise the stack sleeps until woken. A
@@ -226,6 +406,14 @@ pub async fn run(
         tokio::select! {
             biased;
             _ = stop.cancelled() => break,
+            changed = gate.changed(), if gate_open => match changed {
+                Ok(()) => {
+                    current = gate.borrow_and_update().clone();
+                    let addressed = !iface.ip_addrs().is_empty();
+                    sync_listeners(&mut listeners, &mut sockets, &current, addressed);
+                }
+                Err(_) => gate_open = false,
+            },
             command = commands.recv() => match command {
                 None => break,
                 Some(Command::Addresses(addresses)) => {
@@ -245,6 +433,7 @@ pub async fn run(
                             IpAddr::V6(v6) => { let _ = routes.add_default_ipv6_route(v6); }
                         }
                     }
+                    sync_listeners(&mut listeners, &mut sockets, &current, !addresses.is_empty());
                 }
                 Some(Command::Connect(remote, reply)) => {
                     let local = iface.ip_addrs().iter().map(|c| c.address()).find(|a| {
@@ -254,35 +443,24 @@ pub async fn run(
                         let _ = reply.send(Err(anyhow::anyhow!("this node has no tailnet address for {remote}")));
                         continue;
                     };
-                    let mut socket = tcp::Socket::new(
-                        tcp::SocketBuffer::new(vec![0; BUFFER]),
-                        tcp::SocketBuffer::new(vec![0; BUFFER]),
-                    );
-                    socket.set_nagle_enabled(false);
-                    socket.set_ack_delay(None);
-                    socket.set_keep_alive(Some(NetDuration::from_secs(30)));
-                    socket.set_timeout(Some(NetDuration::from_secs(300)));
-                    next_port = if next_port >= 65000 { 49152 } else { next_port + 1 };
+                    let mut socket = tcp_socket();
+                    next_port = if next_port >= LAST_PORT { FIRST_PORT } else { next_port + 1 };
                     let endpoint = IpEndpoint::new(remote.ip().into(), remote.port());
                     if let Err(error) = socket.connect(iface.context(), endpoint, (local, next_port)) {
                         let _ = reply.send(Err(anyhow::anyhow!("tailnet connect: {error}")));
                         continue;
                     }
                     let handle = sockets.add(socket);
-                    let (input, receiver) = mpsc::channel(QUEUE);
-                    let (sender, output) = mpsc::channel(QUEUE);
-                    let stream = Stream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
-                    flows.push(Flow { handle, remote: remote.ip(), input: Some(input), output, pending: None, eof: false,
-                        connecting: Some((reply, Instant::now() + CONNECT_TIMEOUT, Some(stream))) });
+                    flows.push(Flow::new(handle, remote.ip(), Waiter::Dial(reply), &wake));
                 }
             },
             packet = incoming.recv() => match packet {
                 None => break,
                 Some(packet) => {
-                    device.incoming.push_back(packet);
+                    admit(&current, &stats, &mut device.incoming, packet);
                     while device.incoming.len() < 256 {
                         let Ok(packet) = incoming.try_recv() else { break };
-                        device.incoming.push_back(packet);
+                        admit(&current, &stats, &mut device.incoming, packet);
                     }
                 }
             },
@@ -290,24 +468,75 @@ pub async fn run(
             _ = timer => {},
         }
         poll(&mut iface, now(), &mut device, &mut sockets);
+        // A listening socket that took a SYN carries that connection from
+        // now on (smoltcp has no backlog); a fresh one takes the next.
+        for (&port, handle) in listeners.iter_mut() {
+            let socket = sockets.get::<tcp::Socket>(*handle);
+            if socket.state() == tcp::State::Listen {
+                continue;
+            }
+            let remote = socket
+                .remote_endpoint()
+                .map(|endpoint| IpAddr::from(endpoint.addr));
+            let mut fresh = tcp_socket();
+            if fresh.listen(port).is_err() {
+                continue;
+            }
+            let taken = std::mem::replace(handle, sockets.add(fresh));
+            match remote {
+                Some(remote) => flows.push(Flow::new(taken, remote, Waiter::Accept(port), &wake)),
+                None => {
+                    sockets.remove(taken);
+                }
+            }
+        }
         flows.retain_mut(|flow| {
             let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
             if let Some((_, deadline, _)) = &flow.connecting {
                 match socket.state() {
                     tcp::State::Established => {
-                        let (reply, _, stream) = flow.connecting.take().unwrap();
-                        let _ = reply.send(Ok(Box::new(stream.unwrap())));
+                        let (waiter, _, stream) = flow.connecting.take().unwrap();
+                        let stream: BoxStream = Box::new(stream.unwrap());
+                        match waiter {
+                            Waiter::Dial(reply) => {
+                                let _ = reply.send(Ok(stream));
+                            }
+                            Waiter::Accept(port) => {
+                                let remote = socket.remote_endpoint().map(|endpoint| {
+                                    SocketAddr::new(endpoint.addr.into(), endpoint.port)
+                                });
+                                let handed = remote.is_some_and(|remote| {
+                                    accepted
+                                        .try_send(Accepted {
+                                            remote,
+                                            port,
+                                            stream,
+                                        })
+                                        .is_ok()
+                                });
+                                if handed {
+                                    stats.accepted.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    socket.abort();
+                                }
+                            }
+                        }
                     }
                     tcp::State::Closed | tcp::State::TimeWait => {
-                        let (reply, _, _) = flow.connecting.take().unwrap();
-                        let _ =
-                            reply.send(Err(anyhow::anyhow!("tailnet peer refused the connection")));
+                        let (waiter, _, _) = flow.connecting.take().unwrap();
+                        if let Waiter::Dial(reply) = waiter {
+                            let _ = reply
+                                .send(Err(anyhow::anyhow!("tailnet peer refused the connection")));
+                        }
                         sockets.remove(flow.handle);
                         return false;
                     }
                     _ if Instant::now() >= *deadline => {
-                        let (reply, _, _) = flow.connecting.take().unwrap();
-                        let _ = reply.send(Err(anyhow::anyhow!("tailnet connection timed out")));
+                        let (waiter, _, _) = flow.connecting.take().unwrap();
+                        if let Waiter::Dial(reply) = waiter {
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("tailnet connection timed out")));
+                        }
                         socket.abort();
                         return true;
                     }
@@ -362,6 +591,10 @@ pub async fn run(
             }
         });
         poll(&mut iface, now(), &mut device, &mut sockets);
+        stats.active.store(
+            flows.iter().filter(|flow| flow.inbound).count(),
+            Ordering::Relaxed,
+        );
         let mut remotes: Vec<IpAddr> = flows.iter().map(|flow| flow.remote).collect();
         remotes.sort();
         remotes.dedup();
@@ -472,6 +705,283 @@ mod tests {
         }
     }
 
+    fn inbound(gate: Gate) -> (watch::Sender<Gate>, Inbound, mpsc::Receiver<Accepted>) {
+        let (gate, gate_rx) = watch::channel(gate);
+        let (accepted, accepted_rx) = mpsc::channel(8);
+        let inbound = Inbound {
+            gate: gate_rx,
+            accepted,
+            stats: Arc::new(ServeStats::default()),
+        };
+        (gate, inbound, accepted_rx)
+    }
+
+    /// A peer stack at `source` that opens `count` connections to
+    /// 100.64.0.1:`port` one after another, keeping each open, and reports
+    /// each echoed greeting. `states` shows every client socket's state.
+    async fn dialing_peer(
+        source: IpAddress,
+        port: u16,
+        count: usize,
+        mut from: mpsc::Receiver<Vec<u8>>,
+        to: mpsc::Sender<Vec<u8>>,
+        echoed: mpsc::Sender<String>,
+        states: watch::Sender<Vec<tcp::State>>,
+    ) {
+        let (sink, mut sent) = mpsc::channel(256);
+        let mut device = PacketDevice {
+            incoming: VecDeque::new(),
+            outgoing: sink,
+        };
+        let started = Instant::now();
+        let now = || NetInstant::from_millis(started.elapsed().as_millis() as i64);
+        let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, now());
+        iface.update_ip_addrs(|list| {
+            let _ = list.push(IpCidr::new(source, 32));
+        });
+        match source {
+            IpAddress::Ipv4(v4) => {
+                let _ = iface.routes_mut().add_default_ipv4_route(v4);
+            }
+            IpAddress::Ipv6(_) => unreachable!(),
+        }
+        let mut sockets = SocketSet::new(vec![]);
+        struct Client {
+            handle: SocketHandle,
+            greeted: bool,
+            received: Vec<u8>,
+            done: bool,
+        }
+        let mut clients: Vec<Client> = Vec::new();
+        loop {
+            if clients.len() < count && clients.iter().all(|client| client.done) {
+                let mut socket = tcp_socket();
+                let local = 40000 + clients.len() as u16;
+                socket
+                    .connect(iface.context(), (IpAddress::v4(100, 64, 0, 1), port), local)
+                    .unwrap();
+                clients.push(Client {
+                    handle: sockets.add(socket),
+                    greeted: false,
+                    received: Vec::new(),
+                    done: false,
+                });
+            }
+            while let Ok(packet) = from.try_recv() {
+                device.incoming.push_back(packet);
+            }
+            poll(&mut iface, now(), &mut device, &mut sockets);
+            for (index, client) in clients.iter_mut().enumerate() {
+                let socket = sockets.get_mut::<tcp::Socket>(client.handle);
+                let greeting = format!("hello {index}");
+                if !client.greeted && socket.can_send() {
+                    socket.send_slice(greeting.as_bytes()).unwrap();
+                    client.greeted = true;
+                }
+                if socket.can_recv() {
+                    socket
+                        .recv(|bytes| {
+                            client.received.extend_from_slice(bytes);
+                            (bytes.len(), ())
+                        })
+                        .unwrap();
+                }
+                if !client.done && client.received.len() == greeting.len() {
+                    client.done = true;
+                    let _ = echoed.try_send(String::from_utf8_lossy(&client.received).into_owned());
+                }
+            }
+            states.send_replace(
+                clients
+                    .iter()
+                    .map(|client| sockets.get::<tcp::Socket>(client.handle).state())
+                    .collect(),
+            );
+            poll(&mut iface, now(), &mut device, &mut sockets);
+            while let Ok(packet) = sent.try_recv() {
+                if to.send(packet).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Echoes every accepted connection.
+    async fn echo_accepted(
+        mut accepted: mpsc::Receiver<Accepted>,
+        seen: mpsc::Sender<(SocketAddr, u16)>,
+    ) {
+        while let Some(Accepted {
+            remote,
+            port,
+            stream,
+        }) = accepted.recv().await
+        {
+            let _ = seen.send((remote, port)).await;
+            tokio::spawn(async move {
+                let (mut read, mut write) = tokio::io::split(stream);
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    }
+
+    fn served(port: u16, allow: Option<Vec<IpAddr>>) -> Gate {
+        Gate {
+            ports: BTreeMap::from([(port, allow)]),
+        }
+    }
+
+    /// Starts this node's stack at 100.64.0.1 with `gate`, and a dialing
+    /// peer at `source`.
+    async fn serving(
+        gate: Gate,
+        source: IpAddress,
+        port: u16,
+        count: usize,
+    ) -> (
+        CancellationToken,
+        Arc<ServeStats>,
+        mpsc::Receiver<String>,
+        mpsc::Receiver<(SocketAddr, u16)>,
+        watch::Receiver<Vec<tcp::State>>,
+    ) {
+        let (commands, command_rx) = mpsc::channel(4);
+        let (to_stack, incoming) = mpsc::channel(256);
+        let (outgoing, from_stack) = mpsc::channel(256);
+        let (open, _open_rx) = watch::channel(Vec::new());
+        let stop = CancellationToken::new();
+        let (gate, inbound, accepted) = inbound(gate);
+        let stats = inbound.stats.clone();
+        tokio::spawn(run(
+            command_rx,
+            incoming,
+            outgoing,
+            open,
+            inbound,
+            stop.clone(),
+        ));
+        commands
+            .send(Command::Addresses(vec!["100.64.0.1/32".parse().unwrap()]))
+            .await
+            .unwrap();
+        let (echoed_tx, echoed) = mpsc::channel(8);
+        let (states_tx, states) = watch::channel(Vec::new());
+        let (seen_tx, seen) = mpsc::channel(8);
+        tokio::spawn(echo_accepted(accepted, seen_tx));
+        tokio::spawn(dialing_peer(
+            source, port, count, from_stack, to_stack, echoed_tx, states_tx,
+        ));
+        tokio::spawn(async move {
+            // Keep the gate's sender (and the stack's commands) alive.
+            let _keep = (gate, commands);
+            std::future::pending::<()>().await;
+        });
+        (stop, stats, echoed, seen, states)
+    }
+
+    #[tokio::test]
+    async fn accepts_peer_connections_on_serve_ports_one_after_another() {
+        let peer = IpAddress::v4(100, 64, 0, 2);
+        let (stop, stats, mut echoed, mut seen, _) =
+            serving(served(47821, None), peer, 47821, 2).await;
+        for index in 0..2 {
+            let reply = tokio::time::timeout(Duration::from_secs(5), echoed.recv())
+                .await
+                .expect("echo timed out")
+                .unwrap();
+            assert_eq!(reply, format!("hello {index}"));
+            let (remote, port) = seen.recv().await.unwrap();
+            assert_eq!(
+                remote,
+                SocketAddr::new("100.64.0.2".parse().unwrap(), 40000 + index)
+            );
+            assert_eq!(port, 47821);
+        }
+        // The first connection stayed open while the second was accepted.
+        assert_eq!(stats.accepted.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.active.load(Ordering::Relaxed), 2);
+        stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn drops_syns_from_peers_not_allowed_without_a_reset() {
+        let peer = IpAddress::v4(100, 64, 0, 2);
+        let allowed = vec!["100.64.0.9".parse().unwrap()];
+        let (stop, stats, mut echoed, mut seen, mut states) =
+            serving(served(47821, Some(allowed)), peer, 47821, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.denied.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SYN was not counted as denied");
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(echoed.try_recv().is_err());
+        assert!(seen.try_recv().is_err());
+        // No RST: the peer is still waiting for an answer.
+        assert_eq!(*states.borrow_and_update(), vec![tcp::State::SynSent]);
+        stop.cancel();
+    }
+
+    #[test]
+    fn gate_checks_only_tcp_to_serve_ports() {
+        fn tcp_v4(source: [u8; 4], port: u16, flags: u8) -> Vec<u8> {
+            let mut packet = vec![0; 40];
+            packet[0] = 0x45;
+            packet[9] = 6;
+            packet[12..16].copy_from_slice(&source);
+            packet[16..20].copy_from_slice(&[100, 64, 0, 1]);
+            packet[22..24].copy_from_slice(&port.to_be_bytes());
+            packet[33] = flags;
+            packet
+        }
+        let gate = served(47821, Some(vec!["100.64.0.2".parse().unwrap()]));
+        assert_eq!(
+            gate.admits(&tcp_v4([100, 64, 0, 2], 47821, 0x02)),
+            Admission::Pass
+        );
+        assert_eq!(
+            gate.admits(&tcp_v4([100, 64, 0, 3], 47821, 0x02)),
+            Admission::Denied { syn: true }
+        );
+        assert_eq!(
+            gate.admits(&tcp_v4([100, 64, 0, 3], 47821, 0x10)),
+            Admission::Denied { syn: false }
+        );
+        // Replies to our own outbound connections are never filtered.
+        assert_eq!(
+            gate.admits(&tcp_v4([100, 64, 0, 3], 49200, 0x12)),
+            Admission::Pass
+        );
+        let mut udp = tcp_v4([100, 64, 0, 3], 47821, 0x02);
+        udp[9] = 17;
+        assert_eq!(gate.admits(&udp), Admission::Pass);
+        // IPv6 extension headers could hide TCP from the check.
+        let mut v6 = vec![0; 60];
+        v6[0] = 0x60;
+        v6[6] = 0;
+        assert_eq!(gate.admits(&v6), Admission::Denied { syn: false });
+        assert_eq!(
+            served(47821, None).admits(&tcp_v4([100, 64, 0, 3], 47821, 0x02)),
+            Admission::Pass
+        );
+    }
+
+    #[test]
+    fn outbound_ports_stay_out_of_the_serve_range() {
+        let mut port = FIRST_PORT;
+        for _ in 0..40000 {
+            port = if port >= LAST_PORT {
+                FIRST_PORT
+            } else {
+                port + 1
+            };
+            assert!((FIRST_PORT..=LAST_PORT).contains(&port));
+        }
+    }
+
     #[tokio::test]
     async fn connects_and_carries_data_without_a_periodic_tick() {
         let (commands, command_rx) = mpsc::channel(4);
@@ -479,7 +989,15 @@ mod tests {
         let (outgoing, from_stack) = mpsc::channel(256);
         let (open, mut open_rx) = watch::channel(Vec::new());
         let stop = CancellationToken::new();
-        tokio::spawn(run(command_rx, incoming, outgoing, open, stop.clone()));
+        let (_gate, inbound, _accepted) = inbound(Gate::default());
+        tokio::spawn(run(
+            command_rx,
+            incoming,
+            outgoing,
+            open,
+            inbound,
+            stop.clone(),
+        ));
         tokio::spawn(echo_peer(from_stack, to_stack));
         commands
             .send(Command::Addresses(vec!["100.64.0.1/32".parse().unwrap()]))

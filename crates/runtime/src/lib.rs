@@ -567,6 +567,7 @@ pub async fn run(
     let (mut dns_pending, mut dns_waiting) = (false, false);
     #[cfg(target_os = "macos")]
     let mut cooldowns = EgressCooldowns::default();
+    let mut alias_failed = false;
     let result: Result<()> = async { loop {
             tokio::select! {
                 _ = stop.cancelled() => break Ok(()),
@@ -608,6 +609,26 @@ pub async fn run(
                     // Also when only the address or gateway behind the same
                     // exit changed (another Wi-Fi on the same interface).
                     report_network(&core, desktop.as_ref().and_then(|tun| tun.hooks.network().ipv4).as_ref(), &mut reported);
+                    // Served tailnet addresses on the TUN: local programs
+                    // (getifaddrs) can then announce them to their peers.
+                    {
+                        let tun = desktop.as_mut().unwrap();
+                        let wanted = core.tailnet_serve_addresses();
+                        match tun.set_aliases(&wanted) {
+                            Ok(changed) => {
+                                alias_failed = false;
+                                if changed {
+                                    tracing::info!(interface = tun.interface_name(), addresses = ?wanted, "tailnet serve addresses assigned to the TUN interface");
+                                }
+                            }
+                            Err(error) if !alias_failed => {
+                                alias_failed = true;
+                                tracing::warn!(interface = tun.interface_name(), error = %format!("{error:#}"), "cannot assign tailnet serve addresses to the TUN interface; retrying");
+                            }
+                            Err(_) => {}
+                        }
+                        core.set_tailnet_published((!tun.aliases().is_empty()).then(|| tun.interface_name()));
+                    }
                     match changed {
                         Ok(true) => {
                             #[cfg(target_os = "macos")]

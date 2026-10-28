@@ -1485,6 +1485,27 @@ impl Core {
         }
         out
     }
+    /// IPv4 tailnet addresses of the nodes that serve ports: assigned to the
+    /// TUN interface so local programs can find and announce them.
+    pub fn tailnet_serve_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+        let mut addresses: Vec<_> = self
+            .tailscale
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(clyntis_tailscale::Node::serve_address)
+            .collect();
+        addresses.sort();
+        addresses.dedup();
+        addresses
+    }
+    /// Records the interface holding [`Self::tailnet_serve_addresses`].
+    pub fn set_tailnet_published(&self, interface: Option<&str>) {
+        for node in self.tailscale.lock().unwrap().values() {
+            let shown = node.serve_address().and(interface).map(str::to_owned);
+            node.set_published(shown);
+        }
+    }
     pub fn connections(&self) -> Vec<Connection> {
         self.connections
             .lock()

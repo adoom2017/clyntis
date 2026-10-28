@@ -589,6 +589,8 @@ pub struct DesktopTun {
     capture_dns: bool,
     #[cfg(target_os = "macos")]
     upstream_dns: Vec<IpAddr>,
+    /// Extra addresses assigned to the TUN interface (served tailnet addresses).
+    aliases: Vec<std::net::Ipv4Addr>,
 }
 pub struct Options<'a> {
     pub name: &'a str,
@@ -699,6 +701,7 @@ impl DesktopTun {
             capture_dns: options.capture_dns,
             #[cfg(target_os = "macos")]
             upstream_dns: options.upstream_dns.to_vec(),
+            aliases: Vec::new(),
         };
         let desired = desktop.desired_routes()?;
         desktop.transaction.journal.dns_servers = desktop.hooks.network().dns_servers;
@@ -820,7 +823,43 @@ impl DesktopTun {
         self.refresh()
     }
     pub fn restore(&mut self) -> Result<()> {
+        let _ = self.set_aliases(&[]);
         self.transaction.restore(&mut RouteManager::new()?)
+    }
+    /// The TUN interface's name, e.g. `utun7`.
+    pub fn interface_name(&self) -> &str {
+        &self.tunnel.name
+    }
+    /// Makes `wanted` the TUN's extra addresses. Nothing to clean up after a
+    /// crash: they vanish with the interface. Returns whether any changed.
+    pub fn set_aliases(&mut self, wanted: &[std::net::Ipv4Addr]) -> Result<bool> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut changed = false;
+            for address in self.aliases.clone() {
+                if !wanted.contains(&address) {
+                    self.device.remove_alias(address)?;
+                    self.aliases.retain(|a| *a != address);
+                    changed = true;
+                }
+            }
+            for &address in wanted {
+                if !self.aliases.contains(&address) {
+                    self.device.add_alias(address)?;
+                    self.aliases.push(address);
+                    changed = true;
+                }
+            }
+            Ok(changed)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = wanted;
+            Ok(false)
+        }
+    }
+    pub fn aliases(&self) -> &[std::net::Ipv4Addr] {
+        &self.aliases
     }
 }
 impl Drop for DesktopTun {

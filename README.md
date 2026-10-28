@@ -118,6 +118,10 @@ proxies:
     control-url: https://...      # optional: Headscale or another control server
     state-dir: tailscale/home     # optional: relative to the configuration directory
     dialer-proxy: Proxy           # optional: carry control and DERP through this proxy/group
+    serve:                        # optional: accept tailnet connections, see below
+      - port: 47821
+        to: 127.0.0.1:47821
+        allow: [iphone, 100.101.102.103]
 rules:
   - IP-CIDR,100.64.0.0/10,Tailscale,no-resolve
   - DOMAIN-SUFFIX,ts.net,Tailscale
@@ -157,10 +161,25 @@ rules:
   ```
 - A network change rebinds the node's UDP socket, reconnects its DERP relays and
   rediscovers direct paths at once; WireGuard sessions continue.
+- `serve` (a Clyntis addition) accepts TCP connections from peers on `port` of
+  this node's tailnet address and relays them, unchanged (TLS included), to
+  `to` on this device. `to` must be a loopback or local address, so the node
+  never relays into the LAN; `port` cannot be 49152–65000, the node's own
+  outbound ports, or repeat. `allow` lists the peers that may connect, by
+  MagicDNS name or tailnet address, resolved again on each network map update;
+  without it every peer in the map may. Other peers' SYNs are dropped without
+  a reset, so the port does not look open. The local service sees connections
+  from 127.0.0.1; the log names the peer.
+- While a node serves ports, the desktop TUN interface also carries its IPv4
+  tailnet address (`ifconfig utun7` shows `inet 100.a.b.c --> 100.a.b.c`), so
+  programs that list addresses with `getifaddrs` can announce it. It goes away
+  with the TUN. Connecting to that address from this device stays local and
+  does not test the forwarding; try from another tailnet device. The proxy
+  status shows the rules, open/accepted/denied connections and the interface.
 - Limits: TCP only (UDP through Tailscale is not supported yet); login with an
   auth key only (an interactive login URL is logged but not awaited); node-key
-  expiry is not renewed automatically; no peer relays, port mapping or
-  Tailscale SSH/Funnel/Serve.
+  expiry is not renewed automatically; tailnet ACLs are not applied to `serve`
+  (use `allow`); no peer relays, port mapping or Tailscale SSH/Funnel.
 
 ### Per-network hosts, DNS and rules
 

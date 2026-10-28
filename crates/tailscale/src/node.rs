@@ -1,5 +1,6 @@
-//! The node: logs in, follows the network map, and opens TCP connections to
-//! tailnet addresses and MagicDNS names.
+//! The node: logs in, follows the network map, opens TCP connections to
+//! tailnet addresses and MagicDNS names, and forwards its `serve` ports to
+//! services on this device.
 use crate::{
     Dialer,
     control::{Control, ServerUrl},
@@ -16,9 +17,9 @@ use clyntis_protocol::BoxStream;
 use ipnet::IpNet;
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::Duration,
 };
 use tokio::sync::{mpsc, watch};
@@ -36,6 +37,16 @@ pub struct Options {
     pub accept_routes: bool,
     pub exit_node: Option<String>,
     pub os: String,
+    pub serve: Vec<ServeRule>,
+}
+
+/// A TCP port on this node's tailnet address forwarded to `to` on this device.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ServeRule {
+    pub port: u16,
+    pub to: SocketAddr,
+    /// MagicDNS names or tailnet addresses; `None`: every peer.
+    pub allow: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -102,6 +113,41 @@ impl NetMap {
         })
     }
 
+    /// Who may reach each `serve` port: `allow` names resolved against the
+    /// current map (unknown names admit nobody until they appear).
+    fn gate(&self, serve: &[ServeRule]) -> netstack::Gate {
+        let ports = serve
+            .iter()
+            .map(|rule| {
+                let allowed = rule.allow.as_ref().map(|allow| {
+                    let mut addresses: Vec<IpAddr> = allow
+                        .iter()
+                        .flat_map(|entry| match entry.trim().parse::<IpAddr>() {
+                            Ok(ip) => vec![ip],
+                            Err(_) => self
+                                .find(entry.trim())
+                                .map(|node| node.addresses.iter().map(IpNet::addr).collect())
+                                .unwrap_or_default(),
+                        })
+                        .collect();
+                    addresses.sort();
+                    addresses.dedup();
+                    addresses
+                });
+                (rule.port, allowed)
+            })
+            .collect();
+        netstack::Gate { ports }
+    }
+
+    /// The short MagicDNS name of the node with tailnet address `ip`.
+    fn name_of(&self, ip: IpAddr) -> Option<String> {
+        self.peers
+            .values()
+            .find(|node| node.addresses.iter().any(|a| a.addr() == ip))
+            .map(|node| node.fqdn().split('.').next().unwrap_or_default().to_owned())
+    }
+
     fn routes(&self, options: &Options, home: u32) -> Routes {
         let exit = options.exit_node.as_deref().and_then(|wanted| {
             let ip: Option<IpAddr> = wanted.parse().ok();
@@ -159,6 +205,10 @@ struct Inner {
     network: watch::Sender<u64>,
     /// "connecting", "running" or "error", with the last error.
     lifecycle: Mutex<(&'static str, Option<String>)>,
+    gate: watch::Sender<netstack::Gate>,
+    serve_stats: Arc<netstack::ServeStats>,
+    /// The interface showing this node's address to local programs.
+    published: Mutex<Option<String>>,
 }
 
 /// A snapshot for status displays.
@@ -173,6 +223,19 @@ pub struct Status {
     /// Our UDP candidates for direct paths.
     pub endpoints: Vec<String>,
     pub peers: Vec<PeerStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serve: Option<ServeStatus>,
+}
+/// Inbound `serve` forwarding.
+#[derive(serde::Serialize, Debug)]
+pub struct ServeStatus {
+    pub rules: Vec<ServeRule>,
+    /// Connections open now, accepted in total, and attempts refused by `allow`.
+    pub active: usize,
+    pub accepted: u64,
+    pub denied: u64,
+    /// Where this node's tailnet address is assigned for local programs.
+    pub interface: Option<String>,
 }
 #[derive(serde::Serialize, Debug)]
 pub struct PeerStatus {
@@ -209,11 +272,19 @@ impl Node {
         let (to_router, from_stack) = mpsc::channel(1024);
         let (to_stack, from_router) = mpsc::channel(1024);
         let (open, open_rx) = watch::channel(Vec::new());
+        let (gate, gate_rx) = watch::channel(netstack::Gate::default());
+        let (accepted, accepted_rx) = mpsc::channel(64);
+        let serve_stats = Arc::new(netstack::ServeStats::default());
         tokio::spawn(netstack::run(
             commands_rx,
             from_router,
             to_router,
             open,
+            netstack::Inbound {
+                gate: gate_rx,
+                accepted,
+                stats: serve_stats.clone(),
+            },
             stop.clone(),
         ));
         // One disco key for the node's lifetime: peers learn it from the map.
@@ -247,8 +318,12 @@ impl Node {
                 paths,
                 network,
                 lifecycle: Mutex::new(("connecting", None)),
+                gate,
+                serve_stats,
+                published: Mutex::new(None),
             }),
         };
+        tokio::spawn(forward(node.inner.clone(), accepted_rx, stop.clone()));
         let inner = node.inner.clone();
         tokio::spawn(async move {
             let mut state = state;
@@ -286,6 +361,29 @@ impl Node {
     /// rediscover direct paths now rather than when the old ones time out.
     pub fn network_changed(&self) {
         self.inner.network.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// This node's IPv4 tailnet address while it serves ports, for local
+    /// programs to discover (assigned to the TUN interface).
+    pub fn serve_address(&self) -> Option<Ipv4Addr> {
+        if self.inner.options.serve.is_empty() {
+            return None;
+        }
+        let netmap = self.inner.netmap.lock().unwrap();
+        netmap
+            .me
+            .as_ref()?
+            .addresses
+            .iter()
+            .find_map(|a| match a.addr() {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+    }
+
+    /// Records where [`Self::serve_address`] is assigned, for the status.
+    pub fn set_published(&self, interface: Option<String>) {
+        *self.inner.published.lock().unwrap() = interface;
     }
 
     pub fn status(&self) -> Status {
@@ -353,6 +451,13 @@ impl Node {
                 .flat_map(|me| me.addresses.iter().map(|a| a.addr().to_string()))
                 .collect(),
             home_derp: region(routes.home),
+            serve: (!inner.options.serve.is_empty()).then(|| ServeStatus {
+                rules: inner.options.serve.clone(),
+                active: inner.serve_stats.active.load(Ordering::Relaxed),
+                accepted: inner.serve_stats.accepted.load(Ordering::Relaxed),
+                denied: inner.serve_stats.denied.load(Ordering::Relaxed),
+                interface: inner.published.lock().unwrap().clone(),
+            }),
             endpoints: inner
                 .endpoints
                 .borrow()
@@ -401,6 +506,48 @@ impl Node {
             bail!("{ip} is not routed by this tailnet (no peer, subnet route or exit node)");
         }
         self.inner.stack.connect(SocketAddr::new(ip, port)).await
+    }
+}
+
+/// Relays each accepted `serve` connection to its local target, TLS and all.
+async fn forward(
+    inner: Arc<Inner>,
+    mut accepted: mpsc::Receiver<netstack::Accepted>,
+    stop: CancellationToken,
+) {
+    loop {
+        let netstack::Accepted {
+            remote,
+            port,
+            mut stream,
+        } = tokio::select! {
+            _ = stop.cancelled() => return,
+            next = accepted.recv() => match next {
+                Some(next) => next,
+                None => return,
+            },
+        };
+        let Some(rule) = inner.options.serve.iter().find(|rule| rule.port == port) else {
+            continue;
+        };
+        let target = rule.to;
+        let peer = inner.netmap.lock().unwrap().name_of(remote.ip());
+        tracing::info!(proxy = %inner.options.name, peer = ?peer, %remote, port, %target, "Tailscale serve accepted a connection");
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut local = match tokio::net::TcpStream::connect(target).await {
+                Ok(local) => local,
+                Err(error) => {
+                    tracing::debug!(%remote, %target, %error, "Tailscale serve: local target refused");
+                    return;
+                }
+            };
+            let _ = local.set_nodelay(true);
+            tokio::select! {
+                _ = stop.cancelled() => {}
+                _ = tokio::io::copy_bidirectional(&mut stream, &mut local) => {}
+            }
+        });
     }
 }
 
@@ -540,7 +687,7 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
         {
             continue;
         }
-        let (routes, me, peers, derp) = {
+        let (routes, me, peers, derp, gate) = {
             let mut netmap = inner.netmap.lock().unwrap();
             netmap.apply(map);
             (
@@ -548,8 +695,16 @@ async fn session(inner: &Arc<Inner>, state: &mut State) -> Result<()> {
                 netmap.me.clone(),
                 netmap.peers.len(),
                 netmap.derp.clone(),
+                netmap.gate(&options.serve),
             )
         };
+        inner.gate.send_if_modified(|current| {
+            let changed = *current != gate;
+            if changed {
+                *current = gate;
+            }
+            changed
+        });
         if let Some(me) = &me
             && me.key != state.node.public()
         {
@@ -623,6 +778,7 @@ mod tests {
             accept_routes,
             exit_node: exit.map(str::to_owned),
             os: "macOS".into(),
+            serve: vec![],
         }
     }
 
@@ -686,6 +842,32 @@ mod tests {
         assert_eq!(map.find("pi5").unwrap().id, 1);
         assert_eq!(map.find("PI5.tail.ts.net.").unwrap().id, 1);
         assert!(map.find("pi5.example.com").is_none());
+    }
+
+    #[test]
+    fn serve_allow_names_resolve_against_the_network_map() {
+        let map = netmap();
+        let rule = |port, allow: Option<&[&str]>| ServeRule {
+            port,
+            to: "127.0.0.1:47821".parse().unwrap(),
+            allow: allow.map(|names| names.iter().map(|n| n.to_string()).collect()),
+        };
+        let gate = map.gate(&[
+            rule(47821, Some(&["PI5", "100.101.102.103", "gone-phone"])),
+            rule(8080, None),
+        ]);
+        assert_eq!(
+            gate.ports[&47821],
+            Some(vec![
+                "100.101.102.103".parse().unwrap(),
+                "100.104.16.87".parse().unwrap(),
+            ])
+        );
+        assert_eq!(gate.ports[&8080], None);
+        assert_eq!(
+            map.name_of("100.104.16.87".parse().unwrap()).as_deref(),
+            Some("pi5")
+        );
     }
 
     #[test]

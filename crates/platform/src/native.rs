@@ -53,6 +53,17 @@ impl NativeTun {
     pub fn index(&self) -> Result<u32> {
         Ok(self.device.if_index()?)
     }
+    /// Assigns another IPv4 address (/32, point-to-point on macOS) so local
+    /// programs see it in `getifaddrs`. It goes with the interface when the
+    /// process exits.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn add_alias(&self, address: std::net::Ipv4Addr) -> Result<()> {
+        Ok(self.device.add_address_v4(address, 32u8)?)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn remove_alias(&self, address: std::net::Ipv4Addr) -> Result<()> {
+        Ok(self.device.remove_address(address.into())?)
+    }
     /// The descriptor must be an exclusively owned, configured layer-3 TUN fd.
     /// Ownership transfers even if conversion fails. Call within a Tokio runtime.
     #[cfg(unix)]

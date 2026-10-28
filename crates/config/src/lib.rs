@@ -242,7 +242,26 @@ pub struct TailscaleOptions {
     pub exit_node: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_node_allow_lan_access: Option<bool>,
+    /// Clyntis only: TCP ports on this node's tailnet address forwarded to a
+    /// service on this device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<Vec<ServeRule>>,
 }
+/// One `serve` entry of a `type: tailscale` proxy.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ServeRule {
+    /// Port opened on this node's tailnet address.
+    pub port: u16,
+    /// Where accepted connections go: an address of this device only.
+    pub to: std::net::SocketAddr,
+    /// Peers allowed to connect, by MagicDNS name or tailnet address.
+    /// Absent: every peer in the network map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+}
+/// Local ports of the node's own outbound tailnet connections.
+pub const TAILSCALE_EPHEMERAL_PORTS: std::ops::RangeInclusive<u16> = 49152..=65000;
 impl std::fmt::Debug for Proxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Proxy")
@@ -713,6 +732,38 @@ impl Config {
                                     .bytes()
                                     .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
                             "proxy {}: hostname must be a DNS label (with optional {{os}} and {{device}})",
+                            p.name
+                        );
+                    }
+                    let mut ports = HashSet::new();
+                    for rule in t.serve.iter().flatten() {
+                        ensure!(
+                            rule.port != 0 && !TAILSCALE_EPHEMERAL_PORTS.contains(&rule.port),
+                            "proxy {}: serve port {} must be 1-49151 or 65001-65535 (49152-65000 are the node's outbound ports)",
+                            p.name,
+                            rule.port
+                        );
+                        ensure!(
+                            ports.insert(rule.port),
+                            "proxy {}: serve port {} is listed twice",
+                            p.name,
+                            rule.port
+                        );
+                        // Never a relay into the LAN or the internet.
+                        ensure!(
+                            rule.to.port() != 0
+                                && (rule.to.ip().is_loopback()
+                                    || std::net::UdpSocket::bind((rule.to.ip(), 0)).is_ok()),
+                            "proxy {}: serve to {} must be a port on this device (127.0.0.1 or a local address)",
+                            p.name,
+                            rule.to
+                        );
+                        ensure!(
+                            rule.allow
+                                .iter()
+                                .flatten()
+                                .all(|peer| !peer.trim().is_empty()),
+                            "proxy {}: serve allow entries must not be empty",
                             p.name
                         );
                     }
@@ -1198,5 +1249,40 @@ mod tailscale_tests {
         );
         // The auth key never leaves through serialization.
         assert!(!serde_json::to_string(&config).unwrap().contains("tskey"));
+    }
+
+    #[test]
+    fn serve_forwards_only_to_this_device_outside_outbound_ports() {
+        let parse = |serve: &str| {
+            Config::parse(
+                format!("proxies:\n  - {{name: ts, type: tailscale, serve: {serve}}}\n").as_bytes(),
+            )
+        };
+        let config = parse("[{port: 47821, to: '127.0.0.1:47821', allow: [iphone, 100.101.102.103]}, {port: 22, to: '[::1]:22'}]").unwrap();
+        let serve = config.proxies[0].tailscale.serve.as_ref().unwrap();
+        assert_eq!(serve[0].port, 47821);
+        assert_eq!(serve[0].to, "127.0.0.1:47821".parse().unwrap());
+        assert_eq!(
+            serve[0].allow.as_deref(),
+            Some(&["iphone".to_owned(), "100.101.102.103".to_owned()][..])
+        );
+        assert_eq!(serve[1].allow, None);
+        for bad in [
+            // Not this device: the node must not become a relay.
+            "[{port: 47821, to: '192.0.2.10:47821'}]",
+            "[{port: 47821, to: '8.8.8.8:53'}]",
+            // The node's own outbound ports.
+            "[{port: 49152, to: '127.0.0.1:1'}]",
+            "[{port: 65000, to: '127.0.0.1:1'}]",
+            "[{port: 0, to: '127.0.0.1:1'}]",
+            "[{port: 22, to: '127.0.0.1:0'}]",
+            // Listed twice.
+            "[{port: 22, to: '127.0.0.1:22'}, {port: 22, to: '127.0.0.1:2222'}]",
+            "[{port: 22, to: '127.0.0.1:22', allow: ['']}]",
+            "[{port: 22, to: '127.0.0.1:22', bogus: 1}]",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("[{port: 65001, to: '127.0.0.1:1'}]").is_ok());
     }
 }

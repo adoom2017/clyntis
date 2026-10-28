@@ -1,5 +1,5 @@
 //! A Tailscale node in Rust: joins a tailnet through the control server and
-//! carries TCP connections to peers over WireGuard, relayed through DERP.
+//! carries TCP connections to and from peers over WireGuard, relayed through DERP.
 //! No NAT traversal yet: every peer is reached through its home DERP region.
 pub mod control;
 pub mod derp;
@@ -12,7 +12,7 @@ mod node;
 pub mod noise;
 pub mod tailcfg;
 
-pub use node::{Node, Options, PeerStatus, Status};
+pub use node::{Node, Options, PeerStatus, ServeRule, ServeStatus, Status};
 
 use anyhow::Result;
 use clyntis_protocol::BoxStream;
