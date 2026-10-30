@@ -982,6 +982,84 @@ mod tests {
         }
     }
 
+    /// Two nodes' stacks back to back, as with a phone running Clyntis: the
+    /// served side speaks first (a TLS server's certificate flight), then
+    /// both directions carry bulk data.
+    #[tokio::test]
+    async fn served_connections_carry_server_first_and_bulk_data() {
+        let (served_commands, served_rx) = mpsc::channel(4);
+        let (client_commands, client_rx) = mpsc::channel(4);
+        let (to_served, served_in) = mpsc::channel(1024);
+        let (to_client, client_in) = mpsc::channel(1024);
+        let (served_open, _) = watch::channel(Vec::new());
+        let (client_open, _) = watch::channel(Vec::new());
+        let stop = CancellationToken::new();
+        let (_gate, served_inbound, mut accepted) = inbound(served(47821, None));
+        let (_none, client_inbound, _) = inbound(Gate::default());
+        tokio::spawn(run(
+            served_rx,
+            served_in,
+            to_client,
+            served_open,
+            served_inbound,
+            stop.clone(),
+        ));
+        tokio::spawn(run(
+            client_rx,
+            client_in,
+            to_served,
+            client_open,
+            client_inbound,
+            stop.clone(),
+        ));
+        served_commands
+            .send(Command::Addresses(vec!["100.64.0.1/32".parse().unwrap()]))
+            .await
+            .unwrap();
+        client_commands
+            .send(Command::Addresses(vec!["100.64.0.2/32".parse().unwrap()]))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            while let Some(Accepted { stream, .. }) = accepted.recv().await {
+                tokio::spawn(async move {
+                    let (mut read, mut write) = tokio::io::split(stream);
+                    write.write_all(&[7; 6000]).await.unwrap();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+        let handle = Handle {
+            commands: client_commands,
+        };
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.connect("100.64.0.1:47821".parse().unwrap()),
+        )
+        .await
+        .expect("connect timed out")
+        .unwrap();
+        let mut flight = vec![0; 6000];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut flight))
+            .await
+            .expect("server flight timed out")
+            .unwrap();
+        assert!(flight.iter().all(|&b| b == 7));
+        let (mut read, mut write) = tokio::io::split(stream);
+        let writer = tokio::spawn(async move {
+            write.write_all(&vec![3; 300_000]).await.unwrap();
+            write
+        });
+        let mut back = vec![0; 300_000];
+        tokio::time::timeout(Duration::from_secs(10), read.read_exact(&mut back))
+            .await
+            .expect("bulk echo timed out")
+            .unwrap();
+        assert!(back.iter().all(|&b| b == 3));
+        let _write = writer.await.unwrap();
+        stop.cancel();
+    }
+
     #[tokio::test]
     async fn connects_and_carries_data_without_a_periodic_tick() {
         let (commands, command_rx) = mpsc::channel(4);

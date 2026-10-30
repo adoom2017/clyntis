@@ -1187,6 +1187,27 @@ impl Core {
     ) -> Result<(BoxStream, RouteDecision)> {
         let target = self.restore_target(target);
         self.refuse_stale_fake(&target)?;
+        // A served tailnet address sits on the point-to-point TUN, so the
+        // kernel sends this device's own connections to it here instead of
+        // delivering them. Deliver them to the same port on loopback, as
+        // Tailscale does for a node's own address.
+        if let Some(std::net::IpAddr::V4(ip)) = target.ip()
+            && self.tailnet_serve_addresses().contains(&ip)
+        {
+            let local = std::net::SocketAddr::from(([127, 0, 0, 1], target.port));
+            let stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::TcpStream::connect(local),
+            )
+            .await
+            .context("this device's tailnet address timed out")??;
+            let decision = RouteDecision {
+                node: "DIRECT".into(),
+                group: "DIRECT".into(),
+                rule: "TailnetSelf".into(),
+            };
+            return Ok((Box::new(stream), decision));
+        }
         let decision = match selected {
             Some(n) => RouteDecision {
                 node: self.leaf(n)?,

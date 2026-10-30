@@ -535,17 +535,29 @@ async fn forward(
         tracing::info!(proxy = %inner.options.name, peer = ?peer, %remote, port, %target, "Tailscale serve accepted a connection");
         let stop = stop.clone();
         tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
             let mut local = match tokio::net::TcpStream::connect(target).await {
                 Ok(local) => local,
                 Err(error) => {
-                    tracing::debug!(%remote, %target, %error, "Tailscale serve: local target refused");
+                    tracing::warn!(%remote, %target, %error, "Tailscale serve: local target refused");
                     return;
                 }
             };
             let _ = local.set_nodelay(true);
-            tokio::select! {
-                _ = stop.cancelled() => {}
-                _ = tokio::io::copy_bidirectional(&mut stream, &mut local) => {}
+            // Byte counts tell a service that never answered from a peer that
+            // never received the answer (a TLS handshake stuck on the path).
+            let result = tokio::select! {
+                _ = stop.cancelled() => return,
+                result = tokio::io::copy_bidirectional(&mut stream, &mut local) => result,
+            };
+            let millis = started.elapsed().as_millis() as u64;
+            match result {
+                Ok((from_peer, to_peer)) => {
+                    tracing::info!(%remote, port, from_peer, to_peer, millis, "Tailscale serve connection closed")
+                }
+                Err(error) => {
+                    tracing::info!(%remote, port, %error, millis, "Tailscale serve connection failed")
+                }
             }
         });
     }
