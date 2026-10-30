@@ -42,7 +42,7 @@ try {
     foreach ($artifact in $artifacts) {
         Copy-Item -LiteralPath (Join-Path $buildRoot $artifact) -Destination $packageRoot
     }
-    foreach ($entry in @('README.md', 'LICENSE', 'examples')) {
+    foreach ($entry in @('README.md', 'CONFIGURATION.md', 'PACKAGING.md', 'LICENSE', 'examples')) {
         Copy-Item -LiteralPath (Join-Path $workspace $entry) -Destination $packageRoot -Recurse
     }
     Copy-Item -LiteralPath (Join-Path $workspace 'crates/ffi/include') -Destination $packageRoot -Recurse

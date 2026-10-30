@@ -142,7 +142,7 @@ if [[ -n $codesign_identity ]]; then
         codesign --verify --strict --verbose=2 "$package_root/$artifact"
     done
 fi
-cp "$workspace/README.md" "$workspace/LICENSE" "$package_root/"
+cp "$workspace/README.md" "$workspace/CONFIGURATION.md" "$workspace/PACKAGING.md" "$workspace/LICENSE" "$package_root/"
 cp -R "$workspace/examples" "$package_root/"
 mkdir -p "$package_root/crates/ffi" "$package_root/third-party"
 cp -R "$workspace/crates/ffi/include" "$package_root/crates/ffi/"

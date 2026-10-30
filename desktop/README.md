@@ -49,7 +49,7 @@ npm run desktop:dev
   及当前连接数；Tailscale 的登录状态、本机名称与地址、DERP 主区域、公网候选，以及每个
   tailnet 节点是否在线、直连（含往返延迟）还是经 DERP 中继。打开时每 3 秒刷新，点开查看详情。
 - Tailscale 节点（`type: tailscale`）由内核的 Rust 实现直接加入 tailnet，无需安装 Tailscale
-  App，可与代理同时使用；字段与限制见根 README。登录状态保存在配置的资源目录中。
+  App，可与代理同时使用；字段与限制见 [CONFIGURATION.md](../CONFIGURATION.md#tailscale-outbound)。登录状态保存在配置的资源目录中。
 - 每个配置单独保存资源和内核状态。导入会复制配置目录内已存在的 GeoIP/GeoSite 与规则资源。
   TUN 启动将现有资源按受限相对路径传给辅助服务，最多 128 MiB；服务存储与普通模式隔离。
 - TUN 模式下多个网络同时可用时优先使用有线连接；当前出口仍可用就不切换，避免偶发的探测失败

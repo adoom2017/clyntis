@@ -223,7 +223,7 @@ Tailscale nodes (`type: tailscale`) run inside the tunnel as a Rust userspace
 node, so the tailnet is usable together with the proxy without the Tailscale
 app (iOS allows only one VPN at a time). Its control, DERP and direct UDP
 connections leave through the device network. Fields and limits are described
-in the root README.
+in [CONFIGURATION.md](../CONFIGURATION.md#tailscale-outbound).
 
 ## Current scope
 

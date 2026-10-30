@@ -1,359 +1,31 @@
 # clyntis
 
-clyntis is a Rust proxy core with a desktop CLI and a versioned C host API. It
-implements a focused subset of Clash-style configuration; it is not a drop-in
-replacement for every protocol or configuration option.
+clyntis is a Rust proxy core with a desktop CLI, a desktop app, an iOS app and a
+versioned C API. It reads a focused subset of the Clash/mihomo configuration
+format.
 
-## Features and limits
+- **Inbound:** HTTP/CONNECT, SOCKS5 and mixed listeners, a DNS listener and a
+  desktop TUN (Windows Wintun, macOS utun, Linux TUN).
+- **Outbound:** DIRECT, REJECT, VLESS (TCP, WebSocket, gRPC; TLS, REALITY, XTLS
+  Vision), Hysteria2 and Tailscale (a userspace node, no Tailscale app needed).
+- **Routing and DNS:** rule/global/direct modes, select and url-test groups,
+  GeoIP/GeoSite and rule providers, fake-IP and redir-host DNS, ad blocking and
+  per-network hosts, DNS and rules.
 
-- **Inbound:** HTTP/CONNECT, SOCKS5 and mixed proxy listeners; optional DNS
-  listener and desktop TUN. HTTP/SOCKS authentication is supported.
-- **Outbound:** DIRECT, REJECT, VLESS, Hysteria2 and Tailscale. VLESS runs over TCP,
-  WebSocket or gRPC, including TLS, REALITY, XTLS Vision and UDP/XUDP.
-  BoringSSL is the TLS backend. Hysteria2 and Tailscale are described
-  [below](#hysteria2-outbound).
-- **Routing:** rule/global/direct modes, select and url-test groups (a url-test
-  group leaves a member as soon as it fails a round and re-tests right after a
-  network change), domain/IP rules, GeoIP/GeoSite and rule providers. Custom rules can be prepended to any
-  profile (see `clyntis_config::custom`); a rule whose target or rule provider the
-  profile lacks is skipped with a reason instead of failing the profile.
-  A route test shows which rule a domain, IP address or URL matches and the
-  node it would leave through (each group's selection along the way), without
-  connecting: `POST /rules/test` with `{"target": "example.com", "port": 443,
-  "network": "tcp"}` (only `target` is required), `meta_test_route_v1` over the
-  C ABI, and the apps' rules page. It also says when a rule resolved a proxied
-  name locally (a DNS leak).
-- **DNS leak detection:** a configuration review lists what leaks or exposes
-  names: redir-host mode, IP rules without `no-resolve` ahead of a proxy (each
-  rule listed), plaintext upstreams and system DNS that bypasses the TUN
-  (`GET /dns/leak`). An online test (`POST /dns/leak/test`, about 30 s) asks
-  bash.ws which resolvers looked up random names, along two paths: connecting
-  like an app (through the rules) and through the core's own upstreams, beside
-  the exit address. Proxied names leak when the first path's resolvers
-  include the second's (same address, or same network and country); bash.ws's
-  own verdict, which compares resolvers with the exit, is not used. C ABI: `meta_dns_leak_v1`; the apps show both on the rules
-  page. The online test sends random names to bash.ws and reveals the exit
-  and resolver addresses to it.
-- **Ad blocking** (`adblock` section, written by the apps' settings): domain
-  lists in Clash rule-provider, hosts or AdGuard (`||domain^`, with `@@`
-  exceptions) format are downloaded and refreshed like rule providers. Listed
-  domains get NXDOMAIN from DNS and their connections are refused, ahead of
-  every rule; an allowlist (plain domains cover subdomains) wins and can change
-  while running (`PATCH /configs` with `adblock-allow`). Counters cover DNS and
-  connection blocks, the most blocked domains and the latest blocks
-  (`GET /adblock`; the FFI snapshot's `adblock`). Presets: AWAvenue-Ads,
-  anti-AD and AdGuard DNS filter. Clash lists may also carry `IP-CIDR` /
-  `IP-CIDR6` lines or bare networks, refused on connection. Against apps
-  that bypass the system resolver: `block-httpdns` (default on) refuses
-  built-in HTTPDNS and DoH/DoT endpoints (names at DNS and on connection;
-  addresses on ports 80, 443 and 853), and `quic-fallback` (default on)
-  rejects UDP 443 whose destination has no name, so the app retries over
-  TCP where TLS sniffing names it. In TUN mode every rejected UDP flow gets
-  an ICMP port-unreachable at once (and for 10 s of retries), so clients fail
-  over immediately instead of waiting out their handshake timeout. `dns-answer: null` answers listed names
-  with 0.0.0.0 / :: instead of NXDOMAIN; endpoint names always get NXDOMAIN,
-  which Firefox's DoH canary and iCloud Private Relay require.
-- **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
-  redir-host modes. Real lookups also resolve Tailscale MagicDNS names; fake-IP
-  answers keep the domain so domain rules still apply. Upstreams are asked at
-  once and the first answer wins, and a UDP query is resent after 1 s and 2 s,
-  so a silent or lossy server no longer stalls a lookup for its timeout.
-  When the servers of a `nameserver-policy` entry do not answer (a home LAN
-  resolver away from home), `nameserver` answers instead; once they are known
-  to be silent on the current network both are asked at once.
-- **Status:** per-proxy status for the apps and the controller (`/proxies`
-  carries a `status` object): VLESS server, transport and security; the last
-  delay test with its error and time; open connections; and, for Tailscale, the
-  login state, this node's name and addresses, the home DERP region, UDP
-  candidates and each peer's online state and path (direct with RTT, or DERP).
-- **Desktop and host integration:** Windows Wintun, macOS utun and Linux TUN;
-  route recovery after an interrupted session; a reduced local controller with
-  configuration, proxy selection, connections, traffic and logs; and a C ABI for
-  embedding in mobile or other hosts.
-
-Trojan entries can be parsed for configuration compatibility, but the outbound
-protocol is **not implemented**: selecting one fails instead of silently using
-another proxy. Unknown or unsupported configuration fields fail validation.
-`--vless-only` keeps the implemented outbounds (VLESS, Hysteria2 and Tailscale),
-removes the others and replaces dangling references with REJECT, not DIRECT.
-
-### Hysteria2 outbound
-
-A `type: hysteria2` (or `hy2`) proxy speaks Hysteria 2 over QUIC: TCP on QUIC
-streams, UDP in QUIC datagrams (fragmented and reassembled when a packet does
-not fit), after authenticating with `password` (or `auth-str`) in an HTTP/3
-request. QUIC runs on quinn with its crypto on BoringSSL (`clyntis_protocol::quic`):
-the handshake goes through BoringSSL's QUIC API with the same browser profiles
-as TCP TLS, limited to TLS 1.3 (`client-fingerprint`, else
-`global-client-fingerprint`), the same roots and the NTP-corrected clock; `sni`,
-`alpn` and `skip-cert-verify` apply. Each proxy keeps one connection for all its
-traffic and reconnects when it closes.
-
-- `obfs: salamander` with `obfs-password` scrambles every packet.
-- `ports: "443,20000-30000"` hops to a random port, with a new local socket,
-  every `hop-interval` (default 30s, at least 5s), as the official client does.
-- `up`/`down` (e.g. `50 mbps`) state our bandwidth: with `up` set and a server
-  that does not ask for BBR, the connection uses Hysteria's Brutal congestion
-  control at the lower of `up` and the server's limit; otherwise BBR.
-
-`crates/protocol/tests/hysteria2_interop.rs` checks all of this against the
-official server; it is ignored by default and runs with `HYSTERIA_BIN` set to
-Hysteria v2.13.0.
-
-### Tailscale outbound
-
-A `type: tailscale` proxy runs a userspace Tailscale node written in Rust (no Go
-`tsnet`): it joins a tailnet through the control server and carries TCP
-connections to peers over WireGuard. Rules route to it like any proxy:
-
-```yaml
-proxies:
-  - name: Tailscale
-    type: tailscale
-    auth-key: tskey-auth-...      # required for the first login
-    hostname: '{device}-clyntis'  # optional; default clyntis-{os}
-    ephemeral: false              # optional
-    accept-routes: true           # optional: use peers' advertised subnet routes
-    exit-node: us-exit            # optional: node name or 100.x address
-    control-url: https://...      # optional: Headscale or another control server
-    state-dir: tailscale/home     # optional: relative to the configuration directory
-    dialer-proxy: Proxy           # optional: carry control and DERP through this proxy/group
-    serve:                        # optional: accept tailnet connections, see below
-      - port: 47821
-        to: 127.0.0.1:47821
-        allow: [iphone, 100.101.102.103]
-rules:
-  - IP-CIDR,100.64.0.0/10,Tailscale,no-resolve
-  - DOMAIN-SUFFIX,ts.net,Tailscale
-```
-
-- Fields follow mihomo's; `exit-node-allow-lan-access` is accepted for
-  compatibility and has no effect in a proxy. `dialer-proxy` is an addition.
-- `hostname` may contain `{os}` (`macos`, `ios`, `windows`, `linux`) and
-  `{device}` (the device's host name, lowercased; the OS when the system
-  reports none or `localhost`). A profile shared by several devices needs one of them: with a
-  fixed name the control server numbers the copies (`name-1`, `name-2`). A
-  node already numbered may need renaming once in the admin console.
-- Control: the ts2021 Noise transport (HTTP upgrade, then HTTP/2) registers the
-  node with the auth key and streams the network map. Machine and node keys
-  persist in `state-dir` (default `tailscale/<proxy name>/state.json`, mode
-  0600), so later starts do not log in again. `state-dir` must stay inside the
-  configuration directory.
-- Paths: disco pings and STUN (with Tailscale's required attributes) find direct
-  UDP paths using LAN and public candidates and call-me-maybe hole punching; a
-  path is trusted for 6.5 s after a pong and kept alive by 3 s heartbeats while
-  in use. Without one, WireGuard is relayed through each peer's home DERP region.
-  The home region is the fastest by TLS handshake. On the desktop the UDP socket
-  is bound to the physical egress, outside the TUN.
-- Destinations: peers' tailnet addresses, MagicDNS names (full or short), subnet
-  routes with `accept-routes`, and anything else through `exit-node`.
-- At home, reach a subnet directly; away, through the tailnet: put `DIRECT` and
-  the Tailscale proxy in a `url-test` group whose `url` answers only on that LAN
-  (pick a service unique to it; common subnets such as `192.168.2.0/24` exist on
-  other networks too). DIRECT wins while the check answers; once it fails the
-  group switches to Tailscale, and a network change re-tests within seconds.
-
-  ```yaml
-  proxy-groups:
-    - {name: Home LAN, type: url-test, proxies: [DIRECT, Tailscale], url: 'http://192.168.2.50:9090/', interval: 30, tolerance: 20}
-  rules:
-    - IP-CIDR,192.168.2.0/24,Home LAN,no-resolve
-  ```
-- A network change rebinds the node's UDP socket, reconnects its DERP relays and
-  rediscovers direct paths at once; WireGuard sessions continue.
-- `serve` (a Clyntis addition) accepts TCP connections from peers on `port` of
-  this node's tailnet address and relays them, unchanged (TLS included), to
-  `to` on this device. `to` must be a loopback or local address, so the node
-  never relays into the LAN; `port` cannot be 49152–65000, the node's own
-  outbound ports, or repeat. `allow` lists the peers that may connect, by
-  MagicDNS name or tailnet address, resolved again on each network map update;
-  without it every peer in the map may. Other peers' SYNs are dropped without
-  a reset, so the port does not look open. The local service sees connections
-  from 127.0.0.1; the log names the peer.
-- While a node serves ports, the desktop TUN interface also carries its IPv4
-  tailnet address (`ifconfig utun7` shows `inet 100.a.b.c --> 100.a.b.c`), so
-  programs that list addresses with `getifaddrs` can announce it. It goes away
-  with the TUN. Connecting to that address from this device stays local and
-  does not test the forwarding; try from another tailnet device. The proxy
-  status shows the rules, open/accepted/denied connections and the interface.
-- Limits: TCP only (UDP through Tailscale is not supported yet); login with an
-  auth key only (an interactive login URL is logged but not awaited); node-key
-  expiry is not renewed automatically; tailnet ACLs are not applied to `serve`
-  (use `allow`); no peer relays, port mapping or Tailscale SSH/Funnel.
-
-### Per-network hosts, DNS and rules
-
-The same name can need different answers on different networks: a NAS's LAN
-address at home and its public one elsewhere, or a home DNS server that only
-answers on the home LAN. Three additions handle this; they are not part of the
-mihomo format, and profiles without them behave as before.
-
-| Key | Where | Purpose |
-| --- | --- | --- |
-| `networks` | top level | Names networks by what the device sees |
-| `network-overrides` | top level | Hosts and `nameserver-policy` for a network, over the global ones |
-| `NETWORK-NAME,<name>` | rule condition | Holds while the device is on that network |
-
-#### `networks`
-
-Each entry names a network and lists conditions. Every condition given must
-hold; a condition with several values (a list) holds when any of them matches.
-A condition on a fact the platform does not report is skipped, as long as at
-least one other condition is checked (see the table below).
-
-| Condition | Value | Matches when |
-| --- | --- | --- |
-| `type` | `wifi`, `cellular` or `wired` | the device's preferred interface is of that type |
-| `ssid` | Wi-Fi name, exact and case-sensitive | the device is on that Wi-Fi |
-| `subnet` | CIDR (`192.168.2.0/24`) or one address | one of the device's addresses on that network is inside it |
-| `gateway` | address | the network's gateway is that address |
-
-```yaml
-networks:
-  home:
-    ssid: [Home, Home-5G]       # either Wi-Fi name (where it is known)...
-    subnet: 192.168.2.0/24      # ...and an address in the home subnet
-  office:
-    gateway: 10.0.12.1
-  phone:
-    type: cellular
-```
-
-Which facts each platform reports. A condition on a fact that is not reported
-(the Wi-Fi name on desktops, on a wired link or on cellular) is skipped, so
-`ssid` plus `subnet` matches by subnet alone there; a network whose every
-condition is skipped does not match:
-
-| Platform | `type` | `ssid` | `subnet` | `gateway` |
-| --- | --- | --- | --- | --- |
-| iOS | yes | yes (needs the Access WiFi Information capability on the tunnel's App ID) | yes | yes |
-| macOS, Windows | yes | no (the system gives it only to apps with location access) | yes | yes |
-
-On desktops, a network is told apart by `subnet` and `gateway`. Common subnets
-such as `192.168.1.0/24` exist on many networks; add the gateway or prefer an
-uncommon subnet at home. The `[NETWORK] current network` log line shows the
-facts reported and the networks they matched. Names may not start with `!`; at least one condition
-is required, and unknown types, malformed subnets or gateways and unknown keys
-are rejected when the profile loads.
-
-#### `network-overrides`
-
-A list of entries, each with a `network` and any of `hosts` and
-`nameserver-policy` (same syntax as the global `hosts` and
-`dns.nameserver-policy`). `network: '!home'` applies on any network except
-`home`, including one whose facts are unknown. Before the host has reported
-any network (the first moments after start), no entry applies.
-
-- The **first** entry whose `network` applies is used; later ones are ignored.
-  With none applying, only the global settings are used.
-- The entry's `hosts` are added to the global `hosts`; for the same name the
-  entry wins.
-- The entry's `nameserver-policy` is consulted before the global
-  `dns.nameserver-policy`, whatever the patterns' specificity.
-- An entry must name a network defined in `networks`.
-
-```yaml
-network-overrides:
-  - network: home
-    nameserver-policy:
-      '*.example.home': 192.168.2.50      # the LAN resolver, at home only
-    hosts:
-      nas.example.home: 192.168.2.10
-  - network: '!home'
-    hosts:
-      nas.example.home: 203.0.113.7       # the public address elsewhere
-```
-
-When the servers of a `nameserver-policy` entry do not answer (a LAN resolver
-away from home, or a network that is not matched as expected), `nameserver`
-answers instead. While the core does not yet know whether they answer on the
-current network they get 500 ms before `nameserver` is asked too; once they
-are known to be silent both are asked at once and the first answer wins. A
-reply from them, even NXDOMAIN, is final.
-
-#### `NETWORK-NAME` rules
-
-`NETWORK-NAME,<name>` is a rule condition that holds while the device is on
-that network. Combine it with `AND`, `OR` and `NOT`. A home subnet can then go
-direct at home and through Tailscale elsewhere, without a `url-test` group
-probing the LAN all day:
-
-```yaml
-rules:
-  - AND,((NETWORK-NAME,home),(IP-CIDR,192.168.2.0/24)),DIRECT
-  - IP-CIDR,192.168.2.0/24,Tailscale,no-resolve
-```
-
-The name must be defined in `networks`. Until the host first reports the
-network, the condition does not hold. Write it in the profile's `rules` or the
-apps' custom rules; inside a rule provider it never holds.
-
-#### When it applies
-
-- iOS reports the network when the tunnel starts and after each network change;
-  desktops check the physical exit (the default interface without TUN) every
-  3 s. Each report re-evaluates `networks`, applies the override and rules,
-  and clears the DNS cache when the override changes.
-- The log records `[NETWORK] current network` with the matching networks and
-  the override in effect. The apps show **当前网络** on the home page while the
-  profile defines `networks`, and the controller has `GET /network`.
-- Names in `fake-ip-filter` reach apps as real addresses, which apps may cache
-  for the answer's TTL after a network change. Names answered with fake IPs
-  are resolved when connecting, so they switch at once.
-- Embedding hosts report the network with `meta_set_network_v1` (JSON:
-  `{"type": "wifi", "ssid": "Home", "addresses": ["192.168.2.7"],
-  "gateways": ["192.168.2.1"]}`, every field optional) before each
-  `meta_network_changed_v1`.
-
-#### Example: a home server reached by name everywhere
-
-```yaml
-networks:
-  home:
-    ssid: Home
-    subnet: 192.168.2.0/24
-dns:
-  enhanced-mode: fake-ip
-  nameserver: [223.5.5.5, 119.29.29.29]
-network-overrides:
-  - network: home
-    nameserver-policy:
-      '*.example.home': 192.168.2.50     # answers with LAN addresses
-  - network: '!home'
-    hosts:
-      nas.example.home: 203.0.113.7      # or omit: public DNS answers
-rules:
-  - AND,((NETWORK-NAME,home),(IP-CIDR,192.168.2.0/24)),DIRECT
-  - IP-CIDR,192.168.2.0/24,Tailscale,no-resolve
-  - MATCH,DIRECT
-```
-
-## Requirements
-
-- Rust **1.93.1** (pinned in `rust-toolchain.toml`), a C/C++ compiler, CMake and
-  Clang/libclang for the vendored BoringSSL build.
-- On Windows, use an MSVC toolchain, NASM and LLVM/Clang with `libclang.dll`
-  beside `clang.exe`. PowerShell 7 is required for the `.ps1` helper scripts.
-- Desktop TUN requires administrator/root privileges. Windows TUN also requires
-  the official `wintun.dll` beside `clyntis.exe`; the driver is not bundled.
+Trojan entries are parsed but not implemented; unknown fields fail validation.
+Every option, the Clyntis additions and their limits are described in
+[CONFIGURATION.md](CONFIGURATION.md).
 
 ## Build
 
-The optional Windows/macOS desktop application lives in the independent
-[`desktop/`](desktop/README.md) workspace. It uses Tauri 2 and React, with
-profile/subscription management, system proxy and TUN integration. See its
-README for development, privileged helper installation and desktop packaging.
+### Requirements
 
-The native iOS/iPadOS client lives in [`ios/`](ios/README.md). It uses SwiftUI and
-a Network Extension packet tunnel with the Rust C API. See its README for
-Apple Silicon builds, simulator checks, device signing and current limitations.
+- Rust **1.93.1** (pinned in `rust-toolchain.toml`), a C/C++ compiler, CMake and
+  Clang/libclang for the vendored BoringSSL build.
+- Windows: an MSVC toolchain, NASM and LLVM/Clang with `libclang.dll` beside
+  `clang.exe`; PowerShell 7 for the `.ps1` scripts.
 
-Both apps share the core's merge logic for two layers over the selected
-profile: custom rules, matched before the profile's own, and settings that
-override the profile (log level, IPv6 and domain sniffing; unset values follow
-the profile). Both show the per-node status described above, with delay tests
-for VLESS nodes. The commands below continue to build and test the CLI/core
-workspace only.
+### CLI and core
 
 From the repository root:
 
@@ -362,235 +34,91 @@ cargo build -p clyntis --release --locked
 cargo test --workspace --locked
 ```
 
-The executable is `target/release/clyntis` on macOS/Linux or
-`target/release/clyntis.exe` on Windows. On Windows, the toolchain helper checks
-the native prerequisites and sets `LIBCLANG_PATH` for the build:
+The executable is `target/release/clyntis` (`clyntis.exe` on Windows). On
+Windows, this helper checks the prerequisites and sets `LIBCLANG_PATH`:
 
 ```powershell
 pwsh -File scripts/check-boringssl-toolchain.ps1 build -p clyntis --release --locked
 ```
 
-The pinned `Cargo.lock` is used by these commands. Optional external protocol
-oracles and privileged TUN tests need their own environment and are not part of
-the basic run path.
+### C library
 
-The desktop app's version (`desktop/package.json`) is the product version: the
-`clyntis-*` crates of both Cargo workspaces and the iOS app follow it.
-`bash scripts/set-version.sh 1.2.3` sets it everywhere, lockfiles included, and
-CI fails if `bash scripts/set-version.sh --check` finds any of them behind.
+```sh
+cargo build -p clyntis-ffi --release --locked
+```
 
-## Quick start
+The header is `crates/ffi/include/clyntis.h`. Mobile targets build with
+`scripts/check-mobile.sh` (or `.ps1`) and the matching SDK/NDK.
 
-The included VLESS example uses **placeholder** server details. Copy it to a
-local, ignored `config.yaml` and replace the server address, UUID, TLS server
-name and other fields with your own values before connecting:
+### Apps
+
+- Desktop (Windows/macOS, Tauri 2 + React): see [desktop/README.md](desktop/README.md).
+- iOS/iPadOS (SwiftUI + Network Extension): see [ios/README.md](ios/README.md).
+
+### Versions and packages
+
+The product version is `desktop/package.json`; set it everywhere with
+`bash scripts/set-version.sh 1.2.3` (CI runs it with `--check`). Release
+archives, signing and notarization: [PACKAGING.md](PACKAGING.md).
+
+## Usage
+
+### Quick start
+
+`examples/vless.yaml` uses placeholder server details. Copy it to a local
+`config.yaml`, fill in your server, then validate and run:
 
 ```sh
 cp examples/vless.yaml config.yaml
-./target/release/clyntis -f config.yaml -t
+./target/release/clyntis -f config.yaml -t   # validate only
 ./target/release/clyntis -f config.yaml
 ```
 
-On Windows, use `Copy-Item examples/vless.yaml config.yaml` and
-`.\target\release\clyntis.exe` in place of the Unix commands. `-t` validates
-the configuration and exits without opening listeners; it does not test the
-remote server. The example opens a local mixed HTTP/SOCKS port at `127.0.0.1:7890`.
-Once a real server is configured, a separate terminal can use it with:
+The example opens a mixed HTTP/SOCKS port and a loopback controller:
 
 ```sh
 curl -x http://127.0.0.1:7890 https://example.com/
+curl http://127.0.0.1:9090/version
 ```
 
-The example also enables a loopback controller at `127.0.0.1:9090`; check it
-with `curl http://127.0.0.1:9090/version`. Binding the controller to a non-loopback
-address requires a configured Bearer secret.
+A controller on a non-loopback address requires a `secret`.
 
-By default clyntis reads `config.yaml` from the current directory. Use `-f`
-to choose a file (or `-f -` for standard input), and `-d` to set the configuration
-directory. For example:
+### Common options
+
+| Option | Purpose |
+| --- | --- |
+| `-f <file>` | Configuration file (`-` for standard input); default `config.yaml` |
+| `-d <dir>` | Configuration directory for resources and state; default `.` |
+| `-t` | Validate the configuration and exit |
+| `--test-resources` | Load and validate GeoIP/GeoSite and rule providers |
+| `--no-tun` | Run without TUN even if the configuration enables it |
+| `--recover-tun` | Restore routes and DNS after an interrupted TUN session |
+| `--test-egress` | macOS: probe physical exits without starting TUN |
+| `--auto-dns` | macOS: point system DNS at the core for this run |
+| `--ext-ctl`, `--secret` | Override the controller address and secret |
+| `--action encrypt\|decrypt` | Legacy AES-CFB configuration encryption (`-p`, `-o`) |
+
+Run `clyntis --help` for the full list.
+
+### TUN
+
+TUN is off unless the configuration sets `tun.enable: true`. It changes system
+routes, so it needs administrator/root privileges; Windows also needs the
+official `wintun.dll` beside `clyntis.exe`. If a session is interrupted, restore
+routes with the same directory and privileges:
 
 ```sh
-./target/release/clyntis -d /path/to/config-directory
-./target/release/clyntis -f config.yaml --test-resources
+sudo ./target/release/clyntis -d /path/to/config-directory --recover-tun
 ```
 
-`--test-resources` loads and validates routing resources such as GeoIP/GeoSite
-and rule providers; unlike `-t`, this may need access to their configured sources.
-Run `clyntis --help` for all CLI options.
+### Logs
 
-`log-level: debug` enables diagnostic events. If `log.log-path` is set, logs
-go to that file relative to `-d`; the startup message prints the effective
-level and full destination. Remove `log.log-path` to write logs to the terminal.
-The top-level `log-level` takes precedence when both locations specify a level.
+`log-level: debug` adds diagnostic events. With `log.log-path` set, logs go to
+that file relative to `-d`; otherwise to the terminal.
 
-TCP relays, including TUN sessions, allow long periods without application data
-(for example while waiting for the next SSE event). They do not impose a fixed
-five-minute application-idle cutoff. TCP keepalive and transport errors detect
-dead peers; explicit connection closure, shutdown and network changes still end
-sessions. Upstream servers and intermediate proxies may impose their own limits.
+### More
 
-### TUN and recovery
-
-TUN is disabled unless `tun.enable: true` is set in the configuration. It
-changes system routes, so run it only on a machine where you have administrator
-or root access. On macOS the capture routes use the nonzero subranges used by
-sing-tun's Darwin `BuildAutoRouteRanges` (IPv4 starts at `1.0.0.0/8`, IPv6 at
-`100::/8`). Zero-address `/1` routes are avoided because XNU treats their
-destination as a default-route key, which can break interface-bound egress.
-Use `--no-tun` to run the proxy listeners without TUN even when
-the configuration enables it. On macOS, `tun.auto-detect-interface` probes
-physical exits against `example.com:443` and configured proxy endpoints before
-and after installing routes, including when there is only one candidate,
-and reopens the TUN on a different exit when
-needed. Use `--test-egress` to run only the probe without TUN, or set
-`tun.auto-detect-interface` to keep probing exits every 15 seconds while running.
-Exits are ranked by internet reachability, then proxies reached, then a wired
-link over Wi-Fi; the current exit is kept unless another ranks higher, so one
-lost probe does not switch interfaces. An exit change updates routes and socket
-bindings, closes old sessions, and rebinds automatic DNS when the local IPv4
-address changes; a brief loss of the IPv4 exit (sleep, Wi-Fi roaming) keeps the
-TUN running and retries DNS until the network returns. Use `tun.interface` to
-select an interface explicitly. With `ipv6: true`, IPv6 is captured only while a
-physical interface has an IPv6 exit, so apps do not dial IPv6 the core cannot
-reach. `tun.auto-dns` defaults to `false` in the core, preserving the system's
-existing DNS services; the desktop app turns it on in TUN mode unless disabled
-in its settings. Literal public DNS upstreams
-receive physical host routes so the proxy's own DNS queries avoid the TUN.
-Setting `tun.auto-dns: true` when TUN, auto-route and the DNS listener are
-enabled, or passing `--auto-dns` on macOS for a single run, listens on port 53
-of the selected physical interface's own IPv4 address and temporarily sets that
-network service's DNS to the same address. Enabled physical services with IPv4
-addresses are also covered because macOS's default DNS service can differ from
-the proxy's selected egress. Each service's original DNS is journaled and restored
-independently. Only local host requests are answered on this additional listener.
-VPN services, including Tailscale's scoped DNS, are not changed. This does not edit
-`/etc/resolv.conf` directly. A VPN or Network Extension with its own default
-resolver can still take precedence over the physical service's DNS. If a TUN
-session is interrupted, restore its routes and macOS DNS with the same
-configuration directory and privileges:
-
-```sh
-./target/release/clyntis -d /path/to/config-directory --recover-tun
-```
-
-On Windows, run the corresponding `.exe` in an elevated shell. Before upgrading
-from an older binary after an interrupted session, recover with that binary
-first because the journal filename changed with the project name.
-
-#### Fake-IP ranges and Chrome
-
-Chrome treats some address ranges as the local network (Local Network Access):
-a public page that fetches a name whose fake IP falls in them is blocked with
-`Permission was denied for this request to access the 'local' address space`,
-and pages such as the App Store Connect login hang. The local ranges are
-`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
-`100.64.0.0/10`, `0.0.0.0/8`, `fc00::/7` (including the default
-`fake-ip-range6`, `fdfe:dcba:9876::/64`), `fe80::/10`, `fec0::/10`,
-`2001:db8::/32` and `3fff::/20`. With IPv6 enabled, move the IPv6 range out of
-them; Clyntis logs a warning at start while a fake-IP range in use overlaps one:
-
-```yaml
-dns:
-  enhanced-mode: fake-ip
-  fake-ip-range: 28.0.0.1/8         # or the default 198.18.0.0/16
-  fake-ip-range6: 2001:2::/48       # benchmarking prefix, never routed publicly
-```
-
-After changing a range, reconnect and clear Chrome's host cache
-(`chrome://net-internals/#dns`) or restart Chrome.
-
-### Legacy configuration encryption
-
-The CLI retains the previous AES-CFB128/Base64 configuration format:
-
-```sh
-clyntis -f config.yaml --action encrypt
-clyntis -f config-encrypt.yaml --action decrypt
-```
-
-The password is prompted when omitted; `-p` supplies it non-interactively.
-Outputs are written to `config-encrypt.yaml` or `config-decrypt.yaml` by default
-and never overwrite existing files. This legacy format is **not authenticated**;
-do not treat it as a modern secret-storage format.
-
-### Publishing encrypted profiles to Tencent COS
-
-Besides saving an encrypted export to a file, the desktop app and the iOS app
-can publish it to Tencent Cloud COS, replacing the object there, so devices
-subscribed to that URL get the new profile at their next update.
-
-1. Create API keys for a sub-user allowed only `cos:PutObject` on the bucket,
-   and enter the SecretId and SecretKey once: desktop **设置 → 远程发布**, iOS
-   **配置 → 远程发布**. They are kept in the system keychain (macOS Keychain,
-   Windows Credential Manager, iOS Keychain on this device only), never in the
-   app's files; the SecretKey is not shown again.
-2. Choose **发布** on a profile, give the bucket (with its APPID, e.g.
-   `examplebucket-1250000000`), region (e.g. `ap-shanghai`) and file path, and
-   the encryption password. When the profile's subscription URL is a COS
-   object (`https://<bucket>.cos.<region>.myqcloud.com/<path>`), these are
-   filled in from it; afterwards the profile remembers where it was published.
-
-The upload is a single PUT Object request signed with COS's
-`q-sign-algorithm=sha1` scheme (`crates/core/src/cos.rs`), valid for ten
-minutes, so the device clock must be roughly right. Errors name the cause:
-wrong keys, missing PutObject permission, unknown bucket or a skewed clock.
-Embedding hosts can use `meta_cos_target_v1` and `meta_cos_put_v1`.
-
-## Packages and embedding
-
-After fetching locked dependencies, the local packaging scripts build offline
-and write a release archive under the ignored `dist/` directory:
-
-```sh
-cargo fetch --locked
-bash scripts/package-release.sh
-```
-
-On macOS, the script signs the executable and dylib with the sole available
-Developer ID Application identity (hardened runtime and secure timestamp) before
-generating the manifest and archive. If several identities are installed, select
-one explicitly with `CLYNTIS_CODESIGN_IDENTITY` (SHA-1 fingerprint or full
-identity name), for example:
-
-```sh
-CLYNTIS_CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' bash scripts/package-release.sh
-```
-
-With no Developer ID identity, the package remains unsigned (as on CI); set
-`CLYNTIS_CODESIGN=off` to opt out locally. Signing requires timestamp-service
-access. To notarize, first store a `notarytool` keychain profile using your
-Apple ID, app-specific password, and the **same team** as the signing identity
-(or use an App Store Connect API key):
-
-```sh
-xcrun notarytool store-credentials clyntis-notary --apple-id 'you@example.com' --team-id YOURTEAMID
-CLYNTIS_CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
-  CLYNTIS_NOTARY_PROFILE=clyntis-notary bash scripts/package-release.sh
-```
-
-When `CLYNTIS_NOTARY_PROFILE` is set, the script submits a signed DMG with
-`notarytool --wait`, requires an Accepted result, then staples and validates its
-ticket. The resulting `.dmg` and `.tar.gz` each have a `.sha256` sidecar. Use the
-DMG for offline-verifiable distribution; tickets cannot be stapled to a tarball
-or standalone CLI. Notarization needs network access and is opt-in so CI and
-local offline builds remain unchanged. Do not put passwords or API keys in the
-repository.
-
-On Windows, run `cargo fetch --locked` followed by
-`pwsh -File scripts/package-release.ps1`. These scripts do not publish artifacts.
-Pushing a tag `vX.Y.Z` does: the Windows Release workflow builds this package
-and the unsigned desktop installer (NSIS) on Windows and attaches both, with
-SHA-256 files, to the GitHub release for the tag. The tag must match the product
-version, so run `bash scripts/set-version.sh X.Y.Z` and commit before tagging.
-The package contains the CLI, examples, licenses, C libraries and
-`crates/ffi/include/clyntis.h`. Besides creating, starting and driving a core
-(`meta_create_v1`, `meta_create_packet_tunnel_v1`, `meta_snapshot_v1`,
-`meta_select_v1`, `meta_probe_v1`, packet I/O), the C API validates and merges
-custom rules (`meta_custom_rule_*`, `meta_custom_rules_apply_v1`), applies app
-settings (`meta_overrides_apply_v1`), checks and prefetches routing resources
-(`meta_resources_state_v1`, `meta_prefetch_resources_v1`) and drains logs
-(`meta_drain_logs_v1`); every function documents its buffer contract in the
-header. For a separate host-library build, use
-`cargo build -p clyntis-ffi --release --locked`; mobile target builds use the
-`scripts/check-mobile.sh` or `scripts/check-mobile.ps1` helpers with the relevant
-SDK/NDK installed.
+- Configuration reference (Hysteria2, Tailscale and `serve`, per-network
+  settings, DNS, ad blocking, TUN details): [CONFIGURATION.md](CONFIGURATION.md)
+- Publishing encrypted profiles to Tencent COS:
+  [CONFIGURATION.md](CONFIGURATION.md#publishing-encrypted-profiles-to-tencent-cos)

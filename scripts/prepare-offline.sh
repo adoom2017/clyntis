@@ -27,7 +27,7 @@ for package in json.load(open(sys.argv[1]))["packages"]:
         raise SystemExit(f"Unapproved dependency source: {package['name']} {source}")
 PY
 
-cp Cargo.toml Cargo.lock rust-toolchain.toml LICENSE README.md "$snapshot/"
+cp Cargo.toml Cargo.lock rust-toolchain.toml LICENSE README.md CONFIGURATION.md PACKAGING.md "$snapshot/"
 cp -R crates third-party examples "$snapshot/"
 mkdir -p "$snapshot/scripts" "$snapshot/.cargo"
 for script in prepare-offline.ps1 prepare-offline.sh verify-offline.ps1 verify-offline.sh \

@@ -20,7 +20,7 @@ try {
         }
     }
 
-    foreach ($name in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'LICENSE', 'README.md', 'crates', 'third-party', 'examples')) {
+    foreach ($name in @('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'LICENSE', 'README.md', 'CONFIGURATION.md', 'PACKAGING.md', 'crates', 'third-party', 'examples')) {
         Copy-Item -LiteralPath (Join-Path $workspace $name) -Destination $snapshot -Recurse
     }
     New-Item -ItemType Directory -Path (Join-Path $snapshot 'scripts'), (Join-Path $snapshot '.cargo') | Out-Null
