@@ -50,16 +50,16 @@ struct AdblockView: View {
         List {
             // Settings first; statistics and recent blocks below them.
             Section {
-                Toggle("启用去广告", isOn: Binding(get: { settings?.enabled ?? false }, set: { on in
+                Toggle(L("启用去广告"), isOn: Binding(get: { settings?.enabled ?? false }, set: { on in
                     var next = settings ?? AdblockSettings()
                     next.enabled = on
                     save(next)
                 }))
             } footer: {
-                Text("广告、追踪和统计域名在 DNS 查询时直接拒绝，并优先于所有规则。")
+                Text(L("广告、追踪和统计域名在 DNS 查询时直接拒绝，并优先于所有规则。"))
             }
             if let settings, settings.enabled {
-                Section("列表") {
+                Section(L("列表")) {
                     ForEach(AdblockSettings.presetsOffered, id: \.id) { preset in
                         Toggle(isOn: Binding(get: { settings.presets.contains(preset.id) }, set: { on in
                             var next = settings
@@ -78,14 +78,14 @@ struct AdblockView: View {
                             Text(listLine(list.name) ?? list.url).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         .swipeActions {
-                            Button("移除", role: .destructive) {
+                            Button(L("移除"), role: .destructive) {
                                 var next = settings
                                 next.custom.removeAll { $0 == list }
                                 save(next)
                             }
                         }
                     }
-                    Button("添加列表", systemImage: "plus") { addingList = true }
+                    Button(L("添加列表"), systemImage: "plus") { addingList = true }
                 }
                 Section {
                     Toggle(isOn: Binding(get: { settings.blockHttpdns ?? true }, set: { on in
@@ -94,8 +94,8 @@ struct AdblockView: View {
                         save(next)
                     })) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("拦截 HTTPDNS 和加密 DNS")
-                            Text("App 自带的 HTTPDNS、DoH 会绕过 DNS 过滤，拦截后退回系统 DNS")
+                            Text(L("拦截 HTTPDNS 和加密 DNS"))
+                            Text(L("App 自带的 HTTPDNS、DoH 会绕过 DNS 过滤，拦截后退回系统 DNS"))
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -105,29 +105,29 @@ struct AdblockView: View {
                         save(next)
                     })) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("QUIC 回退到 TCP")
-                            Text("拒绝不知道域名的 QUIC，App 改用 TCP 后即可按域名拦截")
+                            Text(L("QUIC 回退到 TCP"))
+                            Text(L("拒绝不知道域名的 QUIC，App 改用 TCP 后即可按域名拦截"))
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    Picker("拦截应答", selection: Binding(get: { settings.dnsAnswer ?? "nxdomain" }, set: { answer in
+                    Picker(L("拦截应答"), selection: Binding(get: { settings.dnsAnswer ?? "nxdomain" }, set: { answer in
                         var next = settings
                         next.dnsAnswer = answer
                         save(next)
                     })) {
-                        Text("域名不存在").tag("nxdomain")
+                        Text(L("域名不存在")).tag("nxdomain")
                         Text("0.0.0.0").tag("null")
                     }
                 } header: {
-                    Text("防绕过")
+                    Text(L("防绕过"))
                 } footer: {
-                    Text("个别 App 收到「域名不存在」会反复重试，可把拦截应答改为 0.0.0.0。")
+                    Text(L("个别 App 收到「域名不存在」会反复重试，可把拦截应答改为 0.0.0.0。"))
                 }
                 Section {
                     ForEach(settings.allow, id: \.self) { domain in
                         Text(domain).font(.body.monospaced())
                             .swipeActions {
-                                Button("删除", role: .destructive) {
+                                Button(L("删除"), role: .destructive) {
                                     var next = settings
                                     next.allow.removeAll { $0 == domain }
                                     save(next)
@@ -135,27 +135,27 @@ struct AdblockView: View {
                             }
                     }
                     HStack {
-                        TextField("添加域名，如 wechat.com", text: $newAllow)
+                        TextField(L("添加域名，如 wechat.com"), text: $newAllow)
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
                             .onSubmit(addAllow)
-                        Button("添加", action: addAllow).disabled(newAllow.trimmingCharacters(in: .whitespaces).isEmpty)
+                        Button(L("添加"), action: addAllow).disabled(newAllow.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
-                } header: { Text("白名单") } footer: { Text("包含子域名；修改后立即生效。") }
+                } header: { Text(L("白名单")) } footer: { Text(L("包含子域名；修改后立即生效。")) }
             }
             if needsReconnect && model.active && !(model.adblockState == .pending && model.connected) {
                 Section {
-                    Button("重新连接以生效") {
+                    Button(L("重新连接以生效")) {
                         Task { await model.reconnect(); needsReconnect = false }
                     }
                     .disabled(model.busy)
-                } footer: { Text("开关和列表的修改需要重新连接。") }
+                } footer: { Text(L("开关和列表的修改需要重新连接。")) }
             }
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
             statusSection
         }
-        .navigationTitle("去广告")
-        .alert("无法放行", isPresented: Binding(get: { allowFailure != nil }, set: { if !$0 { allowFailure = nil } })) {
-            Button("好", role: .cancel) {}
+        .navigationTitle(L("去广告"))
+        .alert(L("无法放行"), isPresented: Binding(get: { allowFailure != nil }, set: { if !$0 { allowFailure = nil } })) {
+            Button(L("好"), role: .cancel) {}
         } message: { Text(allowFailure ?? "") }
         .sheet(isPresented: $addingList) { AddListView { list in
             var next = settings ?? AdblockSettings()
@@ -169,39 +169,39 @@ struct AdblockView: View {
         if let status = model.adblock, status.enabled {
             statistics(status)
         } else if model.adblockState == .pending && model.connected {
-            Section("统计") {
-                Text("去广告已开启，重新连接后开始拦截并统计。").foregroundStyle(.secondary)
-                Button("重新连接") { Task { await model.reconnect(); needsReconnect = false } }
+            Section(L("统计")) {
+                Text(L("去广告已开启，重新连接后开始拦截并统计。")).foregroundStyle(.secondary)
+                Button(L("重新连接")) { Task { await model.reconnect(); needsReconnect = false } }
                     .disabled(model.busy)
             }
         } else if !model.connected && settings?.enabled == true {
-            Section("统计") {
-                Text("连接后显示拦截统计。").foregroundStyle(.secondary)
+            Section(L("统计")) {
+                Text(L("连接后显示拦截统计。")).foregroundStyle(.secondary)
             }
         }
     }
 
     @ViewBuilder private func statistics(_ status: AdblockStatus) -> some View {
         Section {
-            LabeledContent("拦截次数", value: status.total.formatted())
-            LabeledContent("DNS / 连接", value: "\(status.dns.formatted()) / \(status.connections.formatted())")
-            LabeledContent("涉及域名", value: status.domains.formatted())
-            LabeledContent("规则条数", value: status.entries.formatted())
+            LabeledContent(L("拦截次数"), value: status.total.formatted())
+            LabeledContent(L("DNS / 连接"), value: "\(status.dns.formatted()) / \(status.connections.formatted())")
+            LabeledContent(L("涉及域名"), value: status.domains.formatted())
+            LabeledContent(L("规则条数"), value: status.entries.formatted())
         } header: {
-            Text("统计")
+            Text(L("统计"))
         } footer: {
-            Text("自 \(Date(timeIntervalSince1970: status.since).formatted(date: .abbreviated, time: .shortened)) 本次连接以来")
+            Text(L("自 {date} 本次连接以来", ["date": Date(timeIntervalSince1970: status.since).formatted(date: .abbreviated, time: .shortened)]))
         }
         if !status.top.isEmpty {
-            Section("拦截最多") {
+            Section(L("拦截最多")) {
                 ForEach(status.top) { item in
                     HStack {
                         Text(item.domain).lineLimit(1)
                         Spacer()
-                        Text("\(item.count) 次").foregroundStyle(.secondary)
+                        Text(L("{count} 次", ["count": item.count])).foregroundStyle(.secondary)
                         allowButton(item.domain)
                     }
-                    .swipeActions { Button("放行") { allow(item.domain) }.tint(.green) }
+                    .swipeActions { Button(L("放行")) { allow(item.domain) }.tint(.green) }
                 }
             }
         }
@@ -211,24 +211,24 @@ struct AdblockView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(item.domain).font(.subheadline.monospaced()).lineLimit(1)
-                            Text("\(Date(timeIntervalSince1970: item.time).formatted(date: .omitted, time: .standard)) · \(item.via == "dns" ? "DNS" : "连接")")
+                            Text("\(Date(timeIntervalSince1970: item.time).formatted(date: .omitted, time: .standard)) · \(item.via == "dns" ? "DNS" : L("连接"))")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
                         allowButton(item.domain)
                     }
-                    .swipeActions { Button("放行") { allow(item.domain) }.tint(.green) }
+                    .swipeActions { Button(L("放行")) { allow(item.domain) }.tint(.green) }
                 }
-            } header: { Text("最近拦截") } footer: { Text("点「放行」把域名加入白名单，立即生效。") }
+            } header: { Text(L("最近拦截")) } footer: { Text(L("点「放行」把域名加入白名单，立即生效。")) }
         }
     }
 
     /// One tap adds the domain to the allowlist; allowed ones say so.
     @ViewBuilder private func allowButton(_ domain: String) -> some View {
         if settings?.allow.contains(domain) == true {
-            Text("已放行").font(.caption).foregroundStyle(.green)
+            Text(L("已放行")).font(.caption).foregroundStyle(.green)
         } else {
-            Button("放行") { allow(domain) }
+            Button(L("放行")) { allow(domain) }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .tint(.green)
@@ -243,8 +243,8 @@ struct AdblockView: View {
 
     private func listLine(_ name: String) -> String? {
         guard let info = model.adblock?.lists.first(where: { $0.name == name }) else { return nil }
-        if let error = info.error { return "不可用：\(error)" }
-        return "\(info.entries.formatted()) 条" + (info.updated.map { " · 更新于 \(Date(timeIntervalSince1970: $0).formatted(date: .abbreviated, time: .shortened))" } ?? "")
+        if let error = info.error { return L("不可用：{error}", ["error": error]) }
+        return L("{entries} 条", ["entries": info.entries.formatted()]) + (info.updated.map { L(" · 更新于 {date}", ["date": Date(timeIntervalSince1970: $0).formatted(date: .abbreviated, time: .shortened)]) } ?? "")
     }
 
     private func addAllow() {
@@ -274,20 +274,20 @@ private struct AddListView: View {
     var body: some View {
         NavigationStack {
             Form {
-                TextField("名称", text: $name)
+                TextField(L("名称"), text: $name)
                 TextField("https://…", text: $url)
                     .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                Picker("格式", selection: $format) {
-                    Text("Clash 规则集").tag("clash")
+                Picker(L("格式"), selection: $format) {
+                    Text(L("Clash 规则集")).tag("clash")
                     Text("hosts").tag("hosts")
                     Text("AdGuard").tag("adguard")
                 }
             }
-            .navigationTitle("添加列表").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(L("添加列表")).navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(L("取消")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("添加") {
+                    Button(L("添加")) {
                         add(.init(name: name.trimmingCharacters(in: .whitespaces), url: url.trimmingCharacters(in: .whitespaces), format: format))
                         dismiss()
                     }

@@ -18,7 +18,7 @@ enum CosKeychain {
         search[kSecReturnData as String] = true
         let status = SecItemCopyMatching(search as CFDictionary, &item)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = item as? Data else { throw failure(status, "读取") }
+        guard status == errSecSuccess, let data = item as? Data else { throw failure(L("无法读取钥匙串中的 COS 密钥（{status}）。", ["status": status])) }
         return try JSONDecoder().decode(Keys.self, from: data)
     }
 
@@ -30,16 +30,16 @@ enum CosKeychain {
         if status == errSecItemNotFound {
             status = SecItemAdd(query.merging(update) { $1 } as CFDictionary, nil)
         }
-        guard status == errSecSuccess else { throw failure(status, "保存") }
+        guard status == errSecSuccess else { throw failure(L("无法保存钥匙串中的 COS 密钥（{status}）。", ["status": status])) }
     }
 
     static func delete() throws {
         let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw failure(status, "删除") }
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw failure(L("无法删除钥匙串中的 COS 密钥（{status}）。", ["status": status])) }
     }
 
-    private static func failure(_ status: OSStatus, _ action: String) -> Error {
-        ClientError.message("无法\(action)钥匙串中的 COS 密钥（\(status)）。")
+    private static func failure(_ message: String) -> Error {
+        ClientError.message(message)
     }
 }
 
@@ -78,41 +78,41 @@ struct CosPublishView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("存储桶，如 examplebucket-1250000000", text: $target.bucket)
-                    TextField("地域，如 ap-shanghai", text: $target.region)
-                    TextField("文件路径，如 config/home.txt", text: $target.key)
+                    TextField(L("存储桶，如 examplebucket-1250000000"), text: $target.bucket)
+                    TextField(L("地域，如 ap-shanghai"), text: $target.region)
+                    TextField(L("文件路径，如 config/home.txt"), text: $target.key)
                 } header: {
-                    Text("腾讯云 COS")
+                    Text(L("腾讯云 COS"))
                 } footer: {
                     if let url = target.url { Text(url).textSelection(.enabled) }
                 }
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 Section {
-                    SecureField("加密密码", text: $password).textContentType(.newPassword)
-                    SecureField("确认密码", text: $repeated).textContentType(.newPassword)
+                    SecureField(L("加密密码"), text: $password).textContentType(.newPassword)
+                    SecureField(L("确认密码"), text: $repeated).textContentType(.newPassword)
                 } footer: {
                     Text(!repeated.isEmpty && repeated != password
-                         ? "两次输入的密码不一致"
-                         : "加密后上传并覆盖同名文件，订阅了该地址的设备下次更新即拿到新配置。")
+                         ? L("两次输入的密码不一致")
+                         : L("加密后上传并覆盖同名文件，订阅了该地址的设备下次更新即拿到新配置。"))
                         .foregroundStyle(!repeated.isEmpty && repeated != password ? Color.red : Color.secondary)
                 }
                 if !hasKeys {
                     Section {
-                        NavigationLink("填写 COS 密钥") { CosSettingsView { hasKeys = true } }
+                        NavigationLink(L("填写 COS 密钥")) { CosSettingsView { hasKeys = true } }
                     } footer: {
-                        Text("尚未保存 COS 密钥。")
+                        Text(L("尚未保存 COS 密钥。"))
                     }
                 }
                 if working { Section { ProgressView() } }
                 if let errorMessage { Section { Text(errorMessage).foregroundStyle(.red) } }
             }
             .disabled(working)
-            .navigationTitle("发布到 COS").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(L("发布到 COS")).navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(L("取消")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("发布") {
+                    Button(L("发布")) {
                         working = true
                         errorMessage = nil
                         Task {
@@ -124,8 +124,8 @@ struct CosPublishView: View {
                 }
             }
             .interactiveDismissDisabled(working)
-            .alert("已发布", isPresented: Binding(get: { published != nil }, set: { if !$0 { dismiss() } })) {
-                Button("好") { dismiss() }
+            .alert(L("已发布"), isPresented: Binding(get: { published != nil }, set: { if !$0 { dismiss() } })) {
+                Button(L("好")) { dismiss() }
             } message: {
                 Text(published ?? "")
             }
@@ -154,23 +154,23 @@ struct CosSettingsView: View {
             Section {
                 TextField("SecretId", text: $secretID)
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
-                SecureField(saved == nil ? "SecretKey" : "SecretKey（已保存，留空则不修改）", text: $secretKey)
+                SecureField(saved == nil ? "SecretKey" : L("SecretKey（已保存，留空则不修改）"), text: $secretKey)
             } footer: {
-                Text("建议使用只授予该存储桶 PutObject 权限的子用户密钥。密钥只保存在本机钥匙串中。")
+                Text(L("建议使用只授予该存储桶 PutObject 权限的子用户密钥。密钥只保存在本机钥匙串中。"))
             }
             Section {
-                Button("保存") { save() }
+                Button(L("保存")) { save() }
                     .disabled(secretID.trimmingCharacters(in: .whitespaces).isEmpty
                               || (saved == nil && secretKey.isEmpty))
                 if saved != nil {
-                    Button("删除密钥", role: .destructive) {
+                    Button(L("删除密钥"), role: .destructive) {
                         do { try CosKeychain.delete(); load() } catch { failure = error.localizedDescription }
                     }
                 }
             }
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
         }
-        .navigationTitle("远程发布")
+        .navigationTitle(L("远程发布"))
         .onAppear(perform: load)
     }
 
@@ -184,7 +184,7 @@ struct CosSettingsView: View {
         do {
             let id = secretID.trimmingCharacters(in: .whitespaces)
             let key = secretKey.isEmpty ? try CosKeychain.load()?.secretKey : secretKey
-            guard let key, !key.isEmpty else { throw ClientError.message("请填写 SecretKey。") }
+            guard let key, !key.isEmpty else { throw ClientError.message(L("请填写 SecretKey。")) }
             try CosKeychain.save(.init(secretID: id, secretKey: key))
             failure = nil
             load()

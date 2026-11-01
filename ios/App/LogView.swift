@@ -3,8 +3,16 @@ import SwiftUI
 /// Shared app/tunnel/core log, newest first.
 struct LogView: View {
     private enum Level: String, CaseIterable, Identifiable {
-        case all = "全部", info = "信息", warning = "警告", error = "错误"
+        case all, info, warning, error
         var id: Self { self }
+        var title: String {
+            switch self {
+            case .all: L("全部")
+            case .info: L("信息")
+            case .warning: L("警告")
+            case .error: L("错误")
+            }
+        }
         func includes(_ level: String) -> Bool {
             switch self {
             case .all: true
@@ -48,16 +56,16 @@ struct LogView: View {
             .listStyle(.plain)
             .overlay {
                 if visible.isEmpty {
-                    ContentUnavailableView(entries.isEmpty ? "暂无日志" : "无匹配日志",
+                    ContentUnavailableView(entries.isEmpty ? L("暂无日志") : L("无匹配日志"),
                                            systemImage: "doc.text.magnifyingglass")
                 }
             }
-            .searchable(text: $query, prompt: "搜索日志")
-            .navigationTitle("日志")
+            .searchable(text: $query, prompt: L("搜索日志"))
+            .navigationTitle(L("日志"))
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Picker("级别", selection: $level) {
-                        ForEach(Level.allCases) { Text($0.rawValue).tag($0) }
+                    Picker(L("级别"), selection: $level) {
+                        ForEach(Level.allCases) { Text($0.title).tag($0) }
                     }
                     .pickerStyle(.menu)
                 }
@@ -65,12 +73,12 @@ struct LogView: View {
                     if let url = LogFile.shared.url, !entries.isEmpty {
                         ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
                     }
-                    Button("清空", systemImage: "trash") { confirmClear = true }
+                    Button(L("清空"), systemImage: "trash") { confirmClear = true }
                         .disabled(entries.isEmpty)
                 }
             }
-            .confirmationDialog("清空所有日志？", isPresented: $confirmClear, titleVisibility: .visible) {
-                Button("清空", role: .destructive) {
+            .confirmationDialog(L("清空所有日志？"), isPresented: $confirmClear, titleVisibility: .visible) {
+                Button(L("清空"), role: .destructive) {
                     LogFile.shared.clear()
                     entries = []
                 }

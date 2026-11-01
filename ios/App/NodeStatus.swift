@@ -32,9 +32,9 @@ struct TailscaleStatus: Decodable, Equatable {
     var directPeers: Int { peers.filter { $0.path == "direct" }.count }
     var stateText: String {
         switch state {
-        case "running": "已连接"
-        case "error": "连接失败"
-        default: "连接中"
+        case "running": L("已连接")
+        case "error": L("连接失败")
+        default: L("连接中")
         }
     }
 }
@@ -54,9 +54,9 @@ struct TailscalePeer: Decodable, Equatable, Identifiable {
 
     var pathText: String {
         switch path {
-        case "direct": "直连" + (rttMs.map { " \($0) ms" } ?? "")
-        case "derp": "中继" + (derp.map { " \($0)" } ?? "")
-        default: online == true ? "空闲" : "离线"
+        case "direct": L("直连") + (rttMs.map { " \($0) ms" } ?? "")
+        case "derp": L("中继") + (derp.map { " \($0)" } ?? "")
+        default: online == true ? L("空闲") : L("离线")
         }
     }
 }
@@ -76,18 +76,18 @@ extension NodeStatus {
     /// `summary` so it can carry its own colour.
     var delayText: String? {
         if let delay { return "\(delay) ms" }
-        return error != nil && tailscale == nil ? "超时" : nil
+        return error != nil && tailscale == nil ? L("超时") : nil
     }
 
     /// One line for lists: what matters most for this kind of node.
     var summary: String {
         if let tailscale {
             guard tailscale.state == "running" else { return tailscale.stateText }
-            return "\(tailscale.stateText) · \(tailscale.onlinePeers) 台在线"
-                + (tailscale.directPeers > 0 ? " · \(tailscale.directPeers) 直连" : "")
+            return L("{stateText} · {onlinePeers} 台在线", ["stateText": tailscale.stateText, "onlinePeers": tailscale.onlinePeers])
+                + (tailscale.directPeers > 0 ? L(" · {directPeers} 直连", ["directPeers": tailscale.directPeers]) : "")
         }
         var parts = [type]
-        if connections > 0 { parts.append("\(connections) 连接") }
+        if connections > 0 { parts.append(L("{connections} 连接", ["connections": connections])) }
         return parts.joined(separator: " · ")
     }
 }

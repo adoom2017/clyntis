@@ -23,9 +23,9 @@ struct AppOverrides: Codable, Equatable {
     }
 
     func save() throws {
-        guard let url = Self.url else { throw ClientError.message("无法访问共享存储。") }
+        guard let url = Self.url else { throw ClientError.message(L("无法访问共享存储。")) }
         if let logLevel, !Self.logLevels.contains(logLevel) {
-            throw ClientError.message("无效日志级别「\(logLevel)」。")
+            throw ClientError.message(L("无效日志级别「{logLevel}」。", ["logLevel": logLevel]))
         }
         try JSONEncoder().encode(self).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
@@ -62,8 +62,8 @@ struct AdblockSettings: Codable, Equatable {
     }
 
     static let presetsOffered: [(id: String, name: String, detail: String)] = [
-        ("awavenue", "AWAvenue-Ads", "国内 App 广告接口，约 1,000 条，误杀少"),
-        ("anti-ad", "anti-AD", "覆盖面广，以国内为主，约 10 万条"),
-        ("adguard-dns", "AdGuard DNS filter", "偏海外的广告与追踪，约 18 万条，内存占用较大"),
+        ("awavenue", "AWAvenue-Ads", L("国内 App 广告接口，约 1,000 条，误杀少")),
+        ("anti-ad", "anti-AD", L("覆盖面广，以国内为主，约 10 万条")),
+        ("adguard-dns", "AdGuard DNS filter", L("偏海外的广告与追踪，约 18 万条，内存占用较大")),
     ]
 }

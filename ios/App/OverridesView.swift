@@ -8,25 +8,25 @@ struct OverridesView: View {
     var body: some View {
         Form {
             Section {
-                Picker("日志级别", selection: binding(\.logLevel)) {
-                    Text("跟随配置文件").tag(String?.none)
+                Picker(L("日志级别"), selection: binding(\.logLevel)) {
+                    Text(L("跟随配置文件")).tag(String?.none)
                     ForEach(AppOverrides.logLevels, id: \.self) { Text($0).tag(String?.some($0)) }
                 }
                 OverrideToggle(title: "IPv6", value: binding(\.ipv6))
-                OverrideToggle(title: "域名嗅探", value: binding(\.sniffing))
+                OverrideToggle(title: L("域名嗅探"), value: binding(\.sniffing))
             } footer: {
-                Text(model.active ? "已连接：修改后需要重新连接才会生效。"
-                                  : "选「跟随配置文件」时使用配置自己的值。debug 日志较多，平时用 info。")
+                Text(model.active ? L("已连接：修改后需要重新连接才会生效。")
+                                  : L("选「跟随配置文件」时使用配置自己的值。debug 日志较多，平时用 info。"))
             }
             if model.active {
                 Section {
-                    Button("重新连接以生效") { Task { await model.reconnect() } }
+                    Button(L("重新连接以生效")) { Task { await model.reconnect() } }
                         .disabled(model.busy)
                 }
             }
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
         }
-        .navigationTitle("覆盖配置文件")
+        .navigationTitle(L("覆盖配置文件"))
     }
 
     private func binding<Value>(_ key: WritableKeyPath<AppOverrides, Value>) -> Binding<Value> {
@@ -46,9 +46,9 @@ private struct OverrideToggle: View {
     @Binding var value: Bool?
     var body: some View {
         Picker(title, selection: $value) {
-            Text("跟随配置文件").tag(Bool?.none)
-            Text("开启").tag(Bool?.some(true))
-            Text("关闭").tag(Bool?.some(false))
+            Text(L("跟随配置文件")).tag(Bool?.none)
+            Text(L("开启")).tag(Bool?.some(true))
+            Text(L("关闭")).tag(Bool?.some(false))
         }
     }
 }

@@ -2,7 +2,7 @@ import Foundation
 
 /// Legacy AES-CFB/Base64 configuration encryption shared with the desktop app.
 enum ConfigCrypto {
-    static let decryptFailed = "解密失败，请检查密码和文件格式。"
+    static var decryptFailed: String { L("解密失败，请检查密码和文件格式。") }
 
     /// Encrypted files are a single Base64 blob; a YAML configuration always contains `key: value`.
     static func looksEncrypted(_ data: Data) -> Bool {
@@ -19,7 +19,7 @@ enum ConfigCrypto {
     }
 
     static func encrypt(_ plaintext: Data, password: String) throws -> Data {
-        guard !password.isEmpty else { throw ClientError.message("密码不能为空。") }
+        guard !password.isEmpty else { throw ClientError.message(L("密码不能为空。")) }
         return try call(plaintext, password: password, limit: 24 * 1024 * 1024, meta_encrypt_config_v1)
     }
 
@@ -37,9 +37,9 @@ enum ConfigCrypto {
                 let query = operation(source, input.count, key, password.count, nil, 0, &length)
                 guard query == META_BUFFER_TOO_SMALL else {
                     try CoreSession.check(query)
-                    throw ClientError.message("配置为空。")
+                    throw ClientError.message(L("配置为空。"))
                 }
-                guard length > 0, length <= limit else { throw ClientError.message("配置超过大小限制。") }
+                guard length > 0, length <= limit else { throw ClientError.message(L("配置超过大小限制。")) }
                 var output = Data(count: length)
                 let status = output.withUnsafeMutableBytes {
                     operation(source, input.count, key, password.count,

@@ -40,6 +40,9 @@ connected. It also provides:
   off first; after three failed starts within five minutes the app pauses it
   and shows why. The tunnel log says whether a start came from the app or from
   iOS, and reports a previous session that ended without stopping.
+- **Language** (配置 → 语言): Simplified Chinese or English, or follow the
+  system (English when the system language is neither). The tunnel's messages
+  follow the choice through the App Group; core error details pass through.
 
 The VPN is a separate `NEPacketTunnelProvider` extension. It exchanges raw IPv4
 and IPv6 packets with the Rust core through the versioned C API; it does not

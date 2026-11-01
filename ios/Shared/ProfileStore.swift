@@ -49,7 +49,7 @@ struct ProfileStore {
 
     static func shared() throws -> ProfileStore {
         guard let container = sharedContainer() else {
-            throw ClientError.message("无法访问共享配置，请检查 App Group 签名配置。")
+            throw ClientError.message(L("无法访问共享配置，请检查 App Group 签名配置。"))
         }
         return try ProfileStore(root: container.appendingPathComponent("Profiles", isDirectory: true))
     }
@@ -64,7 +64,7 @@ struct ProfileStore {
                 guard UUID(uuidString: url.lastPathComponent) != nil else { return nil }
                 let profile = try JSONDecoder().decode(Profile.self, from: Data(contentsOf: url.appendingPathComponent("profile.json")))
                 guard profile.id.uuidString == url.lastPathComponent else {
-                    throw ClientError.message("配置索引与目录不一致。")
+                    throw ClientError.message(L("配置索引与目录不一致。"))
                 }
                 return profile
             }
@@ -75,7 +75,7 @@ struct ProfileStore {
         let url = directory(for: id).appendingPathComponent("config.yaml")
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size > 0, size <= Self.maximumBytes else {
-            throw ClientError.message("配置为空或超过 16 MiB。")
+            throw ClientError.message(L("配置为空或超过 16 MiB。"))
         }
         return try Data(contentsOf: url)
     }
@@ -83,7 +83,7 @@ struct ProfileStore {
     func add(name: String, configuration: Data, source: String? = nil, encrypted: Bool = false,
              validate: (Data, URL) throws -> Void) throws -> Profile {
         guard !configuration.isEmpty, configuration.count <= Self.maximumBytes else {
-            throw ClientError.message("配置为空或超过 16 MiB。")
+            throw ClientError.message(L("配置为空或超过 16 MiB。"))
         }
         let profile = Profile(id: UUID(), name: name, createdAt: Date(), source: source,
                               encrypted: source == nil ? nil : encrypted)
@@ -111,7 +111,7 @@ struct ProfileStore {
     func replaceConfiguration(_ id: UUID, with configuration: Data,
                               validate: (Data, URL) throws -> Void) throws -> Profile {
         guard !configuration.isEmpty, configuration.count <= Self.maximumBytes else {
-            throw ClientError.message("配置为空或超过 16 MiB。")
+            throw ClientError.message(L("配置为空或超过 16 MiB。"))
         }
         var profile = try profile(id)
         try validate(configuration, directory(for: id))
@@ -124,7 +124,7 @@ struct ProfileStore {
 
     func rename(_ id: UUID, to name: String) throws -> Profile {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name.count <= 100 else { throw ClientError.message("名称不能为空且不超过 100 个字符。") }
+        guard !name.isEmpty, name.count <= 100 else { throw ClientError.message(L("名称不能为空且不超过 100 个字符。")) }
         var profile = try profile(id)
         profile.name = name
         try save(profile)

@@ -7,7 +7,7 @@ enum RemoteConfigImporter {
               let scheme = url.scheme?.lowercased(),
               let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
               scheme == "https" || (scheme == "http" && isLoopback(host)) else {
-            throw ClientError.message("请输入 HTTPS 配置链接。")
+            throw ClientError.message(L("请输入 HTTPS 配置链接。"))
         }
         return url
     }
@@ -48,19 +48,19 @@ enum RemoteConfigImporter {
     private static func read(_ bytes: URLSession.AsyncBytes, response: URLResponse, maximumBytes: Int) async throws -> Data {
         try Task.checkCancellation()
         guard let response = response as? HTTPURLResponse,
-              let finalURL = response.url else { throw ClientError.message("服务器未返回有效配置文件。") }
+              let finalURL = response.url else { throw ClientError.message(L("服务器未返回有效配置文件。")) }
         _ = try Self.url(from: finalURL.absoluteString)
         guard (200..<300).contains(response.statusCode) else {
-            throw ClientError.message("配置下载失败（HTTP \(response.statusCode)）。")
+            throw ClientError.message(L("配置下载失败（HTTP {statusCode}）。", ["statusCode": response.statusCode]))
         }
         guard response.expectedContentLength <= Int64(maximumBytes) else {
-            throw ClientError.message("远程配置文件超过大小限制。")
+            throw ClientError.message(L("远程配置文件超过大小限制。"))
         }
         var data = Data(), chunk: [UInt8] = []
         chunk.reserveCapacity(64 * 1024)
         for try await byte in bytes {
             guard data.count + chunk.count < maximumBytes else {
-                throw ClientError.message("远程配置文件超过大小限制。")
+                throw ClientError.message(L("远程配置文件超过大小限制。"))
             }
             chunk.append(byte)
             if chunk.count == 64 * 1024 {
@@ -71,7 +71,7 @@ enum RemoteConfigImporter {
         }
         try Task.checkCancellation()
         data.append(contentsOf: chunk)
-        guard !data.isEmpty else { throw ClientError.message("远程配置文件为空。") }
+        guard !data.isEmpty else { throw ClientError.message(L("远程配置文件为空。")) }
         return data
     }
 
@@ -79,7 +79,7 @@ enum RemoteConfigImporter {
     static func plaintext(_ source: Data, password: String) throws -> Data {
         let encrypted = !password.isEmpty
         if !encrypted && ConfigCrypto.looksEncrypted(source) {
-            throw ClientError.message("配置已加密，请填写密码。")
+            throw ClientError.message(L("配置已加密，请填写密码。"))
         }
         return encrypted ? try ConfigCrypto.decrypt(source, password: password) : source
     }
@@ -92,7 +92,7 @@ enum RemoteConfigImporter {
         try Task.checkCancellation()
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let profile = try store.add(name: name.isEmpty ? "远程配置" : name, configuration: plaintext,
+            let profile = try store.add(name: name.isEmpty ? L("远程配置") : name, configuration: plaintext,
                                         source: link?.absoluteString, encrypted: encrypted) { bytes, directory in
                 let core = try CoreSession(configuration: bytes, directory: directory)
                 core.close()
@@ -105,7 +105,7 @@ enum RemoteConfigImporter {
             return profile
         } catch is CancellationError { throw CancellationError() }
         catch {
-            if encrypted { throw ClientError.message("解密或配置校验失败，请检查密码和文件格式。") }
+            if encrypted { throw ClientError.message(L("解密或配置校验失败，请检查密码和文件格式。")) }
             throw error
         }
     }

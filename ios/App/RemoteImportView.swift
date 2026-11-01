@@ -13,34 +13,34 @@ struct RemoteImportView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("链接") {
+                Section(L("链接")) {
                     TextField("https://example.com/config.yaml", text: $address)
                         .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .accessibilityLabel("配置链接")
+                        .accessibilityLabel(L("配置链接"))
                         .disabled(importing)
                 }
-                Section("名称") {
-                    TextField("可选", text: $name).disabled(importing)
+                Section(L("名称")) {
+                    TextField(L("可选"), text: $name).disabled(importing)
                 }
                 Section {
-                    SecureField("可选", text: $password)
+                    SecureField(L("可选"), text: $password)
                         .textInputAutocapitalization(.never).autocorrectionDisabled().disabled(importing)
-                } header: { Text("解密密码") }
-                footer: { Text("仅用于加密配置，不会保存") }
+                } header: { Text(L("解密密码")) }
+                footer: { Text(L("仅用于加密配置，不会保存")) }
                 if importing {
-                    Section { ProgressView("正在导入…") }
+                    Section { ProgressView(L("正在导入…")) }
                 }
                 if let errorMessage {
                     Section { Text(errorMessage).foregroundStyle(.red) }
                 }
             }
-            .navigationTitle("从链接导入").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(L("从链接导入")).navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { password = ""; dismiss() }
+                    Button(L("取消")) { password = ""; dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("导入") {
+                    Button(L("导入")) {
                         errorMessage = nil
                         importing = true
                         attempt = UUID()

@@ -2,15 +2,15 @@ import SwiftUI
 
 /// Rule types offered when adding a custom rule.
 private let ruleTypes: [(type: String, label: String, placeholder: String)] = [
-    ("DOMAIN-SUFFIX", "域名后缀", "example.com"),
-    ("DOMAIN", "完整域名", "www.example.com"),
-    ("DOMAIN-KEYWORD", "域名关键字", "example"),
-    ("IP-CIDR", "IPv4 段", "10.0.0.0/8"),
-    ("IP-CIDR6", "IPv6 段", "2001:db8::/32"),
+    ("DOMAIN-SUFFIX", L("域名后缀"), "example.com"),
+    ("DOMAIN", L("完整域名"), "www.example.com"),
+    ("DOMAIN-KEYWORD", L("域名关键字"), "example"),
+    ("IP-CIDR", L("IPv4 段"), "10.0.0.0/8"),
+    ("IP-CIDR6", L("IPv6 段"), "2001:db8::/32"),
     ("GEOSITE", "GeoSite", "cn"),
     ("GEOIP", "GeoIP", "CN"),
-    ("DST-PORT", "目标端口", "443 或 8000-9000"),
-    ("NETWORK-NAME", "所在网络", "配置 networks 中的名称，如 home"),
+    ("DST-PORT", L("目标端口"), L("443 或 8000-9000")),
+    ("NETWORK-NAME", L("所在网络"), L("配置 networks 中的名称，如 home")),
 ]
 
 /// `TYPE,VALUE,TARGET[,no-resolve]` split for display; logical rules stay whole.
@@ -40,8 +40,8 @@ struct RulesView: View {
             RouteTestSection(model: model)
             DnsLeakSection(model: model)
             if model.customRules.isEmpty {
-                ContentUnavailableView("还没有自定义规则", systemImage: "list.bullet.indent",
-                                       description: Text("自定义规则对所有配置生效，并优先于配置自带的规则。"))
+                ContentUnavailableView(L("还没有自定义规则"), systemImage: "list.bullet.indent",
+                                       description: Text(L("自定义规则对所有配置生效，并优先于配置自带的规则。")))
             } else {
                 Section {
                     ForEach(Array(model.customRules.enumerated()), id: \.offset) { _, rule in
@@ -58,24 +58,24 @@ struct RulesView: View {
                         save(rules)
                     }
                 } footer: {
-                    Text(model.active ? "已连接：修改后需要重新连接才会生效。" : "越靠前优先级越高；点「编辑」可拖动排序。")
+                    Text(model.active ? L("已连接：修改后需要重新连接才会生效。") : L("越靠前优先级越高；点「编辑」可拖动排序。"))
                 }
             }
             if model.active {
                 Section {
-                    Button("重新连接以生效") { Task { await model.reconnect() } }
+                    Button(L("重新连接以生效")) { Task { await model.reconnect() } }
                         .disabled(model.busy)
                 }
             }
             if let failure { Section { Text(failure).foregroundStyle(.red) } }
         }
-        .navigationTitle("自定义规则")
+        .navigationTitle(L("自定义规则"))
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if !model.customRules.isEmpty { EditButton() }
-                Menu("添加", systemImage: "plus") {
-                    Button("添加规则", systemImage: "plus") { adding = true }
-                    Button("批量编辑", systemImage: "text.alignleft") { bulk = true }
+                Menu(L("添加"), systemImage: "plus") {
+                    Button(L("添加规则"), systemImage: "plus") { adding = true }
+                    Button(L("批量编辑"), systemImage: "text.alignleft") { bulk = true }
                 }
             }
         }
@@ -118,57 +118,57 @@ private struct RouteTestSection: View {
     @State private var failure: String?
 
     private static let matchText = [
-        "Adblock": "去广告拦截（优先于所有规则）",
-        "Adblock(HTTPDNS)": "去广告：HTTPDNS / 加密 DNS 入口",
-        "Adblock(IP)": "去广告：列表中的 IP",
-        "Adblock(QUIC)": "去广告：没有域名的 QUIC，回退到 TCP",
-        "Mode(Global)": "全局模式",
-        "Mode(Direct)": "直连模式",
-        "Fallback": "没有规则匹配，默认直连",
+        "Adblock": L("去广告拦截（优先于所有规则）"),
+        "Adblock(HTTPDNS)": L("去广告：HTTPDNS / 加密 DNS 入口"),
+        "Adblock(IP)": L("去广告：列表中的 IP"),
+        "Adblock(QUIC)": L("去广告：没有域名的 QUIC，回退到 TCP"),
+        "Mode(Global)": L("全局模式"),
+        "Mode(Direct)": L("直连模式"),
+        "Fallback": L("没有规则匹配，默认直连"),
     ]
 
     private var trimmed: String { target.trimmingCharacters(in: .whitespaces) }
 
     var body: some View {
         Section {
-            TextField("域名或 IP，如 www.google.com", text: $target)
+            TextField(L("域名或 IP，如 www.google.com"), text: $target)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .keyboardType(.URL).font(.body.monospaced())
                 .submitLabel(.search).onSubmit(test)
-            Picker("网络", selection: $network) {
+            Picker(L("网络"), selection: $network) {
                 Text("TCP").tag("tcp")
                 Text("UDP").tag("udp")
             }
             .pickerStyle(.segmented)
             Button(action: test) {
                 HStack {
-                    Text("测试")
+                    Text(L("测试"))
                     if testing { Spacer(); ProgressView() }
                 }
             }
             .disabled(!model.connected || testing || trimmed.isEmpty)
             if let failure { Text(failure).foregroundStyle(.red) }
             if let result {
-                LabeledContent("目标") {
+                LabeledContent(L("目标")) {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text("\(result.host.contains(":") ? "[\(result.host)]" : result.host):\(result.port)")
                         if let ip = result.ip, ip != result.host {
-                            Text("解析为 \(ip)").font(.caption).foregroundStyle(.secondary)
+                            Text(L("解析为 {ip}", ["ip": ip])).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
-                LabeledContent("匹配规则") {
+                LabeledContent(L("匹配规则")) {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text(result.rule ?? Self.matchText[result.matched] ?? result.matched)
                             .font(result.rule == nil ? .body : .footnote.monospaced())
                             .multilineTextAlignment(.trailing)
                         if let rule = result.rule, let index = result.index {
-                            Text("第 \(index + 1) 条" + (model.customRules.contains(rule) ? " · 自定义规则" : ""))
+                            Text(L("第 {index} 条", ["index": index + 1]) + (model.customRules.contains(rule) ? L(" · 自定义规则") : ""))
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
-                LabeledContent("出站节点") {
+                LabeledContent(L("出站节点")) {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text(result.node).fontWeight(.semibold)
                             .foregroundStyle(result.node == "REJECT" ? .red : .primary)
@@ -178,7 +178,7 @@ private struct RouteTestSection: View {
                                 .multilineTextAlignment(.trailing)
                         }
                         if result.resolvedLocally, !["DIRECT", "REJECT"].contains(result.node) {
-                            Text("匹配前已在本地解析域名，存在 DNS 泄露")
+                            Text(L("匹配前已在本地解析域名，存在 DNS 泄露"))
                                 .font(.caption).foregroundStyle(.red)
                                 .multilineTextAlignment(.trailing)
                         }
@@ -186,9 +186,9 @@ private struct RouteTestSection: View {
                 }
             }
         } header: {
-            Text("路由测试")
+            Text(L("路由测试"))
         } footer: {
-            if !model.connected { Text("连接 VPN 后可测试域名或 IP 会匹配哪条规则、从哪个节点出站。") }
+            if !model.connected { Text(L("连接 VPN 后可测试域名或 IP 会匹配哪条规则、从哪个节点出站。")) }
         }
     }
 
@@ -218,8 +218,8 @@ private struct DnsLeakSection: View {
     var body: some View {
         Section {
             if let audit {
-                Label(audit.leaking ? "配置检查发现 DNS 泄露风险"
-                        : audit.findings.isEmpty ? "配置检查未发现问题" : "配置检查未发现泄露，但有以下提示",
+                Label(audit.leaking ? L("配置检查发现 DNS 泄露风险")
+                        : audit.findings.isEmpty ? L("配置检查未发现问题") : L("配置检查未发现泄露，但有以下提示"),
                       systemImage: audit.leaking ? "exclamationmark.shield" : "checkmark.shield")
                     .foregroundStyle(audit.leaking ? .red : .primary)
                 ForEach(audit.findings, id: \.code) { finding in
@@ -238,14 +238,14 @@ private struct DnsLeakSection: View {
             }
             Button(action: runTest) {
                 HStack {
-                    Text(testing ? "检测中…" : "在线检测")
+                    Text(testing ? L("检测中…") : L("在线检测"))
                     if testing { Spacer(); ProgressView() }
                 }
             }
             .disabled(!model.connected || testing)
             if let failure { Text(failure).foregroundStyle(.red) }
             if let test {
-                LabeledContent("出口 IP") {
+                LabeledContent(L("出口 IP")) {
                     VStack(alignment: .trailing, spacing: 2) {
                         ForEach(test.exit, id: \.ip) { server in
                             Text(server.ip)
@@ -253,23 +253,24 @@ private struct DnsLeakSection: View {
                         }
                     }
                 }
-                Text("bash.ws 当前经「\(test.node)」（\(test.matched)）访问"
-                     + (test.node == "DIRECT" ? "，结果反映直连时的情况。" : "。"))
+                Text(test.node == "DIRECT"
+                     ? L("bash.ws 当前经「{node}」（{matched}）访问，结果反映直连时的情况。", ["node": test.node, "matched": test.matched])
+                     : L("bash.ws 当前经「{node}」（{matched}）访问。", ["node": test.node, "matched": test.matched]))
                     .font(.caption).foregroundStyle(.secondary)
-                probe("应用访问时的解析器", test.routed, verdict: test.verdict)
-                probe("内核上游 DNS 的解析器", test.local)
+                probe(L("应用访问时的解析器"), test.routed, verdict: test.verdict)
+                probe(L("内核上游 DNS 的解析器"), test.local)
             }
         } header: {
-            Text("DNS 泄露检测")
+            Text(L("DNS 泄露检测"))
         } footer: {
             Text(model.connected
-                 ? "配置检查在本地完成；在线检测会向 bash.ws 发送随机域名，并暴露出口和解析器的 IP。"
-                 : "连接 VPN 后可检测。")
+                 ? L("配置检查在本地完成；在线检测会向 bash.ws 发送随机域名，并暴露出口和解析器的 IP。")
+                 : L("连接 VPN 后可检测。"))
         }
         .task(id: model.connected) { await check() }
     }
 
-    private static let levelText = ["risk": "泄露", "warning": "注意", "info": "提示"]
+    private static var levelText: [String: String] { ["risk": L("泄露"), "warning": L("注意"), "info": L("提示")] }
 
     private static func levelColor(_ level: String) -> Color {
         switch level {
@@ -284,10 +285,10 @@ private struct DnsLeakSection: View {
     }
 
     private static let verdictText = [
-        "leak": "存在泄露：本地上游看到了走代理的域名",
-        "ok": "未发现泄露",
-        "direct": "直连，无代理路径可检查",
-        "unknown": "无法判断",
+        "leak": L("存在泄露：本地上游看到了走代理的域名"),
+        "ok": L("未发现泄露"),
+        "direct": L("直连，无代理路径可检查"),
+        "unknown": L("无法判断"),
     ]
 
     /// `verdict` judges the routed probe; the local one only lists who resolves locally.
@@ -295,7 +296,7 @@ private struct DnsLeakSection: View {
         let leaking = probe.error != nil || verdict == "leak"
         let status = probe.error
             ?? verdict.map { Self.verdictText[$0] ?? $0 }
-            ?? (probe.resolvers.isEmpty ? "没有结果" : "本地解析由这些服务器完成")
+            ?? (probe.resolvers.isEmpty ? L("没有结果") : L("本地解析由这些服务器完成"))
         return VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(title).font(.subheadline.weight(.semibold))
@@ -350,11 +351,11 @@ private struct RuleRow: View {
             }
             HStack(spacing: 6) {
                 Text(parts.label)
-                if parts.noResolve { Text("· 不解析域名") }
+                if parts.noResolve { Text(L("· 不解析域名")) }
             }
             .font(.caption).foregroundStyle(.secondary)
             if let reason {
-                Text("\(reason)，当前配置下不生效").font(.caption).foregroundStyle(.red)
+                Text(L("{reason}，当前配置下不生效", ["reason": reason])).font(.caption).foregroundStyle(.red)
             }
         }
     }
@@ -375,23 +376,23 @@ private struct AddRuleView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Picker("类型", selection: $type) {
+                Picker(L("类型"), selection: $type) {
                     ForEach(ruleTypes, id: \.type) { Text($0.label).tag($0.type) }
                 }
                 TextField(ruleTypes.first { $0.type == type }?.placeholder ?? "", text: $value)
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     .font(.body.monospaced())
-                Picker("目标", selection: $target) {
+                Picker(L("目标"), selection: $target) {
                     ForEach(targets, id: \.self) { Text($0).tag($0) }
                 }
-                if acceptsNoResolve { Toggle("不解析域名", isOn: $noResolve) }
+                if acceptsNoResolve { Toggle(L("不解析域名"), isOn: $noResolve) }
                 if let failure { Text(failure).foregroundStyle(.red) }
             }
-            .navigationTitle("添加规则").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(L("添加规则")).navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(L("取消")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("添加") {
+                    Button(L("添加")) {
                         let parts = [type, value.trimmingCharacters(in: .whitespaces), target]
                             + (acceptsNoResolve && noResolve ? ["no-resolve"] : [])
                         do {
@@ -425,14 +426,14 @@ private struct BulkRulesView: View {
                     .font(.system(.footnote, design: .monospaced))
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     .padding(.horizontal, 8)
-                Text("每行一条，格式为「类型,值,目标」，越靠前优先级越高。")
+                Text(L("每行一条，格式为「类型,值,目标」，越靠前优先级越高。"))
                     .font(.caption).foregroundStyle(.secondary).padding(12)
             }
-            .navigationTitle("批量编辑").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(L("批量编辑")).navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(L("取消")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
+                    Button(L("保存")) {
                         let lines = text.split(whereSeparator: \.isNewline)
                             .map { $0.trimmingCharacters(in: .whitespaces) }
                             .filter { !$0.isEmpty && !$0.hasPrefix("#") }

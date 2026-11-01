@@ -53,11 +53,11 @@ final class AppModel {
     var selected: Profile? { profiles.first { $0.id == selectedID } }
     var statusText: String {
         switch status {
-        case .connected: "已连接"
-        case .connecting: "正在连接"
-        case .disconnecting: "正在断开"
-        case .reasserting: "正在重连"
-        default: "未连接"
+        case .connected: L("已连接")
+        case .connecting: L("正在连接")
+        case .disconnecting: L("正在断开")
+        case .reasserting: L("正在重连")
+        default: L("未连接")
         }
     }
 
@@ -124,10 +124,10 @@ final class AppModel {
         guard !busy, !startPending, let store else { return }
         if active { await disconnect(); return }
         #if targetEnvironment(simulator)
-        error = "模拟器不支持 VPN，请在已签名的真机上运行。"
+        error = L("模拟器不支持 VPN，请在已签名的真机上运行。")
         return
         #else
-        guard let selected else { error = "请先导入配置。"; return }
+        guard let selected else { error = L("请先导入配置。"); return }
         busy = true
         defer { busy = false; phase = nil }
         let log = Diagnostics.app
@@ -155,7 +155,7 @@ final class AppModel {
             log.info("connect: routing resources \(String(describing: resources))")
             if resources == .missing {
                 step = "prefetch resources"
-                phase = "正在下载路由资源…"
+                phase = L("正在下载路由资源…")
                 let started = Date()
                 do {
                     try await Task.detached {
@@ -218,7 +218,7 @@ final class AppModel {
         }
     }
 
-    private static let startWaitMessage = "系统还没有启动 VPN。应用刚更新时 iOS 可能要几分钟后才会启动，请稍候，或在「设置 > VPN」中打开 Clyntis。"
+    private static var startWaitMessage: String { L("系统还没有启动 VPN。应用刚更新时 iOS 可能要几分钟后才会启动，请稍候，或在「设置 > VPN」中打开 Clyntis。") }
 
     private func endStartWait() {
         // The VPN came up after all: the explanation no longer applies.
@@ -279,7 +279,7 @@ final class AppModel {
             do {
                 try await manager.saveToPreferences()
                 Diagnostics.app.error("auto reconnect paused after \(failures.count) failed starts: \(last.reason)")
-                self.error = "VPN 连续 \(failures.count) 次启动失败，已暂停自动重连：\(last.reason)"
+                self.error = L("VPN 连续 {count} 次启动失败，已暂停自动重连：{reason}", ["count": failures.count, "reason": last.reason])
             } catch {
                 Diagnostics.app.error("pausing auto reconnect failed: \(Diagnostics.describe(error))")
             }
@@ -301,7 +301,7 @@ final class AppModel {
                 // Base64 ciphertext is larger than the 16 MiB plaintext it decrypts to.
                 let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                 guard size > 0, size <= 24 * 1024 * 1024 else {
-                    throw ClientError.message("配置为空或超过大小限制。")
+                    throw ClientError.message(L("配置为空或超过大小限制。"))
                 }
                 return try Data(contentsOf: url)
             }.value
@@ -326,7 +326,7 @@ final class AppModel {
     }
 
     func exportEncrypted(_ profile: Profile, password: String) async throws -> Data {
-        guard let store else { throw ClientError.message("配置存储不可用。") }
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
         return try await Task.detached {
             try ConfigCrypto.encrypt(store.configuration(for: profile.id), password: password)
         }.value
@@ -335,13 +335,13 @@ final class AppModel {
     /// Encrypts `profile` like `exportEncrypted` and uploads it to Tencent COS;
     /// returns the object's URL and remembers the target for the profile.
     func publish(_ profile: Profile, password: String, to target: CosTarget) async throws -> String {
-        guard let store else { throw ClientError.message("配置存储不可用。") }
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
         var target = target
         target.bucket = target.bucket.trimmingCharacters(in: .whitespaces)
         target.region = target.region.trimmingCharacters(in: .whitespaces)
         target.key = target.key.trimmingCharacters(in: CharacterSet(charactersIn: " /"))
         guard let keys = try CosKeychain.load() else {
-            throw ClientError.message("请先在「配置 → 远程发布」中填写腾讯云 COS 的 SecretId 和 SecretKey。")
+            throw ClientError.message(L("请先在「配置 → 远程发布」中填写腾讯云 COS 的 SecretId 和 SecretKey。"))
         }
         let destination = target
         try await Task.detached {
@@ -373,7 +373,7 @@ final class AppModel {
     }
 
     func importRemote(address: String, password: String, name: String) async throws {
-        guard !busy, let store else { throw ClientError.message("正在处理其他操作，请稍后再试。") }
+        guard !busy, let store else { throw ClientError.message(L("正在处理其他操作，请稍后再试。")) }
         busy = true
         defer { busy = false }
         let url = try RemoteConfigImporter.url(from: address)
@@ -443,9 +443,9 @@ final class AppModel {
     }
     var adblockSummary: String {
         switch adblockState {
-        case .on: "已拦截 \((adblock?.total ?? 0).formatted()) 次"
-        case .pending: "重新连接后生效"
-        case .off: "未开启"
+        case .on: L("已拦截 {value} 次", ["value": (adblock?.total ?? 0).formatted()])
+        case .pending: L("重新连接后生效")
+        case .off: L("未开启")
         }
     }
 
@@ -453,7 +453,7 @@ final class AppModel {
     /// Adds `domain` to the app's allowlist and applies it to the running core.
     func allowAdblock(_ domain: String) async throws {
         guard var settings = overrides.adblock else {
-            throw ClientError.message("去广告由配置文件开启，请在配置的 adblock.allow 中放行，或在本页开启去广告后再放行。")
+            throw ClientError.message(L("去广告由配置文件开启，请在配置的 adblock.allow 中放行，或在本页开启去广告后再放行。"))
         }
         guard !settings.allow.contains(domain) else { return }
         settings.allow.append(domain)
@@ -497,13 +497,13 @@ final class AppModel {
     // MARK: Profile details
 
     func configurationText(for profile: Profile) throws -> String {
-        guard let store else { throw ClientError.message("配置存储不可用。") }
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
         return String(decoding: try store.configuration(for: profile.id), as: UTF8.self)
     }
 
     /// Validates and saves edited YAML. A running tunnel keeps its loaded copy until reconnected.
     func saveConfiguration(_ text: String, for profile: Profile) async throws {
-        guard let store else { throw ClientError.message("配置存储不可用。") }
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
         let data = Data(text.utf8)
         try await Task.detached {
             _ = try store.replaceConfiguration(profile.id, with: data) { bytes, directory in
@@ -515,14 +515,14 @@ final class AppModel {
     }
 
     func rename(_ profile: Profile, to name: String) throws {
-        guard let store else { throw ClientError.message("配置存储不可用。") }
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
         _ = try store.rename(profile.id, to: name)
         profiles = try store.profiles()
     }
 
     /// Downloads the profile's link again and replaces its configuration.
     func updateFromSource(_ profile: Profile, password: String = "") async throws {
-        guard let store, let source = profile.source else { throw ClientError.message("此配置不是从链接导入的。") }
+        guard let store, let source = profile.source else { throw ClientError.message(L("此配置不是从链接导入的。")) }
         let url = try RemoteConfigImporter.url(from: source)
         let body = try await RemoteConfigImporter.download(from: url, encrypted: !password.isEmpty)
         try await Task.detached {
@@ -606,7 +606,7 @@ final class AppModel {
 
     /// Which rule `target` matches in the running core and the node it uses.
     func testRoute(_ target: String, network: String) async throws -> RouteTest {
-        guard connected else { throw ClientError.message("VPN 未连接。") }
+        guard connected else { throw ClientError.message(L("VPN 未连接。")) }
         let data = try await send(TunnelMessage(command: "test-route", target: target, network: network), timeout: 15)
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let error = object["error"] as? String {
@@ -617,7 +617,7 @@ final class AppModel {
 
     /// The configuration review, plus the online bash.ws test when `online`.
     func dnsLeak(online: Bool) async throws -> DnsLeakResult {
-        guard connected else { throw ClientError.message("VPN 未连接。") }
+        guard connected else { throw ClientError.message(L("VPN 未连接。")) }
         let data = try await send(TunnelMessage(command: "dns-leak", online: online), timeout: online ? 45 : 5)
         if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let error = object["error"] as? String {
@@ -628,18 +628,18 @@ final class AppModel {
 
     private func send(_ message: TunnelMessage, timeout: Double = 5) async throws -> Data {
         guard let session = manager?.connection as? NETunnelProviderSession else {
-            throw ClientError.message("VPN 会话不可用。")
+            throw ClientError.message(L("VPN 会话不可用。"))
         }
         let payload = try JSONEncoder().encode(message)
         return try await withCheckedThrowingContinuation { continuation in
             let reply = MessageReply(continuation)
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-                reply.finish(.failure(ClientError.message("VPN 无响应。")))
+                reply.finish(.failure(ClientError.message(L("VPN 无响应。"))))
             }
             do {
                 try session.sendProviderMessage(payload) { data in
                     if let data { reply.finish(.success(data)) }
-                    else { reply.finish(.failure(ClientError.message("VPN 已停止或无法响应。"))) }
+                    else { reply.finish(.failure(ClientError.message(L("VPN 已停止或无法响应。")))) }
                 }
             } catch { reply.finish(.failure(error)) }
         }
@@ -647,10 +647,10 @@ final class AppModel {
 
     private func applySnapshot(_ data: Data) throws {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ClientError.message("无效的内核状态。")
+            throw ClientError.message(L("无效的内核状态。"))
         }
         if let error = object["error"] as? String { throw ClientError.message(error) }
-        if object["stopped"] as? Bool == true { throw ClientError.message("内核已停止，请重新连接。") }
+        if object["stopped"] as? Bool == true { throw ClientError.message(L("内核已停止，请重新连接。")) }
         upload = (object["upload"] as? NSNumber)?.uint64Value ?? 0
         download = (object["download"] as? NSNumber)?.uint64Value ?? 0
         connectionCount = (object["connections"] as? [Any])?.count ?? 0
@@ -686,7 +686,7 @@ struct ProxyGroup: Identifiable {
     let selected: String?
 
     var typeText: String {
-        ["select": "手动", "url-test": "自动", "fallback": "故障转移", "load-balance": "负载均衡"][type] ?? type
+        ["select": L("手动"), "url-test": L("自动"), "fallback": L("故障转移"), "load-balance": L("负载均衡")][type] ?? type
     }
 }
 

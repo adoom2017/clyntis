@@ -28,7 +28,7 @@ struct YAMLTextView: UIViewRepresentable {
         view.alwaysBounceVertical = true
         view.keyboardDismissMode = .interactive
         view.textContainerInset = UIEdgeInsets(top: 8, left: 4, bottom: 8, right: 4)
-        view.accessibilityLabel = "YAML 配置"
+        view.accessibilityLabel = L("YAML 配置")
         return view
     }
 
@@ -44,7 +44,7 @@ struct YAMLTextView: UIViewRepresentable {
                 view.scrollRangeToVisible(range)
             }
         }
-        view.accessibilityValue = errorLine.map { "第 \($0) 行有格式错误" }
+        view.accessibilityValue = errorLine.map { L("第 {value} 行有格式错误", ["value": $0]) }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }

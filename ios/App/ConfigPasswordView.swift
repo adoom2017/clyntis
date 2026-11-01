@@ -21,12 +21,12 @@ struct ConfigPasswordView: View {
         NavigationStack {
             Form {
                 Section {
-                    SecureField("密码", text: $password).textContentType(confirm ? .newPassword : .password)
+                    SecureField(L("密码"), text: $password).textContentType(confirm ? .newPassword : .password)
                     if confirm {
-                        SecureField("确认密码", text: $repeated).textContentType(.newPassword)
+                        SecureField(L("确认密码"), text: $repeated).textContentType(.newPassword)
                     }
                 } footer: {
-                    Text(mismatch ? "两次输入的密码不一致" : message)
+                    Text(mismatch ? L("两次输入的密码不一致") : message)
                         .foregroundStyle(mismatch ? Color.red : Color.secondary)
                 }
                 if working { Section { ProgressView() } }
@@ -35,7 +35,7 @@ struct ConfigPasswordView: View {
             .disabled(working)
             .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(L("取消")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(actionTitle) {
                         working = true
@@ -62,8 +62,8 @@ struct EncryptedExportView: View {
     @State private var document: EncryptedConfigDocument?
 
     var body: some View {
-        ConfigPasswordView(title: "加密导出", message: "导入此文件时需要输入该密码。",
-                           actionTitle: "导出", confirm: true) { password in
+        ConfigPasswordView(title: L("加密导出"), message: L("导入此文件时需要输入该密码。"),
+                           actionTitle: L("导出"), confirm: true) { password in
             document = EncryptedConfigDocument(data: try await model.exportEncrypted(profile, password: password))
         }
         .fileExporter(isPresented: Binding(get: { document != nil }, set: { if !$0 { document = nil } }),

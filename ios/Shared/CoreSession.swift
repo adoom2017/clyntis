@@ -5,7 +5,7 @@ final class CoreSession {
     private(set) var handle: UInt64 = 0
 
     init(configuration: Data, directory: URL, hooks: UnsafePointer<meta_hooks_v1>? = nil) throws {
-        guard meta_abi_version_v1() == 1 else { throw ClientError.message("内核接口版本不匹配。") }
+        guard meta_abi_version_v1() == 1 else { throw ClientError.message(L("内核接口版本不匹配。")) }
         let path = Data(directory.path.utf8)
         let result = configuration.withUnsafeBytes { config in
             path.withUnsafeBytes { path in
@@ -238,7 +238,7 @@ final class CoreSession {
     }
 
     func updateMode(_ mode: String) throws {
-        guard ["rule", "global", "direct"].contains(mode) else { throw ClientError.message("无效的代理模式。") }
+        guard ["rule", "global", "direct"].contains(mode) else { throw ClientError.message(L("无效的代理模式。")) }
         let data = try JSONSerialization.data(withJSONObject: ["mode": mode])
         let result = data.withUnsafeBytes {
             meta_update_v1(handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
@@ -260,7 +260,7 @@ final class CoreSession {
     static func check(_ result: Int32) throws {
         guard result == META_OK else {
             let data = try? read { meta_error_v1($0, $1, $2) }
-            throw ClientError.message(data.flatMap { String(data: $0, encoding: .utf8) } ?? "内核操作失败。")
+            throw ClientError.message(data.flatMap { String(data: $0, encoding: .utf8) } ?? L("内核操作失败。"))
         }
     }
 
@@ -274,11 +274,11 @@ final class CoreSession {
             }
             if result == META_OK { return data.prefix(length) }
             guard result == META_BUFFER_TOO_SMALL, length > 0, length <= limit else {
-                throw ClientError.message("无法读取内核结果。")
+                throw ClientError.message(L("无法读取内核结果。"))
             }
             data = Data(count: length)
         }
-        throw ClientError.message("内核结果变化过快，请重试。")
+        throw ClientError.message(L("内核结果变化过快，请重试。"))
     }
 }
 

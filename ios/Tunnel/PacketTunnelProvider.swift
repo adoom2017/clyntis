@@ -43,7 +43,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                       let config = self.protocolConfiguration as? NETunnelProviderProtocol,
                       let rawID = config.providerConfiguration?["profileID"] as? String,
                       let id = UUID(uuidString: rawID) else {
-                    throw ClientError.message("缺少有效的 VPN 配置。")
+                    throw ClientError.message(L("缺少有效的 VPN 配置。"))
                 }
                 log.info("start: profile=\(id.uuidString)")
                 step = "open profile store"
@@ -93,7 +93,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     log.info("start: applying network settings ipv6=\(ipv6) (profile=\(self.profileIPv6) network=\(path.supportsIPv6))")
                     self.applySettings(ipv6: ipv6) { error in
                         guard self.epoch == epoch, self.core != nil else {
-                            completionHandler(ClientError.message("VPN 启动已取消。"))
+                            completionHandler(ClientError.message(L("VPN 启动已取消。")))
                             return
                         }
                         if let error {
@@ -204,7 +204,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             if result != META_OK {
-                self.fail(ClientError.message("无法向内核写入 IP 数据包。"))
+                self.fail(ClientError.message(L("无法向内核写入 IP 数据包。")))
                 return
             }
         }
@@ -237,7 +237,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 break
             }
             guard result == META_OK else {
-                fail(ClientError.message("无法读取内核 IP 数据包。"))
+                fail(ClientError.message(L("无法读取内核 IP 数据包。")))
                 return
             }
             guard length > 0 else { continue }
@@ -401,7 +401,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             do {
                 let state = try JSONSerialization.jsonObject(with: core.status()) as? [String: Any]
                 if state?["stopped"] as? Bool == true {
-                    self.fail(ClientError.message("代理内核已停止，请重新连接。"))
+                    self.fail(ClientError.message(L("代理内核已停止，请重新连接。")))
                     return
                 }
                 // Memory against the ~50 MiB extension limit, with the load behind it.
@@ -424,7 +424,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         queue.async {
             do {
                 guard messageData.count <= 16 * 1024, let core = self.core else {
-                    throw ClientError.message("VPN 未连接。")
+                    throw ClientError.message(L("VPN 未连接。"))
                 }
                 let message = try JSONDecoder().decode(TunnelMessage.self, from: messageData)
                 self.watchdog.begin("app message \(message.command)")
@@ -432,29 +432,29 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 switch message.command {
                 case "snapshot": break
                 case "mode":
-                    guard let mode = message.mode else { throw ClientError.message("缺少模式。") }
+                    guard let mode = message.mode else { throw ClientError.message(L("缺少模式。")) }
                     try core.updateMode(mode)
                 case "select":
-                    guard let group = message.group, let node = message.node else { throw ClientError.message("缺少节点。") }
+                    guard let group = message.group, let node = message.node else { throw ClientError.message(L("缺少节点。")) }
                     try core.select(group: group, node: node)
                 case "adblock-allow":
                     try core.updateAdblockAllow(message.allow ?? [])
                 case "close":
                     try core.closeConnection(message.id)
                 case "probe":
-                    guard let node = message.node else { throw ClientError.message("缺少节点。") }
+                    guard let node = message.node else { throw ClientError.message(L("缺少节点。")) }
                     // Seconds of network I/O: off the packet queue. A failed probe is
                     // a result too; the snapshot carries it in the node's status.
                     DispatchQueue.global(qos: .utility).async {
                         _ = try? core.probe(node)
                         self.queue.async {
                             let reply = try? self.core?.snapshot()
-                            completionHandler?(reply ?? (try? JSONSerialization.data(withJSONObject: ["error": "VPN 未连接。"])))
+                            completionHandler?(reply ?? (try? JSONSerialization.data(withJSONObject: ["error": L("VPN 未连接。")])))
                         }
                     }
                     return
                 case "test-route":
-                    guard let target = message.target else { throw ClientError.message("缺少测试目标。") }
+                    guard let target = message.target else { throw ClientError.message(L("缺少测试目标。")) }
                     // A rule may resolve the name: off the packet queue.
                     DispatchQueue.global(qos: .userInitiated).async {
                         do {
@@ -475,7 +475,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                     return
-                default: throw ClientError.message("不支持的内核命令。")
+                default: throw ClientError.message(L("不支持的内核命令。"))
                 }
                 completionHandler?(try core.snapshot())
             } catch {

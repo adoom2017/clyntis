@@ -44,8 +44,8 @@ struct ConnectionsView: View {
     var body: some View {
         List {
             if model.connections.isEmpty {
-                ContentUnavailableView(model.connected ? "没有连接" : "未连接", systemImage: "arrow.left.arrow.right",
-                                       description: Text(model.connected ? "当前没有打开的连接" : "连接后显示网络连接"))
+                ContentUnavailableView(model.connected ? L("没有连接") : L("未连接"), systemImage: "arrow.left.arrow.right",
+                                       description: Text(model.connected ? L("当前没有打开的连接") : L("连接后显示网络连接")))
             }
             ForEach(visible) { connection in
                 VStack(alignment: .leading, spacing: 4) {
@@ -65,20 +65,20 @@ struct ConnectionsView: View {
                     }
                 }
                 .swipeActions {
-                    Button("关闭", role: .destructive) { Task { await model.closeConnection(connection.id) } }
+                    Button(L("关闭"), role: .destructive) { Task { await model.closeConnection(connection.id) } }
                 }
             }
         }
-        .searchable(text: $query, prompt: "搜索目标或代理链")
-        .navigationTitle("连接（\(model.connections.count)）")
+        .searchable(text: $query, prompt: L("搜索目标或代理链"))
+        .navigationTitle(L("连接（{count}）", ["count": model.connections.count]))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if !model.connections.isEmpty {
-                Button("全部关闭", systemImage: "xmark.circle") { confirmCloseAll = true }
+                Button(L("全部关闭"), systemImage: "xmark.circle") { confirmCloseAll = true }
             }
         }
-        .confirmationDialog("关闭全部 \(model.connections.count) 个连接？", isPresented: $confirmCloseAll, titleVisibility: .visible) {
-            Button("全部关闭", role: .destructive) { Task { await model.closeConnection(nil) } }
+        .confirmationDialog(L("关闭全部 {count} 个连接？", ["count": model.connections.count]), isPresented: $confirmCloseAll, titleVisibility: .visible) {
+            Button(L("全部关闭"), role: .destructive) { Task { await model.closeConnection(nil) } }
         }
     }
 

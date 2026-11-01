@@ -4,15 +4,20 @@ import UniformTypeIdentifiers
 struct RootView: View {
     @Bindable var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(Localization.key, store: Localization.defaults) private var language = "system"
     var body: some View {
+        // A new identity rebuilds every view in the chosen language.
+        let resolved = Localization.resolved(language)
         TabView {
-            ConnectionView(model: model).tabItem { Label("连接", systemImage: "network") }
-            ProfilesView(model: model).tabItem { Label("配置", systemImage: "square.stack.3d.up") }
-            NodesView(model: model).tabItem { Label("节点", systemImage: "point.3.connected.trianglepath.dotted") }
-            LogView().tabItem { Label("日志", systemImage: "doc.text.magnifyingglass") }
+            ConnectionView(model: model).tabItem { Label(L("连接", context: "tab"), systemImage: "network") }
+            ProfilesView(model: model).tabItem { Label(L("配置"), systemImage: "square.stack.3d.up") }
+            NodesView(model: model).tabItem { Label(L("节点"), systemImage: "point.3.connected.trianglepath.dotted") }
+            LogView().tabItem { Label(L("日志"), systemImage: "doc.text.magnifyingglass") }
         }
+        .id(resolved)
+        .environment(\.locale, Localization.locale)
         .alert("Clyntis", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
-            Button("知道了") { model.error = nil }
+            Button(L("知道了")) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
@@ -48,30 +53,30 @@ private struct ConnectionView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(model.busy || model.startPending || (!model.active && model.selected == nil))
-                        .accessibilityLabel(model.active ? "断开 VPN" : "连接 VPN")
+                        .accessibilityLabel(model.active ? L("断开 VPN") : L("连接 VPN"))
                         .sensoryFeedback(.impact, trigger: model.connected)
                         VStack(spacing: 4) {
                             Text(model.statusText).font(.title3.weight(.semibold))
                                 .foregroundStyle(model.connected ? Color.connected : Color.primary)
-                            Text(model.phase ?? (model.startPending ? "正在等待系统启动 VPN…" : nil)
-                                 ?? model.selected?.name ?? "未选择配置")
+                            Text(model.phase ?? (model.startPending ? L("正在等待系统启动 VPN…") : nil)
+                                 ?? model.selected?.name ?? L("未选择配置"))
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                     }
                     .frame(maxWidth: .infinity).padding(.vertical, 32)
                     .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 20))
                     HStack(spacing: 12) {
-                        TrafficStat(title: "上传", value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)))
-                        TrafficStat(title: "下载", value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)))
+                        TrafficStat(title: L("上传"), value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)))
+                        TrafficStat(title: L("下载"), value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)))
                         NavigationLink { ConnectionsView(model: model) } label: {
-                            TrafficStat(title: "连接", value: "\(model.connectionCount)", disclosure: true)
+                            TrafficStat(title: L("连接"), value: "\(model.connectionCount)", disclosure: true)
                         }
                         .buttonStyle(.plain)
                     }
                     if model.connected {
                         NavigationLink { AdblockView(model: model) } label: {
                             HStack {
-                                Label("去广告", systemImage: "nosign").foregroundStyle(.secondary)
+                                Label(L("去广告"), systemImage: "nosign").foregroundStyle(.secondary)
                                 Spacer()
                                 Text(model.adblockSummary).monospacedDigit()
                                 Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(.tertiary)
@@ -84,22 +89,22 @@ private struct ConnectionView: View {
                     }
                     if model.connected, let networks = model.currentNetworks {
                         HStack {
-                            Label("当前网络", systemImage: "wifi").foregroundStyle(.secondary)
+                            Label(L("当前网络"), systemImage: "wifi").foregroundStyle(.secondary)
                             Spacer()
-                            Text(networks.isEmpty ? "未匹配" : networks.joined(separator: "、"))
+                            Text(networks.isEmpty ? L("未匹配") : networks.joined(separator: "、"))
                         }
                         .font(.subheadline)
                         .padding(14)
                         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 14))
                     }
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("路由模式").font(.subheadline).foregroundStyle(.secondary)
-                        Picker("路由模式", selection: Binding(get: { model.mode }, set: { value in
+                        Text(L("路由模式")).font(.subheadline).foregroundStyle(.secondary)
+                        Picker(L("路由模式"), selection: Binding(get: { model.mode }, set: { value in
                             Task { await model.setMode(value) }
                         })) {
-                            Text("规则").tag("rule")
-                            Text("全局").tag("global")
-                            Text("直连").tag("direct")
+                            Text(L("规则")).tag("rule")
+                            Text(L("全局")).tag("global")
+                            Text(L("直连")).tag("direct")
                         }.pickerStyle(.segmented).disabled(!model.connected || model.busy)
                     }
                     .padding(.top, 4)
@@ -131,6 +136,7 @@ private struct TrafficStat: View {
 
 private struct ProfilesView: View {
     @Bindable var model: AppModel
+    @AppStorage(Localization.key, store: Localization.defaults) private var language = "system"
     @State private var importing = false
     @State private var importingLink = false
     @State private var exporting: Profile?
@@ -146,51 +152,61 @@ private struct ProfilesView: View {
                         LabeledContent {
                             Text("\(model.customRules.count)")
                         } label: {
-                            Label("自定义规则", systemImage: "list.bullet.indent")
+                            Label(L("自定义规则"), systemImage: "list.bullet.indent")
                         }
                     }
                     NavigationLink {
                         OverridesView(model: model)
                     } label: {
                         LabeledContent {
-                            Text(model.overrides.isEmpty ? "跟随配置" : "已修改")
+                            Text(model.overrides.isEmpty ? L("跟随配置") : L("已修改"))
                         } label: {
-                            Label("覆盖配置文件", systemImage: "slider.horizontal.3")
+                            Label(L("覆盖配置文件"), systemImage: "slider.horizontal.3")
                         }
                     }
                     NavigationLink {
                         AdblockView(model: model)
                     } label: {
                         LabeledContent {
-                            Text(model.overrides.adblock?.enabled == true ? "已开启" : "未开启")
+                            Text(model.overrides.adblock?.enabled == true ? L("已开启") : L("未开启"))
                         } label: {
-                            Label("去广告", systemImage: "nosign")
+                            Label(L("去广告"), systemImage: "nosign")
                         }
                     }
                 } footer: {
-                    Text("对所有配置生效，优先于配置文件自身的规则和设置")
+                    Text(L("对所有配置生效，优先于配置文件自身的规则和设置"))
                 }
                 Section {
                     NavigationLink {
                         CosSettingsView()
                     } label: {
-                        Label("远程发布", systemImage: "icloud.and.arrow.up")
+                        Label(L("远程发布"), systemImage: "icloud.and.arrow.up")
                     }
                 } footer: {
-                    Text("「发布」把加密后的配置上传到腾讯云 COS")
+                    Text(L("「发布」把加密后的配置上传到腾讯云 COS"))
                 }
                 Section {
                     Toggle(isOn: Binding(get: { model.autoReconnect },
                                          set: { enabled in Task { await model.setAutoReconnect(enabled) } })) {
-                        Label("断开后自动重连", systemImage: "arrow.clockwise.circle")
+                        Label(L("断开后自动重连"), systemImage: "arrow.clockwise.circle")
                     }
                 } footer: {
-                    Text("VPN 意外断开（异常退出、被系统结束、网络恢复或重启手机）后由系统自动重新连接。"
-                         + "在 App 里断开不会触发；在系统设置里关闭 VPN 时，系统通常也会暂停自动重连。")
+                    Text(L("VPN 意外断开（异常退出、被系统结束、网络恢复或重启手机）后由系统自动重新连接。")
+                         + L("在 App 里断开不会触发；在系统设置里关闭 VPN 时，系统通常也会暂停自动重连。"))
+                }
+                Section {
+                    Picker(selection: $language) {
+                        Text(L("跟随系统")).tag("system")
+                        // Each language is named in itself.
+                        Text(verbatim: "中文").tag("zh")
+                        Text(verbatim: "English").tag("en")
+                    } label: {
+                        Label(L("语言"), systemImage: "globe")
+                    }
                 }
                 if model.profiles.isEmpty {
-                    ContentUnavailableView("还没有配置", systemImage: "doc.badge.plus",
-                                           description: Text("点右上角 + 导入 Clash YAML 文件或链接"))
+                    ContentUnavailableView(L("还没有配置"), systemImage: "doc.badge.plus",
+                                           description: Text(L("点右上角 + 导入 Clash YAML 文件或链接")))
                 }
                 ForEach(model.profiles) { profile in
                     HStack(spacing: 12) {
@@ -202,7 +218,7 @@ private struct ProfilesView: View {
                                     .opacity(model.selectedID == profile.id ? 1 : 0)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(profile.name).foregroundStyle(.primary)
-                                    Text("\(profile.sourceHost ?? "本地文件") · \(profile.createdAt.formatted(date: .abbreviated, time: .omitted))")
+                                    Text("\(profile.sourceHost ?? L("本地文件")) · \(profile.createdAt.formatted(date: .abbreviated, time: .omitted))")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                                 Spacer()
@@ -216,29 +232,29 @@ private struct ProfilesView: View {
                             Image(systemName: "info.circle").imageScale(.large)
                         }
                         .buttonStyle(.borderless)
-                        .accessibilityLabel("\(profile.name) 详情")
+                        .accessibilityLabel(L("{name} 详情", ["name": profile.name]))
                     }
                     .swipeActions {
-                        Button("删除", role: .destructive) { model.remove(profile) }.disabled(model.active || model.busy)
-                        Button("加密导出", systemImage: "lock.doc") { exporting = profile }.tint(.brand)
-                        Button("发布", systemImage: "icloud.and.arrow.up") { publishing = profile }.tint(.blue)
+                        Button(L("删除"), role: .destructive) { model.remove(profile) }.disabled(model.active || model.busy)
+                        Button(L("加密导出"), systemImage: "lock.doc") { exporting = profile }.tint(.brand)
+                        Button(L("发布"), systemImage: "icloud.and.arrow.up") { publishing = profile }.tint(.blue)
                     }
                     .contextMenu {
-                        Button("加密导出", systemImage: "lock.doc") { exporting = profile }
-                        Button("发布到 COS", systemImage: "icloud.and.arrow.up") { publishing = profile }
+                        Button(L("加密导出"), systemImage: "lock.doc") { exporting = profile }
+                        Button(L("发布到 COS"), systemImage: "icloud.and.arrow.up") { publishing = profile }
                     }
                 }
                 if model.active && !model.profiles.isEmpty {
-                    Section { } footer: { Text("断开后才能切换或删除配置") }
+                    Section { } footer: { Text(L("断开后才能切换或删除配置")) }
                 }
             }
-            .navigationTitle("配置")
+            .navigationTitle(L("配置"))
             .navigationDestination(item: $detail) { ProfileDetailView(model: model, id: $0.id) }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu("导入", systemImage: "plus") {
-                        Button("从文件导入", systemImage: "doc") { importing = true }
-                        Button("从链接导入", systemImage: "link") { importingLink = true }
+                    Menu(L("导入"), systemImage: "plus") {
+                        Button(L("从文件导入"), systemImage: "doc") { importing = true }
+                        Button(L("从链接导入"), systemImage: "link") { importingLink = true }
                     }.disabled(model.busy)
                 }
             }
@@ -255,8 +271,8 @@ private struct ProfilesView: View {
             .sheet(item: $publishing) { CosPublishView(model: model, profile: $0) }
             .sheet(isPresented: Binding(get: { model.pendingEncryptedImport != nil },
                                         set: { if !$0 { model.pendingEncryptedImport = nil } })) {
-                ConfigPasswordView(title: "导入加密配置", message: "此文件已加密，输入密码后导入。",
-                                   actionTitle: "导入") { password in
+                ConfigPasswordView(title: L("导入加密配置"), message: L("此文件已加密，输入密码后导入。"),
+                                   actionTitle: L("导入")) { password in
                     try await model.importEncrypted(password: password)
                 }
             }
@@ -276,32 +292,32 @@ private struct NodesView: View {
         NavigationStack {
             List {
                 if !model.groups.isEmpty {
-                    Picker("视图", selection: $view) {
-                        Text("代理组 \(model.groups.count)").tag("groups")
-                        Text("节点 \(model.proxies.count)").tag("proxies")
+                    Picker(L("视图"), selection: $view) {
+                        Text(L("代理组 {count}", ["count": model.groups.count])).tag("groups")
+                        Text(L("节点 {count}", ["count": model.proxies.count])).tag("proxies")
                     }
                     .pickerStyle(.segmented)
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
                 }
                 if model.groups.isEmpty && model.proxies.isEmpty {
-                    ContentUnavailableView(model.connected ? "没有节点" : "未连接", systemImage: "network",
-                        description: Text(model.connected ? "当前配置未定义节点" : "连接后可选择节点"))
+                    ContentUnavailableView(model.connected ? L("没有节点") : L("未连接"), systemImage: "network",
+                        description: Text(model.connected ? L("当前配置未定义节点") : L("连接后可选择节点")))
                 } else if shown == "groups" {
                     groupSections
                 } else {
                     Section {
                         ForEach(model.proxies, id: \.self) { ProxyRow(model: model, name: $0) }
                     } footer: {
-                        Text("点按节点测试延迟。")
+                        Text(L("点按节点测试延迟。"))
                     }
                 }
             }
-            .navigationTitle("节点")
+            .navigationTitle(L("节点"))
             .toolbar {
                 if shown == "proxies" && model.connected
                     && model.nodeStatus.values.contains(where: \.probeable) {
-                    Button("测速", systemImage: "bolt") { Task { await model.probeAll() } }
+                    Button(L("测速"), systemImage: "bolt") { Task { await model.probeAll() } }
                         .disabled(!model.probing.isEmpty)
                 }
             }
@@ -315,14 +331,14 @@ private struct NodesView: View {
             let policies = group.nodes.filter(isPolicy)
             let proxies = group.nodes.filter { !isPolicy($0) }
             Section {
-                if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "策略", count: policies.count) }
+                if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: L("策略"), count: policies.count) }
                 ForEach(policies, id: \.self) { node in
                     PolicyRow(model: model, name: node, group: model.groups.first { $0.name == node },
                               selected: group.selected == node) {
                         Task { await model.select(group: group.name, node: node) }
                     }
                 }
-                if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: "节点", count: proxies.count) }
+                if !policies.isEmpty && !proxies.isEmpty { MemberLabel(title: L("节点"), count: proxies.count) }
                 ForEach(proxies, id: \.self) { node in
                     MemberRow(model: model, name: node, selected: group.selected == node) {
                         Task { await model.select(group: group.name, node: node) }
@@ -380,10 +396,10 @@ private struct PolicyRow: View {
     }
     private func detail(_ builtin: BuiltinOutbound?) -> String {
         if let group {
-            return ["代理组", group.typeText, group.selected.map { "当前 \($0)" }]
+            return [L("代理组"), group.typeText, group.selected.map { L("当前 {value}", ["value": $0]) }]
                 .compactMap { $0 }.joined(separator: " · ")
         }
-        return builtin == .reject ? "拒绝连接" : "直连，不经过代理"
+        return builtin == .reject ? L("拒绝连接") : L("直连，不经过代理")
     }
 }
 
@@ -441,13 +457,13 @@ private struct ProxyRow: View {
             }
             .buttonStyle(.borderless)
             .disabled(status?.probeable != true || !model.connected || model.probing.contains(name))
-            .accessibilityHint("测试延迟")
+            .accessibilityHint(L("测试延迟"))
             if status != nil {
                 NavigationLink(value: name) {
                     Image(systemName: "info.circle").foregroundStyle(.tint)
                 }
                 .fixedSize()
-                .accessibilityLabel("\(name) 状态")
+                .accessibilityLabel(L("{name} 状态", ["name": name]))
             }
         }
     }
@@ -472,33 +488,33 @@ private struct NodeDetailView: View {
         List {
             if let status = model.nodeStatus[name] {
                 Section {
-                    LabeledContent("类型", value: status.type)
-                    LabeledContent("当前连接", value: "\(status.connections)")
-                    if let server = status.server { LabeledContent("服务器", value: server) }
-                    if let network = status.network { LabeledContent("传输", value: network) }
-                    if let security = status.security { LabeledContent("安全", value: security.uppercased()) }
+                    LabeledContent(L("类型"), value: status.type)
+                    LabeledContent(L("当前连接"), value: "\(status.connections)")
+                    if let server = status.server { LabeledContent(L("服务器"), value: server) }
+                    if let network = status.network { LabeledContent(L("传输"), value: network) }
+                    if let security = status.security { LabeledContent(L("安全"), value: security.uppercased()) }
                     if let flow = status.flow { LabeledContent("Flow", value: flow) }
-                    if let udp = status.udp { LabeledContent("UDP", value: udp ? "开启" : "关闭") }
+                    if let udp = status.udp { LabeledContent("UDP", value: udp ? L("开启") : L("关闭")) }
                 }
                 if status.probeable {
-                    Section("延迟") {
+                    Section(L("延迟")) {
                         if let delay = status.delay {
-                            LabeledContent("最近一次", value: "\(delay) ms")
+                            LabeledContent(L("最近一次"), value: "\(delay) ms")
                         } else if let error = status.error {
                             Text(error).font(.footnote).foregroundStyle(.red)
                         } else {
-                            Text("尚未测速").foregroundStyle(.secondary)
+                            Text(L("尚未测速")).foregroundStyle(.secondary)
                         }
                         if let checked = status.checkedAt {
-                            LabeledContent("测试时间", value: checked.formatted(date: .omitted, time: .standard))
+                            LabeledContent(L("测试时间"), value: checked.formatted(date: .omitted, time: .standard))
                         }
-                        Button(model.probing.contains(name) ? "测速中…" : "测速") { Task { await model.probe(name) } }
+                        Button(model.probing.contains(name) ? L("测速中…") : L("测速")) { Task { await model.probe(name) } }
                             .disabled(model.probing.contains(name) || !model.connected)
                     }
                 }
                 if let tailscale = status.tailscale { TailscaleSections(status: tailscale) }
             } else {
-                ContentUnavailableView("没有状态", systemImage: "questionmark.circle", description: Text("连接后显示节点状态"))
+                ContentUnavailableView(L("没有状态"), systemImage: "questionmark.circle", description: Text(L("连接后显示节点状态")))
             }
         }
         .navigationTitle(name)
@@ -511,20 +527,20 @@ private struct TailscaleSections: View {
     let status: TailscaleStatus
     var body: some View {
         Section("Tailscale") {
-            LabeledContent("状态", value: status.stateText)
+            LabeledContent(L("状态"), value: status.stateText)
             if let error = status.error { Text(error).font(.footnote).foregroundStyle(.red) }
-            if let name = status.name { LabeledContent("本机名称", value: name) }
-            ForEach(status.addresses, id: \.self) { LabeledContent("地址", value: $0) }
-            if let derp = status.homeDerp { LabeledContent("DERP 主区域", value: derp) }
-            LabeledContent("公网候选", value: status.endpoints.isEmpty ? "无" : status.endpoints.joined(separator: "\n"))
+            if let name = status.name { LabeledContent(L("本机名称"), value: name) }
+            ForEach(status.addresses, id: \.self) { LabeledContent(L("地址"), value: $0) }
+            if let derp = status.homeDerp { LabeledContent(L("DERP 主区域"), value: derp) }
+            LabeledContent(L("公网候选"), value: status.endpoints.isEmpty ? L("无") : status.endpoints.joined(separator: "\n"))
         }
-        Section("节点（\(status.onlinePeers)/\(status.peers.count) 在线）") {
+        Section(L("节点（{onlinePeers}/{count} 在线）", ["onlinePeers": status.onlinePeers, "count": status.peers.count])) {
             ForEach(status.peers) { peer in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Circle().fill(peer.online == true ? Color.connected : Color.secondary.opacity(0.4)).frame(width: 8, height: 8)
                         Text(peer.name)
-                        if peer.exitNode { Text("出口").font(.caption2).padding(.horizontal, 5).background(.tint.opacity(0.15), in: .capsule) }
+                        if peer.exitNode { Text(L("出口")).font(.caption2).padding(.horizontal, 5).background(.tint.opacity(0.15), in: .capsule) }
                         Spacer()
                         Text(peer.pathText).font(.caption).foregroundStyle(peer.path == "direct" ? Color.connected : .secondary)
                     }

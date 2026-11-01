@@ -16,12 +16,12 @@ enum CustomRules {
 
     /// Validates each rule with the core, then saves them in order.
     static func save(_ rules: [String]) throws {
-        guard let url else { throw ClientError.message("无法访问共享存储。") }
-        guard rules.count <= maximum else { throw ClientError.message("自定义规则不能超过 \(maximum) 条。") }
+        guard let url else { throw ClientError.message(L("无法访问共享存储。")) }
+        guard rules.count <= maximum else { throw ClientError.message(L("自定义规则不能超过 {maximum} 条。", ["maximum": maximum])) }
         let rules = rules.map { $0.trimmingCharacters(in: .whitespaces) }
         for (index, rule) in rules.enumerated() {
             do { try CoreSession.validateRule(rule) } catch {
-                throw ClientError.message("第 \(index + 1) 条规则「\(rule)」：\(error.localizedDescription)")
+                throw ClientError.message(L("第 {index} 条规则「{rule}」：{localizedDescription}", ["index": index + 1, "rule": rule, "localizedDescription": error.localizedDescription]))
             }
         }
         try JSONEncoder().encode(rules).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])

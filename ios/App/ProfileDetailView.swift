@@ -20,59 +20,59 @@ struct ProfileDetailView: View {
     var body: some View {
         Form {
             if let profile {
-                Section("名称") {
-                    TextField("名称", text: $name)
+                Section(L("名称")) {
+                    TextField(L("名称"), text: $name)
                         .submitLabel(.done)
                         .onSubmit { rename(profile) }
                 }
-                Section("信息") {
-                    LabeledContent("来源", value: profile.sourceHost ?? "本地文件")
-                    if profile.encrypted == true { LabeledContent("内容", value: "已加密") }
-                    LabeledContent("导入时间", value: profile.createdAt.formatted(date: .abbreviated, time: .shortened))
+                Section(L("信息")) {
+                    LabeledContent(L("来源"), value: profile.sourceHost ?? L("本地文件"))
+                    if profile.encrypted == true { LabeledContent(L("内容"), value: L("已加密")) }
+                    LabeledContent(L("导入时间"), value: profile.createdAt.formatted(date: .abbreviated, time: .shortened))
                     if let updated = profile.updatedAt {
-                        LabeledContent("更新时间", value: updated.formatted(date: .abbreviated, time: .shortened))
+                        LabeledContent(L("更新时间"), value: updated.formatted(date: .abbreviated, time: .shortened))
                     }
                 }
                 Section {
-                    NavigationLink("查看与编辑配置") { ConfigEditorView(model: model, profile: profile) }
+                    NavigationLink(L("查看与编辑配置")) { ConfigEditorView(model: model, profile: profile) }
                     if profile.source != nil {
                         Button {
                             if profile.encrypted == true { askPassword = true } else { update(profile) }
                         } label: {
                             HStack {
-                                Text("从链接更新")
+                                Text(L("从链接更新"))
                                 if working { Spacer(); ProgressView() }
                             }
                         }
                         .disabled(working)
                     }
-                    Button("使用此配置") { model.selectedID = id }
+                    Button(L("使用此配置")) { model.selectedID = id }
                         .disabled(model.selectedID == id || model.active || model.busy)
-                    Button("加密导出") { exporting = true }
-                    Button("发布到 COS") { publishing = true }
+                    Button(L("加密导出")) { exporting = true }
+                    Button(L("发布到 COS")) { publishing = true }
                 } footer: {
-                    if inUse { Text("连接中修改的内容会在重新连接后生效") }
+                    if inUse { Text(L("连接中修改的内容会在重新连接后生效")) }
                 }
                 if let message { Section { Text(message).foregroundStyle(.secondary) } }
                 if let failure { Section { Text(failure).foregroundStyle(.red) } }
                 Section {
-                    Button("删除配置", role: .destructive) { confirmDelete = true }
+                    Button(L("删除配置"), role: .destructive) { confirmDelete = true }
                         .disabled(inUse || model.busy)
                 }
             } else {
-                ContentUnavailableView("配置已删除", systemImage: "doc")
+                ContentUnavailableView(L("配置已删除"), systemImage: "doc")
             }
         }
-        .navigationTitle(profile?.name ?? "配置")
+        .navigationTitle(profile?.name ?? L("配置"))
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { name = profile?.name ?? "" }
         .sheet(isPresented: $askPassword) {
-            ConfigPasswordView(title: "从链接更新", message: "此链接的配置已加密，输入密码后更新。",
-                               actionTitle: "更新") { password in
+            ConfigPasswordView(title: L("从链接更新"), message: L("此链接的配置已加密，输入密码后更新。"),
+                               actionTitle: L("更新")) { password in
                 guard let profile else { return }
                 try await model.updateFromSource(profile, password: password)
                 askPassword = false
-                message = "已从链接更新"
+                message = L("已从链接更新")
             }
         }
         .sheet(isPresented: $exporting) {
@@ -81,13 +81,13 @@ struct ProfileDetailView: View {
         .sheet(isPresented: $publishing) {
             if let profile { CosPublishView(model: model, profile: profile) }
         }
-        .confirmationDialog("删除「\(profile?.name ?? "")」？", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("删除", role: .destructive) {
+        .confirmationDialog(L("删除「{name}」？", ["name": profile?.name ?? ""]), isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button(L("删除"), role: .destructive) {
                 guard let profile else { return }
                 model.remove(profile)
                 dismiss()
             }
-        } message: { Text("配置及其路由资源将从本机删除。") }
+        } message: { Text(L("配置及其路由资源将从本机删除。")) }
     }
 
     private func rename(_ profile: Profile) {
@@ -108,7 +108,7 @@ struct ProfileDetailView: View {
         Task {
             do {
                 try await model.updateFromSource(profile)
-                message = "已从链接更新"
+                message = L("已从链接更新")
             } catch { failure = error.localizedDescription }
             working = false
         }
@@ -141,7 +141,7 @@ struct ConfigEditorView: View {
             if let problem {
                 Button { reveal += 1 } label: {
                     Label {
-                        Text("第 \(problem.line) 行第 \(problem.column) 列：\(problem.message)")
+                        Text(L("第 {line} 行第 {column} 列：{message}", ["line": problem.line, "column": problem.column, "message": problem.message]))
                             .multilineTextAlignment(.leading)
                     } icon: {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -151,7 +151,7 @@ struct ConfigEditorView: View {
                 }
                 .padding(12)
                 .background(Color.red.opacity(0.08))
-                .accessibilityHint("移到出错位置")
+                .accessibilityHint(L("移到出错位置"))
             }
         }
         .task(id: text) {
@@ -164,14 +164,14 @@ struct ConfigEditorView: View {
             if !Task.isCancelled { problem = found }
         }
         .background(Color(.systemBackground))
-        .navigationTitle("配置内容")
+        .navigationTitle(L("配置内容"))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 if saving {
                     ProgressView()
                 } else {
-                    Button(saved && text == original ? "已保存" : "保存") { save() }
+                    Button(saved && text == original ? L("已保存") : L("保存")) { save() }
                         .disabled(!loaded || text == original || problem != nil)
                 }
             }
