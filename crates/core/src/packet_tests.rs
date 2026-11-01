@@ -4,6 +4,12 @@ use clyntis_config::Config as CoreConfig;
 use std::net::SocketAddr;
 use tokio::sync::Mutex;
 
+thread_local! {
+    /// A budget for this thread's packet loop (`#[tokio::test]` runs it on
+    /// the test's thread): small limits without hundreds of sockets.
+    pub(super) static BUDGET: std::cell::Cell<Option<Budget>> = const { std::cell::Cell::new(None) };
+}
+
 struct Packets {
     receiver: Mutex<mpsc::Receiver<Vec<u8>>>,
     sender: mpsc::Sender<Vec<u8>>,
@@ -298,7 +304,7 @@ async fn udp_upload_does_not_cancel_a_partial_vless_response() {
         let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         let flow = Flow { source: "10.0.0.2:12345".parse().unwrap(), target: "192.0.2.1:9999".parse().unwrap(), tcp: false };
         let (input, receiver) = mpsc::channel(16); let (output, mut replies) = mpsc::channel(16);
-        let session = tokio::spawn(udp_session(core.clone(), flow, receiver, output));
+        let session = tokio::spawn(udp_session(core.clone(), flow, 1, receiver, output, Arc::default()));
         let (mut peer, _) = listener.accept().await.unwrap();
         let mut request = [0; 26]; peer.read_exact(&mut request).await.unwrap();
         peer.write_all(&[0]).await.unwrap();
@@ -551,4 +557,127 @@ async fn rejected_udp_gets_port_unreachable_at_once() {
     })
     .await
     .unwrap();
+}
+
+/// Reads packets from the TUN until `wanted` accepts one, or panics.
+async fn wait_for(host_io: &Packets, mut wanted: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
+    let mut buffer = vec![0; 65535];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), host_io.recv(&mut buffer))
+            .await
+            .expect("no matching packet")
+            .unwrap();
+        if wanted(&buffer[..n]) {
+            return buffer[..n].to_vec();
+        }
+    }
+}
+
+fn udp_datagram(source: ([u8; 4], u16), target: ([u8; 4], u16), payload: &[u8]) -> Vec<u8> {
+    let mut udp = Vec::new();
+    udp.extend(source.1.to_be_bytes());
+    udp.extend(target.1.to_be_bytes());
+    udp.extend(((8 + payload.len()) as u16).to_be_bytes());
+    udp.extend([0, 0]);
+    udp.extend(payload);
+    let mut packet = ipv4_header(source.0, target.0, 17, udp.len());
+    packet.extend(udp);
+    packet
+}
+
+/// The UDP payload sent to `port`, if `packet` is one.
+fn udp_reply_to(packet: &[u8], port: u16) -> Option<Vec<u8>> {
+    let ip = Ipv4Packet::new_checked(packet).ok()?;
+    (ip.next_header() == IpProtocol::Udp).then_some(())?;
+    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
+    (udp.dst_port() == port).then(|| udp.payload().to_vec())
+}
+
+/// Whether `packet` is ICMP port unreachable for a datagram from `port`.
+fn unreachable_for(packet: &[u8], port: u16) -> bool {
+    let Ok(ip) = Ipv4Packet::new_checked(packet) else {
+        return false;
+    };
+    if ip.next_header() != IpProtocol::Icmp {
+        return false;
+    }
+    let Ok(icmp) = smoltcp::wire::Icmpv4Packet::new_checked(ip.payload()) else {
+        return false;
+    };
+    let Ok(quoted) = Ipv4Packet::new_checked(icmp.data()) else {
+        return false;
+    };
+    (u8::from(icmp.msg_type()), icmp.msg_code()) == (3, 3)
+        && UdpPacket::new_unchecked(quoted.payload()).src_port() == port
+}
+
+/// With every data session taken, a new flow gets an ICMP error at once
+/// instead of silence, existing flows keep working, and DNS still answers
+/// from the sessions kept for it.
+#[tokio::test]
+async fn full_udp_sessions_refuse_new_flows_but_keep_old_ones_and_dns() {
+    BUDGET.set(Some(Budget {
+        max_udp: udp_table::DNS_RESERVE + 4,
+        max_ports: 8,
+        trace_above: 0,
+        shed_above: 0,
+        close_above: 0,
+        ..Budget::DESKTOP
+    }));
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buffer = [0; 1500];
+            while let Ok((n, from)) = echo.recv_from(&mut buffer).await {
+                let _ = echo.send_to(&buffer[..n], from).await;
+            }
+        });
+        let (device, host_io) = pair();
+        let mut config = CoreConfig::default();
+        config.tun.enable = true;
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let running = core.start_with_packets(Some(device)).await.unwrap();
+        let app = [10, 0, 0, 2];
+        let echo_at = ([127, 0, 0, 1], echo_port);
+        for port in 40000..40004 {
+            host_io
+                .send(&udp_datagram((app, port), echo_at, b"ping"))
+                .await
+                .unwrap();
+            wait_for(&host_io, |packet| udp_reply_to(packet, port).is_some()).await;
+        }
+        // Every data session is taken: the next flow is told so at once.
+        host_io
+            .send(&udp_datagram((app, 40004), echo_at, b"ping"))
+            .await
+            .unwrap();
+        wait_for(&host_io, |packet| unreachable_for(packet, 40004)).await;
+        // The flows already admitted are untouched.
+        host_io
+            .send(&udp_datagram((app, 40000), echo_at, b"again"))
+            .await
+            .unwrap();
+        let reply = wait_for(&host_io, |packet| udp_reply_to(packet, 40000).is_some()).await;
+        assert_eq!(udp_reply_to(&reply, 40000).unwrap(), b"again");
+        // Names still resolve through the hijacked DNS.
+        let mut query = hickory_proto::op::Message::new();
+        query.set_id(7).add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("busy.test").unwrap(),
+            hickory_proto::rr::RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        host_io
+            .send(&udp_datagram((app, 39999), ([8, 8, 8, 8], 53), &query))
+            .await
+            .unwrap();
+        let answer = wait_for(&host_io, |packet| udp_reply_to(packet, 39999).is_some()).await;
+        let answer =
+            hickory_proto::op::Message::from_vec(&udp_reply_to(&answer, 39999).unwrap()).unwrap();
+        assert_eq!(answer.id(), 7);
+        running.shutdown().await;
+    })
+    .await
+    .unwrap();
+    BUDGET.set(None);
 }

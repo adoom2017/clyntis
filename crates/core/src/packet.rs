@@ -1,6 +1,8 @@
 //! Raw IP to proxy-session adapter. smoltcp owns TCP/IP protocol state.
 #[path = "packet_ipv6.rs"]
 mod ipv6;
+#[path = "udp_table.rs"]
+mod udp_table;
 use crate::{
     Core,
     memory::{self, MIB},
@@ -22,7 +24,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
     time::Duration,
 };
@@ -33,6 +35,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::{sync::PollSender, task::AbortOnDropHandle};
+use udp_table::{Drops, UdpTable};
 
 const CHUNK: usize = 8192;
 
@@ -91,6 +94,10 @@ impl Budget {
         self.udp_idle.min(Duration::from_secs(15))
     }
     fn for_config(config: &clyntis_config::Config) -> Self {
+        #[cfg(test)]
+        if let Some(budget) = tests::BUDGET.get() {
+            return budget;
+        }
         if config.internal_host_packet_io {
             Self::HOSTED
         } else {
@@ -116,6 +123,29 @@ struct Guard {
     /// released nothing are logged at most once a minute.
     closed_logged: Option<Instant>,
     shedding: bool,
+    counts: GuardCounts,
+}
+/// Leaving the refusing state needs the footprint this far under
+/// `shed_above`, so a footprint hovering at the line does not flip new flows
+/// on and off.
+const RECOVER_MARGIN: u64 = 2 * MIB;
+/// After closing everything, new flows wait at least this long: apps that
+/// reconnect at once would rebuild the load just released.
+const CLOSE_COOLDOWN: Duration = Duration::from_secs(3);
+/// How often the guard acted since the TUN started, for its log lines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GuardCounts {
+    refusing: u64,
+    recovered: u64,
+    closed: u64,
+}
+/// What the guard does for one footprint reading.
+#[derive(Debug, PartialEq, Eq)]
+struct Decision {
+    /// The refusing state changed to this.
+    shedding: Option<bool>,
+    /// Close every connection and release the packet flows.
+    close: bool,
 }
 #[derive(Debug)]
 struct Load {
@@ -135,39 +165,81 @@ impl Guard {
             closed: None,
             closed_logged: None,
             shedding: false,
+            counts: GuardCounts::default(),
+        }
+    }
+    /// The guard's decision for `footprint` at `now`, apart from sampling so
+    /// tests can feed it readings.
+    fn decide(&mut self, footprint: u64, now: Instant) -> Decision {
+        let close = footprint >= self.budget.close_above
+            && self
+                .closed
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(5));
+        if close {
+            self.closed = Some(now);
+            self.counts.closed += 1;
+        }
+        let cooling = self
+            .closed
+            .is_some_and(|at| now.duration_since(at) < CLOSE_COOLDOWN);
+        let shedding = if self.shedding {
+            footprint + RECOVER_MARGIN >= self.budget.shed_above || cooling
+        } else {
+            footprint >= self.budget.shed_above || close
+        };
+        let changed = shedding != self.shedding;
+        if changed {
+            self.shedding = shedding;
+            if shedding {
+                self.counts.refusing += 1;
+            } else {
+                self.counts.recovered += 1;
+            }
+        }
+        Decision {
+            shedding: changed.then_some(shedding),
+            close,
         }
     }
     fn due(&self) -> bool {
         self.budget.trace_above > 0 && self.sampled.elapsed() >= Duration::from_millis(250)
     }
-    fn check(&mut self, core: &Core, load: impl FnOnce() -> Load) {
+    /// Samples memory and acts on it. Returns whether every connection was
+    /// closed, so the loop releases its packet flows too.
+    fn check(
+        &mut self,
+        core: &Core,
+        usage: Option<memory::Usage>,
+        load: impl FnOnce() -> Load,
+    ) -> bool {
         self.sampled = Instant::now();
-        let Some(usage) = memory::usage() else {
-            return;
+        let Some(usage) = usage else {
+            return false;
         };
         let mib = |bytes: u64| format!("{:.1}", bytes as f64 / MIB as f64);
         let since = |at: Option<Instant>, period: u64| {
             at.is_none_or(|at| at.elapsed() >= Duration::from_secs(period))
         };
-        let shedding = usage.footprint >= self.budget.shed_above;
-        if shedding != self.shedding {
-            self.shedding = shedding;
-            if shedding {
+        let decision = self.decide(usage.footprint, Instant::now());
+        match decision.shedding {
+            Some(true) => {
                 let released = memory::relieve();
                 tracing::warn!(
                     footprint_mib = mib(usage.footprint),
                     released_kib = released / 1024,
+                    times = self.counts.refusing,
                     "memory high; refusing new connections"
                 );
-            } else {
-                tracing::warn!(
-                    footprint_mib = mib(usage.footprint),
-                    "memory recovered; accepting new connections"
-                );
             }
+            Some(false) => tracing::warn!(
+                footprint_mib = mib(usage.footprint),
+                times_refusing = self.counts.refusing,
+                times_closed = self.counts.closed,
+                "memory recovered; accepting new connections"
+            ),
+            None => {}
         }
-        if usage.footprint >= self.budget.close_above && since(self.closed, 5) {
-            self.closed = Some(Instant::now());
+        if decision.close {
             let closed = core.close_connections();
             let released = memory::relieve();
             if closed > 0 || released >= MIB || since(self.closed_logged, 60) {
@@ -176,6 +248,7 @@ impl Guard {
                     footprint_mib = mib(usage.footprint),
                     closed,
                     released_kib = released / 1024,
+                    times = self.counts.closed,
                     "memory critical; closed all connections"
                 );
             }
@@ -201,6 +274,7 @@ impl Guard {
                 "memory load"
             );
         }
+        decision.close
     }
 }
 
@@ -219,18 +293,14 @@ struct TcpFlow {
     created: Instant,
     task: tokio::task::AbortHandle,
 }
-struct UdpFlow {
-    input: mpsc::Sender<Vec<u8>>,
-    task: tokio::task::AbortHandle,
-}
-struct UdpPort {
-    handle: SocketHandle,
-    last: Instant,
-}
 struct Reply {
     flow: Flow,
+    /// The session that produced it (see `UdpTable::superseded`).
+    generation: u64,
     payload: Vec<u8>,
 }
+/// How often the TUN logs its UDP drop counters, when they changed.
+const DROPS_LOG_EVERY: Duration = Duration::from_secs(30);
 
 pub(crate) struct PacketDevice {
     pub(crate) incoming: VecDeque<Vec<u8>>,
@@ -557,9 +627,23 @@ async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> 
 async fn udp_session(
     core: Arc<Core>,
     flow: Flow,
+    generation: u64,
     mut input: mpsc::Receiver<Vec<u8>>,
     output: mpsc::Sender<Reply>,
+    drops: Arc<Drops>,
 ) -> Result<()> {
+    let reply = |payload: Vec<u8>| {
+        if output
+            .try_send(Reply {
+                flow,
+                generation,
+                payload,
+            })
+            .is_err()
+        {
+            drops.reply_full.fetch_add(1, Ordering::Relaxed);
+        }
+    };
     if hijack_dns(&core, flow.target, false) {
         while let Some(packet) =
             tokio::time::timeout(Budget::for_config(&core.config).dns_idle(), input.recv()).await?
@@ -572,7 +656,7 @@ async fn udp_session(
                         response_bytes = payload.len(),
                         "TUN DNS UDP query answered"
                     );
-                    let _ = output.try_send(Reply { flow, payload });
+                    reply(payload);
                 }
                 Ok(Err(error)) => tracing::debug!(%error, "TUN DNS UDP query failed"),
                 Err(_) => tracing::debug!("TUN DNS UDP query timed out"),
@@ -598,7 +682,7 @@ async fn udp_session(
     let recv = async {
         loop {
             let (_, payload) = session.recv().await?;
-            let _ = output.try_send(Reply { flow, payload });
+            reply(payload);
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -703,8 +787,9 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     iface.set_any_ip(true);
     let mut sockets = SocketSet::new(vec![]);
     let mut tcp_flows: HashMap<Flow, TcpFlow> = HashMap::new();
-    let mut udp_flows: HashMap<Flow, UdpFlow> = HashMap::new();
-    let mut ports: HashMap<IpEndpoint, UdpPort> = HashMap::new();
+    let mut udp = UdpTable::new(budget.max_udp, budget.max_ports);
+    let drops = Arc::new(Drops::default());
+    let mut drops_logged = ([0u64; 8], Instant::now());
     let mut tasks = JoinSet::new();
     let (replies, mut incoming_replies) = mpsc::channel::<Reply>(256);
     let wake = Arc::new(Notify::new());
@@ -757,13 +842,26 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                         let (sender, output) = mpsc::channel(budget.tcp_queue);
                         let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
                         let core = core.clone();
-                        let task = tasks.spawn(async move { (flow, tcp_session(core, flow, stream).await) });
+                        let task = tasks.spawn(async move { (flow, 0, tcp_session(core, flow, stream).await) });
                         tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
-                    } else if !flow.tcp && !guard.shedding && !ports.contains_key(&flow.target) && ports.len() < budget.max_ports {
-                        let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; budget.udp_buffer]);
-                        let mut socket = udp::Socket::new(buffer(), buffer());
-                        socket.bind(flow.target)?;
-                        ports.insert(flow.target, UdpPort { handle: sockets.add(socket), last: Instant::now() });
+                    } else if !flow.tcp && !udp.ports.contains_key(&flow.target) {
+                        let dns = hijack_dns(&core, flow.target, false);
+                        let socket = || {
+                            let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; budget.udp_buffer]);
+                            let mut socket = udp::Socket::new(buffer(), buffer());
+                            // The endpoint is a valid unicast target: binding cannot fail.
+                            let _ = socket.bind(flow.target);
+                            socket
+                        };
+                        if let Err(refusal) = udp.admit_port(flow.target, dns, guard.shedding, Instant::now(), &mut sockets, socket) {
+                            // Refused here rather than by smoltcp, which would
+                            // answer every retransmission with an ICMP error.
+                            drops.refused(refusal);
+                            if udp.notice(flow, Instant::now()) {
+                                refuse(&device, &flow);
+                            }
+                            continue;
+                        }
                     }
                 }
                 device.incoming.push_back(packet.into_owned());
@@ -775,19 +873,63 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             last_expiry = Instant::now();
             fragments.expire(last_expiry.into());
             refused.retain(|_, since| since.elapsed() < REFUSED_FOR);
+            if drops_logged.1.elapsed() >= DROPS_LOG_EVERY {
+                let now = drops.snapshot();
+                if now != drops_logged.0 {
+                    let [
+                        memory,
+                        sessions,
+                        ports,
+                        input_full,
+                        reply_full,
+                        socket_full,
+                        xudp_inbox_full,
+                        hysteria2_inbox_full,
+                    ] = now;
+                    tracing::info!(
+                        memory,
+                        sessions,
+                        ports,
+                        input_full,
+                        reply_full,
+                        socket_full,
+                        xudp_inbox_full,
+                        hysteria2_inbox_full,
+                        udp_sessions = udp.flows.len(),
+                        udp_ports = udp.ports.len(),
+                        "UDP datagrams refused or dropped since start"
+                    );
+                }
+                drops_logged = (now, Instant::now());
+            }
         }
         if guard.due() {
-            guard.check(&core, || Load {
+            let closed = guard.check(&core, memory::usage(), || Load {
                 tcp_flows: tcp_flows.len(),
-                udp_flows: udp_flows.len(),
-                udp_ports: ports.len(),
+                udp_flows: udp.flows.len(),
+                udp_ports: udp.ports.len(),
                 queued_packets: device.incoming.len(),
                 tasks: tasks.len(),
             });
+            if closed {
+                // Closing the tracked connections misses flows still dialing
+                // and leaves UDP sockets that would invite new sessions.
+                let (udp_sessions, udp_ports) = udp.purge(&mut sockets);
+                for state in tcp_flows.values() {
+                    state.task.abort();
+                    sockets.get_mut::<tcp::Socket>(state.handle).abort();
+                }
+                tracing::warn!(
+                    udp_sessions,
+                    udp_ports,
+                    tcp_flows = tcp_flows.len(),
+                    "memory critical; released the TUN's flows"
+                );
+            }
         }
         poll(&mut iface, now(), &mut device, &mut sockets);
         while let Some(result) = tasks.try_join_next() {
-            if let Ok((flow, result)) = result {
+            if let Ok((flow, generation, result)) = result {
                 if flow.tcp {
                     if let Err(error) = result {
                         tracing::debug!(source = %flow.source, target = %flow.target, %error, "TUN TCP session failed");
@@ -795,14 +937,12 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                             sockets.get_mut::<tcp::Socket>(state.handle).abort();
                         }
                     }
-                } else {
-                    udp_flows.remove(&flow);
-                    if let Err(error) = result
-                        && error.downcast_ref::<crate::Rejected>().is_some()
-                    {
-                        refused.insert(flow, Instant::now());
-                        refuse(&device, &flow);
-                    }
+                } else if udp.ended(&flow, generation)
+                    && let Err(error) = result
+                    && error.downcast_ref::<crate::Rejected>().is_some()
+                {
+                    refused.insert(flow, Instant::now());
+                    refuse(&device, &flow);
                 }
             }
         }
@@ -871,7 +1011,8 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 true
             }
         });
-        for (endpoint, port) in &mut ports {
+        let mut datagrams = vec![];
+        for (endpoint, port) in &mut udp.ports {
             let socket = sockets.get_mut::<udp::Socket>(port.handle);
             while let Ok((bytes, metadata)) = socket.recv() {
                 port.last = Instant::now();
@@ -880,51 +1021,68 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     target: *endpoint,
                     tcp: false,
                 };
-                if refused
-                    .get(&flow)
-                    .is_some_and(|since| since.elapsed() < REFUSED_FOR)
-                {
-                    refuse(&device, &flow);
-                    continue;
-                }
-                if !udp_flows.contains_key(&flow) && udp_flows.len() < budget.max_udp {
+                datagrams.push((flow, bytes.to_vec()));
+            }
+        }
+        for (flow, bytes) in datagrams {
+            if refused
+                .get(&flow)
+                .is_some_and(|since| since.elapsed() < REFUSED_FOR)
+            {
+                refuse(&device, &flow);
+                continue;
+            }
+            let dns = !udp.flows.contains_key(&flow) && hijack_dns(&core, flow.target, false);
+            match udp.admit_session(&flow, dns, guard.shedding) {
+                Ok(false) => {}
+                Ok(true) => {
                     let (input, receiver) = mpsc::channel(16);
                     let core = core.clone();
                     let replies = replies.clone();
-                    let task = tasks.spawn(async move {
-                        (flow, udp_session(core, flow, receiver, replies).await)
+                    let drops = drops.clone();
+                    udp.insert(flow, dns, input, |generation| {
+                        tasks.spawn(async move {
+                            let result =
+                                udp_session(core, flow, generation, receiver, replies, drops).await;
+                            (flow, generation, result)
+                        })
                     });
-                    udp_flows.insert(flow, UdpFlow { input, task });
                 }
-                if let Some(session) = udp_flows.get(&flow) {
-                    let _ = session.input.try_send(bytes.to_vec());
+                Err(refusal) => {
+                    // A full table used to drop these silently: the app saw a
+                    // black hole until its own timeout.
+                    drops.refused(refusal);
+                    if udp.notice(flow, Instant::now()) {
+                        refuse(&device, &flow);
+                    }
+                    continue;
                 }
+            }
+            if let Some(session) = udp.flows.get(&flow)
+                && session.input.try_send(bytes).is_err()
+            {
+                drops.input_full.fetch_add(1, Ordering::Relaxed);
             }
         }
         for _ in 0..256 {
             let Ok(reply) = incoming_replies.try_recv() else {
                 break;
             };
-            if let Some(port) = ports.get_mut(&reply.flow.target) {
+            if udp.superseded(&reply.flow, reply.generation) {
+                continue;
+            }
+            if let Some(port) = udp.ports.get_mut(&reply.flow.target) {
                 let socket = sockets.get_mut::<udp::Socket>(port.handle);
-                let _ = socket.send_slice(&reply.payload, reply.flow.source);
+                if socket
+                    .send_slice(&reply.payload, reply.flow.source)
+                    .is_err()
+                {
+                    drops.socket_full.fetch_add(1, Ordering::Relaxed);
+                }
                 port.last = Instant::now();
             }
         }
-        ports.retain(|endpoint, port| {
-            if port.last.elapsed() <= budget.udp_idle {
-                return true;
-            }
-            udp_flows.retain(|flow, state| {
-                if flow.target != *endpoint {
-                    return true;
-                }
-                state.task.abort();
-                false
-            });
-            sockets.remove(port.handle);
-            false
-        });
+        udp.expire(budget.udp_idle, Instant::now(), &mut sockets);
         poll(&mut iface, now(), &mut device, &mut sockets);
         for handle in retired {
             sockets.remove(handle);
@@ -963,6 +1121,75 @@ mod congestion_tests {
         );
         socket.set_congestion_control(congestion_control(Some("reno")));
         assert_eq!(socket.congestion_control(), tcp::CongestionControl::Reno);
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// Readings are injected: the decisions do not depend on the test
+    /// process's own footprint.
+    #[test]
+    fn refusing_recovers_with_margin_and_closing_cools_down() {
+        let budget = Budget::HOSTED;
+        let mut guard = Guard::new(budget);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let calm = Decision {
+            shedding: None,
+            close: false,
+        };
+        assert_eq!(guard.decide(budget.trace_above, at(0)), calm);
+        assert_eq!(
+            guard.decide(budget.shed_above, at(250)),
+            Decision {
+                shedding: Some(true),
+                close: false
+            }
+        );
+        // Just under the line is not recovery yet.
+        assert_eq!(guard.decide(budget.shed_above - MIB, at(500)), calm);
+        assert!(guard.shedding);
+        assert_eq!(
+            guard
+                .decide(budget.shed_above - RECOVER_MARGIN - 1, at(750))
+                .shedding,
+            Some(false)
+        );
+        // Critical: close once, keep refusing through the cooldown even if the
+        // footprint drops at once, then recover.
+        assert_eq!(
+            guard.decide(budget.close_above, at(1000)),
+            Decision {
+                shedding: Some(true),
+                close: true
+            }
+        );
+        assert_eq!(
+            guard.decide(budget.close_above, at(1250)),
+            calm,
+            "closed twice"
+        );
+        assert_eq!(
+            guard.decide(0, at(2000)),
+            calm,
+            "recovered inside the cooldown"
+        );
+        assert_eq!(
+            guard.decide(0, at(1000) + CLOSE_COOLDOWN).shedding,
+            Some(false)
+        );
+        assert_eq!(
+            guard.counts,
+            GuardCounts {
+                refusing: 2,
+                recovered: 2,
+                closed: 1
+            }
+        );
+        // Still critical after five seconds: close again.
+        assert!(guard.decide(budget.close_above, at(6000)).close);
     }
 }
 

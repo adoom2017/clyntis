@@ -512,7 +512,12 @@ impl Sessions {
                 continue;
             };
             // A full queue drops the packet, as a congested link would.
-            let _ = inbox.try_send((source, payload.to_vec()));
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                inbox.try_send((source, payload.to_vec()))
+            {
+                crate::drops::HYSTERIA2_INBOX_FULL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         sessions.open.lock().unwrap().clear();
     }

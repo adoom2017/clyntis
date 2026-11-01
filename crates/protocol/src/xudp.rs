@@ -275,7 +275,11 @@ async fn read_multiplexed(mut reader: ReadHalf<BoxStream>, shared: Weak<Shared>)
                 let _ = route.sender.try_send(Err("XUDP session ended".into()));
             } else if let Some(payload) = payload {
                 let target = metadata.target.unwrap_or(route.target);
-                let _ = route.sender.try_send(Ok((target, payload)));
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    route.sender.try_send(Ok((target, payload)))
+                {
+                    crate::drops::XUDP_INBOX_FULL.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }

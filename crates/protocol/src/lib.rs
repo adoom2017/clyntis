@@ -1,3 +1,10 @@
+/// Datagrams dropped because a receive queue was full, since start; the TUN
+/// reports them with its own drop counters.
+pub mod drops {
+    use std::sync::atomic::AtomicU64;
+    pub static XUDP_INBOX_FULL: AtomicU64 = AtomicU64::new(0);
+    pub static HYSTERIA2_INBOX_FULL: AtomicU64 = AtomicU64::new(0);
+}
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
