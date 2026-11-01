@@ -48,6 +48,7 @@ h3 = "0.0.8"
 h3-quinn = { version = "0.0.10", default-features = false }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 serde_json.workspace = true

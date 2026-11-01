@@ -8,11 +8,13 @@ use std::{
     io,
     sync::{
         Arc, Mutex as StdMutex, Weak,
-        atomic::{AtomicBool, AtomicU16, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 const SESSION_ID: u16 = 0;
 const NEW: u8 = 1;
@@ -24,6 +26,14 @@ const ERROR: u8 = 2;
 const UDP: u8 = 2;
 const MAX_METADATA: usize = 512;
 const MAX_PAYLOAD: usize = 65507;
+/// Everything a closing session may spend telling the peer (END): waiting for
+/// the shared writer, writing and flushing. Past it the peer's own idle
+/// timeout ends the session; the stream is not held for a stalled peer.
+/// Tune against weak networks before shortening it.
+const END_DEADLINE: Duration = Duration::from_secs(10);
+/// END frames waiting or being written at once. Closes beyond it skip the
+/// frame rather than queue without bound behind a stalled writer.
+const MAX_PENDING_ENDS: usize = 32;
 
 struct Writer {
     stream: WriteHalf<BoxStream>,
@@ -73,6 +83,10 @@ struct Shared {
     routes: StdMutex<HashMap<u16, Route>>,
     next_id: AtomicU16,
     alive: AtomicBool,
+    /// Cancelled when the stream fails or the last owner leaves: pending END
+    /// frames stop and release the stream.
+    closed: CancellationToken,
+    pending_ends: AtomicUsize,
 }
 
 /// One physical VLESS command-3 stream shared by independent UDP flows.
@@ -89,6 +103,8 @@ impl Multiplexer {
             routes: StdMutex::new(HashMap::new()),
             next_id: AtomicU16::new(0),
             alive: AtomicBool::new(true),
+            closed: CancellationToken::new(),
+            pending_ends: AtomicUsize::new(0),
         });
         let reader = tokio::spawn(read_multiplexed(reader, Arc::downgrade(&shared))).abort_handle();
         Arc::new(Self { shared, reader })
@@ -170,6 +186,7 @@ impl Drop for WriteAttempt {
 }
 
 fn fail_multiplexer(shared: &Shared, message: &str) {
+    shared.closed.cancel();
     if !shared.alive.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -319,19 +336,54 @@ impl Drop for MuxSession {
             return;
         }
         let shared = self.mux.shared.clone();
-        let id = self.id;
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if !shared.alive.load(Ordering::Acquire) {
-                    return;
-                }
-                let mut writer = shared.writer.lock().await;
-                let frame = [0, 4, (id >> 8) as u8, id as u8, END, 0];
-                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
-                    fail_multiplexer(&shared, "XUDP close frame failed");
-                }
-            });
+        if !shared.alive.load(Ordering::Acquire) {
+            return;
         }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if shared.pending_ends.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_ENDS {
+            shared.pending_ends.fetch_sub(1, Ordering::AcqRel);
+            tracing::debug!(
+                id = self.id,
+                "XUDP close frames backed up; leaving this one to the peer's idle timeout"
+            );
+            return;
+        }
+        let id = self.id;
+        handle.spawn(async move {
+            let _pending = PendingEnd(shared.clone());
+            tokio::select! {
+                _ = shared.closed.cancelled() => {}
+                _ = tokio::time::timeout(END_DEADLINE, send_end(&shared, id)) => {}
+            }
+        });
+    }
+}
+
+/// Counts an END frame in flight until its task ends, however it ends.
+struct PendingEnd(Arc<Shared>);
+impl Drop for PendingEnd {
+    fn drop(&mut self) {
+        self.0.pending_ends.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Writes END for `id`. Cancelled before the writer is ours, nothing was
+/// written and the stream stays usable; cancelled after, the frame may be
+/// partial, so `WriteAttempt` fails the whole stream and its sessions reconnect.
+async fn send_end(shared: &Arc<Shared>, id: u16) {
+    let mut writer = shared.writer.lock().await;
+    if !shared.alive.load(Ordering::Acquire) {
+        return;
+    }
+    let mut attempt = WriteAttempt {
+        shared: shared.clone(),
+        committed: false,
+    };
+    let frame = [0, 4, (id >> 8) as u8, id as u8, END, 0];
+    if writer.write_all(&frame).await.is_ok() && writer.flush().await.is_ok() {
+        attempt.committed = true;
     }
 }
 
@@ -543,6 +595,82 @@ mod tests {
             (second.target.clone(), b"second-reply".to_vec())
         );
         peer_task.await.unwrap();
+    }
+
+    /// Closing a session behind a busy writer gives up at the deadline
+    /// without writing: the stream and the other sessions stay usable.
+    #[tokio::test(start_paused = true)]
+    async fn close_frames_wait_for_the_writer_without_corrupting_the_stream() {
+        let (local, _peer) = tokio::io::duplex(64 * 1024);
+        let mux = Multiplexer::new(Box::new(local));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let closing = mux.session(target.clone(), None).unwrap();
+        let other = mux.session(target.clone(), None).unwrap();
+        let busy = mux.shared.writer.lock().await;
+        drop(closing);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(mux.shared.pending_ends.load(Ordering::Acquire), 1);
+        tokio::time::sleep(END_DEADLINE).await;
+        assert_eq!(mux.shared.pending_ends.load(Ordering::Acquire), 0);
+        drop(busy);
+        assert!(mux.is_alive());
+        other.send(&target, b"still here").await.unwrap();
+    }
+
+    /// An END frame cut off mid-write would misalign every later frame: the
+    /// whole stream fails and its sessions learn it, so they reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn a_partly_written_close_frame_fails_the_stream() {
+        // Room for four of END's six bytes; the peer never reads.
+        let (local, _peer) = tokio::io::duplex(4);
+        let mux = Multiplexer::new(Box::new(local));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let closing = mux.session(target.clone(), None).unwrap();
+        let other = mux.session(target.clone(), None).unwrap();
+        drop(closing);
+        tokio::time::sleep(END_DEADLINE + Duration::from_secs(1)).await;
+        assert!(!mux.is_alive());
+        assert!(other.recv().await.is_err());
+        assert!(other.send(&target, b"x").await.is_err());
+        assert_eq!(mux.shared.pending_ends.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closes_behind_a_stalled_writer_stay_bounded() {
+        let (local, _peer) = tokio::io::duplex(64 * 1024);
+        let mux = Multiplexer::new(Box::new(local));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let busy = mux.shared.writer.lock().await;
+        for _ in 0..100 {
+            drop(mux.session(target.clone(), None).unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            mux.shared.pending_ends.load(Ordering::Acquire),
+            MAX_PENDING_ENDS
+        );
+        tokio::time::sleep(END_DEADLINE).await;
+        assert_eq!(mux.shared.pending_ends.load(Ordering::Acquire), 0);
+        drop(busy);
+        assert!(mux.is_alive());
+    }
+
+    /// Once every session and the multiplexer are gone, a close frame stuck
+    /// on a stalled peer no longer holds the stream until its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_owner_leaving_releases_the_stream() {
+        let (local, _peer) = tokio::io::duplex(4);
+        let mux = Multiplexer::new(Box::new(local));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let first = mux.session(target.clone(), None).unwrap();
+        let second = mux.session(target, None).unwrap();
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let shared = Arc::downgrade(&mux.shared);
+        drop(second);
+        drop(mux);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(shared.upgrade().is_none(), "the stream is still held");
     }
 
     #[tokio::test]
