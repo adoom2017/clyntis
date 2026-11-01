@@ -823,12 +823,8 @@ pub unsafe extern "C" fn meta_read_packet_v1(
         let handle = handle(id)?;
         handle.check_packet_queue()?;
         let mut queue = handle.packet_output.lock().unwrap();
-        if queue.pending.is_none() {
-            match queue.receiver.try_recv() {
-                Ok(packet) => queue.pending = Some(packet),
-                Err(mpsc::error::TryRecvError::Empty) => return Ok(WOULD_BLOCK),
-                Err(_) => anyhow::bail!("packet channel closed"),
-            }
+        if !queue.fill()? {
+            return Ok(WOULD_BLOCK);
         }
         let status = unsafe { output(queue.pending.as_ref().unwrap(), buffer, capacity, length)? };
         if status == OK {

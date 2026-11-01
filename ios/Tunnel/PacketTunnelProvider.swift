@@ -5,10 +5,27 @@ import os
 private let log = Diagnostics.tunnel
 private func memory() -> String { String(format: "%.1f MiB", Diagnostics.footprintMiB()) }
 
+/// The packet_ready context: which tunnel run a notification belongs to, so
+/// one from a core the tunnel has since replaced drains nothing. The core
+/// sends one per drain, not per packet (see meta_hooks_v1).
+private final class PacketWake {
+    weak var provider: PacketTunnelProvider?
+    let epoch: UUID
+    init(provider: PacketTunnelProvider, epoch: UUID) {
+        self.provider = provider
+        self.epoch = epoch
+    }
+}
+
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let queue = DispatchQueue(label: "org.clyntis.ios.packet-tunnel")
     private var core: CoreSession?
     private var epoch = UUID()
+    /// Outlives its core: shutdown destroys the core (joining its callbacks)
+    /// before a new start replaces it.
+    private var packetWake: PacketWake?
+    /// Reused by every drain on `queue`; each packet is copied out of it.
+    private var packetBuffer = [UInt8](repeating: 0, count: 65_535)
     private var monitor: NWPathMonitor?
     private var receivedInitialPath = false
     /// The network the core last adapted to, and the coalescing of path updates.
@@ -52,11 +69,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 var hooks = meta_hooks_v1()
                 hooks.size = UInt32(MemoryLayout<meta_hooks_v1>.size)
                 hooks.version = 1
-                hooks.context = Unmanaged.passUnretained(self).toOpaque()
+                let wake = PacketWake(provider: self, epoch: self.epoch)
+                self.packetWake = wake
+                hooks.context = Unmanaged.passUnretained(wake).toOpaque()
                 hooks.packet_ready = { context in
                     guard let context else { return }
-                    let provider = Unmanaged<PacketTunnelProvider>.fromOpaque(context).takeUnretainedValue()
-                    provider.queue.async { provider.drainPackets() }
+                    let wake = Unmanaged<PacketWake>.fromOpaque(context).takeUnretainedValue()
+                    guard let provider = wake.provider else { return }
+                    let epoch = wake.epoch
+                    provider.queue.async { provider.drainPackets(epoch: epoch) }
                 }
                 step = "apply custom rules"
                 let (withRules, skipped) = try CustomRules.applied(to: store.configuration(for: id))
@@ -104,7 +125,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             return
                         }
                         self.readPackets(epoch: epoch)
-                        self.drainPackets()
+                        self.drainPackets(epoch: epoch)
                         self.watchCore()
                         log.info("start: tunnel up memory=\(memory())")
                         StartFailures.clear()
@@ -220,17 +241,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func drainPackets() {
-        guard let core else { return }
+    /// Drains the core's packets, at most 64 per turn so the queue still
+    /// serves uploads and network changes; continues until the core reports
+    /// none left, which re-arms its next notification.
+    private func drainPackets(epoch: UUID) {
+        guard self.epoch == epoch, let core else { return }
         watchdog.begin("read packets")
         defer { watchdog.end() }
         var packets: [Data] = [], protocols: [NSNumber] = []
-        var buffer = Data(count: 65_535)
         var emptied = false
         for _ in 0..<64 {
             var length = 0
-            let result = buffer.withUnsafeMutableBytes {
-                meta_read_packet_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count, &length)
+            var packet = Data()
+            let result = packetBuffer.withUnsafeMutableBytes { buffer -> Int32 in
+                let result = meta_read_packet_v1(core.handle, buffer.bindMemory(to: UInt8.self).baseAddress,
+                                                 buffer.count, &length)
+                // Copied out: the next read reuses the buffer.
+                if result == META_OK, length > 0, let base = buffer.baseAddress {
+                    packet = Data(bytes: base, count: length)
+                }
+                return result
             }
             if result == META_WOULD_BLOCK {
                 emptied = true
@@ -241,7 +271,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             guard length > 0 else { continue }
-            let packet = Data(buffer.prefix(length))
             let version = packet[packet.startIndex] >> 4
             guard version == 4 || version == 6 else {
                 dropped("invalid packet from the core (version \(version))")
@@ -254,7 +283,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // The flow refuses while it is being torn down; stopTunnel follows.
             dropped("the system refused \(packets.count) packet(s)")
         }
-        if !emptied { queue.async { self.drainPackets() } }
+        if !emptied { queue.async { self.drainPackets(epoch: epoch) } }
     }
 
     /// Routes for the tunnel; IPv6 only when `ipv6`. Completes on `queue`.

@@ -457,6 +457,87 @@ fn packet_buffers_notifications_and_shutdown_ownership() {
     assert_eq!(context.notifications.load(Ordering::Relaxed), notifications);
 }
 
+/// A host that reads only after packet_ready, until META_WOULD_BLOCK, gets
+/// every reply although the core notifies once per drain, not per packet.
+#[test]
+fn coalesced_packet_ready_delivers_every_reply() {
+    const ECHOES: u16 = 500;
+    let context = Box::new(Callbacks {
+        id: AtomicU64::new(0),
+        notifications: AtomicUsize::new(0),
+    });
+    let hooks = MetaPlatformV1 {
+        size: std::mem::size_of::<MetaPlatformV1>() as u32,
+        version: 1,
+        context: (&*context as *const Callbacks).cast_mut().cast(),
+        protect_socket: None,
+        packet_ready: Some(ready),
+    };
+    let id = create(b"tun: {enable: true}\n", &hooks);
+    context.id.store(id, Ordering::Relaxed);
+    assert_eq!(meta_start_v1(id), OK);
+    let echo = |seq_no: u16| {
+        let icmp = Icmpv4Repr::EchoRequest {
+            ident: 7,
+            seq_no,
+            data: b"burst",
+        };
+        let ip = Ipv4Repr {
+            src_addr: "10.0.0.2".parse().unwrap(),
+            dst_addr: "198.18.0.1".parse().unwrap(),
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut packet = vec![0; ip.buffer_len() + icmp.buffer_len()];
+        let mut frame = Ipv4Packet::new_unchecked(&mut packet);
+        ip.emit(&mut frame, &ChecksumCapabilities::default());
+        icmp.emit(
+            &mut Icmpv4Packet::new_unchecked(frame.payload_mut()),
+            &ChecksumCapabilities::default(),
+        );
+        packet
+    };
+    let (mut sent, mut replies, mut handled) = (0u16, 0u16, 0usize);
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut buffer = vec![0; 2048];
+    while replies < ECHOES {
+        assert!(
+            Instant::now() < until,
+            "stalled at {replies} replies: a lost wakeup"
+        );
+        if sent < ECHOES {
+            let packet = echo(sent);
+            if unsafe { meta_write_packet_v1(id, packet.as_ptr(), packet.len()) } == OK {
+                sent += 1;
+            }
+        }
+        let notified = context.notifications.load(Ordering::Acquire);
+        if notified == handled {
+            if sent == ECHOES {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            continue;
+        }
+        handled = notified;
+        loop {
+            let mut length = 0;
+            match unsafe { meta_read_packet_v1(id, buffer.as_mut_ptr(), buffer.len(), &mut length) }
+            {
+                OK => replies += 1,
+                WOULD_BLOCK => break,
+                status => panic!("read failed: {status}"),
+            }
+        }
+    }
+    assert_eq!(meta_destroy_v1(id), OK);
+    let notifications = context.notifications.load(Ordering::Relaxed);
+    assert!(
+        notifications < ECHOES as usize,
+        "{notifications} notifications"
+    );
+}
+
 #[test]
 fn prefetch_downloads_rule_providers_into_the_host_directory() {
     use std::io::{Read, Write};

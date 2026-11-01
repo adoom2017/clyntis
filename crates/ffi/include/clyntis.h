@@ -22,7 +22,9 @@ typedef struct {
  * successful protection. Callbacks can run concurrently on worker threads and
  * must return promptly. Context must outlive stop/destroy. Callbacks may read
  * packets/snapshots, but must not call lifecycle functions. packet_ready signals
- * that the host can drain meta_read_packet_v1 until META_WOULD_BLOCK.
+ * that the host can drain meta_read_packet_v1, and must: it is not sent again
+ * until a read has returned META_WOULD_BLOCK, so a host that stops draining
+ * early stops receiving packets. Notifications are coalesced, not one per packet.
  *
  * Every handle owns its runtime. start is allowed once. stop/destroy join the
  * worker and all callbacks; neither can run inside a callback. Full configuration

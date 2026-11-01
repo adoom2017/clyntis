@@ -91,6 +91,30 @@ struct HostPackets {
     input: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     output: mpsc::Sender<Vec<u8>>,
     hooks: HostHooks,
+    wake: Arc<PacketWake>,
+}
+
+/// Coalesces packet_ready: after one notification the host drains until
+/// META_WOULD_BLOCK, and only a packet queued after that notifies again.
+/// Notifying every packet queued one drain task per packet on iOS.
+#[derive(Default)]
+pub(crate) struct PacketWake(AtomicBool);
+impl PacketWake {
+    /// A packet was queued: whether to notify the host.
+    pub(crate) fn queued(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+    /// The host found the queue empty. The caller must check the queue once
+    /// more afterwards: a packet queued just before saw the flag still set
+    /// and did not notify. The swap (not a store) synchronizes with that
+    /// sender, so its packet is visible to the check.
+    pub(crate) fn emptied(&self) {
+        self.0.swap(false, Ordering::AcqRel);
+    }
+    /// The check after `emptied` found a packet: the host is still draining.
+    pub(crate) fn draining(&self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 #[async_trait]
 impl PacketIo for HostPackets {
@@ -108,6 +132,9 @@ impl PacketIo for HostPackets {
     }
     async fn send(&self, packet: &[u8]) -> Result<()> {
         self.output.send(packet.to_vec()).await?;
+        if !self.wake.queued() {
+            return Ok(());
+        }
         if let Some(notify) = self.hooks.notify {
             let _scope = Scope::enter();
             // The nonblocking packet reader may be called from this notification.
@@ -121,6 +148,39 @@ impl PacketIo for HostPackets {
 pub(crate) struct PacketsOut {
     pub(crate) receiver: mpsc::Receiver<Vec<u8>>,
     pub(crate) pending: Option<Vec<u8>>,
+    pub(crate) wake: Arc<PacketWake>,
+}
+impl PacketsOut {
+    /// Makes `pending` the next packet; false when the queue is empty, which
+    /// re-arms packet_ready.
+    pub(crate) fn fill(&mut self) -> Result<bool> {
+        if self.pending.is_some() {
+            return Ok(true);
+        }
+        let packet = match self.receiver.try_recv() {
+            Ok(packet) => packet,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                #[cfg(test)]
+                if wake_tests::WIDEN_RACE.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                // Re-arm, then look again: a packet queued while the flag
+                // was still set did not notify.
+                self.wake.emptied();
+                match self.receiver.try_recv() {
+                    Ok(packet) => {
+                        self.wake.draining();
+                        packet
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => return Ok(false),
+                    Err(_) => anyhow::bail!("packet channel closed"),
+                }
+            }
+            Err(_) => anyhow::bail!("packet channel closed"),
+        };
+        self.pending = Some(packet);
+        Ok(true)
+    }
 }
 enum Command {
     Start(std::sync::mpsc::SyncSender<Result<(), String>>),
@@ -169,6 +229,7 @@ impl Handle {
         let (network, mut network_changes) = tokio::sync::watch::channel(0u64);
         let (input_sender, input_receiver) = mpsc::channel(256);
         let (output_sender, output_receiver) = mpsc::channel(256);
+        let wake = Arc::new(PacketWake::default());
         let packet_input = core.config.tun.enable.then_some(input_sender);
         let packet_queue_enabled = Arc::new(AtomicBool::new(core.config.tun.enable));
         #[cfg(target_os = "android")]
@@ -178,6 +239,7 @@ impl Handle {
                 input: tokio::sync::Mutex::new(input_receiver),
                 output: output_sender,
                 hooks,
+                wake: wake.clone(),
             }) as Arc<dyn PacketIo>
         });
         let owner = core.clone();
@@ -272,6 +334,7 @@ impl Handle {
             packet_output: Mutex::new(PacketsOut {
                 receiver: output_receiver,
                 pending: None,
+                wake,
             }),
         })
     }
@@ -379,5 +442,68 @@ impl Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         let _ = self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// Pauses `fill` between finding the queue empty and re-arming, so a
+    /// packet arrives in that window: the case that loses a wakeup.
+    pub(super) static WIDEN_RACE: AtomicBool = AtomicBool::new(false);
+
+    /// Short bursts from a sender while the host drains only when notified:
+    /// the last packet of each burst lands near the re-arm. Every burst must
+    /// arrive (no lost wakeup), with fewer notifications than packets.
+    #[test]
+    fn coalesced_notifications_never_lose_the_last_packet() {
+        const ROUNDS: usize = 300;
+        const BURST: usize = 3;
+        WIDEN_RACE.store(true, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>(256);
+        let wake = Arc::new(PacketWake::default());
+        let mut queue = PacketsOut {
+            receiver,
+            pending: None,
+            wake: wake.clone(),
+        };
+        let (notify, notified) = std::sync::mpsc::channel::<()>();
+        let (next, rounds) = std::sync::mpsc::channel::<()>();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                for _ in 0..BURST {
+                    sender.blocking_send(vec![0]).unwrap();
+                    if wake.queued() {
+                        notify.send(()).unwrap();
+                    }
+                }
+                if rounds.recv().is_err() {
+                    return;
+                }
+            }
+        });
+        let mut notifications = 0;
+        for round in 0..ROUNDS {
+            let mut received = 0;
+            while received < BURST {
+                notified
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap_or_else(|_| panic!("lost a wakeup in round {round}"));
+                notifications += 1;
+                // What meta_read_packet_v1 does for the host: drain to empty.
+                while queue.fill().unwrap() {
+                    queue.pending.take();
+                    received += 1;
+                }
+            }
+            next.send(()).unwrap();
+        }
+        WIDEN_RACE.store(false, Ordering::Relaxed);
+        producer.join().unwrap();
+        assert!(
+            notifications < ROUNDS * BURST,
+            "{notifications} notifications"
+        );
     }
 }
