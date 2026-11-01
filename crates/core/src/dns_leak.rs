@@ -93,7 +93,7 @@ fn listed(items: impl IntoIterator<Item = String>) -> Vec<String> {
     let total = items.len();
     let mut shown: Vec<_> = items.into_iter().take(LISTED).collect();
     if total > LISTED {
-        shown.push(format!("…共 {total} 项"));
+        shown.push(format!("…{total} in all"));
     }
     shown
 }
@@ -127,7 +127,7 @@ fn verdict(node: &str, routed: &LeakProbe, local: &LeakProbe) -> &'static str {
 /// resolver); its `conclusion` is not used (see `verdict`).
 fn parse_result(body: &[u8]) -> Result<(Vec<LeakServer>, LeakProbe)> {
     let value: serde_json::Value =
-        serde_json::from_slice(body).context("bash.ws 返回了无效的结果")?;
+        serde_json::from_slice(body).context("bash.ws returned an invalid result")?;
     if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
         return Ok((
             Vec::new(),
@@ -137,7 +137,9 @@ fn parse_result(body: &[u8]) -> Result<(Vec<LeakServer>, LeakProbe)> {
             },
         ));
     }
-    let entries = value.as_array().context("bash.ws 返回了无效的结果")?;
+    let entries = value
+        .as_array()
+        .context("bash.ws returned an invalid result")?;
     let text = |entry: &serde_json::Value, key: &str| {
         entry
             .get(key)
@@ -179,8 +181,8 @@ impl Core {
             findings.push(Finding {
                 level: "risk",
                 code: "redir-host",
-                title: "redir-host 模式会在本地解析所有域名".into(),
-                detail: "应用的每次查询都由内核向上游 DNS 解析，走代理的域名也会被上游看到。改用 fake-ip 模式，域名会交给代理在远端解析。".into(),
+                title: "redir-host mode resolves every name locally".into(),
+                detail: "The core resolves every app query through the upstream DNS, so the upstream sees proxied names too. Use fake-ip mode to have proxies resolve names remotely.".into(),
                 items: Vec::new(),
             });
         }
@@ -194,7 +196,7 @@ impl Core {
                 later_proxy |= proxied(&rule.target);
                 if later_proxy && !rule.no_resolve && needs_address(&rule.matcher) {
                     let raw = raw_rules.get(index).map(String::as_str).unwrap_or("?");
-                    resolving.push(format!("第 {} 条：{raw}", index + 1));
+                    resolving.push(format!("rule {}: {raw}", index + 1));
                 }
             }
             resolving.reverse();
@@ -202,8 +204,8 @@ impl Core {
                 findings.push(Finding {
                     level: "risk",
                     code: "resolving-rules",
-                    title: format!("{} 条 IP 规则会在匹配前本地解析域名", resolving.len()),
-                    detail: "域名经过这些规则时，内核会先向上游 DNS 解析；之后走代理的域名也因此被上游看到。给这些规则加上 no-resolve，或把它们移到域名规则之后。".into(),
+                    title: format!("{} IP rule(s) resolve names locally before matching", resolving.len()),
+                    detail: "A name reaching these rules is first resolved through the upstream DNS, which then sees names that go through a proxy. Add no-resolve to these rules or move them after the domain rules.".into(),
                     items: listed(resolving),
                 });
             }
@@ -231,8 +233,8 @@ impl Core {
             findings.push(Finding {
                 level: "warning",
                 code: "plain-upstream",
-                title: "上游 DNS 使用明文协议".into(),
-                detail: "内核本地解析的域名（直连连接、IP 规则）会以明文发出，运营商可以看到甚至篡改。改用 https:// 或 tls:// 上游。".into(),
+                title: "Upstream DNS uses a plaintext protocol".into(),
+                detail: "Names the core resolves locally (direct connections, IP rules) go out in plaintext, which the network can see or alter. Use https:// or tls:// upstreams.".into(),
                 items: listed(plain),
             });
         }
@@ -244,11 +246,11 @@ impl Core {
             findings.push(Finding {
                 level: "warning",
                 code: "system-dns",
-                title: "系统 DNS 没有交给内核".into(),
+                title: "System DNS does not go to the core".into(),
                 detail: if cfg!(target_os = "macos") {
-                    "TUN 模式下系统仍可能直接向原来的 DNS 服务器查询。开启 DNS 和「自动设置系统 DNS」（tun.auto-dns）。"
+                    "In TUN mode the system may still query its original DNS servers directly. Enable DNS and automatic system DNS (tun.auto-dns)."
                 } else {
-                    "TUN 模式下发往 53 端口的查询不会被内核接管。设置 tun.dns-hijack（例如 any:53）。"
+                    "In TUN mode queries to port 53 are not taken over by the core. Set tun.dns-hijack (e.g. any:53)."
                 }
                 .into(),
                 items: Vec::new(),
@@ -258,8 +260,8 @@ impl Core {
             findings.push(Finding {
                 level: "info",
                 code: "dns-disabled",
-                title: "内核 DNS 未启用".into(),
-                detail: "使用系统代理的应用通常把域名直接交给代理，不会泄露；不走代理的程序仍使用系统 DNS。".into(),
+                title: "The core's DNS is off".into(),
+                detail: "Apps using the system proxy usually hand names to the proxy and do not leak; programs that bypass the proxy still use the system DNS.".into(),
                 items: Vec::new(),
             });
         }
@@ -276,14 +278,17 @@ impl Core {
             biased;
             _ = self.stop.cancelled() => anyhow::bail!("core stopped"),
             result = tokio::time::timeout(Duration::from_secs(30), self.dns_leak_test_inner()) => {
-                result.context("DNS 泄露测试超时")?
+                result.context("the DNS leak test timed out")?
             }
         }
     }
 
     async fn dns_leak_test_inner(&self) -> Result<DnsLeakTest> {
         let route = self.test_route(&Target::new(SERVICE, 443)?, "tcp").await?;
-        ensure!(route.node != "REJECT", "{SERVICE} 被规则拒绝，无法测试");
+        ensure!(
+            route.node != "REJECT",
+            "a rule rejects {SERVICE}; cannot test"
+        );
         let (routed_id, local_id) = tokio::try_join!(self.leak_id(), self.leak_id())?;
         let routed = futures_util::future::join_all((1..=PROBES).map(|n| {
             let id = &routed_id;
@@ -336,7 +341,7 @@ impl Core {
         let id = String::from_utf8(body)?.trim().to_owned();
         ensure!(
             !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric()),
-            "{SERVICE} 返回了无效的测试编号"
+            "{SERVICE} returned an invalid test ID"
         );
         Ok(id)
     }
@@ -418,8 +423,8 @@ mod tests {
         assert_eq!(
             audit.findings[0].items,
             [
-                "第 2 条：IP-CIDR,10.0.0.0/8,DIRECT",
-                "第 4 条：AND,((DOMAIN-KEYWORD,x),(IP-CIDR,1.0.0.0/8)),DIRECT"
+                "rule 2: IP-CIDR,10.0.0.0/8,DIRECT",
+                "rule 4: AND,((DOMAIN-KEYWORD,x),(IP-CIDR,1.0.0.0/8)),DIRECT"
             ]
         );
         // Global mode ignores the rules.

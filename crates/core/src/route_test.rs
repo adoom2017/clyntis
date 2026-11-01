@@ -54,28 +54,29 @@ pub fn parse_test_target(input: &str, port: Option<u16>) -> Result<Target> {
         .rsplit('@')
         .next()
         .unwrap_or_default();
-    ensure!(!rest.is_empty(), "请输入域名或 IP 地址");
+    ensure!(!rest.is_empty(), "enter a domain or IP address");
     let (host, parsed_port) = if let Ok(ip) = rest.parse::<IpAddr>() {
         (ip.to_string(), None)
     } else if let Some(v6) = rest.strip_prefix('[') {
-        let (address, tail) = v6.split_once(']').context("无效的 IPv6 地址")?;
-        let ip: IpAddr = address.parse().context("无效的 IPv6 地址")?;
+        let (address, tail) = v6.split_once(']').context("invalid IPv6 address")?;
+        let ip: IpAddr = address.parse().context("invalid IPv6 address")?;
         let port = match tail.strip_prefix(':') {
-            Some(port) => Some(port.parse::<u16>().context("无效的端口")?),
+            Some(port) => Some(port.parse::<u16>().context("invalid port")?),
             None if tail.is_empty() => None,
-            None => anyhow::bail!("无效的 IPv6 地址"),
+            None => anyhow::bail!("invalid IPv6 address"),
         };
         (ip.to_string(), port)
     } else if let Some((host, port)) = rest.rsplit_once(':') {
         (
             host.to_owned(),
-            Some(port.parse::<u16>().context("无效的端口")?),
+            Some(port.parse::<u16>().context("invalid port")?),
         )
     } else {
         (rest.to_owned(), None)
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    Target::new(host, port.or(parsed_port).unwrap_or(default_port)).context("无效的域名或 IP 地址")
+    Target::new(host, port.or(parsed_port).unwrap_or(default_port))
+        .context("invalid domain or IP address")
 }
 
 impl Core {

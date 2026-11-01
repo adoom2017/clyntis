@@ -132,21 +132,21 @@ pub const PRESETS: [Preset; 3] = [
         name: "AWAvenue-Ads",
         url: "https://cdn.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-Ads-Rule-Clash.yaml",
         format: "clash",
-        description: "国内 App 广告接口，约 1,000 条，误杀少",
+        description: "Ad endpoints of Chinese apps, about 1,000 entries, few false positives",
     },
     Preset {
         id: "anti-ad",
         name: "anti-AD",
         url: "https://anti-ad.net/clash.yaml",
         format: "clash",
-        description: "覆盖面广，以国内为主，约 10 万条",
+        description: "Broad, mostly Chinese, about 100,000 entries",
     },
     Preset {
         id: "adguard-dns",
         name: "AdGuard DNS filter",
         url: "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
         format: "adguard",
-        description: "偏海外的广告与追踪，约 18 万条，内存占用较大",
+        description: "Mostly international ads and tracking, about 180,000 entries; uses more memory",
     },
 ];
 

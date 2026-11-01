@@ -38,7 +38,7 @@ final class ProfileStoreTests: XCTestCase {
         XCTAssertNil(CoreSession.yamlProblem(in: "mode: rule\nrules: ['MATCH,DIRECT']\n"))
         let problem = CoreSession.yamlProblem(in: "mode: rule\nmode: global\n")
         XCTAssertEqual(problem?.line, 2)
-        XCTAssertEqual(problem?.message.hasPrefix("键重复"), true)
+        XCTAssertEqual(problem?.message.hasPrefix("duplicate key"), true)
     }
 
     func testEditingValidatesAndKeepsTheOldConfigurationOnFailure() throws {

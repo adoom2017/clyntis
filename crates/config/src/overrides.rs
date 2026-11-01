@@ -26,7 +26,7 @@ impl Overrides {
         if let Some(level) = &self.log_level {
             ensure!(
                 LOG_LEVELS.contains(&level.as_str()),
-                "无效日志级别「{level}」"
+                "invalid log level \"{level}\""
             );
         }
         if let Some(adblock) = &self.adblock {
@@ -81,8 +81,13 @@ impl Overrides {
         if self.is_empty() {
             return Ok(yaml.to_owned());
         }
-        let mut document: Value = serde_yaml::from_str(yaml).context("配置不是有效的 YAML")?;
-        self.apply_to(document.as_mapping_mut().context("配置必须是 YAML 对象")?)?;
+        let mut document: Value =
+            serde_yaml::from_str(yaml).context("the profile is not valid YAML")?;
+        self.apply_to(
+            document
+                .as_mapping_mut()
+                .context("the profile must be a YAML mapping")?,
+        )?;
         Ok(serde_yaml::to_string(&document)?)
     }
 }
@@ -91,7 +96,7 @@ fn nested<'a>(map: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
     map.entry(Value::from(key))
         .or_insert(Value::Mapping(Mapping::new()))
         .as_mapping_mut()
-        .with_context(|| format!("配置项 {key} 必须是对象"))
+        .with_context(|| format!("setting {key} must be a mapping"))
 }
 
 #[cfg(test)]

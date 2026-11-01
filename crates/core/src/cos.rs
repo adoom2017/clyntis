@@ -69,9 +69,12 @@ impl CosTarget {
                     .bucket
                     .rsplit_once('-')
                     .is_some_and(|(_, appid)| appid.bytes().all(|b| b.is_ascii_digit())),
-            "存储桶名称应形如 examplebucket-1250000000（含 APPID）"
+            "the bucket should look like examplebucket-1250000000 (with the APPID)"
         );
-        ensure!(label(&self.region), "地域应形如 ap-shanghai");
+        ensure!(
+            label(&self.region),
+            "the region should look like ap-shanghai"
+        );
         ensure!(
             !self.key.is_empty()
                 && !self.key.starts_with('/')
@@ -81,7 +84,7 @@ impl CosTarget {
                     .split('/')
                     .any(|part| part.is_empty() || part == "." || part == "..")
                 && !self.key.chars().any(char::is_control),
-            "文件路径不能为空，不能以 / 开头或结尾，也不能包含空的段、. 或 .."
+            "the file path must not be empty, start or end with /, or contain empty, . or .. segments"
         );
         Ok(())
     }
@@ -160,7 +163,7 @@ pub async fn put_object(
     target.validate()?;
     ensure!(
         !credentials.secret_id.trim().is_empty() && !credentials.secret_key.trim().is_empty(),
-        "请先填写 COS 的 SecretId 和 SecretKey"
+        "enter the COS SecretId and SecretKey first"
     );
     let host = target.host();
     let length = body.len().to_string();
@@ -192,12 +195,12 @@ pub async fn put_object(
     let exchange = async {
         let address = tokio::net::lookup_host((host.as_str(), 443))
             .await
-            .with_context(|| format!("无法解析 {host}"))?
+            .with_context(|| format!("cannot resolve {host}"))?
             .next()
-            .with_context(|| format!("无法解析 {host}"))?;
+            .with_context(|| format!("cannot resolve {host}"))?;
         let socket = tokio::net::TcpStream::connect(address)
             .await
-            .with_context(|| format!("无法连接 {host}"))?;
+            .with_context(|| format!("cannot connect to {host}"))?;
         let tls = clyntis_protocol::tls::SecureConnector::new(Default::default())
             .connect(
                 Box::new(socket),
@@ -224,7 +227,7 @@ pub async fn put_object(
     };
     let (status, body) = tokio::time::timeout(Duration::from_secs(30), exchange)
         .await
-        .map_err(|_| anyhow::anyhow!("上传到 COS 超时"))??;
+        .map_err(|_| anyhow::anyhow!("uploading to COS timed out"))??;
     if status.is_success() {
         return Ok(());
     }
@@ -244,12 +247,12 @@ fn describe_error(status: http::StatusCode, body: &str) -> String {
     };
     let code = field("Code").unwrap_or_default();
     let hint = match code.as_str() {
-        "SignatureDoesNotMatch" => "签名不匹配，请检查 SecretKey",
-        "InvalidAccessKeyId" => "SecretId 不存在或已停用",
-        "AccessDenied" => "没有写入权限，请为该密钥授予此存储桶的 PutObject 权限",
-        "NoSuchBucket" => "存储桶不存在，请检查名称和地域",
-        "RequestTimeTooSkewed" => "设备时间与服务器相差过大，请校准系统时间",
-        "EntityTooLarge" => "文件过大",
+        "SignatureDoesNotMatch" => "the signature does not match; check the SecretKey",
+        "InvalidAccessKeyId" => "the SecretId does not exist or is disabled",
+        "AccessDenied" => "no write permission; allow PutObject on this bucket for the key",
+        "NoSuchBucket" => "the bucket does not exist; check its name and region",
+        "RequestTimeTooSkewed" => "the device clock is too far off; correct the system time",
+        "EntityTooLarge" => "the file is too large",
         _ => "",
     };
     let detail = match (code.is_empty(), field("Message")) {
@@ -258,9 +261,9 @@ fn describe_error(status: http::StatusCode, body: &str) -> String {
         (true, _) => format!("HTTP {status}"),
     };
     if hint.is_empty() {
-        format!("上传到 COS 失败（{detail}）")
+        format!("uploading to COS failed ({detail})")
     } else {
-        format!("上传到 COS 失败：{hint}（{detail}）")
+        format!("uploading to COS failed: {hint} ({detail})")
     }
 }
 

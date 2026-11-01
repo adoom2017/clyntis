@@ -39,8 +39,8 @@ pub fn check(text: &str) -> Option<SyntaxError> {
             return Some(SyntaxError {
                 line,
                 column,
-                message: if tabbed && !message.starts_with("缩进不能使用 Tab") {
-                    format!("缩进不能使用 Tab，请改用空格（{}）", message)
+                message: if tabbed && !message.starts_with("tabs cannot indent") {
+                    format!("tabs cannot indent YAML; use spaces ({})", message)
                 } else {
                     message
                 },
@@ -65,7 +65,7 @@ pub fn check(text: &str) -> Option<SyntaxError> {
             Some(SyntaxError {
                 line,
                 column: 1,
-                message: "顶层应是「键: 值」形式的映射".into(),
+                message: "the top level must be a mapping of key: value".into(),
             })
         }
     }
@@ -101,34 +101,34 @@ fn describe(error: &str) -> String {
     // "... at line 3 column 5, while parsing ..." — the position is shown separately.
     let reason = error.split(" at line ").next().unwrap_or(error).trim();
     let hint = [
-        ("found a tab character", "缩进不能使用 Tab"),
+        ("found a tab character", "tabs cannot indent YAML"),
         (
             "found character that cannot start any token",
-            "出现了不能作为开头的字符（如 Tab 缩进或 @、`），可给值加引号",
+            "a character that cannot start a value (such as a tab, @ or `); quote the value",
         ),
         (
             "mapping values are not allowed in this context",
-            "这里不能出现「键: 值」，检查缩进，或给含冒号的值加引号",
+            "key: value is not allowed here; check the indentation or quote a value containing a colon",
         ),
-        ("did not find expected key", "缩进不一致或缺少键"),
-        ("did not find expected '-' indicator", "列表项缩进不一致"),
+        ("did not find expected key", "inconsistent indentation or a missing key"),
+        ("did not find expected '-' indicator", "list items are indented inconsistently"),
         (
             "did not find expected ',' or ']'",
-            "方括号列表缺少「,」或「]」",
+            "a [list] is missing , or ]",
         ),
         (
             "did not find expected ',' or '}'",
-            "花括号映射缺少「,」或「}」",
+            "a {mapping} is missing , or }",
         ),
-        ("could not find expected ':'", "缺少「:」"),
-        ("found unexpected end of stream", "引号或括号没有闭合"),
+        ("could not find expected ':'", "missing :"),
+        ("found unexpected end of stream", "an unclosed quote or bracket"),
         (
             "block sequence entries are not allowed",
-            "这里不能开始列表项，检查缩进",
+            "a list item cannot start here; check the indentation",
         ),
-        ("duplicate entry", "键重复"),
-        ("unknown anchor", "引用了不存在的锚点"),
-        ("found undefined alias", "引用了不存在的锚点"),
+        ("duplicate entry", "duplicate key"),
+        ("unknown anchor", "refers to an anchor that does not exist"),
+        ("found undefined alias", "refers to an anchor that does not exist"),
     ]
     .into_iter()
     .find_map(|(english, chinese)| reason.starts_with(english).then_some(chinese));
@@ -158,21 +158,27 @@ mod tests {
     fn locates_the_first_error() {
         let error = check("mode: rule\nproxies:\n  - name: a\n   type: vless\n").unwrap();
         assert_eq!((error.line, error.column), (4, 4), "{error:?}");
-        assert!(error.message.starts_with("列表项缩进不一致"), "{error:?}");
+        assert!(
+            error.message.starts_with("list items are indented"),
+            "{error:?}"
+        );
 
         let error = check("a: b: c\n").unwrap();
-        assert!(error.message.starts_with("这里不能出现"), "{error:?}");
+        assert!(
+            error.message.starts_with("key: value is not allowed"),
+            "{error:?}"
+        );
 
         let error = check("mode: rule\nrules:\n\t- MATCH,DIRECT\n").unwrap();
         assert_eq!(error.line, 3, "{error:?}");
-        assert!(error.message.starts_with("缩进不能使用 Tab"), "{error:?}");
+        assert!(error.message.starts_with("tabs cannot indent"), "{error:?}");
 
         let error = check("a: 1\nproxies: [a, b\n").unwrap();
         assert!(error.line >= 2, "{error:?}");
 
         let error = check("mode: rule\nmode: global\n").unwrap();
         assert_eq!(error.line, 2, "{error:?}");
-        assert!(error.message.starts_with("键重复"), "{error:?}");
+        assert!(error.message.starts_with("duplicate key"), "{error:?}");
     }
 
     #[test]

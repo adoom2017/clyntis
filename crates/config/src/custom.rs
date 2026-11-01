@@ -27,12 +27,12 @@ pub struct Applied {
 pub fn validate(rule: &str) -> Result<()> {
     ensure!(
         !rule.trim().is_empty() && rule.len() <= 4096,
-        "规则不能为空且不能超过 4096 字节"
+        "a rule must be 1–4096 bytes"
     );
-    ensure!(!rule.contains(['\n', '\r']), "一条规则只能占一行");
+    ensure!(!rule.contains(['\n', '\r']), "a rule must fit on one line");
     let parsed = crate::rule::Rule::parse(rule.trim())?;
     if matches!(parsed.matcher, crate::rule::Matcher::All) {
-        bail!("MATCH 会覆盖配置中的全部规则，不能作为自定义规则");
+        bail!("MATCH would override every rule in the profile; it cannot be a custom rule");
     }
     Ok(())
 }
@@ -40,8 +40,10 @@ pub fn validate(rule: &str) -> Result<()> {
 /// Rule targets a profile offers, in display order: DIRECT, REJECT, then its
 /// proxy groups and proxies.
 pub fn targets(yaml: &str) -> Result<Vec<String>> {
-    let document: Value = serde_yaml::from_str(yaml).context("配置不是有效的 YAML")?;
-    let map = document.as_mapping().context("配置必须是 YAML 对象")?;
+    let document: Value = serde_yaml::from_str(yaml).context("the profile is not valid YAML")?;
+    let map = document
+        .as_mapping()
+        .context("the profile must be a YAML mapping")?;
     let mut names = vec!["DIRECT".to_owned(), "REJECT".to_owned()];
     for key in ["proxy-groups", "proxies"] {
         for item in map
@@ -66,14 +68,17 @@ pub fn targets(yaml: &str) -> Result<Vec<String>> {
 pub fn apply(yaml: &str, rules: &[String]) -> Result<Applied> {
     ensure!(
         rules.len() <= MAX_RULES,
-        "自定义规则不能超过 {MAX_RULES} 条"
+        "no more than {MAX_RULES} custom rules"
     );
-    let mut document: Value = serde_yaml::from_str(yaml).context("配置不是有效的 YAML")?;
+    let mut document: Value =
+        serde_yaml::from_str(yaml).context("the profile is not valid YAML")?;
     let names: HashSet<String> = targets(yaml)?
         .into_iter()
         .chain(["GLOBAL".into()])
         .collect();
-    let map = document.as_mapping_mut().context("配置必须是 YAML 对象")?;
+    let map = document
+        .as_mapping_mut()
+        .context("the profile must be a YAML mapping")?;
     let providers: HashSet<String> = map
         .get("rule-providers")
         .and_then(Value::as_mapping)
@@ -99,7 +104,7 @@ pub fn apply(yaml: &str, rules: &[String]) -> Result<Applied> {
         let parsed = crate::rule::Rule::parse(rule)?;
         if !names.contains(&parsed.target) {
             skipped.push(skip(format!(
-                "当前配置没有代理或代理组「{}」",
+                "the profile has no proxy or group \"{}\"",
                 parsed.target
             )));
             continue;
@@ -110,7 +115,7 @@ pub fn apply(yaml: &str, rules: &[String]) -> Result<Applied> {
             .iter()
             .find(|(kind, name)| kind == "rule-set" && !providers.contains(name))
         {
-            skipped.push(skip(format!("当前配置没有规则集「{name}」")));
+            skipped.push(skip(format!("the profile has no rule provider \"{name}\"")));
             continue;
         }
         kept.push(Value::from(rule));
