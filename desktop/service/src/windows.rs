@@ -1,4 +1,5 @@
 use super::*;
+use clyntis_desktop_model::tr;
 use std::ffi::OsString;
 use windows_service::{
     define_windows_service,
@@ -78,7 +79,11 @@ fn install(restart: bool) -> Result<()> {
         }
         ensure!(
             service.query_status()?.current_state == ServiceState::Stopped,
-            "辅助服务仍在恢复网络设置，更新已停止，请稍后重试"
+            "{}",
+            tr!(
+                "辅助服务仍在恢复网络设置，更新已停止，请稍后重试",
+                "The helper service is still restoring network settings; the update stopped. Try again shortly"
+            )
         );
     }
     service.change_config(&info)?;
@@ -101,7 +106,11 @@ fn install(restart: bool) -> Result<()> {
         }
         ensure!(
             std::time::Instant::now() < deadline,
-            "Windows 辅助服务启动超时，请检查安装目录中的 clyntis-service.log"
+            "{}",
+            tr!(
+                "Windows 辅助服务启动超时，请检查安装目录中的 clyntis-service.log",
+                "The Windows helper service timed out starting; check clyntis-service.log in the installation folder"
+            )
         );
         std::thread::sleep(Duration::from_millis(100));
     }

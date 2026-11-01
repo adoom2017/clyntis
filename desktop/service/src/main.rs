@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use clyntis_desktop_model::protocol::FrameReader;
+use clyntis_desktop_model::tr;
 use clyntis_desktop_model::{
     private_dir,
     profiles::{safe_relative, validate},
@@ -122,9 +123,17 @@ impl Runner {
                 },
                 _ => self.diagnostics.tail(),
             };
-            self.diagnostics
-                .record(&self.directory, &format!("内核退出（{status}）：{detail}"));
-            let error = format!("内核进程已退出（{status}）：{detail}");
+            self.diagnostics.record(
+                &self.directory,
+                &tr!(
+                    "内核退出（{status}）：{detail}",
+                    "Core exited ({status}): {detail}"
+                ),
+            );
+            let error = tr!(
+                "内核进程已退出（{status}）：{detail}",
+                "The core process exited ({status}): {detail}"
+            );
             self.exit_error = Some(error.clone());
             anyhow::bail!("{error}");
         }
@@ -213,7 +222,7 @@ async fn session(
             },
             line = protocol::read_frame(&mut stream) => {
                 let Some(line) = line? else { break; };
-                let request: Request = serde_json::from_str(&line).context("桌面请求不是有效的 JSON")?;
+                let request: Request = serde_json::from_str(&line).context("invalid desktop request JSON")?;
                 ensure!(request.version() == VERSION, "IPC version mismatch");
                 deadline = tokio::time::Instant::now() + Duration::from_secs(30);
                 let response = match request {
@@ -237,7 +246,8 @@ async fn session(
                         pending_resources.entry(name).or_default().extend(bytes);
                         Response::Ok { version: VERSION }
                     },
-                    Request::Start { version, yaml, profile_id, system_proxy_port } => {
+                    Request::Start { version, yaml, profile_id, system_proxy_port, language } => {
+                        clyntis_desktop_model::i18n::set(language.as_deref().unwrap_or("zh"));
                         ensure!(runner.is_none(), "already running");
                         ensure!(system_proxy_port.is_none(), "service cannot set a user's proxy");
                         let config = validate(&yaml)?;
@@ -265,13 +275,13 @@ async fn session(
                         let stderr_task = tokio::spawn(async move { capture.capture(stderr, log_directory).await; });
                         runner = Some(Runner { child, input, output, directory, diagnostics, stderr_task, exit_error: None });
                         let child = runner.as_mut().unwrap();
-                        protocol::write_frame(&mut child.input, &Request::Start { version, yaml, profile_id, system_proxy_port: None }).await?;
+                        protocol::write_frame(&mut child.input, &Request::Start { version, yaml, profile_id, system_proxy_port: None, language }).await?;
                         let line = tokio::select! {
                             _ = stop.cancelled() => anyhow::bail!("service stopping"),
                             result = tokio::time::timeout(Duration::from_secs(100), protocol::read_frame(&mut child.output)) => result??.context("runner exited before ready")?,
                         };
                         deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                        let response: Response = serde_json::from_str(&line).context("内核启动响应不是有效的 JSON")?;
+                        let response: Response = serde_json::from_str(&line).context("invalid core start response JSON")?;
                         if let Response::Error { message, .. } = response { anyhow::bail!("{message}"); }
                         response
                     },

@@ -5,8 +5,12 @@
 pub fn prepare(directory: &std::path::Path) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use std::os::unix::fs::PermissionsExt;
-    let team = option_env!("CLYNTIS_SIGNING_TEAM_ID")
-        .context("此服务构建未设置 CLYNTIS_SIGNING_TEAM_ID，不能启用提权功能")?;
+    let team = option_env!("CLYNTIS_SIGNING_TEAM_ID").with_context(|| {
+        clyntis_desktop_model::tr!(
+            "此服务构建未设置 CLYNTIS_SIGNING_TEAM_ID，不能启用提权功能",
+            "This service build has no CLYNTIS_SIGNING_TEAM_ID; privileged features are unavailable"
+        )
+    })?;
     ensure!(
         !team.is_empty()
             && team
@@ -31,7 +35,14 @@ pub fn prepare(directory: &std::path::Path) -> anyhow::Result<()> {
                 .args(["--verify", "--strict", "-R", &requirement])
                 .arg(&staged)
                 .output()?;
-            ensure!(output.status.success(), "辅助程序签名校验失败：{name}");
+            ensure!(
+                output.status.success(),
+                "{}",
+                clyntis_desktop_model::tr!(
+                    "辅助程序签名校验失败：{name}",
+                    "Helper signature check failed: {name}"
+                )
+            );
             std::fs::rename(&staged, destination.join(name))?;
             Ok(())
         })();

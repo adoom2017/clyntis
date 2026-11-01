@@ -1,5 +1,6 @@
 //! An update is successful only after the running process confirms the expected build.
 use anyhow::{Result, ensure};
+use clyntis_desktop_model::tr;
 use std::{future::Future, time::Duration};
 
 pub async fn verify<P, F>(status: String, mut current: P, timeout: Duration) -> Result<String>
@@ -9,7 +10,11 @@ where
 {
     ensure!(
         status != "requires_approval",
-        "请在系统设置 → 通用 → 登录项与扩展中允许 Clyntis 在后台运行，然后再次点击启动。辅助服务用于配置 TUN、路由、DNS 和系统代理，并在停止时恢复网络设置。"
+        "{}",
+        tr!(
+            "请在系统设置 → 通用 → 登录项与扩展中允许 Clyntis 在后台运行，然后再次点击启动。辅助服务用于配置 TUN、路由、DNS 和系统代理，并在停止时恢复网络设置。",
+            "Allow Clyntis to run in the background in System Settings → General → Login Items & Extensions, then start again. The helper service configures TUN, routes, DNS and the system proxy, and restores network settings when stopped."
+        )
     );
     let verified = tokio::time::timeout(timeout, async {
         loop {
@@ -22,7 +27,11 @@ where
     .await;
     ensure!(
         verified.is_ok(),
-        "辅助服务更新后未能确认新版已运行。请检查系统后台权限后重试启动；无需手动卸载服务。"
+        "{}",
+        tr!(
+            "辅助服务更新后未能确认新版已运行。请检查系统后台权限后重试启动；无需手动卸载服务。",
+            "The updated helper service could not be confirmed running. Check the background permission and start again; there is no need to uninstall the service."
+        )
     );
     Ok(status)
 }

@@ -53,6 +53,13 @@ pub struct Desktop {
     running: tokio::sync::watch::Sender<bool>,
 }
 impl Desktop {
+    /// The saved interface language: `zh`, `en` or `system`.
+    pub fn language(&self) -> String {
+        self.store
+            .settings()
+            .map(|settings| settings.language)
+            .unwrap_or_default()
+    }
     pub fn new(app: tauri::AppHandle, root: PathBuf) -> Result<Self> {
         let store = Store::new(root)?;
         let selected = store.selected()?;
@@ -139,7 +146,10 @@ impl Desktop {
             &self.app,
             &self.logs,
             "info",
-            "正在安装或更新网络辅助服务。系统可能请求管理员或后台运行授权，用于配置 TUN、路由、DNS 和系统代理，并在停止时恢复网络设置。",
+            &tr!(
+                "正在安装或更新网络辅助服务。系统可能请求管理员或后台运行授权，用于配置 TUN、路由、DNS 和系统代理，并在停止时恢复网络设置。",
+                "Installing or updating the network helper service. The system may ask for administrator or background permission; the service configures TUN, routes, DNS and the system proxy, and restores network settings when stopped."
+            ),
         );
         match platform::update_service().await {
             Ok(_) => {
@@ -176,8 +186,9 @@ impl Desktop {
                     &self.app,
                     &self.logs,
                     "warning",
-                    &clyntis_desktop_model::redact(&format!(
-                        "路由资源预下载失败，将由内核重试：{error:#}"
+                    &clyntis_desktop_model::redact(&tr!(
+                        "路由资源预下载失败，将由内核重试：{error:#}",
+                        "Prefetching routing resources failed; the core will retry: {error:#}"
                     )),
                 );
             }
@@ -233,13 +244,16 @@ impl Desktop {
                             operation.active = Some((old_profile, old_settings));
                             self.status(
                                 "running",
-                                Some(format!("新配置启动失败，已恢复旧配置：{error}")),
+                                Some(tr!("新配置启动失败，已恢复旧配置：{error}", "The new profile failed to start; restored the previous one: {error}")),
                             );
                         }
                         Err(recovery) => {
                             self.status(
                                 "failed",
-                                Some(format!("启动失败：{error}；恢复失败：{recovery}")),
+                                Some(tr!(
+                                    "启动失败：{error}；恢复失败：{recovery}",
+                                    "Start failed: {error}; recovery failed: {recovery}"
+                                )),
                             );
                         }
                     }
@@ -252,8 +266,15 @@ impl Desktop {
     }
     async fn start(&self) -> Result<()> {
         let mut op = self.operation.lock().await;
-        ensure!(op.engine.is_none(), "内核已经运行");
-        let id = self.store.selected()?.context("请先导入并选择配置")?;
+        ensure!(
+            op.engine.is_none(),
+            "{}",
+            tr!("内核已经运行", "The core is already running")
+        );
+        let id = self
+            .store
+            .selected()?
+            .with_context(|| tr!("请先导入并选择配置", "Import and select a profile first"))?;
         self.replace(&mut op, self.store.get(id)?, self.store.settings()?)
             .await
     }
@@ -283,9 +304,16 @@ impl Desktop {
         }
     }
     pub async fn mode(&self, mode: &str) -> Result<()> {
-        ensure!(["rule", "global", "direct"].contains(&mode), "无效代理模式");
+        ensure!(
+            ["rule", "global", "direct"].contains(&mode),
+            "{}",
+            tr!("无效代理模式", "Invalid proxy mode")
+        );
         let mut op = self.operation.lock().await;
-        let id = self.store.selected()?.context("请先选择配置")?;
+        let id = self
+            .store
+            .selected()?
+            .with_context(|| tr!("请先选择配置", "Select a profile first"))?;
         let mut profile = self.store.get(id)?;
         let previous = profile.mode.clone();
         if let Some(engine) = &op.engine {
@@ -402,7 +430,10 @@ impl Desktop {
                 let _ = self.replace(&mut op, profile, settings).await;
             }
             self.notify();
-            return Err(error.context("新规则无法启动，已恢复原来的规则"));
+            return Err(error.context(tr!(
+                "新规则无法启动，已恢复原来的规则",
+                "The new rules failed to start; restored the previous rules"
+            )));
         }
         drop(op);
         self.notify();
@@ -411,7 +442,10 @@ impl Desktop {
     async fn update(&self, id: Uuid) -> Result<()> {
         let _guard = self.subscription_lock.lock().await;
         let profile = self.store.get(id)?;
-        let url = profile.url.as_deref().context("该配置不是订阅")?;
+        let url = profile
+            .url
+            .as_deref()
+            .with_context(|| tr!("该配置不是订阅", "This profile is not a subscription"))?;
         let before = (profile.yaml.clone(), profile.pending.clone());
         let downloaded = profiles::download(url, profile.password.as_deref()).await;
         // Re-read under the operation lock, so a concurrent edit/delete is never overwritten.
@@ -419,7 +453,11 @@ impl Desktop {
         let mut profile = self.store.get(id)?;
         ensure!(
             (profile.yaml.clone(), profile.pending.clone()) == before,
-            "下载期间配置已被编辑，未覆盖本地修改，请重新检查更新"
+            "{}",
+            tr!(
+                "下载期间配置已被编辑，未覆盖本地修改，请重新检查更新",
+                "The profile was edited during the download; kept your changes. Check for updates again"
+            )
         );
         profile.last_checked = clyntis_desktop_model::now();
         match downloaded {
@@ -443,9 +481,15 @@ impl Desktop {
         let mut profile = self.store.get(id)?;
         let original = profile.clone();
         let yaml = if rollback {
-            profile.previous.clone().context("没有可回滚版本")?
+            profile
+                .previous
+                .clone()
+                .with_context(|| tr!("没有可回滚版本", "No earlier version to roll back to"))?
         } else {
-            profile.pending.clone().context("没有待应用更新")?
+            profile
+                .pending
+                .clone()
+                .with_context(|| tr!("没有待应用更新", "No pending update"))?
         };
         profiles::validate(&yaml)?;
         let old = profile.yaml.clone();
@@ -598,7 +642,7 @@ pub fn export_encrypted(
     let profile = state.store.get(id).map_err(error)?;
     let encrypted = profiles::encrypt_yaml(&profile.yaml, &password).map_err(error)?;
     std::fs::write(&path, encrypted)
-        .context("无法写入导出文件")
+        .with_context(|| tr!("无法写入导出文件", "Cannot write the export file"))
         .map_err(error)
 }
 /// The saved COS SecretId, or None without saved keys. The SecretKey never
@@ -616,11 +660,15 @@ pub async fn cos_credentials() -> Reply<Option<String>> {
 pub async fn save_cos_credentials(secret_id: String, secret_key: String) -> Reply<()> {
     tokio::task::spawn_blocking(move || {
         let secret_id = secret_id.trim().to_owned();
-        ensure!(!secret_id.is_empty(), "SecretId 不能为空");
+        ensure!(
+            !secret_id.is_empty(),
+            "{}",
+            tr!("SecretId 不能为空", "SecretId cannot be empty")
+        );
         let secret_key = match secret_key.trim() {
             "" => {
                 crate::keychain::load()?
-                    .context("请填写 SecretKey")?
+                    .with_context(|| tr!("请填写 SecretKey", "Enter the SecretKey"))?
                     .secret_key
             }
             key => key.to_owned(),
@@ -677,7 +725,7 @@ pub async fn publish_encrypted(
         .map_err(|e| error(e.into()))?
         .map_err(error)?
         .ok_or_else(|| {
-            "请先在「设置 → 远程发布」中填写腾讯云 COS 的 SecretId 和 SecretKey".to_owned()
+            tr!("请先在「设置 → 远程发布」中填写腾讯云 COS 的 SecretId 和 SecretKey", "Enter the Tencent Cloud COS SecretId and SecretKey in Settings → Remote publishing first")
         })?;
     clyntis_core::cos::put_object(
         &cos,
@@ -735,7 +783,10 @@ pub async fn delete_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<()> {
         .as_ref()
         .is_some_and(|(profile, _)| profile.id == id)
     {
-        return Err("请先停止内核或切换配置".into());
+        return Err(tr!(
+            "请先停止内核或切换配置",
+            "Stop the core or switch profiles first"
+        ));
     }
     state.store.delete(id).map_err(error)?;
     if state.view.lock().unwrap().selected == Some(id)
@@ -766,7 +817,7 @@ async fn controller(state: &Desktop) -> Reply<engine::Controller> {
     op.engine
         .as_ref()
         .map(Engine::controller)
-        .context("内核未运行")
+        .with_context(|| tr!("内核未运行", "The core is not running"))
         .map_err(error)
 }
 #[tauri::command]
@@ -830,7 +881,7 @@ pub async fn select_proxy(state: State<'_, Desktop>, group: String, name: String
     let op = state.operation.lock().await;
     op.engine
         .as_ref()
-        .context("内核未运行")
+        .with_context(|| tr!("内核未运行", "The core is not running"))
         .map_err(error)?
         .request(
             reqwest::Method::PUT,
@@ -866,7 +917,7 @@ pub async fn close_connection(state: State<'_, Desktop>, id: Option<String>) -> 
     }
     op.engine
         .as_ref()
-        .context("内核未运行")
+        .with_context(|| tr!("内核未运行", "The core is not running"))
         .map_err(error)?
         .request(reqwest::Method::DELETE, &path, None)
         .await
@@ -968,7 +1019,10 @@ pub async fn background(app: tauri::AppHandle) {
         {
             let error = match state.stop_locked(&mut op).await {
                 Ok(()) => error,
-                Err(cleanup) => anyhow::anyhow!("{error:#}；停止及恢复详情：{cleanup:#}"),
+                Err(cleanup) => anyhow::anyhow!(tr!(
+                    "{error:#}；停止及恢复详情：{cleanup:#}",
+                    "{error:#}; stop and recovery details: {cleanup:#}"
+                )),
             };
             state.status("failed", Some(error.to_string()));
             state.report(&error);

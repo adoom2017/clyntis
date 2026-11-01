@@ -45,8 +45,12 @@ pub async fn service(action: &str) -> Result<String> {
             }
             ensure!(
                 output.status.success(),
-                "无法查询 Windows 辅助服务：{}",
-                String::from_utf8_lossy(&output.stdout).trim()
+                "{}",
+                tr!(
+                    "无法查询 Windows 辅助服务：{}",
+                    "Cannot query the Windows helper service: {}",
+                    String::from_utf8_lossy(&output.stdout).trim()
+                )
             );
             if action == "status" {
                 return Ok("installed".into());
@@ -78,7 +82,7 @@ pub async fn service(action: &str) -> Result<String> {
         let output = tokio::time::timeout(std::time::Duration::from_secs(180), command.output())
             .await
             .map_err(|_| {
-                anyhow::anyhow!("管理员授权或辅助服务操作等待超时，请检查系统授权弹窗及服务状态")
+                anyhow::anyhow!(tr!("管理员授权或辅助服务操作等待超时，请检查系统授权弹窗及服务状态", "Timed out waiting for administrator permission or the helper service; check the system permission prompt and the service status"))
             })??;
         if !output.status.success()
             && output.stderr.is_empty()
@@ -91,8 +95,12 @@ pub async fn service(action: &str) -> Result<String> {
         }
         ensure!(
             output.status.success(),
-            "辅助服务操作失败或管理员授权被取消：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{}",
+            tr!(
+                "辅助服务操作失败或管理员授权被取消：{}",
+                "The helper service operation failed or administrator permission was cancelled: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
         );
         Ok(if action == "install" || action == "update" {
             "installed"
@@ -103,7 +111,7 @@ pub async fn service(action: &str) -> Result<String> {
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        anyhow::bail!("不支持的平台")
+        anyhow::bail!("{}", tr!("不支持的平台", "Unsupported platform"))
     }
 }
 
@@ -130,7 +138,12 @@ pub async fn update_service() -> Result<String> {
                     clyntis_desktop_service::windows_security::service_status,
                 )
                 .await??
-                .ok_or_else(|| anyhow::anyhow!("Windows 网络辅助服务尚未注册"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(tr!(
+                        "Windows 网络辅助服务尚未注册",
+                        "The Windows network helper service is not registered"
+                    ))
+                })?;
                 clyntis_desktop_service::windows_security::require_service_alive(&service)?;
                 let probe = tokio::time::timeout(std::time::Duration::from_secs(12), async {
                     let mut client = clyntis_desktop_service::client::Client::connect().await?;
@@ -139,17 +152,32 @@ pub async fn update_service() -> Result<String> {
                 .await;
                 match probe {
                     Ok(Ok(true)) => return Ok(status),
-                    Ok(Ok(false)) => last_error = "辅助服务的构建版本与桌面程序不一致".into(),
+                    Ok(Ok(false)) => {
+                        last_error = tr!(
+                            "辅助服务的构建版本与桌面程序不一致",
+                            "The helper service build does not match the desktop app"
+                        )
+                    }
                     Ok(Err(error)) => {
                         last_error = clyntis_desktop_model::redact(&format!("{error:#}"))
                     }
-                    Err(_) => last_error = "辅助服务身份校验或状态请求超时".into(),
+                    Err(_) => {
+                        last_error = tr!(
+                            "辅助服务身份校验或状态请求超时",
+                            "The helper service identity check or status request timed out"
+                        )
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         })
         .await;
-        verified.map_err(|_| anyhow::anyhow!("Windows 网络辅助服务未能响应：{last_error}"))?
+        verified.map_err(|_| {
+            anyhow::anyhow!(tr!(
+                "Windows 网络辅助服务未能响应：{last_error}",
+                "The Windows network helper service did not respond: {last_error}"
+            ))
+        })?
     }
     #[cfg(not(windows))]
     {

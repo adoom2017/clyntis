@@ -13,6 +13,10 @@ pub enum Request {
         yaml: String,
         profile_id: String,
         system_proxy_port: Option<u16>,
+        /// The interface language (`zh` or `en`) for messages from the
+        /// service and runner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
     },
     Resource {
         version: u32,

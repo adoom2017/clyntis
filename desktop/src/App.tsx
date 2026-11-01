@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import brandIcon from "../src-tauri/icons/clyntis-v3/brand-128.png";
+import { locale, resolveLanguage, setLanguage, t, type Language } from "./i18n";
 import {
   Activity,
   ArrowDown,
@@ -106,37 +107,51 @@ const pages: {
 }[] = [
   {
     id: "overview",
-    label: "概览",
+    get label() {
+      return t("概览");
+    },
     icon: Gauge,
   },
   {
     id: "proxies",
-    label: "节点",
+    get label() {
+      return t("节点");
+    },
     icon: Globe2,
   },
   {
     id: "profiles",
-    label: "配置",
+    get label() {
+      return t("配置");
+    },
     icon: Layers3,
   },
   {
     id: "rules",
-    label: "规则",
+    get label() {
+      return t("规则");
+    },
     icon: ListFilter,
   },
   {
     id: "connections",
-    label: "连接",
+    get label() {
+      return t("连接");
+    },
     icon: Network,
   },
   {
     id: "logs",
-    label: "日志",
+    get label() {
+      return t("日志");
+    },
     icon: Terminal,
   },
   {
     id: "settings",
-    label: "设置",
+    get label() {
+      return t("设置");
+    },
     icon: Settings2,
   },
 ];
@@ -151,6 +166,22 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<ReactNode>(null);
+  // "Follow the system" re-renders when the system language changes.
+  const [, setSystemLanguage] = useState(0);
+  useEffect(() => {
+    const changed = () => setSystemLanguage((n) => n + 1);
+    window.addEventListener("languagechange", changed);
+    return () => window.removeEventListener("languagechange", changed);
+  }, []);
+  // Set before any child renders, so every t() call below uses it.
+  const interfaceLanguage = resolveLanguage(state.settings.language);
+  setLanguage(interfaceLanguage);
+  useEffect(() => {
+    // The tray menu and the backend's messages follow the window.
+    void invoke("set_language", { language: interfaceLanguage }).catch(
+      () => {},
+    );
+  }, [interfaceLanguage]);
   const refresh = useCallback(async () => {
     const next = await invoke<Snapshot>("snapshot");
     setState(next);
@@ -204,7 +235,7 @@ export default function App() {
         setLoaded(true);
       }
     })().catch(() => {
-      if (alive) setError("无法连接 Clyntis 后台，请从桌面应用打开。");
+      if (alive) setError(t("无法连接 Clyntis 后台，请从桌面应用打开。"));
     });
     return () => {
       alive = false;
@@ -233,10 +264,12 @@ export default function App() {
     setPage("profiles");
     if (result.warnings.length) {
       setModal(
-        <Modal title="导入完成" onClose={() => setModal(null)}>
+        <Modal title={t("导入完成")} onClose={() => setModal(null)}>
           <p>
-            已创建「{result.profile.name}」，跳过 {result.warnings.length}{" "}
-            项不兼容内容：
+            {t("已创建「{name}」，跳过 {count} 项不兼容内容：", {
+              name: result.profile.name,
+              count: result.warnings.length,
+            })}
           </p>
           <ul className="import-warnings">
             {result.warnings.map((warning, index) => (
@@ -248,20 +281,20 @@ export default function App() {
           </ul>
           <div className="modal-actions">
             <button className="button primary" onClick={() => setModal(null)}>
-              知道了
+              {t("知道了")}
             </button>
           </div>
         </Modal>,
       );
     } else {
       setModal(null);
-      setNotice(`已导入「${result.profile.name}」`);
+      setNotice(t("已导入「{name}」", { name: result.profile.name }));
     }
   };
   const importFile = async () => {
     const path = await open({
       multiple: false,
-      filters: [{ name: "配置文件", extensions: ["yaml", "yml", "txt"] }],
+      filters: [{ name: t("配置文件"), extensions: ["yaml", "yml", "txt"] }],
     });
     if (typeof path !== "string") return;
     const { encrypted } = await invoke<{ encrypted: boolean }>(
@@ -274,9 +307,9 @@ export default function App() {
     }
     setModal(
       <PasswordForm
-        title="导入加密配置"
-        text="此文件已加密，输入密码后导入。"
-        submitLabel="解密并导入"
+        title={t("导入加密配置")}
+        text={t("此文件已加密，输入密码后导入。")}
+        submitLabel={t("解密并导入")}
         onClose={() => setModal(null)}
         onSubmit={async (password) => {
           try {
@@ -297,16 +330,16 @@ export default function App() {
   const exportEncrypted = (profile: ProfileSummary) =>
     setModal(
       <PasswordForm
-        title={`加密导出「${profile.name}」`}
-        text="导出的文件需要此密码才能导入。导出的是当前生效的版本。"
-        submitLabel="选择位置并导出"
+        title={t("加密导出「{name}」", { name: profile.name })}
+        text={t("导出的文件需要此密码才能导入。导出的是当前生效的版本。")}
+        submitLabel={t("选择位置并导出")}
         confirm
         onClose={() => setModal(null)}
         onSubmit={async (password) => {
           try {
             const path = await save({
               defaultPath: `${profile.name}.txt`,
-              filters: [{ name: "加密配置", extensions: ["txt"] }],
+              filters: [{ name: t("加密配置"), extensions: ["txt"] }],
             });
             if (!path) return "";
             await invoke("export_encrypted", {
@@ -315,7 +348,7 @@ export default function App() {
               path,
             });
             setModal(null);
-            setNotice("已加密导出");
+            setNotice(t("已加密导出"));
             return null;
           } catch (e) {
             return String(e);
@@ -330,7 +363,7 @@ export default function App() {
         onClose={() => setModal(null)}
         onPublished={(url) => {
           setModal(null);
-          setNotice(`已发布到 ${url}`);
+          setNotice(t("已发布到 {url}", { url }));
         }}
       />,
     );
@@ -359,7 +392,7 @@ export default function App() {
           <img className="brand-icon" src={brandIcon} alt="" />
           <span>Clyntis</span>
         </div>
-        <nav aria-label="主导航">
+        <nav aria-label={t("主导航")}>
           {pages.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
@@ -392,8 +425,9 @@ export default function App() {
             <div className="alert info" role="status">
               <LoaderCircle size={16} className="spin" />
               <span>
-                正在更新辅助服务。请在系统弹窗中授权，用于配置虚拟网卡、路由、DNS
-                和系统代理，断开后会恢复网络设置。
+                {t(
+                  "正在更新辅助服务。请在系统弹窗中授权，用于配置虚拟网卡、路由、DNS 和系统代理，断开后会恢复网络设置。",
+                )}
               </span>
             </div>
           )}
@@ -404,7 +438,7 @@ export default function App() {
               {error && (
                 <button
                   className="icon-button"
-                  aria-label="关闭"
+                  aria-label={t("关闭")}
                   onClick={() => setError(null)}
                 >
                   <X size={16} />
@@ -432,14 +466,15 @@ export default function App() {
                       className="text-button"
                       onClick={() => setPage("profiles")}
                     >
-                      添加配置 <ChevronRight size={14} />
+                      {t("添加配置")}
+                      <ChevronRight size={14} />
                     </button>
                   )}
                   <div className="connection-details">
                     <div
                       className="segmented"
                       role="group"
-                      aria-label="接管方式"
+                      aria-label={t("接管方式")}
                     >
                       {(["manual", "system", "tun"] as Capture[]).map(
                         (capture) => (
@@ -470,8 +505,8 @@ export default function App() {
                 <button
                   className={`power-button ${running ? "on" : ""}`}
                   disabled={disabled || !selected}
-                  aria-label={running ? "停止连接" : "启动连接"}
-                  title={running ? "断开" : "连接"}
+                  aria-label={running ? t("停止连接") : t("启动连接")}
+                  title={running ? t("断开") : t("连接")}
                   onClick={() =>
                     void perform(() => invoke(running ? "stop" : "start"))
                   }
@@ -485,13 +520,13 @@ export default function App() {
               </section>
               <div className="stat-grid">
                 <Stat
-                  label="下载"
+                  label={t("下载")}
                   value={`${bytes(traffic.at(-1)?.down ?? 0)}/s`}
                   icon={<ArrowDown size={14} />}
                   tone="green"
                 />
                 <Stat
-                  label="上传"
+                  label={t("上传")}
                   value={`${bytes(traffic.at(-1)?.up ?? 0)}/s`}
                   icon={<ArrowUp size={14} />}
                   tone="blue"
@@ -501,16 +536,16 @@ export default function App() {
               <div className="overview-grid">
                 <section className="panel traffic-panel">
                   <div className="panel-title">
-                    <h3>流量</h3>
+                    <h3>{t("流量")}</h3>
                     <div className="chart-legend">
                       <span>
                         <i className="legend-dot green" />
-                        下载
+                        {t("下载")}
                         <b>{bytes(traffic.at(-1)?.down ?? 0)}/s</b>
                       </span>
                       <span>
                         <i className="legend-dot blue" />
-                        上传
+                        {t("上传")}
                         <b>{bytes(traffic.at(-1)?.up ?? 0)}/s</b>
                       </span>
                     </div>
@@ -519,12 +554,12 @@ export default function App() {
                   <div className="chart-axis">
                     <span>60s</span>
                     <span>30s</span>
-                    <span>现在</span>
+                    <span>{t("现在")}</span>
                   </div>
                 </section>
                 <section className="panel routing-panel">
                   <div className="panel-title">
-                    <h3>路由模式</h3>
+                    <h3>{t("路由模式")}</h3>
                   </div>
                   {(["rule", "global", "direct"] as Mode[]).map((mode) => (
                     <button
@@ -543,9 +578,9 @@ export default function App() {
                         <small>
                           {
                             {
-                              rule: "按规则分流",
-                              global: "全部走代理",
-                              direct: "全部直连",
+                              rule: t("按规则分流"),
+                              global: t("全部走代理"),
+                              direct: t("全部直连"),
                             }[mode]
                           }
                         </small>
@@ -564,7 +599,7 @@ export default function App() {
             <>
               <div className="toolbar">
                 <span className="muted small">
-                  {state.profiles.length} 个配置
+                  {t("{count} 个配置", { count: state.profiles.length })}
                 </span>
                 <div>
                   <button
@@ -573,7 +608,7 @@ export default function App() {
                     onClick={() => void perform(importFile)}
                   >
                     <FolderOpen size={16} />
-                    导入文件
+                    {t("导入文件")}
                   </button>
                   <button
                     className="button primary"
@@ -581,15 +616,15 @@ export default function App() {
                     onClick={addSubscription}
                   >
                     <Plus size={16} />
-                    添加订阅
+                    {t("添加订阅")}
                   </button>
                 </div>
               </div>
               {!state.profiles.length ? (
                 <Empty
                   icon={<Layers3 />}
-                  title="还没有配置"
-                  text="导入 YAML 文件或添加订阅链接。"
+                  title={t("还没有配置")}
+                  text={t("导入 YAML 文件或添加订阅链接。")}
                 />
               ) : (
                 <div className="profile-list">
@@ -609,20 +644,22 @@ export default function App() {
                               <Lock
                                 size={11}
                                 className="inline-icon"
-                                aria-label="加密订阅"
+                                aria-label={t("加密订阅")}
                               />
                             )}
-                            {profile.source} · 检查于{" "}
-                            {new Date(
-                              profile.lastChecked * 1000,
-                            ).toLocaleString("zh-CN", {
-                              dateStyle: "short",
-                              timeStyle: "short",
+                            {profile.source} ·{" "}
+                            {t("检查于 {time}", {
+                              time: new Date(
+                                profile.lastChecked * 1000,
+                              ).toLocaleString(locale(), {
+                                dateStyle: "short",
+                                timeStyle: "short",
+                              }),
                             })}
                           </p>
                         </div>
                         {profile.pending && (
-                          <span className="pending-tag">待应用</span>
+                          <span className="pending-tag">{t("待应用")}</span>
                         )}
                       </div>
                       {profile.lastError && (
@@ -632,7 +669,7 @@ export default function App() {
                         {profile.id === state.selected ? (
                           <span className="current-tag">
                             <Check size={13} />
-                            当前
+                            {t("当前")}
                           </span>
                         ) : (
                           <button
@@ -644,26 +681,28 @@ export default function App() {
                               )
                             }
                           >
-                            使用
+                            {t("使用")}
                           </button>
                         )}
                         {profile.subscription && (
                           <button
                             className="action-button"
                             disabled={disabled}
-                            aria-label={`更新 ${profile.name}`}
+                            aria-label={t("更新 {name}", {
+                              name: profile.name,
+                            })}
                             onClick={() =>
                               void perform(
                                 () =>
                                   invoke("update_subscription", {
                                     id: profile.id,
                                   }),
-                                "已检查更新",
+                                t("已检查更新"),
                               )
                             }
                           >
                             <RefreshCw size={14} />
-                            检查更新
+                            {t("检查更新")}
                           </button>
                         )}
                         <button
@@ -686,7 +725,7 @@ export default function App() {
                                           id: profile.id,
                                           yaml,
                                         }),
-                                      "已保存，待应用",
+                                      t("已保存，待应用"),
                                     );
                                     if (ok) setModal(null);
                                     return ok;
@@ -697,7 +736,7 @@ export default function App() {
                           }
                         >
                           <PencilLine size={14} />
-                          编辑
+                          {t("编辑")}
                         </button>
                         {profile.pending && (
                           <button
@@ -707,23 +746,23 @@ export default function App() {
                               void perform(
                                 () =>
                                   invoke("apply_pending", { id: profile.id }),
-                                "配置已应用",
+                                t("配置已应用"),
                               )
                             }
                           >
-                            应用更新
+                            {t("应用更新")}
                           </button>
                         )}
                         <button
                           className="action-button"
                           disabled={disabled}
-                          title="回滚到上一版本"
-                          aria-label={`回滚 ${profile.name}`}
+                          title={t("回滚到上一版本")}
+                          aria-label={t("回滚 {name}", { name: profile.name })}
                           onClick={() =>
                             setModal(
                               <Confirm
-                                title="回滚到上一版本？"
-                                text="运行中会重启内核，现有连接将断开。"
+                                title={t("回滚到上一版本？")}
+                                text={t("运行中会重启内核，现有连接将断开。")}
                                 onClose={() => setModal(null)}
                                 onConfirm={async () => {
                                   setModal(null);
@@ -738,36 +777,42 @@ export default function App() {
                           }
                         >
                           <Undo2 size={14} />
-                          回滚
+                          {t("回滚")}
                         </button>
                         <button
                           className="action-button"
                           disabled={disabled}
-                          aria-label={`加密导出 ${profile.name}`}
+                          aria-label={t("加密导出 {name}", {
+                            name: profile.name,
+                          })}
                           onClick={() => exportEncrypted(profile)}
                         >
                           <FileLock2 size={14} />
-                          加密导出
+                          {t("加密导出")}
                         </button>
                         <button
                           className="action-button"
                           disabled={disabled}
-                          aria-label={`发布 ${profile.name} 到 COS`}
+                          aria-label={t("发布 {name} 到 COS", {
+                            name: profile.name,
+                          })}
                           onClick={() => publishEncrypted(profile)}
                         >
                           <CloudUpload size={14} />
-                          发布
+                          {t("发布")}
                         </button>
                         <button
                           className="icon-button danger"
                           disabled={disabled}
-                          title="删除配置"
-                          aria-label={`删除 ${profile.name}`}
+                          title={t("删除配置")}
+                          aria-label={t("删除 {name}", { name: profile.name })}
                           onClick={() =>
                             setModal(
                               <Confirm
-                                title={`删除「${profile.name}」？`}
-                                text="配置及其历史版本将被删除。"
+                                title={t("删除「{name}」？", {
+                                  name: profile.name,
+                                })}
+                                text={t("配置及其历史版本将被删除。")}
                                 danger
                                 onClose={() => setModal(null)}
                                 onConfirm={async () => {
@@ -790,8 +835,9 @@ export default function App() {
                 </div>
               )}
               <p className="hint">
-                支持 VLESS、Hysteria2 和 Tailscale
-                节点，导入时会跳过不兼容的项，不会改动原文件。
+                {t(
+                  "支持 VLESS、Hysteria2 和 Tailscale 节点，导入时会跳过不兼容的项，不会改动原文件。",
+                )}
               </p>
             </>
           )}
@@ -846,10 +892,10 @@ function isPolicy(name: string, proxy: Proxy | undefined) {
   return !!proxy?.all || builtinOutbound(name, proxy) !== null;
 }
 const groupTypeText: Record<string, string> = {
-  Selector: "手动",
-  URLTest: "自动",
-  Fallback: "故障转移",
-  LoadBalance: "负载均衡",
+  Selector: t("手动"),
+  URLTest: t("自动"),
+  Fallback: t("故障转移"),
+  LoadBalance: t("负载均衡"),
 };
 /** Proxy groups folded on the nodes page; a per-viewer convenience. */
 const collapsedKey = "clyntis.collapsed-groups";
@@ -928,12 +974,12 @@ function ConnectionStats({ running }: { running: boolean }) {
   return (
     <>
       <Stat
-        label="连接数"
+        label={t("连接数")}
         value={String(value.connections.length)}
         icon={<Network size={14} />}
       />
       <Stat
-        label="总流量"
+        label={t("总流量")}
         value={bytes(value.uploadTotal + value.downloadTotal)}
         icon={<Activity size={14} />}
       />
@@ -955,7 +1001,7 @@ function TrafficChart({ values }: { values: Traffic[] }) {
         viewBox="0 0 600 150"
         preserveAspectRatio="none"
         role="img"
-        aria-label="最近 60 秒上传和下载速率"
+        aria-label={t("最近 60 秒上传和下载速率")}
       >
         <defs>
           <linearGradient id="download-fill" x1="0" y1="0" x2="0" y2="1">
@@ -1088,7 +1134,11 @@ export function Modal({
       >
         <div className="modal-heading">
           <h2>{title}</h2>
-          <button className="icon-button" aria-label="关闭" onClick={onClose}>
+          <button
+            className="icon-button"
+            aria-label={t("关闭")}
+            onClick={onClose}
+          >
             <X size={18} />
           </button>
         </div>
@@ -1115,13 +1165,13 @@ function Confirm({
       <p className="muted">{text}</p>
       <div className="modal-actions">
         <button className="button secondary" onClick={onClose}>
-          取消
+          {t("取消")}
         </button>
         <button
           className={`button ${danger ? "destructive" : "primary"}`}
           onClick={() => void onConfirm()}
         >
-          确认
+          {t("确认")}
         </button>
       </div>
     </Modal>
@@ -1162,7 +1212,7 @@ function PasswordForm({
       >
         <p className="small muted">{text}</p>
         <label className="field">
-          密码
+          {t("密码")}
           <input
             autoFocus
             required
@@ -1174,7 +1224,7 @@ function PasswordForm({
         </label>
         {confirm && (
           <label className="field">
-            确认密码
+            {t("确认密码")}
             <input
               required
               type="password"
@@ -1184,7 +1234,9 @@ function PasswordForm({
             />
           </label>
         )}
-        {mismatch && <p className="inline-error">两次输入的密码不一致</p>}
+        {mismatch && (
+          <p className="inline-error">{t("两次输入的密码不一致")}</p>
+        )}
         {failure && (
           <p role="alert" className="inline-error">
             {failure}
@@ -1192,7 +1244,7 @@ function PasswordForm({
         )}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>
-            取消
+            {t("取消")}
           </button>
           <button
             className="button primary"
@@ -1241,7 +1293,10 @@ function PublishForm({
       ? `https://${target.bucket}.cos.${target.region}.myqcloud.com/${target.key.replace(/^\/+/, "")}`
       : null;
   return (
-    <Modal title={`发布「${profile.name}」到腾讯云 COS`} onClose={onClose}>
+    <Modal
+      title={t("发布「{name}」到腾讯云 COS", { name: profile.name })}
+      onClose={onClose}
+    >
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -1258,15 +1313,17 @@ function PublishForm({
         }}
       >
         <p className="small muted">
-          加密后上传并覆盖同名文件，订阅了该地址的设备下次更新即拿到新配置。
+          {t(
+            "加密后上传并覆盖同名文件，订阅了该地址的设备下次更新即拿到新配置。",
+          )}
         </p>
         {secretId === null && (
           <p className="inline-error">
-            尚未保存 COS 密钥，请先在「设置 → 远程发布」中填写。
+            {t("尚未保存 COS 密钥，请先在「设置 → 远程发布」中填写。")}
           </p>
         )}
         <label className="field">
-          存储桶
+          {t("存储桶")}
           <input
             required
             placeholder="examplebucket-1250000000"
@@ -1275,7 +1332,7 @@ function PublishForm({
           />
         </label>
         <label className="field">
-          地域
+          {t("地域")}
           <input
             required
             placeholder="ap-shanghai"
@@ -1284,7 +1341,7 @@ function PublishForm({
           />
         </label>
         <label className="field">
-          文件路径
+          {t("文件路径")}
           <input
             required
             placeholder="config/home.txt"
@@ -1294,7 +1351,7 @@ function PublishForm({
         </label>
         {url && <p className="small muted publish-url">{url}</p>}
         <label className="field">
-          加密密码
+          {t("加密密码")}
           <input
             required
             type="password"
@@ -1304,7 +1361,7 @@ function PublishForm({
           />
         </label>
         <label className="field">
-          确认密码
+          {t("确认密码")}
           <input
             required
             type="password"
@@ -1314,7 +1371,7 @@ function PublishForm({
           />
         </label>
         {repeat !== "" && repeat !== password && (
-          <p className="inline-error">两次输入的密码不一致</p>
+          <p className="inline-error">{t("两次输入的密码不一致")}</p>
         )}
         {failure && (
           <p role="alert" className="inline-error">
@@ -1323,7 +1380,7 @@ function PublishForm({
         )}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>
-            取消
+            {t("取消")}
           </button>
           <button
             className="button primary"
@@ -1332,7 +1389,7 @@ function PublishForm({
             }
           >
             {saving && <LoaderCircle className="spin" size={16} />}
-            加密并发布
+            {t("加密并发布")}
           </button>
         </div>
       </form>
@@ -1356,10 +1413,12 @@ function CosSettingsSection({ perform }: { perform: Perform }) {
   return (
     <>
       <Setting
-        label="腾讯云 COS 密钥"
-        text="用于「发布」配置。建议使用只授予该存储桶 PutObject 权限的子用户密钥，密钥保存在系统钥匙串中。"
+        label={t("腾讯云 COS 密钥")}
+        text={t(
+          "用于「发布」配置。建议使用只授予该存储桶 PutObject 权限的子用户密钥，密钥保存在系统钥匙串中。",
+        )}
       >
-        <span className="tiny-tag">{saved ? "已保存" : "未设置"}</span>
+        <span className="tiny-tag">{saved ? t("已保存") : t("未设置")}</span>
       </Setting>
       <div className="cos-keys">
         <label className="field">
@@ -1377,7 +1436,7 @@ function CosSettingsSection({ perform }: { perform: Perform }) {
             type="password"
             value={secretKey}
             autoComplete="off"
-            placeholder={saved ? "已保存，留空则不修改" : ""}
+            placeholder={saved ? t("已保存，留空则不修改") : ""}
             onChange={(e) => setSecretKey(e.target.value)}
           />
         </label>
@@ -1388,11 +1447,11 @@ function CosSettingsSection({ perform }: { perform: Perform }) {
             onClick={() =>
               void perform(
                 () => invoke("save_cos_credentials", { secretId, secretKey }),
-                "COS 密钥已保存",
+                t("COS 密钥已保存"),
               ).then(load)
             }
           >
-            保存密钥
+            {t("保存密钥")}
           </button>
           {saved && (
             <button
@@ -1400,11 +1459,11 @@ function CosSettingsSection({ perform }: { perform: Perform }) {
               onClick={() =>
                 void perform(
                   () => invoke("delete_cos_credentials"),
-                  "COS 密钥已删除",
+                  t("COS 密钥已删除"),
                 ).then(load)
               }
             >
-              删除
+              {t("删除")}
             </button>
           )}
         </div>
@@ -1425,7 +1484,7 @@ function SubscriptionForm({
   const [saving, setSaving] = useState(false);
   const [failed, setFailed] = useState(false);
   return (
-    <Modal title="添加订阅" onClose={onClose}>
+    <Modal title={t("添加订阅")} onClose={onClose}>
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -1436,18 +1495,18 @@ function SubscriptionForm({
         }}
       >
         <label className="field">
-          配置名称
+          {t("配置名称")}
           <input
             autoFocus
             required
             maxLength={100}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例如：日常使用"
+            placeholder={t("例如：日常使用")}
           />
         </label>
         <label className="field">
-          订阅 URL
+          {t("订阅 URL")}
           <input
             required
             type="url"
@@ -1459,26 +1518,26 @@ function SubscriptionForm({
           />
         </label>
         <label className="field">
-          解密密码（可选）
+          {t("解密密码（可选）")}
           <input
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            placeholder="订阅内容未加密时留空"
+            placeholder={t("订阅内容未加密时留空")}
             autoComplete="off"
           />
         </label>
         <p className="small muted">
-          仅支持 HTTPS。密码保存在本机，用于之后自动更新时解密。
+          {t("仅支持 HTTPS。密码保存在本机，用于之后自动更新时解密。")}
         </p>
         {failed && (
           <p role="alert" className="inline-error">
-            添加失败，关闭此窗口查看原因。
+            {t("添加失败，关闭此窗口查看原因。")}
           </p>
         )}
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>
-            取消
+            {t("取消")}
           </button>
           <button
             className="button primary"
@@ -1489,7 +1548,7 @@ function SubscriptionForm({
             ) : (
               <Link2 size={16} />
             )}
-            添加
+            {t("添加")}
           </button>
         </div>
       </form>
@@ -1543,9 +1602,13 @@ export function Editor({
     );
   };
   return (
-    <Modal title={`编辑 · ${profile.name}`} onClose={onClose} wide>
+    <Modal
+      title={t("编辑 · {name}", { name: profile.name })}
+      onClose={onClose}
+      wide
+    >
       <p className="small muted">
-        保存时会校验，点「应用更新」后生效。内容含节点凭据，注意保密。
+        {t("保存时会校验，点「应用更新」后生效。内容含节点凭据，注意保密。")}
       </p>
       <div className={`yaml-field${problem ? " invalid" : ""}`}>
         {problem && (
@@ -1561,7 +1624,7 @@ export function Editor({
         <textarea
           ref={area}
           className="yaml-editor"
-          aria-label="YAML 配置"
+          aria-label={t("YAML 配置")}
           aria-invalid={problem ? true : undefined}
           aria-describedby={problem ? "yaml-problem" : undefined}
           value={yaml}
@@ -1574,24 +1637,27 @@ export function Editor({
       {problem && (
         <p className="inline-error yaml-problem" id="yaml-problem" role="alert">
           <button type="button" className="link-button" onClick={reveal}>
-            第 {problem.line} 行第 {problem.column} 列
+            {t("第 {line} 行第 {column} 列", {
+              line: problem.line,
+              column: problem.column,
+            })}
           </button>
-          ：{problem.message}
+          {t("：{message}", { message: problem.message })}
         </p>
       )}
       {failed && (
         <p className="inline-error" role="alert">
-          保存失败，原配置未改动。关闭此窗口查看原因。
+          {t("保存失败，原配置未改动。关闭此窗口查看原因。")}
         </p>
       )}
       <div className="modal-actions">
         <button className="button secondary" onClick={onClose}>
-          取消
+          {t("取消")}
         </button>
         <button
           className="button primary"
           disabled={saving || problem !== null}
-          title={problem ? "先修正 YAML 格式错误" : undefined}
+          title={problem ? t("先修正 YAML 格式错误") : undefined}
           onClick={() => {
             setSaving(true);
             void onSave(yaml)
@@ -1600,7 +1666,7 @@ export function Editor({
           }}
         >
           {saving && <LoaderCircle className="spin" size={16} />}
-          保存
+          {t("保存")}
         </button>
       </div>
     </Modal>
@@ -1622,23 +1688,27 @@ function NetworkPanel() {
   if (!status?.defined) return null;
   const facts = [
     status.info.type &&
-      { wifi: "Wi-Fi", wired: "有线", cellular: "蜂窝" }[status.info.type],
+      { wifi: "Wi-Fi", wired: t("有线"), cellular: t("蜂窝") }[
+        status.info.type
+      ],
     status.info.addresses.find((address) => !address.includes(":")),
-    status.info.gateways.length > 0 && `网关 ${status.info.gateways[0]}`,
+    status.info.gateways.length > 0 &&
+      t("网关 {gateways}", { gateways: status.info.gateways[0] }),
   ].filter(Boolean);
   return (
     <section className="panel network-panel">
       <div className="panel-title">
         <h3>
-          <Wifi size={15} /> 当前网络
+          <Wifi size={15} /> {t("当前网络")}
         </h3>
         <strong>
-          {status.networks.length ? status.networks.join("、") : "未匹配"}
+          {status.networks.length ? status.networks.join(t("、")) : t("未匹配")}
         </strong>
       </div>
       <p className="muted small">
         {facts.join(" · ")}
-        {status.override && ` · 生效的覆盖：${status.override}`}
+        {status.override &&
+          ` · ${t("生效的覆盖：{override}", { override: status.override })}`}
       </p>
     </section>
   );
@@ -1674,7 +1744,7 @@ function AdblockPanel({
     };
     void perform(
       () => invoke("save_settings", { settings: next }),
-      `已放行 ${domain}`,
+      t("已放行 {domain}", { domain }),
     );
   };
   if (!status) return null;
@@ -1682,14 +1752,14 @@ function AdblockPanel({
     <section className="panel adblock-panel">
       <div className="panel-title">
         <h3>
-          <Ban size={15} /> 去广告
+          <Ban size={15} /> {t("去广告")}
         </h3>
         {status.enabled ? (
           <button className="text-button" onClick={() => setOpen(true)}>
-            详情
+            {t("详情")}
           </button>
         ) : (
-          <span className="muted small">未开启，可在设置中启用</span>
+          <span className="muted small">{t("未开启，可在设置中启用")}</span>
         )}
       </div>
       {status.enabled && (
@@ -1697,7 +1767,7 @@ function AdblockPanel({
           <div className="adblock-metrics">
             <div>
               <strong>{status.total.toLocaleString()}</strong>
-              <small>次拦截</small>
+              <small>{t("次拦截")}</small>
             </div>
             <div>
               <strong>{status.dns.toLocaleString()}</strong>
@@ -1705,15 +1775,15 @@ function AdblockPanel({
             </div>
             <div>
               <strong>{status.connections.toLocaleString()}</strong>
-              <small>连接</small>
+              <small>{t("连接")}</small>
             </div>
             <div>
               <strong>{status.entries.toLocaleString()}</strong>
-              <small>条规则</small>
+              <small>{t("条规则")}</small>
             </div>
           </div>
           <div className="adblock-top">
-            <small>拦截最多</small>
+            <small>{t("拦截最多")}</small>
             {status.top.length ? (
               <ul>
                 {status.top.slice(0, 3).map((item) => (
@@ -1724,13 +1794,13 @@ function AdblockPanel({
                 ))}
               </ul>
             ) : (
-              <span className="muted">暂无拦截</span>
+              <span className="muted">{t("暂无拦截")}</span>
             )}
           </div>
         </div>
       )}
       {open && (
-        <Modal title="去广告统计" onClose={() => setOpen(false)} wide>
+        <Modal title={t("去广告统计")} onClose={() => setOpen(false)} wide>
           <AdblockDetail status={status} onAllow={allow} />
         </Modal>
       )}
@@ -1745,13 +1815,20 @@ function AdblockDetail({
   onAllow: (domain: string) => void;
 }) {
   const time = (seconds: number) =>
-    new Date(seconds * 1000).toLocaleTimeString();
+    new Date(seconds * 1000).toLocaleTimeString(locale());
   return (
     <div className="node-detail">
       <p className="muted small">
-        自 {new Date(status.since * 1000).toLocaleString()} 起，共拦截{" "}
-        {status.total} 次（DNS {status.dns}，连接 {status.connections}），涉及{" "}
-        {status.domains} 个域名。误拦时点「放行」加入白名单，立即生效。
+        {t(
+          "自 {since} 起，共拦截 {total} 次（DNS {dns}，连接 {connections}），涉及 {domains} 个域名。误拦时点「放行」加入白名单，立即生效。",
+          {
+            since: new Date(status.since * 1000).toLocaleString(locale()),
+            total: status.total,
+            dns: status.dns,
+            connections: status.connections,
+            domains: status.domains,
+          },
+        )}
       </p>
       <dl className="detail-list">
         {status.lists.map((list) => (
@@ -1759,36 +1836,47 @@ function AdblockDetail({
             <dt>{list.name}</dt>
             <dd className={list.error ? "danger-text" : ""}>
               {list.error
-                ? `不可用：${list.error}`
-                : `${list.entries.toLocaleString()} 条${list.updated ? ` · 更新于 ${new Date(list.updated * 1000).toLocaleString()}` : ""}`}
+                ? t("不可用：{error}", { error: list.error })
+                : t("{count} 条", {
+                    count: list.entries.toLocaleString(locale()),
+                  }) +
+                  (list.updated
+                    ? ` · ${t("更新于 {time}", {
+                        time: new Date(list.updated * 1000).toLocaleString(
+                          locale(),
+                        ),
+                      })}`
+                    : "")}
             </dd>
           </div>
         ))}
       </dl>
-      <h4 className="detail-heading">拦截最多</h4>
+      <h4 className="detail-heading">{t("拦截最多")}</h4>
       <div className="peer-list">
         {status.top.length === 0 && (
-          <div className="peer-row muted">暂无拦截</div>
+          <div className="peer-row muted">{t("暂无拦截")}</div>
         )}
         {status.top.map((item) => (
           <div className="peer-row" key={item.domain}>
             <span className="peer-name">
               <strong>{item.domain}</strong>
             </span>
-            <span className="peer-path">{item.count} 次</span>
+            <span className="peer-path">
+              {t("{count} 次", { count: item.count })}
+            </span>
             <button
               className="text-button"
               onClick={() => onAllow(item.domain)}
             >
-              放行
+              {t("放行")}
             </button>
           </div>
         ))}
       </div>
-      <h4 className="detail-heading">最近拦截</h4>
+      <h4 className="detail-heading">{t("最近拦截")}</h4>
       <div className="peer-list">
         {status.recent.length === 0 && (
-          <div className="peer-row muted">暂无拦截</div>
+          <div className="peer-row muted">{t("暂无拦截")}</div>
         )}
         {status.recent.map((item, index) => (
           <div
@@ -1798,14 +1886,14 @@ function AdblockDetail({
             <span className="peer-name">
               <strong>{item.domain}</strong>
               <small>
-                {time(item.time)} · {item.via === "dns" ? "DNS" : "连接"}
+                {time(item.time)} · {item.via === "dns" ? "DNS" : t("连接")}
               </small>
             </span>
             <button
               className="text-button"
               onClick={() => onAllow(item.domain)}
             >
-              放行
+              {t("放行")}
             </button>
           </div>
         ))}
@@ -1827,8 +1915,8 @@ function AdblockSettingsSection({
   return (
     <>
       <Setting
-        label="启用去广告"
-        text="广告域名在 DNS 层直接拒绝，并优先于所有规则"
+        label={t("启用去广告")}
+        text={t("广告域名在 DNS 层直接拒绝，并优先于所有规则")}
       >
         <Toggle
           checked={adblock.enabled}
@@ -1839,7 +1927,7 @@ function AdblockSettingsSection({
                 : { ...adblock, enabled },
             )
           }
-          label="启用去广告"
+          label={t("启用去广告")}
         />
       </Setting>
       {adblock.enabled && (
@@ -1877,36 +1965,42 @@ function AdblockSettingsSection({
                   })
                 }
               >
-                移除
+                {t("移除")}
               </button>
             </Setting>
           ))}
           <Setting
-            label="拦截 HTTPDNS 和加密 DNS"
-            text="不少 App 自带 HTTPDNS 或 DoH，绕过了 DNS 过滤；拦截后它们会退回系统 DNS"
+            label={t("拦截 HTTPDNS 和加密 DNS")}
+            text={t(
+              "不少 App 自带 HTTPDNS 或 DoH，绕过了 DNS 过滤；拦截后它们会退回系统 DNS",
+            )}
           >
             <Toggle
               checked={adblock.blockHttpdns ?? true}
               onChange={(blockHttpdns) => update({ blockHttpdns })}
-              label="拦截 HTTPDNS 和加密 DNS"
+              label={t("拦截 HTTPDNS 和加密 DNS")}
             />
           </Setting>
           <Setting
-            label="QUIC 回退到 TCP"
-            text="拒绝不知道域名的 QUIC 连接，App 改用 TCP 后即可按域名拦截"
+            label={t("QUIC 回退到 TCP")}
+            text={t(
+              "拒绝不知道域名的 QUIC 连接，App 改用 TCP 后即可按域名拦截",
+            )}
           >
             <Toggle
               checked={adblock.quicFallback ?? true}
               onChange={(quicFallback) => update({ quicFallback })}
-              label="QUIC 回退到 TCP"
+              label={t("QUIC 回退到 TCP")}
             />
           </Setting>
           <Setting
-            label="拦截应答"
-            text="个别 App 收到「域名不存在」会反复重试，可改为返回 0.0.0.0"
+            label={t("拦截应答")}
+            text={t(
+              "个别 App 收到「域名不存在」会反复重试，可改为返回 0.0.0.0",
+            )}
           >
             <select
-              aria-label="拦截应答"
+              aria-label={t("拦截应答")}
               value={adblock.dnsAnswer ?? "nxdomain"}
               onChange={(e) =>
                 update({
@@ -1914,35 +2008,39 @@ function AdblockSettingsSection({
                 })
               }
             >
-              <option value="nxdomain">域名不存在</option>
+              <option value="nxdomain">{t("域名不存在")}</option>
               <option value="null">0.0.0.0</option>
             </select>
           </Setting>
           <Setting
-            label="自定义列表"
-            text="Clash 规则集（域名或 IP）、hosts 或 AdGuard 格式的链接"
+            label={t("自定义列表")}
+            text={t("Clash 规则集（域名或 IP）、hosts 或 AdGuard 格式的链接")}
           >
             <button
               className="button secondary"
               onClick={() => setDialog("list")}
             >
               <Plus size={14} />
-              添加
+              {t("添加")}
             </button>
           </Setting>
           <Setting
-            label="白名单"
+            label={t("白名单")}
             text={
               adblock.allow.length
-                ? `${adblock.allow.length} 个域名，包含其子域名；保存后立即生效，无需重启`
-                : "误拦的域名加入这里，包含其子域名；也可在概览的统计里一键放行"
+                ? t("{count} 个域名，包含其子域名；保存后立即生效，无需重启", {
+                    count: adblock.allow.length,
+                  })
+                : t(
+                    "误拦的域名加入这里，包含其子域名；也可在概览的统计里一键放行",
+                  )
             }
           >
             <button
               className="button secondary"
               onClick={() => setDialog("allow")}
             >
-              管理
+              {t("管理")}
             </button>
           </Setting>
         </>
@@ -1983,7 +2081,7 @@ function AdListDialog({
   const valid =
     !!name.trim() && !duplicate && /^https?:\/\/\S+$/.test(url.trim());
   return (
-    <Modal title="添加自定义列表" onClose={onClose}>
+    <Modal title={t("添加自定义列表")} onClose={onClose}>
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1991,17 +2089,17 @@ function AdListDialog({
         }}
       >
         <label className="field">
-          名称
+          {t("名称")}
           <input
             autoFocus
             maxLength={64}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例如：我的广告列表"
+            placeholder={t("例如：我的广告列表")}
           />
         </label>
         <label className="field">
-          链接
+          {t("链接")}
           <input
             type="url"
             value={url}
@@ -2012,28 +2110,28 @@ function AdListDialog({
           />
         </label>
         <label className="field">
-          格式
+          {t("格式")}
           <select
             value={format}
             onChange={(e) => setFormat(e.target.value as AdListFormat)}
           >
-            <option value="clash">Clash 规则集（yaml 或 text）</option>
-            <option value="hosts">hosts（0.0.0.0 域名）</option>
-            <option value="adguard">AdGuard（||域名^）</option>
+            <option value="clash">{t("Clash 规则集（yaml 或 text）")}</option>
+            <option value="hosts">{t("hosts（0.0.0.0 域名）")}</option>
+            <option value="adguard">{t("AdGuard（||域名^）")}</option>
           </select>
         </label>
         {duplicate && (
           <p role="alert" className="inline-error">
-            已有同名列表。
+            {t("已有同名列表。")}
           </p>
         )}
-        <p className="small muted">保存设置后下载，之后每天自动更新。</p>
+        <p className="small muted">{t("保存设置后下载，之后每天自动更新。")}</p>
         <div className="modal-actions">
           <button type="button" className="button secondary" onClick={onClose}>
-            取消
+            {t("取消")}
           </button>
           <button className="button primary" disabled={!valid}>
-            添加
+            {t("添加")}
           </button>
         </div>
       </form>
@@ -2056,7 +2154,7 @@ function AllowDialog({
       entry,
     ) && !value.includes(entry);
   return (
-    <Modal title="白名单" onClose={onClose}>
+    <Modal title={t("白名单")} onClose={onClose}>
       <form
         className="allow-add"
         onSubmit={(e) => {
@@ -2070,25 +2168,25 @@ function AllowDialog({
           autoFocus
           value={domain}
           onChange={(e) => setDomain(e.target.value)}
-          placeholder="例如：wechat.com"
+          placeholder={t("例如：wechat.com")}
           autoComplete="off"
           spellCheck={false}
         />
         <button className="button secondary" disabled={!valid}>
           <Plus size={14} />
-          添加
+          {t("添加")}
         </button>
       </form>
       <div className="allow-list">
         {value.length === 0 && (
-          <div className="allow-row muted">还没有放行的域名</div>
+          <div className="allow-row muted">{t("还没有放行的域名")}</div>
         )}
         {value.map((item) => (
           <div className="allow-row" key={item}>
             <span>{item}</span>
             <button
               className="icon-button"
-              aria-label={`移除 ${item}`}
+              aria-label={t("移除 {item}", { item })}
               onClick={() => onChange(value.filter((d) => d !== item))}
             >
               <X size={14} />
@@ -2097,11 +2195,13 @@ function AllowDialog({
         ))}
       </div>
       <p className="small muted">
-        包含子域名。记得点设置页底部的「保存」，保存后立即生效，无需重启。
+        {t(
+          "包含子域名。记得点设置页底部的「保存」，保存后立即生效，无需重启。",
+        )}
       </p>
       <div className="modal-actions">
         <button className="button primary" onClick={onClose}>
-          完成
+          {t("完成")}
         </button>
       </div>
     </Modal>
@@ -2188,7 +2288,11 @@ function Proxies({
   };
   if (!running)
     return (
-      <Empty icon={<Globe2 />} title="未连接" text="连接后可选择节点和测速。" />
+      <Empty
+        icon={<Globe2 />}
+        title={t("未连接")}
+        text={t("连接后可选择节点和测速。")}
+      />
     );
   // GLOBAL only routes traffic in global mode; elsewhere it is noise.
   const groups = Object.values(nodes).filter(
@@ -2202,15 +2306,15 @@ function Proxies({
   const icon = (name: string) => {
     const builtin = builtinOutbound(name, nodes[name]);
     return nodes[name]?.all ? (
-      <span className="node-icon" title="代理组">
+      <span className="node-icon" title={t("代理组")}>
         <Layers3 size={16} />
       </span>
     ) : builtin === "reject" ? (
-      <span className="node-icon reject" title="拒绝">
+      <span className="node-icon reject" title={t("拒绝")}>
         <Ban size={16} />
       </span>
     ) : builtin === "direct" ? (
-      <span className="node-icon" title="直连">
+      <span className="node-icon" title={t("直连")}>
         <ArrowRight size={16} />
       </span>
     ) : null;
@@ -2219,9 +2323,12 @@ function Proxies({
     const node = nodes[name];
     const builtin = builtinOutbound(name, node);
     if (node?.all)
-      return `代理组 · ${groupTypeText[node.type] ?? node.type}${node.now ? ` · 当前 ${node.now}` : ""}`;
-    if (builtin === "direct") return "直连，不经过代理";
-    if (builtin === "reject") return "拒绝连接";
+      return (
+        t("代理组 · {type}", { type: groupTypeText[node.type] ?? node.type }) +
+        (node.now ? ` · ${t("当前 {now}", { now: node.now })}` : "")
+      );
+    if (builtin === "direct") return t("直连，不经过代理");
+    if (builtin === "reject") return t("拒绝连接");
     return nodeSummary(node?.status, node?.type);
   };
   const label = (name: string) => (
@@ -2241,7 +2348,7 @@ function Proxies({
       <div className="toolbar">
         <div>
           {groups.length > 0 && (
-            <div className="segmented" role="group" aria-label="节点视图">
+            <div className="segmented" role="group" aria-label={t("节点视图")}>
               {(["groups", "proxies"] as NodesView[]).map((v) => (
                 <button
                   key={v}
@@ -2249,7 +2356,7 @@ function Proxies({
                   className={shown === v ? "selected" : ""}
                   onClick={() => chooseView(v)}
                 >
-                  {v === "groups" ? "代理组" : "节点"}
+                  {v === "groups" ? t("代理组") : t("节点")}
                   <span className="segment-count">
                     {v === "groups" ? groups.length : servers.length}
                   </span>
@@ -2260,10 +2367,12 @@ function Proxies({
           <label className="search">
             <Search size={16} />
             <input
-              aria-label="搜索节点"
+              aria-label={t("搜索节点")}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder={shown === "groups" ? "搜索代理组或成员" : "搜索节点"}
+              placeholder={
+                shown === "groups" ? t("搜索代理组或成员") : t("搜索节点")
+              }
             />
           </label>
         </div>
@@ -2274,7 +2383,7 @@ function Proxies({
             onClick={() => void probeAll()}
           >
             <Zap size={16} />
-            测速
+            {t("测速")}
           </button>
         )}
       </div>
@@ -2341,7 +2450,8 @@ function Proxies({
                   {policies.length > 0 && (
                     <>
                       <div className="member-label">
-                        策略<span>{policies.length}</span>
+                        {t("策略")}
+                        <span>{policies.length}</span>
                       </div>
                       <div className="node-grid">{policies.map(card)}</div>
                     </>
@@ -2350,7 +2460,8 @@ function Proxies({
                     <>
                       {policies.length > 0 && (
                         <div className="member-label">
-                          节点<span>{proxies.length}</span>
+                          {t("节点")}
+                          <span>{proxies.length}</span>
                         </div>
                       )}
                       <div className="node-grid">{proxies.map(card)}</div>
@@ -2368,16 +2479,16 @@ function Proxies({
             return (
               <Empty
                 icon={<Globe2 />}
-                title="没有节点"
-                text="当前配置没有代理节点。"
+                title={t("没有节点")}
+                text={t("当前配置没有代理节点。")}
               />
             );
           if (!list.length)
             return (
               <Empty
                 icon={<Search />}
-                title="没有匹配的节点"
-                text="换个关键词试试。"
+                title={t("没有匹配的节点")}
+                text={t("换个关键词试试。")}
               />
             );
           return (
@@ -2394,7 +2505,7 @@ function Proxies({
                       {nodes[name]?.status && (
                         <button
                           className="node-info"
-                          aria-label={`${name} 状态`}
+                          aria-label={t("{name} 状态", { name })}
                           onClick={() => setDetail(name)}
                         >
                           <Info size={15} />
@@ -2403,16 +2514,16 @@ function Proxies({
                       {nodes[name]?.type !== "Tailscale" && (
                         <button
                           className={`delay ${delayTone(delay)}`}
-                          aria-label={`测试 ${name} 延迟`}
+                          aria-label={t("测试 {name} 延迟", { name })}
                           disabled={busy || probing.includes(name)}
                           onClick={() => void probe(name)}
                         >
                           {probing.includes(name) ? (
                             <LoaderCircle className="spin" size={13} />
                           ) : delay === null ? (
-                            "超时"
+                            t("超时")
                           ) : delay === undefined ? (
-                            "测速"
+                            t("测速")
                           ) : (
                             `${delay} ms`
                           )}
@@ -2448,21 +2559,21 @@ function NodeDetail({
 }) {
   const ts = status.tailscale;
   const rows: [string, string][] = [
-    ["类型", status.type],
-    ["当前连接", String(status.connections)],
+    [t("类型"), status.type],
+    [t("当前连接"), String(status.connections)],
   ];
-  if (status.server) rows.push(["服务器", status.server]);
-  if (status.network) rows.push(["传输", status.network]);
-  if (status.security) rows.push(["安全", status.security.toUpperCase()]);
+  if (status.server) rows.push([t("服务器"), status.server]);
+  if (status.network) rows.push([t("传输"), status.network]);
+  if (status.security) rows.push([t("安全"), status.security.toUpperCase()]);
   if (status.flow) rows.push(["Flow", status.flow]);
   if (status.udp !== undefined)
-    rows.push(["UDP", status.udp ? "开启" : "关闭"]);
+    rows.push(["UDP", status.udp ? t("开启") : t("关闭")]);
   if (ts) {
-    rows.push(["状态", tailscaleStateText[ts.state]]);
-    if (ts.name) rows.push(["本机名称", ts.name]);
-    if (ts.addresses.length) rows.push(["地址", ts.addresses.join("、")]);
-    if (ts.home_derp) rows.push(["DERP 主区域", ts.home_derp]);
-    rows.push(["公网候选", ts.endpoints.join("、") || "无"]);
+    rows.push([t("状态"), tailscaleStateText[ts.state]]);
+    if (ts.name) rows.push([t("本机名称"), ts.name]);
+    if (ts.addresses.length) rows.push([t("地址"), ts.addresses.join("、")]);
+    if (ts.home_derp) rows.push([t("DERP 主区域"), ts.home_derp]);
+    rows.push([t("公网候选"), ts.endpoints.join("、") || t("无")]);
   }
   return (
     <div className="node-detail">
@@ -2483,12 +2594,12 @@ function NodeDetail({
             }
           >
             {status.delay != null
-              ? `最近一次 ${status.delay} ms`
+              ? t("最近一次 {delay} ms", { delay: status.delay })
               : status.error
-                ? `测速失败：${status.error}`
-                : "尚未测速"}
+                ? t("测速失败：{error}", { error: status.error })
+                : t("尚未测速")}
             {status.checked
-              ? ` · ${new Date(status.checked * 1000).toLocaleTimeString()}`
+              ? ` · ${new Date(status.checked * 1000).toLocaleTimeString(locale())}`
               : ""}
           </span>
           <button
@@ -2501,15 +2612,17 @@ function NodeDetail({
             ) : (
               <Zap size={14} />
             )}
-            测速
+            {t("测速")}
           </button>
         </div>
       )}
       {ts && (
         <>
           <h4 className="detail-heading">
-            节点（{ts.peers.filter((p) => p.online).length}/{ts.peers.length}{" "}
-            在线）
+            {t("节点（{online}/{total} 在线）", {
+              online: ts.peers.filter((p) => p.online).length,
+              total: ts.peers.length,
+            })}
           </h4>
           <div className="peer-list">
             {ts.peers.map((peer) => (
@@ -2517,7 +2630,9 @@ function NodeDetail({
                 <span className={`peer-dot ${peer.online ? "online" : ""}`} />
                 <span className="peer-name">
                   <strong>{peer.name}</strong>
-                  {peer.exit_node && <span className="tiny-tag">出口</span>}
+                  {peer.exit_node && (
+                    <span className="tiny-tag">{t("出口")}</span>
+                  )}
                   <small>
                     {[peer.address, peer.os, peer.direct]
                       .filter(Boolean)
@@ -2566,7 +2681,11 @@ function ConnectionPage({
   }, [running, refresh]);
   if (!running)
     return (
-      <Empty icon={<Network />} title="未连接" text="连接后显示活跃连接。" />
+      <Empty
+        icon={<Network />}
+        title={t("未连接")}
+        text={t("连接后显示活跃连接。")}
+      />
     );
   const visible = items.filter((item) =>
     `${item.metadata.host} ${item.chains.join(" ")}`
@@ -2579,8 +2698,8 @@ function ConnectionPage({
         <label className="search">
           <Search size={16} />
           <input
-            placeholder="搜索目标或代理链"
-            aria-label="搜索连接"
+            placeholder={t("搜索目标或代理链")}
+            aria-label={t("搜索连接")}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
@@ -2595,22 +2714,22 @@ function ConnectionPage({
             })
           }
         >
-          全部断开
+          {t("全部断开")}
         </button>
       </div>
       {failed && (
         <p className="inline-error" role="alert">
-          刷新失败，正在重试。
+          {t("刷新失败，正在重试。")}
         </p>
       )}
       <div className="panel table-wrap">
         <table className="connection-table">
           <thead>
             <tr>
-              <th>目标地址</th>
-              <th>协议 / 代理链</th>
-              <th className="num">下载</th>
-              <th className="num">上传</th>
+              <th>{t("目标地址")}</th>
+              <th>{t("协议 / 代理链")}</th>
+              <th className="num">{t("下载")}</th>
+              <th className="num">{t("上传")}</th>
               <th />
             </tr>
           </thead>
@@ -2634,7 +2753,9 @@ function ConnectionPage({
                 <td>
                   <button
                     className="icon-button"
-                    aria-label={`关闭 ${item.metadata.host} 连接`}
+                    aria-label={t("关闭 {host} 连接", {
+                      host: item.metadata.host,
+                    })}
                     onClick={() =>
                       void perform(async () => {
                         await invoke("close_connection", { id: item.id });
@@ -2651,11 +2772,13 @@ function ConnectionPage({
         </table>
         {!visible.length && (
           <div className="table-empty">
-            {items.length ? "无匹配结果" : "暂无连接"}
+            {items.length ? t("无匹配结果") : t("暂无连接")}
           </div>
         )}
       </div>
-      <p className="small muted table-note">{items.length} 个连接</p>
+      <p className="small muted table-note">
+        {t("{count} 个连接", { count: items.length })}
+      </p>
     </>
   );
 }
@@ -2698,7 +2821,7 @@ function RulesPage({
   };
   if (!data) return failure ? <p className="inline-error">{failure}</p> : null;
   const ip = type === "IP-CIDR" || type === "IP-CIDR6" || type === "GEOIP";
-  const placeholder = ruleTypes.find((t) => t.type === type)?.placeholder;
+  const placeholder = ruleTypes.find((rule) => rule.type === type)?.placeholder;
   const add = async () => {
     const rule = [
       type,
@@ -2718,7 +2841,7 @@ function RulesPage({
   const disabled = busy || saving;
   return (
     <>
-      <h3 className="settings-heading">自定义规则</h3>
+      <h3 className="settings-heading">{t("自定义规则")}</h3>
       <section className="panel settings-section rule-form">
         <form
           onSubmit={(event) => {
@@ -2727,18 +2850,18 @@ function RulesPage({
           }}
         >
           <select
-            aria-label="规则类型"
+            aria-label={t("规则类型")}
             value={type}
             onChange={(e) => setType(e.target.value)}
           >
-            {ruleTypes.map((t) => (
-              <option key={t.type} value={t.type}>
-                {t.label}
+            {ruleTypes.map((rule) => (
+              <option key={rule.type} value={rule.type}>
+                {rule.label}
               </option>
             ))}
           </select>
           <input
-            aria-label="规则值"
+            aria-label={t("规则值")}
             value={value}
             onChange={(e) => setValue(e.target.value)}
             placeholder={placeholder}
@@ -2746,12 +2869,12 @@ function RulesPage({
             autoComplete="off"
           />
           <select
-            aria-label="目标"
+            aria-label={t("目标")}
             value={target}
             onChange={(e) => setTarget(e.target.value)}
           >
-            {data.targets.map((t) => (
-              <option key={t}>{t}</option>
+            {data.targets.map((target) => (
+              <option key={target}>{target}</option>
             ))}
           </select>
           {ip && (
@@ -2761,7 +2884,7 @@ function RulesPage({
                 checked={noResolve}
                 onChange={(e) => setNoResolve(e.target.checked)}
               />
-              不解析域名
+              {t("不解析域名")}
             </label>
           )}
           <button
@@ -2773,7 +2896,7 @@ function RulesPage({
             ) : (
               <Plus size={16} />
             )}
-            添加
+            {t("添加")}
           </button>
         </form>
       </section>
@@ -2784,8 +2907,10 @@ function RulesPage({
       )}
       <div className="toolbar">
         <span className="muted small">
-          {data.rules.length} 条规则 · 优先于配置中的规则，按顺序匹配
-          {running ? " · 修改后立即生效" : ""}
+          {t("{count} 条规则 · 优先于配置中的规则，按顺序匹配", {
+            count: data.rules.length,
+          })}
+          {running ? ` · ${t("修改后立即生效")}` : ""}
         </span>
         <button
           className="button secondary"
@@ -2805,23 +2930,23 @@ function RulesPage({
           }
         >
           <PencilLine size={16} />
-          批量编辑
+          {t("批量编辑")}
         </button>
       </div>
       {!data.rules.length ? (
         <Empty
           icon={<ListFilter />}
-          title="还没有自定义规则"
-          text="自定义规则对所有配置生效，并且优先于配置自带的规则。"
+          title={t("还没有自定义规则")}
+          text={t("自定义规则对所有配置生效，并且优先于配置自带的规则。")}
         />
       ) : (
         <div className="panel table-wrap">
           <table className="rule-table">
             <thead>
               <tr>
-                <th>类型</th>
-                <th>值</th>
-                <th>目标</th>
+                <th>{t("类型")}</th>
+                <th>{t("值")}</th>
+                <th>{t("目标")}</th>
                 <th />
               </tr>
             </thead>
@@ -2833,18 +2958,18 @@ function RulesPage({
                   <tr key={`${index}-${rule}`}>
                     <td>
                       <span className="tiny-tag">
-                        {ruleTypes.find((t) => t.type === parts.type)?.label ??
-                          parts.type}
+                        {ruleTypes.find((rule) => rule.type === parts.type)
+                          ?.label ?? parts.type}
                       </span>
                     </td>
                     <td>
                       <strong>{parts.value}</strong>
                       {parts.noResolve && (
-                        <span className="chain">不解析域名</span>
+                        <span className="chain">{t("不解析域名")}</span>
                       )}
                       {reason && (
                         <span className="chain danger">
-                          {reason}，当前配置下不生效
+                          {t("{reason}，当前配置下不生效", { reason })}
                         </span>
                       )}
                     </td>
@@ -2852,7 +2977,7 @@ function RulesPage({
                     <td className="rule-actions">
                       <button
                         className="icon-button"
-                        aria-label={`上移 ${rule}`}
+                        aria-label={t("上移 {rule}", { rule })}
                         disabled={disabled || index === 0}
                         onClick={() => move(index, -1)}
                       >
@@ -2860,7 +2985,7 @@ function RulesPage({
                       </button>
                       <button
                         className="icon-button"
-                        aria-label={`下移 ${rule}`}
+                        aria-label={t("下移 {rule}", { rule })}
                         disabled={disabled || index === data.rules.length - 1}
                         onClick={() => move(index, 1)}
                       >
@@ -2868,7 +2993,7 @@ function RulesPage({
                       </button>
                       <button
                         className="icon-button danger"
-                        aria-label={`删除 ${rule}`}
+                        aria-label={t("删除 {rule}", { rule })}
                         disabled={disabled}
                         onClick={() =>
                           void save(data.rules.filter((_, i) => i !== index))
@@ -2886,24 +3011,26 @@ function RulesPage({
       )}
       {data.profile && (
         <p className="hint">
-          目标列表来自当前配置「{data.profile}
-          」；切换到没有该代理组的配置时，对应规则会被跳过。
+          {t(
+            "目标列表来自当前配置「{profile}」；切换到没有该代理组的配置时，对应规则会被跳过。",
+            { profile: data.profile },
+          )}
         </p>
       )}
-      <h3 className="settings-heading spaced">诊断</h3>
+      <h3 className="settings-heading spaced">{t("诊断")}</h3>
       <RouteTester running={running} customRules={data.rules} />
       <DnsLeakPanel running={running} rules={data.rules} />
     </>
   );
 }
 const routeMatchText: Record<string, string> = {
-  Adblock: "去广告拦截（优先于所有规则）",
-  "Adblock(HTTPDNS)": "去广告：HTTPDNS / 加密 DNS 入口",
-  "Adblock(IP)": "去广告：列表中的 IP",
-  "Adblock(QUIC)": "去广告：没有域名的 QUIC，回退到 TCP",
-  "Mode(Global)": "全局模式",
-  "Mode(Direct)": "直连模式",
-  Fallback: "没有规则匹配，默认直连",
+  Adblock: t("去广告拦截（优先于所有规则）"),
+  "Adblock(HTTPDNS)": t("去广告：HTTPDNS / 加密 DNS 入口"),
+  "Adblock(IP)": t("去广告：列表中的 IP"),
+  "Adblock(QUIC)": t("去广告：没有域名的 QUIC，回退到 TCP"),
+  "Mode(Global)": t("全局模式"),
+  "Mode(Direct)": t("直连模式"),
+  Fallback: t("没有规则匹配，默认直连"),
 };
 function RouteTester({
   running,
@@ -2939,7 +3066,7 @@ function RouteTester({
       <div className="panel-title">
         <h3>
           <Route size={16} />
-          路由测试
+          {t("路由测试")}
         </h3>
       </div>
       <form
@@ -2949,15 +3076,15 @@ function RouteTester({
         }}
       >
         <input
-          aria-label="测试目标"
+          aria-label={t("测试目标")}
           value={target}
           onChange={(e) => setTarget(e.target.value)}
-          placeholder="测试域名或 IP，如 www.google.com、8.8.8.8:53"
+          placeholder={t("测试域名或 IP，如 www.google.com、8.8.8.8:53")}
           spellCheck={false}
           autoComplete="off"
         />
         <select
-          aria-label="网络"
+          aria-label={t("网络")}
           value={network}
           onChange={(e) => setNetwork(e.target.value as "tcp" | "udp")}
         >
@@ -2967,40 +3094,44 @@ function RouteTester({
         <button
           className="button secondary"
           disabled={!running || testing || !target.trim()}
-          title={running ? undefined : "启动内核后可测试"}
+          title={running ? undefined : t("启动内核后可测试")}
         >
           {testing ? (
             <LoaderCircle className="spin" size={16} />
           ) : (
             <Search size={16} />
           )}
-          测试
+          {t("测试")}
         </button>
       </form>
-      {!running && <p className="small muted">启动内核后可测试路由。</p>}
+      {!running && <p className="small muted">{t("启动内核后可测试路由。")}</p>}
       {failure && (
         <p className="inline-error" role="alert">
           {failure}
         </p>
       )}
       {result && (
-        <dl className="route-result" aria-label="路由测试结果">
-          <dt>目标</dt>
+        <dl className="route-result" aria-label={t("路由测试结果")}>
+          <dt>{t("目标")}</dt>
           <dd>
             {result.host.includes(":") ? `[${result.host}]` : result.host}:
             {result.port} · {result.network.toUpperCase()}
             {result.ip && result.ip !== result.host && (
-              <span className="chain">解析为 {result.ip}</span>
+              <span className="chain">
+                {t("解析为 {ip}", { ip: result.ip })}
+              </span>
             )}
           </dd>
-          <dt>匹配规则</dt>
+          <dt>{t("匹配规则")}</dt>
           <dd>
             {result.rule ? (
               <>
                 <strong>{result.rule}</strong>
                 <span className="chain">
-                  第 {(result.index ?? 0) + 1} 条
-                  {customRules.includes(result.rule) ? " · 自定义规则" : ""}
+                  {t("第 {index} 条", { index: (result.index ?? 0) + 1 })}
+                  {customRules.includes(result.rule)
+                    ? ` · ${t("自定义规则")}`
+                    : ""}
                 </span>
               </>
             ) : (
@@ -3009,7 +3140,7 @@ function RouteTester({
               </strong>
             )}
           </dd>
-          <dt>出站节点</dt>
+          <dt>{t("出站节点")}</dt>
           <dd>
             <strong
               className={result.node === "REJECT" ? "danger-text" : undefined}
@@ -3023,7 +3154,7 @@ function RouteTester({
               result.node !== "DIRECT" &&
               result.node !== "REJECT" && (
                 <span className="chain danger">
-                  匹配前已在本地解析域名，存在 DNS 泄露
+                  {t("匹配前已在本地解析域名，存在 DNS 泄露")}
                 </span>
               )}
           </dd>
@@ -3032,12 +3163,16 @@ function RouteTester({
     </section>
   );
 }
-const findingLevelText = { risk: "泄露", warning: "注意", info: "提示" };
+const findingLevelText = {
+  risk: t("泄露"),
+  warning: t("注意"),
+  info: t("提示"),
+};
 const leakVerdictText = {
-  leak: "存在泄露：本地上游看到了走代理的域名",
-  ok: "未发现泄露",
-  direct: "直连，无代理路径可检查",
-  unknown: "无法判断",
+  leak: t("存在泄露：本地上游看到了走代理的域名"),
+  ok: t("未发现泄露"),
+  direct: t("直连，无代理路径可检查"),
+  unknown: t("无法判断"),
 };
 function LeakResolvers({
   title,
@@ -3053,8 +3188,8 @@ function LeakResolvers({
     (verdict
       ? leakVerdictText[verdict]
       : probe.resolvers.length
-        ? "本地解析由这些服务器完成"
-        : "没有结果");
+        ? t("本地解析由这些服务器完成")
+        : t("没有结果"));
   return (
     <div className="leak-probe">
       <div className="leak-probe-title">
@@ -3117,7 +3252,7 @@ function DnsLeakPanel({
       <div className="panel-title">
         <h3>
           <ShieldCheck size={16} />
-          DNS 泄露检测
+          {t("DNS 泄露检测")}
         </h3>
         <button
           className="button secondary"
@@ -3129,10 +3264,10 @@ function DnsLeakPanel({
           ) : (
             <Globe2 size={16} />
           )}
-          {testing ? "检测中…" : "在线检测"}
+          {testing ? t("检测中…") : t("在线检测")}
         </button>
       </div>
-      {!running && <p className="small muted">启动内核后可检测。</p>}
+      {!running && <p className="small muted">{t("启动内核后可检测。")}</p>}
       {failure && (
         <p className="inline-error" role="alert">
           {failure}
@@ -3142,10 +3277,10 @@ function DnsLeakPanel({
         <>
           <p className={audit.leaking ? "danger-text" : "muted small"}>
             {audit.leaking
-              ? "配置检查发现 DNS 泄露风险"
+              ? t("配置检查发现 DNS 泄露风险")
               : audit.findings.length
-                ? "配置检查未发现泄露，但有以下提示"
-                : "配置检查未发现问题"}
+                ? t("配置检查未发现泄露，但有以下提示")
+                : t("配置检查未发现问题")}
           </p>
           {audit.findings.map((finding) => (
             <div key={finding.code} className={`leak-finding ${finding.level}`}>
@@ -3170,9 +3305,9 @@ function DnsLeakPanel({
         </>
       )}
       {test && (
-        <div className="leak-test" aria-label="在线检测结果">
+        <div className="leak-test" aria-label={t("在线检测结果")}>
           <div className="leak-server">
-            <strong>出口 IP</strong>
+            <strong>{t("出口 IP")}</strong>
             <span>
               {test.exit.length
                 ? test.exit
@@ -3180,26 +3315,35 @@ function DnsLeakPanel({
                       [e.ip, e.country, e.asn].filter(Boolean).join(" · "),
                     )
                     .join("，")
-                : "未知"}
+                : t("未知")}
             </span>
           </div>
           <p className="small muted">
-            bash.ws 当前经「{test.node}」（{test.matched}）访问
             {test.node === "DIRECT"
-              ? "，结果反映直连时的情况；让 bash.ws 走代理后再测可检查代理路径。"
-              : "。"}
+              ? t(
+                  "bash.ws 当前经「{node}」（{matched}）访问，结果反映直连时的情况；让 bash.ws 走代理后再测可检查代理路径。",
+                  { node: test.node, matched: test.matched },
+                )
+              : t("bash.ws 当前经「{node}」（{matched}）访问。", {
+                  node: test.node,
+                  matched: test.matched,
+                })}
           </p>
           <LeakResolvers
-            title="应用访问时的解析器"
+            title={t("应用访问时的解析器")}
             probe={test.routed}
             verdict={test.verdict}
           />
-          <LeakResolvers title="内核上游 DNS 的解析器" probe={test.local} />
+          <LeakResolvers
+            title={t("内核上游 DNS 的解析器")}
+            probe={test.local}
+          />
         </div>
       )}
       <p className="hint">
-        配置检查在本地完成；在线检测会向 bash.ws
-        发送随机域名，并暴露出口和解析器的 IP。
+        {t(
+          "配置检查在本地完成；在线检测会向 bash.ws 发送随机域名，并暴露出口和解析器的 IP。",
+        )}
       </p>
     </section>
   );
@@ -3216,13 +3360,15 @@ function BulkRules({
   const [text, setText] = useState(rules.join("\n"));
   const [saving, setSaving] = useState(false);
   return (
-    <Modal title="批量编辑规则" onClose={onClose} wide>
+    <Modal title={t("批量编辑规则")} onClose={onClose} wide>
       <p className="small muted">
-        每行一条，格式为「类型,值,目标」，越靠前优先级越高。保存时会校验每一条。
+        {t(
+          "每行一条，格式为「类型,值,目标」，越靠前优先级越高。保存时会校验每一条。",
+        )}
       </p>
       <textarea
         className="yaml-editor"
-        aria-label="自定义规则"
+        aria-label={t("自定义规则")}
         value={text}
         onChange={(e) => setText(e.target.value)}
         spellCheck={false}
@@ -3232,7 +3378,7 @@ function BulkRules({
       />
       <div className="modal-actions">
         <button className="button secondary" onClick={onClose}>
-          取消
+          {t("取消")}
         </button>
         <button
           className="button primary"
@@ -3247,7 +3393,7 @@ function BulkRules({
           }}
         >
           {saving && <LoaderCircle className="spin" size={16} />}
-          保存
+          {t("保存")}
         </button>
       </div>
     </Modal>
@@ -3290,11 +3436,11 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
       <div className="toolbar">
         <div>
           <select
-            aria-label="日志级别"
+            aria-label={t("日志级别")}
             value={level}
             onChange={(e) => setLevel(e.target.value)}
           >
-            <option value="all">全部</option>
+            <option value="all">{t("全部")}</option>
             {["debug", "info", "warning", "error"].map((v) => (
               <option key={v}>{v}</option>
             ))}
@@ -3302,8 +3448,8 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
           <label className="search">
             <Search size={16} />
             <input
-              aria-label="搜索日志"
-              placeholder="搜索日志"
+              aria-label={t("搜索日志")}
+              placeholder={t("搜索日志")}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -3318,7 +3464,7 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
             }}
           >
             {paused ? <Play size={15} /> : <Pause size={15} />}
-            {paused ? "继续" : "暂停"}
+            {paused ? t("继续") : t("暂停")}
           </button>
           <button
             className="button secondary"
@@ -3326,14 +3472,14 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
               void perform(async () => {
                 const path = await save({
                   defaultPath: "clyntis-logs.jsonl",
-                  filters: [{ name: "日志", extensions: ["jsonl"] }],
+                  filters: [{ name: t("日志"), extensions: ["jsonl"] }],
                 });
                 if (path) await invoke("export_logs", { path });
               })
             }
           >
             <Download size={15} />
-            导出
+            {t("导出")}
           </button>
         </div>
       </div>
@@ -3342,7 +3488,7 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
           visible.map((log, i) => (
             <div className={`log-row ${log.type}`} key={`${log.time}-${i}`}>
               <time>
-                {new Date(log.time * 1000).toLocaleTimeString("zh-CN", {
+                {new Date(log.time * 1000).toLocaleTimeString(locale(), {
                   hour12: false,
                 })}
               </time>
@@ -3353,11 +3499,11 @@ function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
             </div>
           ))
         ) : (
-          <div className="table-empty">暂无日志</div>
+          <div className="table-empty">{t("暂无日志")}</div>
         )}
       </div>
       <p className="small muted table-note">
-        保留最近 2000 条，URL、UUID 和凭据已脱敏。
+        {t("保留最近 2000 条，URL、UUID 和凭据已脱敏。")}
       </p>
     </>
   );
@@ -3376,9 +3522,9 @@ function OverrideSwitch({
         onChange(e.target.value === "" ? null : e.target.value === "true")
       }
     >
-      <option value="">跟随配置文件</option>
-      <option value="true">开启</option>
-      <option value="false">关闭</option>
+      <option value="">{t("跟随配置文件")}</option>
+      <option value="true">{t("开启")}</option>
+      <option value="false">{t("关闭")}</option>
     </select>
   );
 }
@@ -3419,9 +3565,9 @@ function SettingsPage({
   const portInvalid = settings.mixedPort < 1024 || settings.mixedPort > 65535;
   return (
     <>
-      <h3 className="settings-heading">网络</h3>
+      <h3 className="settings-heading">{t("网络")}</h3>
       <section className="panel settings-section">
-        <Setting label="接管方式" text="运行中切换会重启内核">
+        <Setting label={t("接管方式")} text={t("运行中切换会重启内核")}>
           <select
             value={settings.capture}
             onChange={(e) => update("capture", e.target.value as Capture)}
@@ -3433,7 +3579,7 @@ function SettingsPage({
             ))}
           </select>
         </Setting>
-        <Setting label="代理端口" text="HTTP / SOCKS 共用">
+        <Setting label={t("代理端口")} text={t("HTTP / SOCKS 共用")}>
           <input
             type="number"
             min={1024}
@@ -3442,38 +3588,41 @@ function SettingsPage({
             onChange={(e) => update("mixedPort", Number(e.target.value))}
           />
         </Setting>
-        <Setting label="允许局域网访问" text="同一网络的设备可连接此端口">
+        <Setting
+          label={t("允许局域网访问")}
+          text={t("同一网络的设备可连接此端口")}
+        >
           <Toggle
             checked={settings.allowLan}
             onChange={(v) => update("allowLan", v)}
-            label="允许局域网访问"
+            label={t("允许局域网访问")}
           />
         </Setting>
-        <Setting label="TUN 自动 DNS" text="接管系统 DNS，断开后恢复">
+        <Setting label={t("TUN 自动 DNS")} text={t("接管系统 DNS，断开后恢复")}>
           <Toggle
             checked={settings.autoDns}
             onChange={(v) => update("autoDns", v)}
-            label="TUN 自动 DNS"
+            label={t("TUN 自动 DNS")}
           />
         </Setting>
-        <Setting label="出口网卡" text="留空自动选择，如 en0">
+        <Setting label={t("出口网卡")} text={t("留空自动选择，如 en0")}>
           <input
             value={settings.tunInterface ?? ""}
-            placeholder="自动"
+            placeholder={t("自动")}
             onChange={(e) => update("tunInterface", e.target.value || null)}
           />
         </Setting>
       </section>
-      <h3 className="settings-heading">覆盖配置文件</h3>
+      <h3 className="settings-heading">{t("覆盖配置文件")}</h3>
       <section className="panel settings-section">
-        <Setting label="日志级别" text="debug 日志多，平时用 info">
+        <Setting label={t("日志级别")} text={t("debug 日志多，平时用 info")}>
           <select
             value={settings.overrides.logLevel ?? ""}
             onChange={(e) =>
               override("logLevel", (e.target.value || null) as LogLevel | null)
             }
           >
-            <option value="">跟随配置文件</option>
+            <option value="">{t("跟随配置文件")}</option>
             {(["debug", "info", "warning", "error", "silent"] as const).map(
               (level) => (
                 <option key={level} value={level}>
@@ -3489,35 +3638,35 @@ function SettingsPage({
             onChange={(v) => override("ipv6", v)}
           />
         </Setting>
-        <Setting label="域名嗅探" text="从 TLS / HTTP 识别域名">
+        <Setting label={t("域名嗅探")} text={t("从 TLS / HTTP 识别域名")}>
           <OverrideSwitch
             value={settings.overrides.sniffing}
             onChange={(v) => override("sniffing", v)}
           />
         </Setting>
       </section>
-      <h3 className="settings-heading">去广告</h3>
+      <h3 className="settings-heading">{t("去广告")}</h3>
       <section className="panel settings-section">
         <AdblockSettingsSection
           value={settings.overrides.adblock}
           onChange={(adblock) => override("adblock", adblock)}
         />
       </section>
-      <h3 className="settings-heading">辅助服务</h3>
+      <h3 className="settings-heading">{t("辅助服务")}</h3>
       <section className="panel settings-section">
         <div className="panel-title">
-          <span className="service-note">TUN 和系统代理依赖此服务</span>
+          <span className="service-note">{t("TUN 和系统代理依赖此服务")}</span>
           <span className="tiny-tag">
             {{
-              checking: "检查中",
-              current: "已是最新",
-              updating: "更新中",
-              update_failed: "更新失败",
-              installed: "已安装",
-              enabled: "已启用",
-              requires_approval: "待授权",
-              not_installed: "未安装",
-              not_registered: "未安装",
+              checking: t("检查中"),
+              current: t("已是最新"),
+              updating: t("更新中"),
+              update_failed: t("更新失败"),
+              installed: t("已安装"),
+              enabled: t("已启用"),
+              requires_approval: t("待授权"),
+              not_installed: t("未安装"),
+              not_registered: t("未安装"),
             }[state.serviceStatus] ?? state.serviceStatus}
           </span>
         </div>
@@ -3528,12 +3677,12 @@ function SettingsPage({
             onClick={() =>
               void perform(
                 () => invoke("install_service"),
-                "请在系统弹窗中授权",
+                t("请在系统弹窗中授权"),
               )
             }
           >
             <ShieldCheck size={16} />
-            安装或更新
+            {t("安装或更新")}
           </button>
           <button
             className="text-button danger"
@@ -3541,8 +3690,8 @@ function SettingsPage({
             onClick={() =>
               confirm(
                 <Confirm
-                  title="卸载辅助服务？"
-                  text="会先断开连接并恢复网络设置。"
+                  title={t("卸载辅助服务？")}
+                  text={t("会先断开连接并恢复网络设置。")}
                   onClose={() => confirm(null)}
                   onConfirm={async () => {
                     confirm(null);
@@ -3552,43 +3701,54 @@ function SettingsPage({
               )
             }
           >
-            卸载
+            {t("卸载")}
           </button>
         </div>
       </section>
-      <h3 className="settings-heading">远程发布</h3>
+      <h3 className="settings-heading">{t("远程发布")}</h3>
       <section className="panel settings-section">
         <CosSettingsSection perform={perform} />
       </section>
-      <h3 className="settings-heading">通用</h3>
+      <h3 className="settings-heading">{t("通用")}</h3>
       <section className="panel settings-section">
-        <Setting label="外观">
+        <Setting label={t("外观")}>
           <select
             value={settings.theme}
             onChange={(e) =>
               update("theme", e.target.value as Settings["theme"])
             }
           >
-            <option value="system">跟随系统</option>
-            <option value="light">浅色</option>
-            <option value="dark">深色</option>
+            <option value="system">{t("跟随系统")}</option>
+            <option value="light">{t("浅色")}</option>
+            <option value="dark">{t("深色")}</option>
           </select>
         </Setting>
-        <Setting label="登录时启动">
+        <Setting label={t("语言")}>
+          <select
+            value={settings.language}
+            onChange={(e) => update("language", e.target.value as Language)}
+          >
+            <option value="system">{t("跟随系统")}</option>
+            {/* Each language is named in itself. */}
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
+        </Setting>
+        <Setting label={t("登录时启动")}>
           <Toggle
             checked={settings.launchAtLogin}
             onChange={(v) => update("launchAtLogin", v)}
-            label="登录时启动"
+            label={t("登录时启动")}
           />
         </Setting>
-        <Setting label="打开应用后自动连接" text="使用上次的配置">
+        <Setting label={t("打开应用后自动连接")} text={t("使用上次的配置")}>
           <Toggle
             checked={settings.autoConnect}
             onChange={(v) => update("autoConnect", v)}
-            label="打开应用后自动连接"
+            label={t("打开应用后自动连接")}
           />
         </Setting>
-        <Setting label="订阅更新间隔" text="0 为仅手动更新">
+        <Setting label={t("订阅更新间隔")} text={t("0 为仅手动更新")}>
           <div className="input-suffix">
             <input
               type="number"
@@ -3599,23 +3759,25 @@ function SettingsPage({
                 update("subscriptionIntervalHours", Number(e.target.value))
               }
             />
-            <span>小时</span>
+            <span>{t("小时")}</span>
           </div>
         </Setting>
       </section>
       {/* Changes wait for 保存: switching capture or the port restarts the
           core, so nothing applies while a value is half typed. */}
       {dirty && (
-        <div className="save-bar" role="region" aria-label="未保存的设置">
+        <div className="save-bar" role="region" aria-label={t("未保存的设置")}>
           <span>
-            {portInvalid ? "代理端口需在 1024–65535 之间" : "有未保存的更改"}
+            {portInvalid
+              ? t("代理端口需在 1024–65535 之间")
+              : t("有未保存的更改")}
           </span>
           <button
             className="button secondary"
             disabled={busy}
             onClick={() => setSettings(state.settings)}
           >
-            撤销
+            {t("撤销")}
           </button>
           <button
             className="button primary"
@@ -3623,11 +3785,11 @@ function SettingsPage({
             onClick={() =>
               void perform(
                 () => invoke("save_settings", { settings }),
-                "设置已保存",
+                t("设置已保存"),
               )
             }
           >
-            保存
+            {t("保存")}
           </button>
         </div>
       )}

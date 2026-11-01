@@ -32,7 +32,13 @@ pub async fn connect() -> Result<Stream> {
             Err(e) => return Err(e.into()),
         }
     }
-    anyhow::bail!("辅助服务忙，请稍后重试")
+    anyhow::bail!(
+        "{}",
+        clyntis_desktop_model::tr!(
+            "辅助服务忙，请稍后重试",
+            "The helper service is busy; try again shortly"
+        )
+    )
 }
 
 #[cfg(unix)]

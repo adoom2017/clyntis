@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use clyntis_desktop_model::protocol::FrameReader;
 use clyntis_desktop_model::protocol::{self, Request, Response, VERSION};
+use clyntis_desktop_model::tr;
 
 pub struct Client {
     stream: FrameReader<super::transport::Stream>,
@@ -11,7 +12,7 @@ impl Client {
             stream: FrameReader::new(
                 super::transport::connect()
                     .await
-                    .context("辅助服务不可用，请先安装或在系统设置中允许后台服务")?,
+                    .with_context(|| tr!("辅助服务不可用，请先安装或在系统设置中允许后台服务", "The helper service is unavailable; install it or allow it to run in the background in System Settings"))?,
             ),
         })
     }
@@ -19,7 +20,11 @@ impl Client {
         let mut client = Self::connect().await?;
         ensure!(
             client.is_current().await?,
-            "辅助服务尚未更新到当前构建，请重试启动以完成自动更新"
+            "{}",
+            tr!(
+                "辅助服务尚未更新到当前构建，请重试启动以完成自动更新",
+                "The helper service is not yet updated to this build; start again to finish the automatic update"
+            )
         );
         Ok(client)
     }
@@ -35,9 +40,9 @@ impl Client {
             protocol::read_frame(&mut self.stream),
         )
         .await??
-        .context("辅助服务已断开")?;
+        .with_context(|| tr!("辅助服务已断开", "The helper service disconnected"))?;
         let response: Response =
-            serde_json::from_str(&line).context("辅助服务响应不是有效的 JSON")?;
+            serde_json::from_str(&line).context("invalid helper service response JSON")?;
         if let Response::Error { message, .. } = &response {
             anyhow::bail!("{message}");
         }
@@ -50,7 +55,11 @@ impl Client {
         };
         ensure!(
             version == VERSION,
-            "辅助服务通信版本不匹配，请重试启动以完成自动更新"
+            "{}",
+            tr!(
+                "辅助服务通信版本不匹配，请重试启动以完成自动更新",
+                "The helper service protocol does not match; start again to finish the automatic update"
+            )
         );
         Ok(response)
     }
@@ -64,7 +73,8 @@ impl Client {
                 self.request(&Request::Ping { version: VERSION }).await?,
                 Response::Ok { .. }
             ),
-            "无效心跳响应"
+            "{}",
+            tr!("无效心跳响应", "Invalid heartbeat response")
         );
         Ok(())
     }
@@ -74,7 +84,11 @@ impl Client {
                 self.request(&Request::Stop { version: VERSION }).await?,
                 Response::Stopped { .. }
             ),
-            "服务未确认完成网络恢复"
+            "{}",
+            tr!(
+                "服务未确认完成网络恢复",
+                "The service did not confirm that the network was restored"
+            )
         );
         Ok(())
     }
@@ -83,7 +97,13 @@ impl Client {
 fn matches_build(response: Response) -> Result<bool> {
     match response {
         Response::Status { build, .. } => Ok(build.as_deref() == Some(protocol::SERVICE_BUILD)),
-        _ => anyhow::bail!("辅助服务没有返回版本信息"),
+        _ => anyhow::bail!(
+            "{}",
+            tr!(
+                "辅助服务没有返回版本信息",
+                "The helper service returned no version"
+            )
+        ),
     }
 }
 

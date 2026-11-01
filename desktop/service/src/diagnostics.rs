@@ -1,5 +1,6 @@
 //! Bounded, redacted stderr capture for privileged runners. Paths are selected
 //! by the service, never supplied by the client.
+use clyntis_desktop_model::tr;
 use std::{
     collections::VecDeque,
     io::Write,
@@ -57,7 +58,10 @@ impl Diagnostics {
                                 _ => {}
                             }
                         }
-                        self.record(&directory, "[过长日志已省略]");
+                        self.record(
+                            &directory,
+                            &tr!("[过长日志已省略]", "[overlong log omitted]"),
+                        );
                     } else {
                         self.record(&directory, String::from_utf8_lossy(&line).trim());
                     }

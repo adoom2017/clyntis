@@ -1,3 +1,4 @@
+use crate::tr;
 use crate::{CONFIG_LIMIT, atomic_write, now, private_dir, read_limited, settings::Settings};
 use anyhow::{Context, Result, ensure};
 use clyntis_config::{Config, ProxyKind};
@@ -65,7 +66,7 @@ impl Profile {
                 .as_ref()
                 .and_then(|s| reqwest::Url::parse(s).ok())
                 .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_else(|| "本地文件".into()),
+                .unwrap_or_else(|| tr!("本地文件", "Local file")),
             subscription: self.url.is_some(),
             encrypted: self.password.is_some(),
             pending: self.pending.is_some(),
@@ -104,8 +105,13 @@ impl Store {
     }
     pub fn get(&self, id: Uuid) -> Result<Profile> {
         let path = self.directory(id).join("profile.json");
-        serde_json::from_slice(&read_limited(&path, CONFIG_LIMIT * 3 + 65536)?)
-            .with_context(|| format!("配置文件不是有效的 JSON：{}", path.display()))
+        serde_json::from_slice(&read_limited(&path, CONFIG_LIMIT * 3 + 65536)?).with_context(|| {
+            tr!(
+                "配置文件不是有效的 JSON：{}",
+                "The profile file is not valid JSON: {}",
+                path.display()
+            )
+        })
     }
     pub fn save(&self, profile: &Profile) -> Result<()> {
         validate(&profile.yaml)?;
@@ -123,7 +129,11 @@ impl Store {
     ) -> Result<Profile> {
         ensure!(
             !name.trim().is_empty() && name.len() <= 256,
-            "配置名称不能为空且不能超过 256 字节"
+            "{}",
+            tr!(
+                "配置名称不能为空且不能超过 256 字节",
+                "The profile name must be 1–256 bytes"
+            )
         );
         let config = validate(&yaml)?;
         if let Some(url) = &url {
@@ -160,7 +170,13 @@ impl Store {
             return Ok(Settings::default());
         }
         let settings: Settings = serde_json::from_slice(&read_limited(&path, 65536)?)
-            .with_context(|| format!("设置文件不是有效的 JSON：{}", path.display()))?;
+            .with_context(|| {
+                tr!(
+                    "设置文件不是有效的 JSON：{}",
+                    "The settings file is not valid JSON: {}",
+                    path.display()
+                )
+            })?;
         settings.validate()?;
         Ok(settings)
     }
@@ -177,19 +193,28 @@ impl Store {
         if !path.exists() {
             return Ok(vec![]);
         }
-        serde_json::from_slice(&read_limited(&path, 1024 * 1024)?)
-            .with_context(|| format!("自定义规则文件不是有效的 JSON：{}", path.display()))
+        serde_json::from_slice(&read_limited(&path, 1024 * 1024)?).with_context(|| {
+            tr!(
+                "自定义规则文件不是有效的 JSON：{}",
+                "The custom rules file is not valid JSON: {}",
+                path.display()
+            )
+        })
     }
     pub fn save_custom_rules(&self, rules: &[String]) -> Result<()> {
         ensure!(
             rules.len() <= clyntis_config::custom::MAX_RULES,
-            "自定义规则不能超过 {} 条",
-            clyntis_config::custom::MAX_RULES
+            "{}",
+            tr!(
+                "自定义规则不能超过 {} 条",
+                "No more than {} custom rules",
+                clyntis_config::custom::MAX_RULES
+            )
         );
         let rules: Vec<String> = rules.iter().map(|r| r.trim().to_owned()).collect();
         for (i, rule) in rules.iter().enumerate() {
             clyntis_config::custom::validate(rule)
-                .with_context(|| format!("第 {} 条规则「{rule}」", i + 1))?;
+                .with_context(|| tr!("第 {} 条规则「{rule}」", "Rule {} “{rule}”", i + 1))?;
         }
         atomic_write(
             &self.root.join("custom-rules.json"),
@@ -201,8 +226,14 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
-        let id: Option<Uuid> = serde_json::from_slice(&read_limited(&path, 1024)?)
-            .with_context(|| format!("配置选择记录不是有效的 JSON：{}", path.display()))?;
+        let id: Option<Uuid> =
+            serde_json::from_slice(&read_limited(&path, 1024)?).with_context(|| {
+                tr!(
+                    "配置选择记录不是有效的 JSON：{}",
+                    "The selected-profile record is not valid JSON: {}",
+                    path.display()
+                )
+            })?;
         Ok(id.filter(|id| self.directory(*id).exists()))
     }
     pub fn select(&self, id: Option<Uuid>) -> Result<()> {
@@ -212,18 +243,28 @@ impl Store {
         atomic_write(&self.root.join("selected.json"), &serde_json::to_vec(&id)?)
     }
     pub fn import_file(&self, path: &Path, password: Option<&str>) -> Result<ImportResult> {
-        let source =
-            String::from_utf8(read_limited(path, CONFIG_LIMIT)?).context("配置不是 UTF-8 文本")?;
+        let source = String::from_utf8(read_limited(path, CONFIG_LIMIT)?)
+            .with_context(|| tr!("配置不是 UTF-8 文本", "The profile is not UTF-8 text"))?;
         let yaml = match password {
             Some(password) => decrypt_source(&source, password)?,
             None => {
-                ensure!(!looks_encrypted(&source), "配置已加密，需要密码");
+                ensure!(
+                    !looks_encrypted(&source),
+                    "{}",
+                    tr!(
+                        "配置已加密，需要密码",
+                        "The profile is encrypted and needs a password"
+                    )
+                );
                 source
             }
         };
         let (yaml, warnings) = crate::import::compatible_yaml(&yaml)?;
         let config = validate(&yaml)?;
-        let source = path.parent().context("无法读取配置目录")?.canonicalize()?;
+        let source = path
+            .parent()
+            .with_context(|| tr!("无法读取配置目录", "Cannot read the profile directory"))?
+            .canonicalize()?;
         let profile = self.create(
             path.file_stem()
                 .unwrap_or_default()
@@ -241,7 +282,14 @@ impl Store {
                     continue;
                 }
                 let file = file.canonicalize()?;
-                ensure!(file.starts_with(&source), "资源不能指向配置目录外部");
+                ensure!(
+                    file.starts_with(&source),
+                    "{}",
+                    tr!(
+                        "资源不能指向配置目录外部",
+                        "Resources cannot point outside the profile directory"
+                    )
+                );
                 atomic_write(
                     &self.runtime_dir(profile.id).join(relative),
                     &read_limited(&file, 128 * 1024 * 1024)?,
@@ -289,23 +337,40 @@ pub fn looks_encrypted(source: &str) -> bool {
 /// CFB has no authentication tag, so a wrong password yields garbage rather
 /// than an error; anything that is not a UTF-8 YAML mapping is reported as such.
 pub fn decrypt_source(source: &str, password: &str) -> Result<String> {
-    ensure!(!password.is_empty(), "密码不能为空");
+    ensure!(
+        !password.is_empty(),
+        "{}",
+        tr!("密码不能为空", "The password cannot be empty")
+    );
     let compact: Vec<u8> = source
         .bytes()
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
-    let failed = || anyhow::anyhow!("解密失败，请检查密码");
+    let failed = || {
+        anyhow::anyhow!(tr!(
+            "解密失败，请检查密码",
+            "Decryption failed; check the password"
+        ))
+    };
     let plaintext = clyntis_config::crypto::decrypt(&compact, password).map_err(|_| failed())?;
     let yaml = String::from_utf8(plaintext.to_vec()).map_err(|_| failed())?;
     ensure!(
         matches!(serde_yaml::from_str::<Value>(&yaml), Ok(Value::Mapping(_))),
-        "解密失败，请检查密码"
+        "{}",
+        tr!(
+            "解密失败，请检查密码",
+            "Decryption failed; check the password"
+        )
     );
     Ok(yaml)
 }
 
 pub fn encrypt_yaml(yaml: &str, password: &str) -> Result<String> {
-    ensure!(!password.is_empty(), "密码不能为空");
+    ensure!(
+        !password.is_empty(),
+        "{}",
+        tr!("密码不能为空", "The password cannot be empty")
+    );
     clyntis_config::crypto::encrypt(yaml.as_bytes(), password)
 }
 
@@ -316,7 +381,11 @@ pub fn subscription_yaml(source: &str, password: Option<&str>) -> Result<String>
         None => {
             ensure!(
                 !looks_encrypted(source),
-                "订阅内容已加密，请删除后重新添加并填写密码"
+                "{}",
+                tr!(
+                    "订阅内容已加密，请删除后重新添加并填写密码",
+                    "The subscription is encrypted; remove it and add it again with the password"
+                )
             );
             Ok(source.to_owned())
         }
@@ -340,7 +409,11 @@ pub fn resource_names(config: &Config) -> Vec<String> {
 pub fn safe_relative(path: &str) -> Result<PathBuf> {
     ensure!(
         path.len() <= 512 && !path.contains([':', '\\']),
-        "资源路径必须使用可移植的相对路径"
+        "{}",
+        tr!(
+            "资源路径必须使用可移植的相对路径",
+            "Resource paths must be portable relative paths"
+        )
     );
     let path = Path::new(path);
     ensure!(
@@ -348,18 +421,31 @@ pub fn safe_relative(path: &str) -> Result<PathBuf> {
             && path
                 .components()
                 .all(|part| matches!(part, Component::Normal(_) | Component::CurDir)),
-        "资源必须使用配置目录内的相对路径"
+        "{}",
+        tr!(
+            "资源必须使用配置目录内的相对路径",
+            "Resources must use relative paths inside the profile directory"
+        )
     );
     // The journals and application data may never be overwritten by a provider.
     ensure!(
         path.components()
             .all(|part| matches!(part, Component::CurDir)
                 || !part.as_os_str().to_string_lossy().starts_with('.')),
-        "资源路径不能包含隐藏文件"
+        "{}",
+        tr!(
+            "资源路径不能包含隐藏文件",
+            "Resource paths cannot contain hidden files"
+        )
     );
     let name = path
         .file_name()
-        .context("资源路径必须包含文件名")?
+        .with_context(|| {
+            tr!(
+                "资源路径必须包含文件名",
+                "Resource paths must include a file name"
+            )
+        })?
         .to_string_lossy();
     ensure!(
         !name.starts_with("clyntis-")
@@ -367,14 +453,23 @@ pub fn safe_relative(path: &str) -> Result<PathBuf> {
                 name.as_ref(),
                 "profile.json" | "settings.json" | "selected.json"
             ),
-        "资源路径与运行文件冲突"
+        "{}",
+        tr!(
+            "资源路径与运行文件冲突",
+            "The resource path conflicts with a runtime file"
+        )
     );
     Ok(path.to_owned())
 }
 
 pub fn validate(yaml: &str) -> Result<Config> {
-    ensure!(yaml.len() <= CONFIG_LIMIT, "配置超过 24 MiB");
-    let config = Config::parse(yaml.as_bytes()).context("配置校验失败")?;
+    ensure!(
+        yaml.len() <= CONFIG_LIMIT,
+        "{}",
+        tr!("配置超过 24 MiB", "The profile exceeds 24 MiB")
+    );
+    let config = Config::parse(yaml.as_bytes())
+        .with_context(|| tr!("配置校验失败", "Profile validation failed"))?;
     let unsupported: Vec<_> = config
         .proxies
         .iter()
@@ -388,8 +483,12 @@ pub fn validate(yaml: &str) -> Result<Config> {
         .collect();
     ensure!(
         unsupported.is_empty(),
-        "当前支持 VLESS、Hysteria2 和 Tailscale，以下节点协议未实现：{}",
-        unsupported.join("、")
+        "{}",
+        tr!(
+            "当前支持 VLESS、Hysteria2 和 Tailscale，以下节点协议未实现：{}",
+            "Only VLESS, Hysteria2 and Tailscale are supported; these node protocols are not implemented: {}",
+            unsupported.join(if crate::i18n::english() { ", " } else { "、" })
+        )
     );
     for provider in config.rule_providers.values() {
         if !provider.path.is_empty() {
@@ -412,7 +511,9 @@ pub fn runtime_yaml(
     settings.validate()?;
     let yaml = clyntis_config::custom::apply(&profile.yaml, custom)?.yaml;
     let mut document: Value = serde_yaml::from_str(&yaml)?;
-    let map = document.as_mapping_mut().context("配置必须是 YAML 对象")?;
+    let map = document
+        .as_mapping_mut()
+        .with_context(|| tr!("配置必须是 YAML 对象", "The profile must be a YAML mapping"))?;
     settings.overrides.apply_to(map)?;
     for (key, value) in [
         ("port", Value::from(0)),
@@ -458,18 +559,24 @@ fn nested<'a>(map: &'a mut Mapping, key: &str) -> Result<&'a mut Mapping> {
     map.entry(Value::from(key))
         .or_insert(Value::Mapping(Mapping::new()))
         .as_mapping_mut()
-        .context("配置项必须是对象")
+        .with_context(|| tr!("配置项必须是对象", "The setting must be a mapping"))
 }
 
 pub fn subscription_url(url: &str) -> Result<reqwest::Url> {
-    let url = reqwest::Url::parse(url).context("订阅 URL 无效")?;
+    let url = reqwest::Url::parse(url)
+        .with_context(|| tr!("订阅 URL 无效", "Invalid subscription URL"))?;
     ensure!(
         url.scheme() == "https" && url.host_str().is_some(),
-        "订阅需要使用 HTTPS URL"
+        "{}",
+        tr!("订阅需要使用 HTTPS URL", "Subscriptions need an HTTPS URL")
     );
     ensure!(
         url.username().is_empty() && url.password().is_none(),
-        "请将订阅令牌放在 URL 路径或查询参数中"
+        "{}",
+        tr!(
+            "请将订阅令牌放在 URL 路径或查询参数中",
+            "Put the subscription token in the URL path or query"
+        )
     );
     Ok(url)
 }
@@ -489,32 +596,44 @@ pub async fn download_source(url: &str) -> Result<String> {
         .user_agent("Clyntis-Desktop/0.1")
         .build()?;
     // Do not return reqwest errors verbatim: they contain private subscription URLs.
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| anyhow::anyhow!("订阅下载失败，请检查网络和 URL"))?;
+    let mut response = client.get(url).send().await.map_err(|_| {
+        anyhow::anyhow!(tr!(
+            "订阅下载失败，请检查网络和 URL",
+            "The subscription download failed; check the network and URL"
+        ))
+    })?;
     ensure!(
         response.status().is_success(),
-        "订阅服务器返回 HTTP {}",
-        response.status().as_u16()
+        "{}",
+        tr!(
+            "订阅服务器返回 HTTP {}",
+            "The subscription server returned HTTP {}",
+            response.status().as_u16()
+        )
     );
     ensure!(
         response
             .content_length()
             .is_none_or(|n| n <= CONFIG_LIMIT as u64),
-        "订阅超过 24 MiB"
+        "{}",
+        tr!("订阅超过 24 MiB", "The subscription exceeds 24 MiB")
     );
     let mut data = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| anyhow::anyhow!("订阅下载中断"))?
-    {
-        ensure!(data.len() + chunk.len() <= CONFIG_LIMIT, "订阅超过 24 MiB");
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        anyhow::anyhow!(tr!(
+            "订阅下载中断",
+            "The subscription download was interrupted"
+        ))
+    })? {
+        ensure!(
+            data.len() + chunk.len() <= CONFIG_LIMIT,
+            "{}",
+            tr!("订阅超过 24 MiB", "The subscription exceeds 24 MiB")
+        );
         data.extend_from_slice(&chunk);
     }
-    let yaml = String::from_utf8(data).context("订阅不是 UTF-8 YAML")?;
+    let yaml = String::from_utf8(data)
+        .with_context(|| tr!("订阅不是 UTF-8 YAML", "The subscription is not UTF-8 YAML"))?;
     Ok(yaml)
 }
 

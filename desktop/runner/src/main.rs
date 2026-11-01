@@ -43,11 +43,13 @@ async fn run() -> Result<()> {
         version,
         yaml,
         system_proxy_port,
+        language,
         ..
-    } = serde_json::from_str(&first).context("内核启动请求不是有效的 JSON")?
+    } = serde_json::from_str(&first).context("invalid start request JSON")?
     else {
         anyhow::bail!("expected start");
     };
+    clyntis_desktop_model::i18n::set(language.as_deref().unwrap_or("zh"));
     ensure!(version == VERSION, "IPC version mismatch");
     let mut config = validate(&yaml)?;
     config.directory = directory.clone();

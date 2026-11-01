@@ -1,3 +1,4 @@
+pub mod i18n;
 pub mod import;
 pub mod profiles;
 pub mod protocol;
@@ -37,7 +38,11 @@ pub fn read_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
     fs::File::open(path)?
         .take(limit as u64 + 1)
         .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= limit, "文件超过大小限制");
+    ensure!(
+        bytes.len() <= limit,
+        "{}",
+        tr!("文件超过大小限制", "The file exceeds the size limit")
+    );
     Ok(bytes)
 }
 
@@ -61,11 +66,16 @@ pub fn redact(text: &str) -> String {
     static SECRET: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#"(?i)((?:"|')?(?:password|secret|token|authorization|uuid)(?:"|')?)(\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,}]+)"#).unwrap()
     });
-    let text = BEARER.replace_all(text, "Bearer [已隐藏]");
+    let (hidden, url, uuid) = if i18n::english() {
+        ("[hidden]", "[URL hidden]", "[UUID hidden]")
+    } else {
+        ("[已隐藏]", "[URL 已隐藏]", "[UUID 已隐藏]")
+    };
+    let text = BEARER.replace_all(text, format!("Bearer {hidden}"));
     SECRET
         .replace_all(
-            &UUID.replace_all(&URL.replace_all(&text, "[URL 已隐藏]"), "[UUID 已隐藏]"),
-            "$1$2[已隐藏]",
+            &UUID.replace_all(&URL.replace_all(&text, url), uuid),
+            format!("$1$2{hidden}"),
         )
         .into_owned()
 }

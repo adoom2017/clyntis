@@ -1,6 +1,7 @@
 //! A write-ahead journal records exactly the settings this application owns.
 use anyhow::Context;
 use anyhow::{Result, ensure};
+use clyntis_desktop_model::tr;
 use clyntis_desktop_model::{atomic_write, read_limited};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
@@ -24,8 +25,13 @@ pub struct ProxyGuard {
 impl ProxyGuard {
     pub fn recover(path: PathBuf) -> Result<Self> {
         let journal = if path.exists() {
-            serde_json::from_slice(&read_limited(&path, 1024 * 1024)?)
-                .with_context(|| format!("系统代理恢复记录不是有效的 JSON：{}", path.display()))?
+            serde_json::from_slice(&read_limited(&path, 1024 * 1024)?).with_context(|| {
+                tr!(
+                    "系统代理恢复记录不是有效的 JSON：{}",
+                    "The system proxy recovery record is not valid JSON: {}",
+                    path.display()
+                )
+            })?
         } else {
             Journal::default()
         };
@@ -76,8 +82,9 @@ impl ProxyGuard {
                 Ok(conflict) => {
                     self.journal.entries.remove(&service);
                     if conflict {
-                        errors.push(format!(
-                            "{service} 的代理设置被其他程序修改，已保留外部修改"
+                        errors.push(tr!(
+                            "{service} 的代理设置被其他程序修改，已保留外部修改",
+                            "Another program changed the proxy settings of {service}; kept its changes"
                         ));
                     }
                 }
@@ -144,21 +151,25 @@ fn native(action: &str, service: Option<&str>, value: Option<&Snapshot>) -> Resu
     let output = child.wait_with_output()?;
     ensure!(
         output.status.success(),
-        "系统代理操作失败：{}",
-        String::from_utf8_lossy(&output.stderr)
+        "{}",
+        tr!(
+            "系统代理操作失败：{}",
+            "The system proxy operation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
     );
     Ok(String::from_utf8(output.stdout)?)
 }
 #[cfg(target_os = "macos")]
 fn services() -> Result<Vec<String>> {
     serde_json::from_str(&native("proxy-list", None, None)?)
-        .context("系统代理辅助程序 proxy-list 未返回有效的 JSON")
+        .context("proxy-list returned invalid JSON")
 }
 #[cfg(target_os = "macos")]
 fn snapshot(service: &str) -> Result<Snapshot> {
     Ok(Snapshot(
         serde_json::from_str(&native("proxy-read", Some(service), None)?)
-            .context("系统代理辅助程序 proxy-read 未返回有效的 JSON")?,
+            .context("proxy-read returned invalid JSON")?,
     ))
 }
 #[cfg(target_os = "macos")]
@@ -209,8 +220,12 @@ fn powershell(script: &str, input: Option<&str>) -> Result<String> {
     let result = child.wait_with_output()?;
     ensure!(
         result.status.success(),
-        "Windows 系统代理操作失败：{}",
-        String::from_utf8_lossy(&result.stderr)
+        "{}",
+        tr!(
+            "Windows 系统代理操作失败：{}",
+            "The Windows system proxy operation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )
     );
     Ok(String::from_utf8(result.stdout)?
         .trim()
@@ -230,9 +245,9 @@ fn snapshot(_: &str) -> Result<Snapshot> {
         ),
         None,
     )?;
-    Ok(Snapshot(
-        serde_json::from_str(&value).context("Windows 系统代理读取结果不是有效的 JSON")?,
-    ))
+    Ok(Snapshot(serde_json::from_str(&value).context(
+        "Windows system proxy read returned invalid JSON",
+    )?))
 }
 #[cfg(windows)]
 fn desired(original: &Snapshot, port: u16) -> Snapshot {

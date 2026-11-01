@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[macro_use(tr)]
+extern crate clyntis_desktop_model;
+
 mod app;
 mod engine;
 mod keychain;
@@ -11,10 +14,42 @@ mod windows_diagnostics;
 
 use app::Desktop;
 use tauri::{
-    Manager,
+    Manager, State, Wry,
     menu::{Menu, MenuItem},
     tray::{TrayIconBuilder, TrayIconEvent},
 };
+
+/// Tray menu entries: id, Chinese and English label.
+const TRAY_ITEMS: [(&str, &str, &str); 6] = [
+    ("show", "显示 Clyntis", "Show Clyntis"),
+    ("toggle", "启动 / 停止", "Start / Stop"),
+    ("rule", "规则模式", "Rule mode"),
+    ("global", "全局模式", "Global mode"),
+    ("direct", "直连模式", "Direct mode"),
+    ("quit", "退出", "Quit"),
+];
+
+/// The tray menu items, relabelled when the interface language changes.
+struct TrayLabels(Vec<MenuItem<Wry>>);
+
+fn tray_label(index: usize) -> &'static str {
+    let (_, zh, en) = TRAY_ITEMS[index];
+    if clyntis_desktop_model::i18n::english() {
+        en
+    } else {
+        zh
+    }
+}
+
+/// The interface language in effect (`zh` or `en`): the window resolves
+/// "follow the system" and reports it here for the tray and messages.
+#[tauri::command]
+fn set_language(labels: State<'_, TrayLabels>, language: String) {
+    clyntis_desktop_model::i18n::set(&language);
+    for (index, item) in labels.0.iter().enumerate() {
+        let _ = item.set_text(tray_label(index));
+    }
+}
 
 #[cfg(target_os = "macos")]
 const TRAY_ICON: &[u8] = include_bytes!("../icons/clyntis-v3/tray-template.png");
@@ -73,22 +108,27 @@ fn main() {
             app::export_logs,
             app::install_service,
             app::uninstall_service,
-            app::quit
+            app::quit,
+            set_language
         ])
         .setup(|app| {
             let desktop = Desktop::new(app.handle().clone(), app.path().app_data_dir()?)?;
+            // Until the window reports the system language, a chosen one applies.
+            clyntis_desktop_model::i18n::set(&desktop.language());
             app.manage(desktop);
-            let menu = Menu::with_items(
-                app,
-                &[
-                    &MenuItem::with_id(app, "show", "显示 Clyntis", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "toggle", "启动 / 停止", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "rule", "规则模式", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "global", "全局模式", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "direct", "直连模式", true, None::<&str>)?,
-                    &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
-                ],
-            )?;
+            let items = TRAY_ITEMS
+                .iter()
+                .enumerate()
+                .map(|(index, (id, _, _))| {
+                    MenuItem::with_id(app, *id, tray_label(index), true, None::<&str>)
+                })
+                .collect::<tauri::Result<Vec<_>>>()?;
+            let entries: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = items
+                .iter()
+                .map(|item| item as &dyn tauri::menu::IsMenuItem<Wry>)
+                .collect();
+            let menu = Menu::with_items(app, &entries)?;
+            app.manage(TrayLabels(items));
             let tray_icon = tauri::image::Image::from_bytes(TRAY_ICON)?;
             #[allow(unused_variables)] // Only the macOS icon is animated.
             let tray = TrayIconBuilder::new()

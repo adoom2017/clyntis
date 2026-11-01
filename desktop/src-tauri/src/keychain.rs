@@ -10,9 +10,12 @@ pub fn load() -> Result<Option<CosCredentials>> {
     let Some(bytes) = platform::read()? else {
         return Ok(None);
     };
-    Ok(Some(
-        serde_json::from_slice(&bytes).context("钥匙串中的 COS 密钥无法读取，请重新填写")?,
-    ))
+    Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+        tr!(
+            "钥匙串中的 COS 密钥无法读取，请重新填写",
+            "The COS keys in the keychain cannot be read; enter them again"
+        )
+    })?))
 }
 
 pub fn store(credentials: &CosCredentials) -> Result<()> {
@@ -36,15 +39,19 @@ mod platform {
         match passwords::get_generic_password(SERVICE, ACCOUNT) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.code() == NOT_FOUND => Ok(None),
-            Err(error) => Err(error).context("无法读取钥匙串"),
+            Err(error) => {
+                Err(error).with_context(|| tr!("无法读取钥匙串", "Cannot read the keychain"))
+            }
         }
     }
     pub fn write(bytes: &[u8]) -> Result<()> {
-        passwords::set_generic_password(SERVICE, ACCOUNT, bytes).context("无法写入钥匙串")
+        passwords::set_generic_password(SERVICE, ACCOUNT, bytes)
+            .with_context(|| tr!("无法写入钥匙串", "Cannot write to the keychain"))
     }
     pub fn delete() -> Result<()> {
         match passwords::delete_generic_password(SERVICE, ACCOUNT) {
-            Err(error) if error.code() != NOT_FOUND => Err(error).context("无法删除钥匙串项目"),
+            Err(error) if error.code() != NOT_FOUND => Err(error)
+                .with_context(|| tr!("无法删除钥匙串项目", "Cannot delete the keychain item")),
             _ => Ok(()),
         }
     }
@@ -76,7 +83,14 @@ mod platform {
                 if GetLastError() == ERROR_NOT_FOUND {
                     return Ok(None);
                 }
-                bail!("无法读取 Windows 凭据管理器（{}）", GetLastError());
+                bail!(
+                    "{}",
+                    tr!(
+                        "无法读取 Windows 凭据管理器（{}）",
+                        "Cannot read Windows Credential Manager ({})",
+                        GetLastError()
+                    )
+                );
             }
             let blob = std::slice::from_raw_parts(
                 (*credential).CredentialBlob,
@@ -100,9 +114,16 @@ mod platform {
         };
         // SAFETY: every pointer in `credential` outlives the call.
         if unsafe { CredWriteW(&credential, 0) } == 0 {
-            bail!("无法写入 Windows 凭据管理器（{}）", unsafe {
-                GetLastError()
-            });
+            // SAFETY: GetLastError only reads this thread's last error.
+            let code = unsafe { GetLastError() };
+            bail!(
+                "{}",
+                tr!(
+                    "无法写入 Windows 凭据管理器（{}）",
+                    "Cannot write to Windows Credential Manager ({})",
+                    code
+                )
+            );
         }
         Ok(())
     }
@@ -113,7 +134,14 @@ mod platform {
             if CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) == 0
                 && GetLastError() != ERROR_NOT_FOUND
             {
-                bail!("无法删除 Windows 凭据（{}）", GetLastError());
+                bail!(
+                    "{}",
+                    tr!(
+                        "无法删除 Windows 凭据（{}）",
+                        "Cannot delete the Windows credential ({})",
+                        GetLastError()
+                    )
+                );
             }
         }
         Ok(())
@@ -127,7 +155,13 @@ mod platform {
         Ok(None)
     }
     pub fn write(_: &[u8]) -> Result<()> {
-        bail!("此平台不支持保存 COS 密钥")
+        bail!(
+            "{}",
+            tr!(
+                "此平台不支持保存 COS 密钥",
+                "This platform cannot store COS keys"
+            )
+        )
     }
     pub fn delete() -> Result<()> {
         Ok(())

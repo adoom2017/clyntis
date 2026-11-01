@@ -1,3 +1,4 @@
+use crate::tr;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,8 @@ pub struct Settings {
     pub auto_dns: bool,
     pub tun_interface: Option<String>,
     pub theme: String,
+    /// Interface language: `system`, `zh` or `en`.
+    pub language: String,
     pub launch_at_login: bool,
     pub auto_connect: bool,
     pub subscription_interval_hours: u16,
@@ -34,6 +37,7 @@ impl Default for Settings {
             auto_dns: true,
             tun_interface: None,
             theme: "system".into(),
+            language: "system".into(),
             launch_at_login: false,
             auto_connect: false,
             subscription_interval_hours: 24,
@@ -43,20 +47,38 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.mixed_port >= 1024, "代理端口必须在 1024–65535 之间");
+        ensure!(
+            self.mixed_port >= 1024,
+            "{}",
+            tr!(
+                "代理端口必须在 1024–65535 之间",
+                "The proxy port must be between 1024 and 65535"
+            )
+        );
         ensure!(
             ["light", "dark", "system"].contains(&self.theme.as_str()),
-            "无效主题"
+            "{}",
+            tr!("无效主题", "Invalid theme")
+        );
+        ensure!(
+            ["system", "zh", "en"].contains(&self.language.as_str()),
+            "{}",
+            tr!("无效语言", "Invalid language")
         );
         ensure!(
             self.subscription_interval_hours <= 720,
-            "订阅更新间隔不能超过 720 小时"
+            "{}",
+            tr!(
+                "订阅更新间隔不能超过 720 小时",
+                "The subscription update interval cannot exceed 720 hours"
+            )
         );
         ensure!(
             self.tun_interface
                 .as_ref()
                 .is_none_or(|s| s.len() <= 64 && !s.contains('\0')),
-            "无效网络接口"
+            "{}",
+            tr!("无效网络接口", "Invalid network interface")
         );
         self.overrides.validate()
     }

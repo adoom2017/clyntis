@@ -58,13 +58,19 @@ impl Controller {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request.send().await.context("内核控制接口无法连接")?;
+        let response = request
+            .send()
+            .await
+            .with_context(|| tr!("内核控制接口无法连接", "Cannot reach the core controller"))?;
         let status = response.status();
         let value: serde_json::Value = response.json().await?;
         ensure!(
             status.is_success(),
             "{}",
-            value["message"].as_str().unwrap_or("内核请求失败")
+            value["message"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| tr!("内核请求失败", "The core request failed"))
         );
         Ok(value)
     }
@@ -94,8 +100,9 @@ pub fn spawn_prefetch(app: tauri::AppHandle, logs: Logs, store: Store, profile: 
                 &app,
                 &logs,
                 "warning",
-                &clyntis_desktop_model::redact(&format!(
-                    "路由资源预下载失败，将在连接时重试：{error:#}"
+                &clyntis_desktop_model::redact(&tr!(
+                    "路由资源预下载失败，将在连接时重试：{error:#}",
+                    "Prefetching routing resources failed; they will be retried when connecting: {error:#}"
                 )),
             );
         }
@@ -129,6 +136,7 @@ impl Engine {
             profile_id: profile.id.to_string(),
             system_proxy_port: (cfg!(windows) && settings.capture == Capture::System)
                 .then_some(settings.mixed_port),
+            language: Some(clyntis_desktop_model::i18n::current().into()),
         };
         let mut process = None;
         let mut service = None;
@@ -143,7 +151,14 @@ impl Engine {
                 }
                 let bytes = clyntis_desktop_model::read_limited(&path, 128 * 1024 * 1024)?;
                 total += bytes.len();
-                ensure!(total <= 128 * 1024 * 1024, "路由资源总量超过 128 MiB");
+                ensure!(
+                    total <= 128 * 1024 * 1024,
+                    "{}",
+                    tr!(
+                        "路由资源总量超过 128 MiB",
+                        "Routing resources exceed 128 MiB in total"
+                    )
+                );
                 for chunk in bytes.chunks(2 * 1024 * 1024) {
                     connection
                         .request(&Request::Resource {
@@ -170,9 +185,12 @@ impl Engine {
                 .kill_on_drop(true);
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let mut child = command
-                .spawn()
-                .context("无法启动内核，请重新构建或安装完整桌面应用")?;
+            let mut child = command.spawn().with_context(|| {
+                tr!(
+                    "无法启动内核，请重新构建或安装完整桌面应用",
+                    "Cannot start the core; rebuild or reinstall the full desktop app"
+                )
+            })?;
             let mut input = child.stdin.take().context("runner stdin missing")?;
             let mut output =
                 protocol::FrameReader::new(child.stdout.take().context("runner stdout missing")?);
@@ -199,13 +217,25 @@ impl Engine {
                 });
             }
             protocol::write_frame(&mut input, &request).await?;
-            let first =
-                tokio::time::timeout(Duration::from_secs(110), protocol::read_frame(&mut output))
-                    .await
-                    .context("内核启动超时，请检查订阅资源和网络")??
-                    .context("内核在启动完成前退出，请查看日志")?;
+            let first = tokio::time::timeout(
+                Duration::from_secs(110),
+                protocol::read_frame(&mut output),
+            )
+            .await
+            .with_context(|| {
+                tr!(
+                    "内核启动超时，请检查订阅资源和网络",
+                    "The core timed out starting; check the subscription resources and the network"
+                )
+            })??
+            .with_context(|| {
+                tr!(
+                    "内核在启动完成前退出，请查看日志",
+                    "The core exited before it finished starting; see the logs"
+                )
+            })?;
             let address =
-                ready(serde_json::from_str(&first).context("内核启动响应不是有效的 JSON")?)?;
+                ready(serde_json::from_str(&first).context("invalid core start response JSON")?)?;
             process = Some(Process {
                 child,
                 input,
@@ -290,7 +320,11 @@ impl Engine {
         if let Some(process) = &mut self.process {
             ensure!(
                 process.child.try_wait()?.is_none(),
-                "内核进程异常退出，请查看日志"
+                "{}",
+                tr!(
+                    "内核进程异常退出，请查看日志",
+                    "The core process exited unexpectedly; see the logs"
+                )
             );
         }
         if let Some(error) = self.heartbeat_error.lock().unwrap().clone() {
@@ -328,12 +362,15 @@ impl Engine {
                         .and_then(|s| serde_json::from_str::<Response>(&s).ok());
                     errors.push(match message {
                         Some(Response::Error { message, .. }) => message,
-                        _ => "内核退出失败，请检查网络恢复状态".into(),
+                        _ => tr!(
+                            "内核退出失败，请检查网络恢复状态",
+                            "The core failed to exit; check that the network was restored"
+                        ),
                     });
                 }
                 _ => {
                     let _ = process.child.kill().await;
-                    errors.push("内核停止超时，已终止进程；下次启动会尝试恢复系统代理".into());
+                    errors.push(tr!("内核停止超时，已终止进程；下次启动会尝试恢复系统代理", "The core timed out stopping and was killed; the next start will try to restore the system proxy"));
                 }
             }
         }
@@ -403,11 +440,15 @@ fn ready(response: Response) -> Result<std::net::SocketAddr> {
         } => {
             ensure!(
                 version == VERSION && controller.ip().is_loopback(),
-                "无效内核握手"
+                "{}",
+                tr!("无效内核握手", "Invalid core handshake")
             );
             Ok(controller)
         }
         Response::Error { message, .. } => anyhow::bail!("{message}"),
-        _ => anyhow::bail!("内核未完成启动"),
+        _ => anyhow::bail!(
+            "{}",
+            tr!("内核未完成启动", "The core did not finish starting")
+        ),
     }
 }

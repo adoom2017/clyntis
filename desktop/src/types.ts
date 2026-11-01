@@ -1,3 +1,5 @@
+import { t, tx, type Language } from "./i18n";
+
 export type Capture = "manual" | "system" | "tun";
 export type Mode = "rule" | "global" | "direct";
 export type Status =
@@ -14,6 +16,7 @@ export interface Settings {
   autoDns: boolean;
   tunInterface: string | null;
   theme: "system" | "light" | "dark";
+  language: Language;
   launchAtLogin: boolean;
   autoConnect: boolean;
   subscriptionIntervalHours: number;
@@ -50,17 +53,23 @@ export const adblockPresets = [
   {
     id: "awavenue",
     name: "AWAvenue-Ads",
-    description: "国内 App 广告接口，约 1,000 条，误杀少",
+    get description() {
+      return t("国内 App 广告接口，约 1,000 条，误杀少");
+    },
   },
   {
     id: "anti-ad",
     name: "anti-AD",
-    description: "覆盖面广，以国内为主，约 10 万条",
+    get description() {
+      return t("覆盖面广，以国内为主，约 10 万条");
+    },
   },
   {
     id: "adguard-dns",
     name: "AdGuard DNS filter",
-    description: "偏海外的广告与追踪，约 18 万条",
+    get description() {
+      return t("偏海外的广告与追踪，约 18 万条");
+    },
   },
 ] as const;
 export const defaultAdblock: AdblockSettings = {
@@ -193,15 +202,24 @@ export interface TailscalePeer {
   exit_node: boolean;
 }
 export const tailscaleStateText: Record<TailscaleStatus["state"], string> = {
-  connecting: "连接中",
-  running: "已连接",
-  error: "连接失败",
+  get connecting() {
+    return t("连接中");
+  },
+  get running() {
+    return t("已连接");
+  },
+  get error() {
+    return t("连接失败");
+  },
 };
 export function peerPathText(peer: TailscalePeer): string {
   if (peer.path === "direct")
-    return peer.rtt_ms == null ? "直连" : `直连 ${peer.rtt_ms} ms`;
-  if (peer.path === "derp") return peer.derp ? `中继 ${peer.derp}` : "中继";
-  return peer.online ? "空闲" : "离线";
+    return peer.rtt_ms == null
+      ? t("直连")
+      : t("直连 {rtt} ms", { rtt: peer.rtt_ms });
+  if (peer.path === "derp")
+    return peer.derp ? t("中继 {region}", { region: peer.derp }) : t("中继");
+  return peer.online ? t("空闲") : t("离线");
 }
 /** One line for node cards: what matters most for this kind of node. */
 export function nodeSummary(status: NodeStatus | undefined, type?: string) {
@@ -211,11 +229,13 @@ export function nodeSummary(status: NodeStatus | undefined, type?: string) {
     if (ts.state !== "running") return tailscaleStateText[ts.state];
     const online = ts.peers.filter((p) => p.online).length;
     const direct = ts.peers.filter((p) => p.path === "direct").length;
-    return `已连接 · ${online} 台在线${direct ? ` · ${direct} 直连` : ""}`;
+    const summary = t("已连接 · {online} 台在线", { online });
+    return direct ? `${summary} · ${t("{direct} 直连", { direct })}` : summary;
   }
   const parts = [status.type];
   if (status.server) parts.push(status.server);
-  if (status.connections) parts.push(`${status.connections} 连接`);
+  if (status.connections)
+    parts.push(t("{count} 连接", { count: status.connections }));
   return parts.join(" · ");
 }
 export interface Connection {
@@ -292,18 +312,60 @@ export interface DnsLeakTest {
 }
 export const ruleTypes: { type: string; label: string; placeholder: string }[] =
   [
-    { type: "DOMAIN-SUFFIX", label: "域名后缀", placeholder: "example.com" },
-    { type: "DOMAIN", label: "完整域名", placeholder: "www.example.com" },
-    { type: "DOMAIN-KEYWORD", label: "域名关键字", placeholder: "example" },
-    { type: "IP-CIDR", label: "IPv4 段", placeholder: "10.0.0.0/8" },
-    { type: "IP-CIDR6", label: "IPv6 段", placeholder: "2001:db8::/32" },
+    {
+      type: "DOMAIN-SUFFIX",
+      get label() {
+        return t("域名后缀");
+      },
+      placeholder: "example.com",
+    },
+    {
+      type: "DOMAIN",
+      get label() {
+        return t("完整域名");
+      },
+      placeholder: "www.example.com",
+    },
+    {
+      type: "DOMAIN-KEYWORD",
+      get label() {
+        return t("域名关键字");
+      },
+      placeholder: "example",
+    },
+    {
+      type: "IP-CIDR",
+      get label() {
+        return t("IPv4 段");
+      },
+      placeholder: "10.0.0.0/8",
+    },
+    {
+      type: "IP-CIDR6",
+      get label() {
+        return t("IPv6 段");
+      },
+      placeholder: "2001:db8::/32",
+    },
     { type: "GEOSITE", label: "GeoSite", placeholder: "cn" },
     { type: "GEOIP", label: "GeoIP", placeholder: "CN" },
-    { type: "DST-PORT", label: "目标端口", placeholder: "443 或 8000-9000" },
+    {
+      type: "DST-PORT",
+      get label() {
+        return t("目标端口");
+      },
+      get placeholder() {
+        return t("443 或 8000-9000");
+      },
+    },
     {
       type: "NETWORK-NAME",
-      label: "所在网络",
-      placeholder: "配置 networks 中的名称，如 home",
+      get label() {
+        return t("所在网络");
+      },
+      get placeholder() {
+        return t("配置 networks 中的名称，如 home");
+      },
     },
   ];
 /** Splits `TYPE,VALUE,TARGET[,no-resolve]` for display; logical rules stay whole. */
@@ -335,6 +397,7 @@ export const initial: Snapshot = {
     autoDns: true,
     tunInterface: null,
     theme: "system",
+    language: "system",
     launchAtLogin: false,
     autoConnect: false,
     subscriptionIntervalHours: 24,
@@ -342,22 +405,46 @@ export const initial: Snapshot = {
   },
 };
 export const statusText: Record<Status, string> = {
-  stopped: "未连接",
-  starting: "正在连接",
-  running: "已连接",
-  stopping: "正在停止",
-  recovering: "正在恢复",
-  failed: "连接失败",
+  get stopped() {
+    return t("未连接");
+  },
+  get starting() {
+    return t("正在连接");
+  },
+  get running() {
+    return t("已连接");
+  },
+  get stopping() {
+    return t("正在停止");
+  },
+  get recovering() {
+    return t("正在恢复");
+  },
+  get failed() {
+    return t("连接失败");
+  },
 };
 export const modeText: Record<Mode, string> = {
-  rule: "规则",
-  global: "全局",
-  direct: "直连",
+  get rule() {
+    return tx("mode", "规则");
+  },
+  get global() {
+    return t("全局");
+  },
+  get direct() {
+    return t("直连");
+  },
 };
 export const captureText: Record<Capture, string> = {
-  manual: "手动代理",
-  system: "系统代理",
-  tun: "TUN 模式",
+  get manual() {
+    return t("手动代理");
+  },
+  get system() {
+    return t("系统代理");
+  },
+  get tun() {
+    return t("TUN 模式");
+  },
 };
 export function bytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";

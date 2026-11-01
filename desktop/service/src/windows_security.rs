@@ -1,5 +1,6 @@
 //! Windows-only installation policy. The installer uses the same embedded script.
 use anyhow::{Context, Result, ensure};
+use clyntis_desktop_model::tr;
 use std::{
     path::Path,
     process::{Command, Stdio},
@@ -59,7 +60,12 @@ fn run(directory: &Path, action: &str) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("无法检查 Windows 安装目录权限")?;
+        .with_context(|| {
+            tr!(
+                "无法检查 Windows 安装目录权限",
+                "Cannot check the Windows installation folder permissions"
+            )
+        })?;
     let mut stderr = child.stderr.take().context("missing PowerShell stderr")?;
     let reader = std::thread::spawn(move || {
         let mut text = Vec::new();
@@ -74,15 +80,25 @@ fn run(directory: &Path, action: &str) -> Result<()> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("Windows 安装目录权限检查超时，请检查系统 PowerShell 是否可用");
+            anyhow::bail!(
+                "{}",
+                tr!(
+                    "Windows 安装目录权限检查超时，请检查系统 PowerShell 是否可用",
+                    "The Windows installation folder permission check timed out; check that PowerShell works"
+                )
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     let stderr = reader.join().unwrap_or_default();
     ensure!(
         status.success(),
-        "Windows 安装目录权限检查失败：{}",
-        String::from_utf8_lossy(&stderr).trim()
+        "{}",
+        tr!(
+            "Windows 安装目录权限检查失败：{}",
+            "The Windows installation folder permission check failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )
     );
     Ok(())
 }
@@ -131,11 +147,17 @@ pub fn stopped_error(exit_code: windows_service::service::ServiceExitCode) -> an
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
     let detail = if detail.trim().is_empty() {
-        "请查看安装目录中的 clyntis-service.log 和 Windows 系统服务事件".into()
+        tr!(
+            "请查看安装目录中的 clyntis-service.log 和 Windows 系统服务事件",
+            "See clyntis-service.log in the installation folder and the Windows service events"
+        )
     } else {
         clyntis_desktop_model::redact(detail.trim())
     };
-    anyhow::anyhow!("Windows 网络辅助服务启动失败（{exit_code:?}）：{detail}")
+    anyhow::anyhow!(tr!(
+        "Windows 网络辅助服务启动失败（{exit_code:?}）：{detail}",
+        "The Windows network helper service failed to start ({exit_code:?}): {detail}"
+    ))
 }
 
 pub fn require_service_alive(status: &windows_service::service::ServiceStatus) -> Result<()> {

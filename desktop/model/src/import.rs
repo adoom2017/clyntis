@@ -1,5 +1,6 @@
 //! Lossy import is explicit and confined to newly created profiles. Keep raw YAML
 //! values: serializing Config would discard credentials and provider URLs.
+use crate::tr;
 use anyhow::{Context, Result, ensure};
 use clyntis_config::{Config, Group, Proxy, ProxyKind, RuleProvider};
 use serde::{Serialize, de::DeserializeOwned};
@@ -69,7 +70,7 @@ fn known_fields<T: DeserializeOwned>(
                 warn(
                     warnings,
                     format!("{location}.{key}"),
-                    "不支持的字段，已跳过",
+                    &tr!("不支持的字段，已跳过", "Unsupported field, skipped"),
                 );
             }
         }
@@ -146,7 +147,7 @@ fn settings(
                     warn(
                         warnings,
                         format!("{location}[{i}]"),
-                        "不兼容的列表项，已跳过",
+                        &tr!("不兼容的列表项，已跳过", "Incompatible list item, skipped"),
                     );
                 }
             }
@@ -157,17 +158,25 @@ fn settings(
                 .map(|k| k.as_str().unwrap_or("?"))
                 .collect::<Vec<_>>()
                 .join("."),
-            "不兼容的配置项，已跳过并使用默认值",
+            &tr!(
+                "不兼容的配置项，已跳过并使用默认值",
+                "Incompatible setting, skipped; the default applies"
+            ),
         ),
     }
 }
 
 pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
-    ensure!(yaml.len() <= crate::CONFIG_LIMIT, "配置超过 24 MiB");
-    let document: Value = serde_yaml::from_str(yaml).context("配置不是有效的 YAML")?;
+    ensure!(
+        yaml.len() <= crate::CONFIG_LIMIT,
+        "{}",
+        tr!("配置超过 24 MiB", "The profile exceeds 24 MiB")
+    );
+    let document: Value = serde_yaml::from_str(yaml)
+        .with_context(|| tr!("配置不是有效的 YAML", "The profile is not valid YAML"))?;
     let mut source = document
         .as_mapping()
-        .context("配置必须是 YAML 对象")?
+        .with_context(|| tr!("配置必须是 YAML 对象", "The profile must be a YAML mapping"))?
         .clone();
     if crate::profiles::validate(yaml).is_ok() {
         return Ok((yaml.into(), vec![]));
@@ -194,7 +203,14 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
         let path = format!("proxies[{i}]");
         let parsed = known_fields::<Proxy>(&mut value, &path, &mut warnings);
         let Ok(proxy) = parsed else {
-            warn(&mut warnings, path, "不支持的协议或无效节点，已跳过");
+            warn(
+                &mut warnings,
+                path,
+                &tr!(
+                    "不支持的协议或无效节点，已跳过",
+                    "Unsupported protocol or invalid node, skipped"
+                ),
+            );
             continue;
         };
         let mut trial = base.clone();
@@ -208,7 +224,10 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
             warn(
                 &mut warnings,
                 path,
-                "仅支持有效且名称唯一的 VLESS、Hysteria2 或 Tailscale 节点，已跳过",
+                &tr!(
+                    "仅支持有效且名称唯一的 VLESS、Hysteria2 或 Tailscale 节点，已跳过",
+                    "Only valid, uniquely named VLESS, Hysteria2 or Tailscale nodes are supported; skipped"
+                ),
             );
             continue;
         }
@@ -224,11 +243,22 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
     {
         let path = format!("proxy-groups[{i}]");
         let Ok(group) = known_fields::<Group>(&mut value, &path, &mut warnings) else {
-            warn(&mut warnings, path, "不支持的代理组，已跳过");
+            warn(
+                &mut warnings,
+                path,
+                &tr!("不支持的代理组，已跳过", "Unsupported proxy group, skipped"),
+            );
             continue;
         };
         if group.name.is_empty() || group.interval == 0 || !names.insert(group.name.clone()) {
-            warn(&mut warnings, path, "无效或重名的代理组，已跳过");
+            warn(
+                &mut warnings,
+                path,
+                &tr!(
+                    "无效或重名的代理组，已跳过",
+                    "Invalid or duplicate proxy group, skipped"
+                ),
+            );
             continue;
         }
         parsed_groups.push(group);
@@ -250,7 +280,10 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
                     warn(
                         &mut warnings,
                         format!("proxy-groups[{index}].proxies"),
-                        "已跳过不存在或形成循环的节点引用",
+                        &tr!(
+                            "已跳过不存在或形成循环的节点引用",
+                            "Skipped node references that are missing or circular"
+                        ),
                     );
                     changed = true;
                 }
@@ -261,7 +294,10 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
                 warn(
                     &mut warnings,
                     format!("proxy-groups[{index}]"),
-                    "代理组无兼容成员，已跳过",
+                    &tr!(
+                        "代理组无兼容成员，已跳过",
+                        "The proxy group has no compatible members; skipped"
+                    ),
                 );
                 changed = true;
             }
@@ -291,7 +327,14 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
                 let path = format!("rule-providers.{}", key.as_str().unwrap_or("?"));
                 let Ok(provider) = known_fields::<RuleProvider>(&mut value, &path, &mut warnings)
                 else {
-                    warn(&mut warnings, path, "不兼容的规则集，已跳过");
+                    warn(
+                        &mut warnings,
+                        path,
+                        &tr!(
+                            "不兼容的规则集，已跳过",
+                            "Incompatible rule provider, skipped"
+                        ),
+                    );
                     continue;
                 };
                 let mut trial = Config::default();
@@ -301,7 +344,14 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
                     || (!provider.path.is_empty()
                         && crate::profiles::safe_relative(&provider.path).is_err())
                 {
-                    warn(&mut warnings, path, "不兼容的规则集或资源路径，已跳过");
+                    warn(
+                        &mut warnings,
+                        path,
+                        &tr!(
+                            "不兼容的规则集或资源路径，已跳过",
+                            "Incompatible rule provider or resource path, skipped"
+                        ),
+                    );
                     continue;
                 }
                 config
@@ -310,7 +360,14 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
                 kept.insert(key, value);
             }
         } else {
-            warn(&mut warnings, "rule-providers", "规则集必须是对象，已跳过");
+            warn(
+                &mut warnings,
+                "rule-providers",
+                &tr!(
+                    "规则集必须是对象，已跳过",
+                    "Rule providers must be a mapping; skipped"
+                ),
+            );
         }
     }
     output["rule-providers"] = Value::Mapping(kept);
@@ -336,14 +393,18 @@ pub fn compatible_yaml(yaml: &str) -> Result<(String, Vec<ImportWarning>)> {
                 warn(
                     &mut warnings,
                     format!("rules[{i}]"),
-                    "不支持的规则或引用的节点、规则集不可用，已跳过",
+                    &tr!(
+                        "不支持的规则或引用的节点、规则集不可用，已跳过",
+                        "Unsupported rule, or its node or rule provider is unavailable; skipped"
+                    ),
                 );
             }
         }
         output["rules"] = Value::Sequence(kept);
     }
     let yaml = serde_yaml::to_string(&output)?;
-    crate::profiles::validate(&yaml).context("无法生成兼容配置")?;
+    crate::profiles::validate(&yaml)
+        .with_context(|| tr!("无法生成兼容配置", "Cannot produce a compatible profile"))?;
     Ok((yaml, warnings))
 }
 
@@ -352,7 +413,11 @@ fn sequence(value: Option<Value>, path: &str, warnings: &mut Vec<ImportWarning>)
         Some(Value::Sequence(items)) => items,
         None => vec![],
         _ => {
-            warn(warnings, path, "必须是列表，已跳过");
+            warn(
+                warnings,
+                path,
+                &tr!("必须是列表，已跳过", "Must be a list; skipped"),
+            );
             vec![]
         }
     }
