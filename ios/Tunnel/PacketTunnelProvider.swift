@@ -32,6 +32,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var appliedNetwork: NetworkSnapshot?
     private var pendingNetwork: DispatchWorkItem?
     private var ignoredPathUpdates = 0
+    /// While iOS reports the device network unusable: since when, the next
+    /// probe, how many probes and recoveries ran, and raw updates logged.
+    /// See `checkStall`.
+    private var stalledSince: Date?
+    private var stallCheck: DispatchWorkItem?
+    private var stallProbes = 0
+    private var stallRecoveries = 0
+    private var stallUpdates = 0
+    private var probing = false
     /// Whether the profile enables IPv6, and whether the applied settings route it.
     private var profileIPv6 = false
     private var routesIPv6: Bool?
@@ -177,6 +186,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pendingNetwork = nil
         appliedNetwork = nil
         ignoredPathUpdates = 0
+        resetStall()
         routesIPv6 = nil
         healthTimer?.cancel()
         healthTimer = nil
@@ -331,6 +341,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Nothing gets through while iOS reports the network unusable.
         if snapshot.usable { log.info(line) } else { log.warning(line) }
         ignoredPathUpdates = 0
+        if snapshot.usable { endStall() } else { beginStall() }
         // Returns at once; fails only when the core already stopped, which
         // the health check reports.
         reportNetwork(path) { core in
@@ -384,6 +395,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 ready(path)
                 return
             }
+            // Whether iOS keeps reporting while the network is unusable, and
+            // what: unchanged updates are otherwise only counted.
+            if self.stalledSince != nil {
+                self.stallUpdates += 1
+                if self.stallUpdates <= 30 {
+                    log.info("path update \(self.stallUpdates) while unusable: \(NetworkSnapshot(path))")
+                }
+            }
             // A switch emits several updates within a second: settle first, then
             // compare with what the core last adapted to.
             self.pendingNetwork?.cancel()
@@ -391,8 +410,118 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.pendingNetwork = work
             self.queue.asyncAfter(deadline: .now() + Self.pathSettleDelay, execute: work)
         }
+        self.monitor?.cancel()
         monitor.start(queue: queue)
         self.monitor = monitor
+    }
+
+    // MARK: Recovery while the device network is unusable
+
+    /// Delays before each probe of a stall, in seconds; the last repeats.
+    private static let stallProbeDelays = [10, 20, 30, 60, 60, 60, 60, 60, 60, 60, 300]
+    /// Recoveries (re-applied settings, a new path monitor) per stall.
+    private static let stallRecoveryLimit = 3
+    /// How long iOS may refuse this process's sockets (EPIPE) after the
+    /// recoveries before the tunnel stops, as reconnecting by hand did.
+    private static let refusedRestartAfter: TimeInterval = 120
+
+    /// iOS reported the device network unusable. It usually comes back in
+    /// seconds; once it stayed so for 8 minutes while cellular worked, every
+    /// socket of this process failing with EPIPE until a reconnect.
+    private func beginStall() {
+        guard stalledSince == nil else { return }
+        stalledSince = Date()
+        stallProbes = 0
+        stallRecoveries = 0
+        stallUpdates = 0
+        scheduleStallCheck()
+    }
+
+    private func endStall() {
+        guard let since = stalledSince else { return }
+        log.info("device network usable again after \(Int(Date().timeIntervalSince(since))) s "
+                 + "(\(stallProbes) probe(s), \(stallRecoveries) recovery attempt(s), \(stallUpdates) path update(s))")
+        resetStall()
+    }
+
+    private func resetStall() {
+        stallCheck?.cancel()
+        stallCheck = nil
+        stalledSince = nil
+        stallProbes = 0
+        stallRecoveries = 0
+        stallUpdates = 0
+        probing = false
+    }
+
+    private func scheduleStallCheck() {
+        stallCheck?.cancel()
+        let delays = Self.stallProbeDelays
+        let delay = delays[min(stallProbes, delays.count - 1)]
+        let epoch = self.epoch
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.epoch == epoch else { return }
+            self.checkStall()
+        }
+        stallCheck = work
+        queue.asyncAfter(deadline: .now() + .seconds(delay), execute: work)
+    }
+
+    /// Probes the device network, then: it answers, so only the path report is
+    /// wrong and the core reconnects; it does not, so re-apply the settings
+    /// and restart the path monitor (a few times); iOS still refuses the
+    /// sockets after that, so stop the tunnel. A network that is simply gone
+    /// is left to come back.
+    private func checkStall() {
+        guard let since = stalledSince, !probing, core != nil else { return }
+        probing = true
+        stallProbes += 1
+        let epoch = self.epoch
+        EgressProbe.run(queue: queue) { result in
+            guard self.epoch == epoch, self.stalledSince == since, let core = self.core else { return }
+            self.probing = false
+            let elapsed = Date().timeIntervalSince(since)
+            if result.reachable {
+                log.warning("egress probe \(self.stallProbes): iOS reports the network unusable for \(Int(elapsed)) s "
+                            + "but it answers; reconnecting the core: \(result)")
+                do { try core.networkChanged() } catch {
+                    log.warning("network change not delivered: \(Diagnostics.describe(error))")
+                }
+                return
+            }
+            log.warning("egress probe \(self.stallProbes): no answer after \(Int(elapsed)) s unusable "
+                        + "refused=\(result.refused): \(result)")
+            if self.stallRecoveries < Self.stallRecoveryLimit {
+                self.stallRecoveries += 1
+                self.recoverEgress()
+            } else if result.refused, elapsed >= Self.refusedRestartAfter {
+                log.error("iOS has refused the tunnel's sockets for \(Int(elapsed)) s after "
+                          + "\(self.stallRecoveries) recoveries; stopping the tunnel")
+                self.fail(ClientError.message(L("切换网络后系统一直拒绝 VPN 访问网络，已断开，请重新连接。")))
+                return
+            }
+            self.scheduleStallCheck()
+        }
+    }
+
+    /// What reconnecting by hand redoes, short of a new process: the tunnel
+    /// settings (iOS re-evaluates this extension's routes and policies), a new
+    /// path monitor, and the core's sockets.
+    private func recoverEgress() {
+        let attempt = stallRecoveries, epoch = self.epoch
+        log.warning("recovery \(attempt): re-applying network settings and restarting the path monitor")
+        reasserting = true
+        applySettings(ipv6: routesIPv6 ?? false) { error in
+            self.reasserting = false
+            guard self.epoch == epoch, let core = self.core else { return }
+            if let error {
+                log.error("recovery \(attempt): network settings failed: \(Diagnostics.describe(error))")
+            }
+            self.watchNetwork { _ in }
+            do { try core.networkChanged() } catch {
+                log.warning("network change not delivered: \(Diagnostics.describe(error))")
+            }
+        }
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
@@ -556,7 +685,7 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
     }
 
     var description: String {
-        "status=\(status) interfaces=\(interfaces) ipv4=\(ipv4) ipv6=\(ipv6) addresses=\(addresses)"
+        "status=\(status) interfaces=\(interfaces) gateways=\(gateways) ipv4=\(ipv4) ipv6=\(ipv6) addresses=\(addresses)"
     }
 
     var usable: Bool { status == "satisfied" }

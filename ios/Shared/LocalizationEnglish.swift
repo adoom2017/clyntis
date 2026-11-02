@@ -329,6 +329,7 @@ let englishText: [String: String] = [
     "无法向内核写入 IP 数据包。": "Cannot write IP packets to the core.",
     "无法读取内核 IP 数据包。": "Cannot read IP packets from the core.",
     "代理内核已停止，请重新连接。": "The proxy core stopped; reconnect.",
+    "切换网络后系统一直拒绝 VPN 访问网络，已断开，请重新连接。": "After the network changed, iOS kept refusing the VPN network access; it disconnected, reconnect.",
     "缺少模式。": "Missing mode.",
     "缺少节点。": "Missing node.",
     "缺少测试目标。": "Missing test target.",
