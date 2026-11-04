@@ -37,7 +37,7 @@ afterEach(() => {
 
 describe("interface language", () => {
   it("has English for every text in the source, with the same placeholders", () => {
-    const source = ["../src/App.tsx", "../src/types.ts"]
+    const source = ["../src/App.tsx", "../src/types.ts", "../src/Updates.tsx"]
       .map((file) => readFileSync(new URL(file, import.meta.url), "utf8"))
       .join("\n");
     const keys = new Set<string>();

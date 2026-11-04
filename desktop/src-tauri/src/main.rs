@@ -9,6 +9,7 @@ mod keychain;
 mod platform;
 #[cfg(target_os = "macos")]
 mod tray;
+mod updates;
 #[cfg(windows)]
 mod windows_diagnostics;
 
@@ -69,6 +70,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(autostart.build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             app::snapshot,
             app::start,
@@ -109,6 +111,10 @@ fn main() {
             app::install_service,
             app::uninstall_service,
             app::quit,
+            updates::app_update_state,
+            updates::check_app_update,
+            updates::download_app_update,
+            updates::install_app_update,
             set_language
         ])
         .setup(|app| {
@@ -116,6 +122,7 @@ fn main() {
             // Until the window reports the system language, a chosen one applies.
             clyntis_desktop_model::i18n::set(&desktop.language());
             app.manage(desktop);
+            app.manage(updates::Updates::default());
             let items = TRAY_ITEMS
                 .iter()
                 .enumerate()
@@ -172,6 +179,8 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 app::background(handle).await;
             });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(updates::background(handle));
             Ok(())
         })
         .on_window_event(|window, event| {

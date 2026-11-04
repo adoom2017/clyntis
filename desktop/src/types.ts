@@ -19,6 +19,7 @@ export interface Settings {
   language: Language;
   launchAtLogin: boolean;
   autoConnect: boolean;
+  autoCheckUpdates: boolean;
   subscriptionIntervalHours: number;
   overrides: Overrides;
 }
@@ -404,6 +405,7 @@ export const initial: Snapshot = {
     language: "system",
     launchAtLogin: false,
     autoConnect: false,
+    autoCheckUpdates: true,
     subscriptionIntervalHours: 24,
     overrides: {},
   },
