@@ -48,6 +48,7 @@ pub struct Desktop {
     view: Mutex<Snapshot>,
     pub logs: Logs,
     pub exiting: AtomicBool,
+    update_cleanup_failed: AtomicBool,
     subscription_lock: tokio::sync::Mutex<()>,
     /// Whether the core is running; drives the menu-bar icon animation.
     running: tokio::sync::watch::Sender<bool>,
@@ -88,6 +89,7 @@ impl Desktop {
             }),
             logs: Arc::new(Mutex::new(VecDeque::new())),
             exiting: AtomicBool::new(false),
+            update_cleanup_failed: AtomicBool::new(false),
             subscription_lock: tokio::sync::Mutex::new(()),
             running: tokio::sync::watch::Sender::new(false),
         })
@@ -171,6 +173,10 @@ impl Desktop {
         profile: Profile,
         settings: Settings,
     ) -> Result<()> {
+        ensure!(
+            !self.exiting.load(Ordering::SeqCst),
+            "Application is exiting"
+        );
         profiles::runtime_yaml(
             &profile,
             &settings,
@@ -518,6 +524,44 @@ impl Desktop {
         }
         self.exiting.store(true, Ordering::SeqCst);
         self.app.exit(0);
+    }
+
+    pub fn auto_check_updates(&self) -> bool {
+        self.store.settings().is_ok_and(|s| s.auto_check_updates)
+    }
+
+    pub async fn install_update(
+        &self,
+        update: tauri_plugin_updater::Update,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        // Keep starts, profile switches and shutdown serialized until replacement finishes.
+        let mut op = self.operation.lock().await;
+        ensure!(
+            !self.exiting.load(Ordering::SeqCst),
+            "Application is exiting"
+        );
+        ensure!(
+            !self.update_cleanup_failed.load(Ordering::SeqCst),
+            "Restart Clyntis and check network recovery before retrying the update"
+        );
+        if let Err(error) = self.stop_locked(&mut op).await {
+            self.update_cleanup_failed.store(true, Ordering::SeqCst);
+            return Err(error.context("Update cancelled: could not restore network settings; restart Clyntis before retrying"));
+        }
+        self.exiting.store(true, Ordering::SeqCst);
+        let result = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+        match result {
+            Ok(Ok(())) => self.app.restart(),
+            result => {
+                self.exiting.store(false, Ordering::SeqCst);
+                match result {
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(error) => Err(error.into()),
+                    Ok(Ok(())) => unreachable!(),
+                }
+            }
+        }
     }
 }
 

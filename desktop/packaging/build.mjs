@@ -3,6 +3,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { buildVersionArguments } from "./version.mjs";
+import { findUpdaterArtifact, updaterBuildConfig } from "./updates.mjs";
 import {
   helpers,
   resolveIdentity,
@@ -13,7 +14,10 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const input = process.argv.slice(2);
 const unsigned = input.includes("--unsigned") || input.includes("--no-sign");
-const args = input.filter((arg) => !["--unsigned", "--no-sign"].includes(arg));
+const updater = input.includes("--updater");
+const args = input.filter(
+  (arg) => !["--unsigned", "--no-sign", "--updater"].includes(arg),
+);
 const targetIndex = args.findIndex((arg) => arg === "--target" || arg === "-t");
 const target =
   targetIndex < 0 ? process.env.CLYNTIS_DESKTOP_TARGET : args[targetIndex + 1];
@@ -28,9 +32,18 @@ const { version, buildNumber } = versioned;
 args.splice(0, args.length, ...versioned.args);
 let env = { ...process.env };
 env.CLYNTIS_APP_VERSION = version;
-const versionConfig = { version };
+const versionConfig = {
+  version,
+  ...updaterBuildConfig(updater, env, mac, unsigned),
+};
+if (!updater) {
+  delete env.CLYNTIS_UPDATER_PUBLIC_KEY;
+  delete env.CLYNTIS_UPDATER_ENDPOINT;
+} else if (args.includes("--no-bundle")) {
+  throw new Error("--updater requires installer bundles");
+}
 if (buildNumber !== undefined)
-  versionConfig.bundle = { macOS: { bundleVersion: buildNumber } };
+  versionConfig.bundle.macOS = { bundleVersion: buildNumber };
 args.push("--config", JSON.stringify(versionConfig));
 console.log(`应用版本：${version}${buildNumber ? ` (${buildNumber})` : ""}`);
 if (target) env.CLYNTIS_DESKTOP_TARGET = target;
@@ -69,6 +82,19 @@ run(process.execPath, [
   "build",
   ...args,
 ]);
+if (updater) {
+  const arch =
+    target?.split("-")[0] || (process.arch === "arm64" ? "aarch64" : "x86_64");
+  const platform = mac ? `darwin-${arch}` : "windows-x86_64";
+  const bundle = join(
+    resolve(root, env.CARGO_TARGET_DIR || "target"),
+    ...(target ? [target] : []),
+    args.includes("--debug") || args.includes("-d") ? "debug" : "release",
+    "bundle",
+  );
+  findUpdaterArtifact(bundle, platform, version);
+  console.log("更新包与绑定版本号的签名文件已生成。");
+}
 if (identity) {
   const config = JSON.parse(
     readFileSync(join(root, "src-tauri/tauri.conf.json"), "utf8"),

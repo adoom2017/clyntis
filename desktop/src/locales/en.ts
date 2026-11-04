@@ -4,6 +4,34 @@
  * A missing entry shows the Chinese; tests/i18n.test.ts checks coverage.
  */
 export const en: Record<string, string> = {
+  检查是否有新版本: "Check for a newer version",
+  "此构建未配置更新签名，请安装官方发布版本以启用自动更新。":
+    "This build has no update signing key. Install an official release to enable automatic updates.",
+  "正在检查客户端更新…": "Checking for app updates…",
+  当前已是最新版本: "You are up to date",
+  "发现新版本 {version}": "Version {version} is available",
+  "正在下载并校验更新…": "Downloading and verifying the update…",
+  "更新包已验证，可以安装": "Update verified and ready to install",
+  "正在恢复网络设置并安装更新…":
+    "Restoring network settings and installing the update…",
+  "更新未完成，请检查网络后重试":
+    "Update did not complete. Check your connection and try again.",
+  客户端更新: "App updates",
+  "当前版本 {version}": "Current version {version}",
+  "上次检查：{time}": "Last checked: {time}",
+  检查客户端更新: "Check for app updates",
+  下载更新: "Download update",
+  安装并重启: "Install and restart",
+  更新下载进度: "Update download progress",
+  版本说明: "Release notes",
+  "发现客户端新版本 {version}": "App version {version} is available",
+  查看更新: "View update",
+  自动检查客户端更新: "Automatically check for app updates",
+  "启动后和每 6 小时检查；安装前会征求确认":
+    "Check after launch and every 6 hours; ask before installing",
+  安装客户端更新: "Install app update",
+  "安装将停止代理、恢复网络设置并重启 Clyntis。正在进行的连接会中断，是否继续？":
+    "Installation will stop the proxy, restore network settings and restart Clyntis. Active connections will be interrupted. Continue?",
   概览: "Overview",
   节点: "Proxies",
   配置: "Profiles",

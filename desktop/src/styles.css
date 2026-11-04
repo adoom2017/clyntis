@@ -1553,6 +1553,45 @@ td.num {
   color: var(--muted);
   font-size: 12px;
 }
+.app-updates .setting-row {
+  flex-wrap: wrap;
+}
+.app-updates .service-actions {
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0;
+}
+.app-updates .service-note {
+  overflow-wrap: anywhere;
+  padding: 8px 0;
+}
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.update-progress progress {
+  flex: 1;
+  min-width: 80px;
+  accent-color: var(--accent);
+}
+.update-notes {
+  font-size: 12px;
+  padding: 10px 0;
+}
+.update-notes summary {
+  cursor: pointer;
+}
+.update-notes p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
+  margin-top: 8px;
+}
 .service-actions {
   display: flex;
   align-items: center;

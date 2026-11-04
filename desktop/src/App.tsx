@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import brandIcon from "../src-tauri/icons/clyntis-v3/brand-128.png";
+import { UpdatesPanel, useUpdates, type UpdateController } from "./Updates";
 import { locale, resolveLanguage, setLanguage, t, type Language } from "./i18n";
 import {
   Activity,
@@ -166,6 +167,7 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [modal, setModal] = useState<ReactNode>(null);
+  const updates = useUpdates();
   // "Follow the system" re-renders when the system language changes.
   const [, setSystemLanguage] = useState(0);
   useEffect(() => {
@@ -452,6 +454,23 @@ export default function App() {
               {notice}
             </div>
           )}
+          {page !== "settings" &&
+            ["available", "ready"].includes(updates.state?.phase ?? "") && (
+              <div className="alert info" role="status">
+                <Download size={16} />
+                <span>
+                  {t("发现客户端新版本 {version}", {
+                    version: updates.state?.version ?? "",
+                  })}
+                </span>
+                <button
+                  className="button secondary compact"
+                  onClick={() => setPage("settings")}
+                >
+                  {t("查看更新")}
+                </button>
+              </div>
+            )}
           {page === "overview" && (
             <>
               <section
@@ -858,6 +877,7 @@ export default function App() {
           {page === "logs" && <LogPage logs={logs} perform={perform} />}
           {page === "settings" && (
             <SettingsPage
+              updates={updates}
               state={state}
               busy={disabled}
               perform={perform}
@@ -3530,11 +3550,13 @@ function OverrideSwitch({
 }
 
 function SettingsPage({
+  updates,
   state,
   busy,
   perform,
   confirm,
 }: {
+  updates: UpdateController;
   state: Snapshot;
   busy: boolean;
   perform: Perform;
@@ -3748,6 +3770,16 @@ function SettingsPage({
             label={t("打开应用后自动连接")}
           />
         </Setting>
+        <Setting
+          label={t("自动检查客户端更新")}
+          text={t("启动后和每 6 小时检查；安装前会征求确认")}
+        >
+          <Toggle
+            checked={settings.autoCheckUpdates}
+            onChange={(v) => update("autoCheckUpdates", v)}
+            label={t("自动检查客户端更新")}
+          />
+        </Setting>
         <Setting label={t("订阅更新间隔")} text={t("0 为仅手动更新")}>
           <div className="input-suffix">
             <input
@@ -3763,6 +3795,26 @@ function SettingsPage({
           </div>
         </Setting>
       </section>
+      <h3 className="settings-heading">{t("客户端更新")}</h3>
+      <UpdatesPanel
+        updates={updates}
+        busy={busy || dirty}
+        onInstall={() =>
+          confirm(
+            <Confirm
+              title={t("安装客户端更新")}
+              text={t(
+                "安装将停止代理、恢复网络设置并重启 Clyntis。正在进行的连接会中断，是否继续？",
+              )}
+              onClose={() => confirm(null)}
+              onConfirm={async () => {
+                confirm(null);
+                await updates.run("install_app_update");
+              }}
+            />,
+          )
+        }
+      />
       {/* Changes wait for 保存: switching capture or the port restarts the
           core, so nothing applies while a value is half typed. */}
       {dirty && (

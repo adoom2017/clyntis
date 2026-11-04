@@ -24,6 +24,7 @@ pub struct Settings {
     pub language: String,
     pub launch_at_login: bool,
     pub auto_connect: bool,
+    pub auto_check_updates: bool,
     pub subscription_interval_hours: u16,
     /// Values chosen here replace the profile's own (log level, IPv6, sniffing).
     pub overrides: clyntis_config::overrides::Overrides,
@@ -40,6 +41,7 @@ impl Default for Settings {
             language: "system".into(),
             launch_at_login: false,
             auto_connect: false,
+            auto_check_updates: true,
             subscription_interval_hours: 24,
             overrides: Default::default(),
         }
@@ -95,5 +97,15 @@ mod tests {
         assert!(saved.auto_dns);
         let off: Settings = serde_json::from_str(r#"{"autoDns":false}"#).unwrap();
         assert!(!off.auto_dns);
+    }
+
+    #[test]
+    fn existing_settings_enable_update_checks_and_preserve_opt_out() {
+        let existing: Settings = serde_json::from_str(r#"{"autoConnect":true}"#).unwrap();
+        assert!(existing.auto_check_updates);
+        let off: Settings = serde_json::from_str(r#"{"autoCheckUpdates":false}"#).unwrap();
+        assert!(!off.auto_check_updates);
+        let saved: Settings = serde_json::from_value(serde_json::to_value(off).unwrap()).unwrap();
+        assert!(!saved.auto_check_updates);
     }
 }
