@@ -259,18 +259,20 @@ pub async fn background(app: tauri::AppHandle) {
         return;
     }
     tokio::time::sleep(Duration::from_secs(20)).await;
-    let mut last_check: Option<Instant> = None;
+    // The next check is set forward from now: an Instant is measured from
+    // boot on macOS and Windows, so subtracting hours from one shortly after
+    // a login start underflowed and panicked, ending the checks.
+    let mut next_check = Instant::now();
     loop {
-        if app.state::<Desktop>().auto_check_updates()
-            && last_check.is_none_or(|last| last.elapsed() >= Duration::from_secs(6 * 3600))
-        {
+        if app.state::<Desktop>().auto_check_updates() && Instant::now() >= next_check {
             let result = app.state::<Updates>().check(&app).await;
             // Retry offline failures after 15 minutes, rather than waiting six hours.
-            last_check = Some(if result.is_ok() {
-                Instant::now()
-            } else {
-                Instant::now() - Duration::from_secs(6 * 3600 - 15 * 60)
-            });
+            next_check = Instant::now()
+                + if result.is_ok() {
+                    Duration::from_secs(6 * 3600)
+                } else {
+                    Duration::from_secs(15 * 60)
+                };
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
