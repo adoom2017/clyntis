@@ -658,8 +658,14 @@ async fn udp_session(
                     );
                     reply(payload);
                 }
-                Ok(Err(error)) => tracing::debug!(%error, "TUN DNS UDP query failed"),
-                Err(_) => tracing::debug!("TUN DNS UDP query timed out"),
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "TUN DNS UDP query failed");
+                    drops.dns_failure(Some(&error));
+                }
+                Err(_) => {
+                    tracing::debug!("TUN DNS UDP query timed out");
+                    drops.dns_failure(None);
+                }
             }
         }
         return Ok(());
@@ -790,6 +796,10 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut udp = UdpTable::new(budget.max_udp, budget.max_ports);
     let drops = Arc::new(Drops::default());
     let mut drops_logged = ([0u64; 8], Instant::now());
+    // TCP sessions that failed since the last summary, and the latest error.
+    let mut tcp_failed = 0u64;
+    let mut last_tcp_error: Option<String> = None;
+    let mut failures_logged = [0u64; 2];
     let mut tasks = JoinSet::new();
     let (replies, mut incoming_replies) = mpsc::channel::<Reply>(256);
     let wake = Arc::new(Notify::new());
@@ -901,6 +911,23 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     );
                 }
                 drops_logged = (now, Instant::now());
+                let dns = [
+                    drops.dns_failed.load(Ordering::Relaxed),
+                    drops.dns_timed_out.load(Ordering::Relaxed),
+                ];
+                if dns != failures_logged || tcp_failed != 0 {
+                    tracing::info!(
+                        dns_failed = dns[0] - failures_logged[0],
+                        dns_timed_out = dns[1] - failures_logged[1],
+                        last_dns_error = drops.last_dns_error.lock().unwrap().take().as_deref(),
+                        tcp_failed,
+                        last_tcp_error = last_tcp_error.take().as_deref(),
+                        "TUN DNS queries and TCP sessions failed in the last {}s",
+                        DROPS_LOG_EVERY.as_secs()
+                    );
+                    failures_logged = dns;
+                    tcp_failed = 0;
+                }
             }
         }
         if guard.due() {
@@ -933,6 +960,8 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 if flow.tcp {
                     if let Err(error) = result {
                         tracing::debug!(source = %flow.source, target = %flow.target, %error, "TUN TCP session failed");
+                        tcp_failed += 1;
+                        last_tcp_error = Some(format!("{}: {error:#}", flow.target));
                         if let Some(state) = tcp_flows.get_mut(&flow) {
                             sockets.get_mut::<tcp::Socket>(state.handle).abort();
                         }

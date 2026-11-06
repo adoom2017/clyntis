@@ -35,6 +35,18 @@ const CACHE_OVERHEAD: usize = 256;
 /// How long nameserver-policy servers not yet heard from on this network
 /// answer alone before the plain nameservers are asked too.
 const POLICY_HEAD_START: Duration = Duration::from_millis(500);
+/// How long a lookup that already has IPv4 addresses waits for the AAAA
+/// query sent alongside (RFC 8305's resolution delay). An AAAA query that
+/// is never answered must not hold back a usable IPv4 result.
+const AAAA_GRACE: Duration = Duration::from_millis(50);
+/// NOERROR and NXDOMAIN settle a name; other codes say only that this
+/// server could not or would not answer.
+fn answered(response: &Message) -> bool {
+    matches!(
+        response.response_code(),
+        ResponseCode::NoError | ResponseCode::NXDomain
+    )
+}
 #[derive(Default)]
 struct Cache {
     entries: HashMap<Vec<u8>, CacheEntry>,
@@ -468,13 +480,32 @@ impl Resolver {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
-        let (a, aaaa) = tokio::join!(self.records(host, RecordType::A), async {
+        let a = self.records(host, RecordType::A);
+        let aaaa = async {
             if self.config.ipv6 {
                 self.records(host, RecordType::AAAA).await
             } else {
                 Ok(vec![])
             }
-        });
+        };
+        tokio::pin!(a, aaaa);
+        let (a, aaaa) = tokio::select! {
+            a = &mut a => {
+                let usable = a
+                    .as_ref()
+                    .is_ok_and(|records| records.iter().any(|r| matches!(r.data(), RData::A(_))));
+                let aaaa = if usable {
+                    tokio::time::timeout(AAAA_GRACE, &mut aaaa).await.unwrap_or_else(|_| {
+                        tracing::debug!(%host, "AAAA lookup still pending; using the IPv4 answer");
+                        Ok(vec![])
+                    })
+                } else {
+                    aaaa.await
+                };
+                (a, aaaa)
+            }
+            aaaa = &mut aaaa => (a.await, aaaa),
+        };
         let mut addresses = vec![];
         for record in [&a, &aaaa]
             .into_iter()
@@ -521,9 +552,9 @@ impl Resolver {
             "DNS lookup response"
         );
         ensure!(
-            response.response_code() == ResponseCode::NoError
-                || response.response_code() == ResponseCode::NXDomain,
-            "DNS server rejected query"
+            answered(&response),
+            "DNS server rejected query ({})",
+            response.response_code()
         );
         Ok(response.answers().to_vec())
     }
@@ -576,13 +607,7 @@ impl Resolver {
                 .unwrap_or(0)
         }
         .min(3600);
-        if ttl > 0
-            && !response.truncated()
-            && matches!(
-                response.response_code(),
-                ResponseCode::NoError | ResponseCode::NXDomain
-            )
-        {
+        if ttl > 0 && !response.truncated() && answered(&response) {
             // Encoders reserve far more than a typical answer needs.
             let mut bytes = response.to_vec()?;
             bytes.shrink_to_fit();
@@ -721,9 +746,13 @@ impl Resolver {
         }
     }
     /// Asks every upstream at once and takes the first answer: trying them
-    /// in turn left a lookup waiting out each silent server first.
+    /// in turn left a lookup waiting out each silent server first. A server
+    /// that refuses or fails the query (SERVFAIL, REFUSED, ...) does not end
+    /// the race: a broken upstream answers fastest and would hide the working
+    /// ones. Its reply is returned only when no other upstream answers.
     async fn race(&self, servers: &[String], request: &Message) -> Result<Message> {
         let mut error = anyhow::anyhow!("no DNS upstream");
+        let mut rejected = None;
         let mut pending: futures_util::stream::FuturesUnordered<_> = servers
             .iter()
             .map(|upstream| async move {
@@ -737,7 +766,19 @@ impl Resolver {
             .collect();
         while let Some((upstream, result)) = futures_util::StreamExt::next(&mut pending).await {
             match result {
-                Ok(Ok(response)) => return Ok(response),
+                Ok(Ok(response)) if answered(&response) => return Ok(response),
+                Ok(Ok(response)) => {
+                    tracing::debug!(
+                        %upstream,
+                        response_code = ?response.response_code(),
+                        "DNS upstream rejected query; waiting for the others"
+                    );
+                    error = anyhow::anyhow!(
+                        "DNS upstream {upstream} answered {}",
+                        response.response_code()
+                    );
+                    rejected.get_or_insert(response);
+                }
                 Ok(Err(e)) => {
                     tracing::debug!(%upstream, error = %e, "DNS upstream failed");
                     error = e.context(format!("DNS upstream {upstream}"));
@@ -748,7 +789,7 @@ impl Resolver {
                 }
             }
         }
-        Err(error)
+        rejected.ok_or(error)
     }
     async fn bootstrap(&self, host: &str, port: u16) -> Result<SocketAddr> {
         if let Ok(ip) = host.parse() {

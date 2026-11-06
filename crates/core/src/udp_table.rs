@@ -67,8 +67,25 @@ pub(super) struct Drops {
     pub(super) reply_full: AtomicU64,
     /// smoltcp could not queue a reply on the target socket.
     pub(super) socket_full: AtomicU64,
+    /// Hijacked DNS queries the resolver failed or did not answer in time.
+    /// Logged as a periodic summary: one line per failure floods the log,
+    /// none left resolver outages invisible at the info level.
+    pub(super) dns_failed: AtomicU64,
+    pub(super) dns_timed_out: AtomicU64,
+    pub(super) last_dns_error: std::sync::Mutex<Option<String>>,
 }
 impl Drops {
+    pub(super) fn dns_failure(&self, error: Option<&anyhow::Error>) {
+        match error {
+            Some(error) => {
+                self.dns_failed.fetch_add(1, Ordering::Relaxed);
+                *self.last_dns_error.lock().unwrap() = Some(format!("{error:#}"));
+            }
+            None => {
+                self.dns_timed_out.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     pub(super) fn refused(&self, refusal: Refusal) {
         match refusal {
             Refusal::Memory => &self.memory,

@@ -500,3 +500,127 @@ async fn hosts_entries_win_over_tailnet_names() {
         vec!["100.104.16.87:22".parse().unwrap()]
     );
 }
+
+/// Answers every query on `udp` with `code` after `delay`, adding `answer`
+/// to A queries; AAAA queries go unanswered unless `answer_aaaa`.
+fn serve(
+    udp: tokio::net::UdpSocket,
+    code: ResponseCode,
+    delay: Duration,
+    answer: Option<&'static str>,
+    answer_aaaa: bool,
+) -> tokio_util::task::AbortOnDropHandle<()> {
+    tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let udp = Arc::new(udp);
+        let mut buffer = [0; 4096];
+        loop {
+            let (n, peer) = udp.recv_from(&mut buffer).await.unwrap();
+            let mut reply = Message::from_vec(&buffer[..n]).unwrap();
+            let query = reply.queries()[0].clone();
+            if query.query_type() == RecordType::AAAA && !answer_aaaa {
+                continue;
+            }
+            reply.set_message_type(MessageType::Response);
+            reply.set_response_code(code);
+            if let (Some(ip), RecordType::A) = (answer, query.query_type()) {
+                reply.add_answer(Record::from_rdata(
+                    query.name().clone(),
+                    60,
+                    RData::A(A(ip.parse().unwrap())),
+                ));
+            }
+            let udp = udp.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = udp.send_to(&reply.to_vec().unwrap(), peer).await;
+            });
+        }
+    }))
+}
+
+#[tokio::test]
+async fn failing_upstream_does_not_win_over_a_working_one() {
+    for code in [ResponseCode::ServFail, ResponseCode::Refused] {
+        let broken = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let working = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = Resolver::new(
+            Dns {
+                nameserver: vec![
+                    broken.local_addr().unwrap().to_string(),
+                    working.local_addr().unwrap().to_string(),
+                ],
+                ipv6: false,
+                ..Dns::default()
+            },
+            Arc::new(clyntis_platform::DefaultHooks),
+        );
+        let _broken = serve(broken, code, Duration::ZERO, None, true);
+        let _working = serve(
+            working,
+            ResponseCode::NoError,
+            Duration::from_millis(100),
+            Some("192.0.2.20"),
+            true,
+        );
+        let addresses =
+            tokio::time::timeout(Duration::from_secs(5), resolver.lookup("up.test", 443))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            addresses,
+            vec!["192.0.2.20:443".parse::<SocketAddr>().unwrap()],
+            "{code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_failing_upstreams_still_report_the_failure() {
+    let broken = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let resolver = Resolver::new(
+        Dns {
+            nameserver: vec![broken.local_addr().unwrap().to_string()],
+            ipv6: false,
+            ..Dns::default()
+        },
+        Arc::new(clyntis_platform::DefaultHooks),
+    );
+    let _broken = serve(broken, ResponseCode::ServFail, Duration::ZERO, None, true);
+    let error = tokio::time::timeout(Duration::from_secs(5), resolver.lookup("down.test", 443))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("rejected"), "{error:#}");
+}
+
+#[tokio::test]
+async fn unanswered_aaaa_does_not_delay_an_ipv4_answer() {
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let resolver = Resolver::new(
+        Dns {
+            nameserver: vec![udp.local_addr().unwrap().to_string()],
+            ipv6: true,
+            ..Dns::default()
+        },
+        Arc::new(clyntis_platform::DefaultHooks),
+    );
+    let _server = serve(
+        udp,
+        ResponseCode::NoError,
+        Duration::ZERO,
+        Some("192.0.2.30"),
+        false,
+    );
+    let started = std::time::Instant::now();
+    let addresses = tokio::time::timeout(Duration::from_secs(5), resolver.lookup("v4.test", 443))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        addresses,
+        vec!["192.0.2.30:443".parse::<SocketAddr>().unwrap()]
+    );
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(1), "lookup took {took:?}");
+}
