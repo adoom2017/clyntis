@@ -141,6 +141,20 @@ function Find-UntrustedItem([string]$Directory) {
     return $null
 }
 
+# NSIS removes the program files on uninstall but can leave its uninstaller and
+# private service recovery data behind. Recognize only those leftovers; Prepare
+# must still verify ownership and permissions on the entire tree before adoption.
+function Assert-InstallContents([string]$Directory) {
+    if (Test-Path -LiteralPath (Join-Path $Directory 'clyntis-desktop.exe') -PathType Leaf) { return }
+    foreach ($item in Get-ChildItem -LiteralPath $Directory -Force) {
+        $recognized = ($item.Name -eq 'service-data' -and $item.PSIsContainer) -or
+            ($item.Name -eq 'uninstall.exe' -and -not $item.PSIsContainer)
+        if (-not $recognized -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Select an empty directory or an existing Clyntis installation directory. Unrecognized item: $($item.FullName)"
+        }
+    }
+}
+
 # Dot-sourcing exposes policy functions to the Windows regression tests without changing files.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
@@ -151,10 +165,7 @@ try {
             Assert-SecureParents $directory
             if (Test-Path -LiteralPath $directory) {
                 $existing = Get-ChildItem -LiteralPath $directory -Force | Select-Object -First 1
-                if ($existing -and
-                    -not (Test-Path -LiteralPath (Join-Path $directory 'clyntis-desktop.exe') -PathType Leaf)) {
-                    throw 'Select an empty directory or an existing Clyntis installation directory.'
-                }
+                Assert-InstallContents $directory
                 # Protecting the tree below would make anything an ordinary user
                 # left here (for example a DLL next to the SYSTEM service) look
                 # trusted. Only adopt contents nobody else could have touched.

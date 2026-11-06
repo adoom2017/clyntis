@@ -63,6 +63,55 @@ try {
     Expect-Rejected { Get-InstallPath '\\?\GLOBALROOT\Device\HarddiskVolume1\Clyntis' } 'device namespace'
     Expect-Rejected { Assert-SecureParents $unicode } 'user-writable parent'
 
+    # A normal uninstall can leave private recovery data and uninstall.exe but
+    # no main executable. These are recognized without accepting arbitrary files
+    # or trusting their ACLs (Prepare checks the entire tree separately).
+    $contents = Join-Path $directory 'install contents'
+    $null = New-Item -ItemType Directory -Path $contents
+    $uninstaller = Join-Path $contents 'uninstall.exe'
+    $data = Join-Path $contents 'service-data'
+    $unrelated = Join-Path $contents 'unrelated.dll'
+    $main = Join-Path $contents 'clyntis-desktop.exe'
+    try {
+        Assert-InstallContents $contents
+        [IO.File]::WriteAllText($uninstaller, 'uninstaller fixture')
+        Assert-InstallContents $contents
+        $null = New-Item -ItemType Directory -Path $data
+        Assert-InstallContents $contents
+        [IO.File]::Delete($uninstaller)
+        Assert-InstallContents $contents
+        $script:Checks += 4
+        if ((Find-UntrustedItem $contents) -ne $contents) { throw 'Untrusted uninstall leftovers were adopted.' }
+        $script:Checks++
+        [IO.File]::WriteAllText($unrelated, 'unrelated fixture')
+        Expect-Rejected { Assert-InstallContents $contents } 'unrelated file among uninstall leftovers'
+        [IO.File]::WriteAllText($main, 'existing installation fixture')
+        Assert-InstallContents $contents
+        $script:Checks++
+        [IO.File]::Delete($main)
+        [IO.File]::Delete($unrelated)
+        [IO.Directory]::Delete($data)
+        [IO.File]::WriteAllText($data, 'not a directory')
+        Expect-Rejected { Assert-InstallContents $contents } 'service-data must be a directory'
+        [IO.File]::Delete($data)
+        $null = New-Item -ItemType Directory -Path $uninstaller
+        Expect-Rejected { Assert-InstallContents $contents } 'uninstall.exe must be a file'
+        [IO.Directory]::Delete($uninstaller)
+        $null = New-Item -ItemType Junction -Path $data -Target $unicode
+        Expect-Rejected { Assert-InstallContents $contents } 'service-data cannot be a junction'
+        [IO.Directory]::Delete($data)
+    }
+    finally {
+        foreach ($path in @($main, $unrelated, $uninstaller, $data)) {
+            if (Test-Path -LiteralPath $path) {
+                $item = Get-Item -LiteralPath $path -Force
+                if ($item.PSIsContainer) { [IO.Directory]::Delete($path) }
+                else { [IO.File]::Delete($path) }
+            }
+        }
+        [IO.Directory]::Delete($contents)
+    }
+
     # Exercise the actual native ACL setter without elevation. Keep the test's owner/group
     # so cleanup remains possible, but use the production DACL to remove an explicit grant.
     $file = Join-Path $directory 'dummy-program.exe'
