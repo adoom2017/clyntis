@@ -197,6 +197,18 @@ fn options(core: &Core, proxy: &Proxy) -> clyntis_tailscale::Options {
 /// Starts a node for every tailscale proxy; they stop with the core.
 pub(crate) fn start(core: &Arc<Core>) -> Result<HashMap<String, clyntis_tailscale::Node>> {
     let mut nodes = HashMap::new();
+    if !core.config.tailscale_enable {
+        let count = core
+            .config
+            .proxies
+            .iter()
+            .filter(|p| p.kind == ProxyKind::Tailscale)
+            .count();
+        if count > 0 {
+            tracing::info!(count, "Tailscale is turned off; its proxies stay stopped");
+        }
+        return Ok(nodes);
+    }
     for proxy in core
         .config
         .proxies
@@ -224,6 +236,31 @@ pub(crate) fn start(core: &Arc<Core>) -> Result<HashMap<String, clyntis_tailscal
 #[cfg(test)]
 mod tests {
     use super::expand_hostname;
+
+    /// Turned off: no node starts (no state directory, no control traffic),
+    /// the status says so and a connection routed to it fails at once.
+    #[tokio::test]
+    async fn turned_off_starts_no_node() {
+        let dir = std::env::temp_dir().join(format!("meta-tailscale-off-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = clyntis_config::Config::parse(
+            b"tailscale-enable: false\nproxies:\n  - {name: ts, type: tailscale, auth-key: tskey-auth-x}\nrules: ['MATCH,ts']\n",
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        let core =
+            crate::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        assert!(super::start(&core).unwrap().is_empty());
+        assert!(!dir.join("tailscale").exists());
+        assert_eq!(core.proxy_status()["ts"]["tailscale"]["state"], "disabled");
+        let target = clyntis_protocol::Target {
+            host: "pi5".into(),
+            port: 22,
+        };
+        let error = core.dial(&target, None).await.err().unwrap();
+        assert!(format!("{error:#}").contains("turned off"), "{error:#}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn hostnames_differ_per_device_and_stay_dns_labels() {

@@ -9,7 +9,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import brandIcon from "../src-tauri/icons/clyntis-v3/brand-128.png";
-import { locale, resolveLanguage, setLanguage, t, type Language } from "./i18n";
+import {
+  locale,
+  resolveLanguage,
+  setLanguage,
+  t,
+  tx,
+  type Language,
+} from "./i18n";
 import {
   Activity,
   ArrowDown,
@@ -3524,7 +3531,7 @@ function OverrideSwitch({
     >
       <option value="">{t("跟随配置文件")}</option>
       <option value="true">{t("开启")}</option>
-      <option value="false">{t("关闭")}</option>
+      <option value="false">{tx("switch", "关闭")}</option>
     </select>
   );
 }
@@ -3642,6 +3649,15 @@ function SettingsPage({
           <OverrideSwitch
             value={settings.overrides.sniffing}
             onChange={(v) => override("sniffing", v)}
+          />
+        </Setting>
+        <Setting
+          label="Tailscale"
+          text={t("关闭后不连接 tailnet，发往 Tailscale 节点的连接会失败")}
+        >
+          <OverrideSwitch
+            value={settings.overrides.tailscale}
+            onChange={(v) => override("tailscale", v)}
           />
         </Setting>
       </section>

@@ -1239,7 +1239,11 @@ impl Core {
                         .unwrap()
                         .get(name.as_str())
                         .cloned()
-                        .context("Tailscale proxy is not running")?;
+                        .context(if self.config.tailscale_enable {
+                            "Tailscale proxy is not running"
+                        } else {
+                            "Tailscale is turned off in the settings"
+                        })?;
                     node.dial(&target.host, target.port).await
                 }
                 ProxyKind::Hysteria2 => self.hysteria2_stream(p, &target).await,
@@ -1498,6 +1502,11 @@ impl Core {
                 ProxyKind::Tailscale => {
                     if let Some(node) = nodes.get(&p.name) {
                         status["tailscale"] = json!(node.status());
+                    } else if !self.config.tailscale_enable {
+                        status["tailscale"] = json!({
+                            "state": "disabled", "error": null, "name": null, "addresses": [],
+                            "home_derp": null, "endpoints": [], "peers": [],
+                        });
                     }
                 }
                 _ => {}

@@ -14,9 +14,13 @@ struct OverridesView: View {
                 }
                 OverrideToggle(title: "IPv6", value: binding(\.ipv6))
                 OverrideToggle(title: L("域名嗅探"), value: binding(\.sniffing))
+                OverrideToggle(title: "Tailscale", value: binding(\.tailscale))
             } footer: {
-                Text(model.active ? L("已连接：修改后需要重新连接才会生效。")
-                                  : L("选「跟随配置文件」时使用配置自己的值。debug 日志较多，平时用 info。"))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(model.active ? L("已连接：修改后需要重新连接才会生效。")
+                                      : L("选「跟随配置文件」时使用配置自己的值。debug 日志较多，平时用 info。"))
+                    Text(L("Tailscale 关闭后不连接 tailnet，发往 Tailscale 节点的连接会失败。"))
+                }
             }
             if model.active {
                 Section {
@@ -48,7 +52,7 @@ private struct OverrideToggle: View {
         Picker(title, selection: $value) {
             Text(L("跟随配置文件")).tag(Bool?.none)
             Text(L("开启")).tag(Bool?.some(true))
-            Text(L("关闭")).tag(Bool?.some(false))
+            Text(L("关闭", context: "switch")).tag(Bool?.some(false))
         }
     }
 }

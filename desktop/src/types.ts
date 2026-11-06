@@ -28,6 +28,7 @@ export interface Overrides {
   logLevel?: LogLevel | null;
   ipv6?: boolean | null;
   sniffing?: boolean | null;
+  tailscale?: boolean | null;
   adblock?: AdblockSettings | null;
 }
 export type AdListFormat = "clash" | "hosts" | "adguard";
@@ -182,7 +183,7 @@ export interface NodeStatus {
   tailscale?: TailscaleStatus;
 }
 export interface TailscaleStatus {
-  state: "connecting" | "running" | "error";
+  state: "connecting" | "running" | "error" | "disabled";
   error: string | null;
   name: string | null;
   addresses: string[];
@@ -210,6 +211,9 @@ export const tailscaleStateText: Record<TailscaleStatus["state"], string> = {
   },
   get error() {
     return t("连接失败");
+  },
+  get disabled() {
+    return t("已关闭");
   },
 };
 export function peerPathText(peer: TailscalePeer): string {

@@ -34,6 +34,7 @@ struct TailscaleStatus: Decodable, Equatable {
         switch state {
         case "running": L("已连接")
         case "error": L("连接失败")
+        case "disabled": L("已关闭")
         default: L("连接中")
         }
     }

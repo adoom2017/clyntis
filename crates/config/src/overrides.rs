@@ -19,6 +19,8 @@ pub struct Overrides {
     pub sniffing: Option<bool>,
     /// Ad blocking from the app's settings; replaces the profile's `adblock`.
     pub adblock: Option<crate::adblock::Settings>,
+    /// `tailscale-enable`: whether the profile's Tailscale proxies run.
+    pub tailscale: Option<bool>,
 }
 
 impl Overrides {
@@ -55,6 +57,9 @@ impl Overrides {
         if let Some(ipv6) = self.ipv6 {
             map.insert(Value::from("ipv6"), Value::from(ipv6));
             nested(map, "dns")?.insert(Value::from("ipv6"), Value::from(ipv6));
+        }
+        if let Some(tailscale) = self.tailscale {
+            map.insert(Value::from("tailscale-enable"), Value::from(tailscale));
         }
         if let Some(sniffing) = self.sniffing {
             let sniffer = nested(map, "sniffer")?;
@@ -125,8 +130,10 @@ mod tests {
                 allow: vec!["ok.test".into()],
                 ..Default::default()
             }),
+            tailscale: Some(false),
         };
         let config = crate::Config::parse(overrides.apply(PROFILE).unwrap().as_bytes()).unwrap();
+        assert!(!config.tailscale_enable);
         assert_eq!(config.log.log_level, "warning");
         assert!(config.ipv6 && config.dns.ipv6);
         assert!(config.sniffer.enable);
@@ -154,6 +161,22 @@ mod tests {
             config.sniffer.sniff.keys().collect::<Vec<_>>(),
             ["HTTP", "TLS"]
         );
+    }
+
+    #[test]
+    fn tailscale_runs_unless_turned_off() {
+        assert!(
+            crate::Config::parse(PROFILE.as_bytes())
+                .unwrap()
+                .tailscale_enable
+        );
+        let off = "tailscale-enable: false\n";
+        let on = Overrides {
+            tailscale: Some(true),
+            ..Overrides::default()
+        };
+        let config = crate::Config::parse(on.apply(off).unwrap().as_bytes()).unwrap();
+        assert!(config.tailscale_enable);
     }
 
     #[test]

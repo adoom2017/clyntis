@@ -126,6 +126,10 @@ rules:
   - DOMAIN-SUFFIX,ts.net,Tailscale
 ```
 
+- On/off: the top-level `tailscale-enable: false` (a Clyntis addition; the
+  app's Tailscale setting writes it) keeps every Tailscale proxy stopped: no
+  control or DERP connections, no MagicDNS names, no `serve`. Connections
+  routed to it fail with "Tailscale is turned off", and its status shows Off.
 - Fields follow mihomo's; `exit-node-allow-lan-access` is accepted for
   compatibility and has no effect in a proxy. `dialer-proxy` is an addition.
 - `hostname` may contain `{os}` (`macos`, `ios`, `windows`, `linux`) and

@@ -249,7 +249,7 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
     })
 }
 
-/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing"}`, each
+/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing","adblock","tailscale"}`, each
 /// optional) over `config`. Writes the resulting YAML; unset values keep the
 /// profile's own.
 ///

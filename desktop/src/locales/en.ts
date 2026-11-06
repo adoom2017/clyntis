@@ -12,6 +12,7 @@ export const en: Record<string, string> = {
   日志: "Logs",
   设置: "Settings",
   "mode|规则": "Rule",
+  "switch|关闭": "Off",
   "无法连接 Clyntis 后台，请从桌面应用打开。":
     "Cannot reach the Clyntis backend; open it from the desktop app.",
   导入完成: "Import complete",
@@ -227,6 +228,9 @@ export const en: Record<string, string> = {
   传输: "Transport",
   安全: "Security",
   开启: "On",
+  已关闭: "Off",
+  "关闭后不连接 tailnet，发往 Tailscale 节点的连接会失败":
+    "Off: no tailnet connection; connections to Tailscale nodes fail",
   状态: "Status",
   本机名称: "This device's name",
   地址: "Addresses",

@@ -9,6 +9,8 @@ struct AppOverrides: Codable, Equatable {
     var logLevel: String?
     var ipv6: Bool?
     var sniffing: Bool?
+    /// Whether the profile's Tailscale proxies run.
+    var tailscale: Bool?
     var adblock: AdblockSettings?
 
     var isEmpty: Bool { self == AppOverrides() }
