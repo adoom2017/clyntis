@@ -1,6 +1,13 @@
 use anyhow::{Result, ensure};
+#[cfg(not(windows))]
 use tauri_plugin_autostart::ManagerExt;
 
+#[cfg(windows)]
+pub fn autostart(_app: &tauri::AppHandle, enabled: bool) -> Result<()> {
+    crate::windows_autostart::set(enabled)
+}
+
+#[cfg(not(windows))]
 pub fn autostart(app: &tauri::AppHandle, enabled: bool) -> Result<()> {
     if enabled {
         app.autolaunch().enable()?;
