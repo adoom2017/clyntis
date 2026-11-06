@@ -16,10 +16,10 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows-x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-aarch64
-          - os: macos-14
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             platform: darwin-x86_64
     runs-on: ${{ matrix.os }}
@@ -83,7 +83,10 @@ jobs:
       - name: CLI and C library package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/package-release.ps1 -OutputDirectory release
+        run: |
+          # package-release.ps1 builds with --offline; fill the Cargo cache first.
+          cargo fetch --locked
+          ./scripts/package-release.ps1 -OutputDirectory release
       - name: Install frontend dependencies and run tests
         working-directory: desktop
         run: |
