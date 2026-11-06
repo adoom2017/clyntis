@@ -11,6 +11,8 @@ mod platform;
 mod tray;
 mod updates;
 #[cfg(windows)]
+mod windows_autostart;
+#[cfg(windows)]
 mod windows_diagnostics;
 
 use app::Desktop;
@@ -121,6 +123,10 @@ fn main() {
             let desktop = Desktop::new(app.handle().clone(), app.path().app_data_dir()?)?;
             // Until the window reports the system language, a chosen one applies.
             clyntis_desktop_model::i18n::set(&desktop.language());
+            #[cfg(windows)]
+            if let Err(error) = desktop.reconcile_autostart() {
+                desktop.report(&error);
+            }
             app.manage(desktop);
             app.manage(updates::Updates::default());
             let items = TRAY_ITEMS

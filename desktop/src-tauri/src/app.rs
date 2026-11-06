@@ -49,6 +49,8 @@ pub struct Desktop {
     pub logs: Logs,
     pub exiting: AtomicBool,
     update_cleanup_failed: AtomicBool,
+    #[cfg(windows)]
+    autostart_error: Mutex<Option<String>>,
     subscription_lock: tokio::sync::Mutex<()>,
     /// Whether the core is running; drives the menu-bar icon animation.
     running: tokio::sync::watch::Sender<bool>,
@@ -60,6 +62,15 @@ impl Desktop {
             .settings()
             .map(|settings| settings.language)
             .unwrap_or_default()
+    }
+    #[cfg(windows)]
+    pub fn reconcile_autostart(&self) -> Result<()> {
+        let result = crate::windows_autostart::reconcile(self.store.settings()?.launch_at_login);
+        if let Err(failure) = &result {
+            *self.autostart_error.lock().unwrap() =
+                Some(clyntis_desktop_model::redact(&format!("{failure:#}")));
+        }
+        result
     }
     pub fn new(app: tauri::AppHandle, root: PathBuf) -> Result<Self> {
         let store = Store::new(root)?;
@@ -90,6 +101,8 @@ impl Desktop {
             logs: Arc::new(Mutex::new(VecDeque::new())),
             exiting: AtomicBool::new(false),
             update_cleanup_failed: AtomicBool::new(false),
+            #[cfg(windows)]
+            autostart_error: Mutex::new(None),
             subscription_lock: tokio::sync::Mutex::new(()),
             running: tokio::sync::watch::Sender::new(false),
         })
@@ -371,7 +384,8 @@ impl Desktop {
             || settings.auto_dns != previous.auto_dns
             || settings.tun_interface != previous.tun_interface
             || without_allow(&settings) != without_allow(&previous);
-        if settings.launch_at_login != previous.launch_at_login {
+        // Saving an already-enabled setting must also repair a missing Windows entry.
+        if cfg!(windows) || settings.launch_at_login != previous.launch_at_login {
             platform::autostart(&self.app, settings.launch_at_login)?;
         }
         let result = async {
@@ -394,6 +408,15 @@ impl Desktop {
         if result.is_err() {
             self.store.save_settings(&previous)?;
             let _ = platform::autostart(&self.app, previous.launch_at_login);
+        }
+        #[cfg(windows)]
+        if result.is_ok()
+            && let Some(failure) = self.autostart_error.lock().unwrap().take()
+        {
+            let mut view = self.view.lock().unwrap();
+            if view.error.as_ref() == Some(&failure) {
+                view.error = None;
+            }
         }
         self.notify();
         result
