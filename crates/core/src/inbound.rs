@@ -20,15 +20,57 @@ pub enum Kind {
     Socks,
     Mixed,
 }
+/// Local connections open at once, over all proxy listeners.
+pub(crate) const CONNECTION_SLOTS: usize = 4096;
+
+/// At most one warning per period, so a condition that persists (descriptors
+/// used up, every slot taken) cannot flood the log.
+pub(crate) struct Throttle(Option<tokio::time::Instant>);
+impl Throttle {
+    const PERIOD: Duration = Duration::from_secs(10);
+    pub(crate) fn new() -> Self {
+        Self(None)
+    }
+    pub(crate) fn ready(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        if self.0.is_some_and(|last| now < last + Self::PERIOD) {
+            return false;
+        }
+        self.0 = Some(now);
+        true
+    }
+}
+
+/// Accept errors concern one connection or a moment (`EMFILE`, a peer that
+/// reset before accept, `WSAECONNRESET`); the listener stays usable. Leaving
+/// the loop instead closed the port for good while the core kept running.
+async fn accept_failed(warned: &mut Throttle, listener: &str, error: &std::io::Error) {
+    if warned.ready() {
+        tracing::warn!(listener, %error, "cannot accept a local connection; listener keeps running");
+    } else {
+        tracing::debug!(listener, %error, "cannot accept a local connection");
+    }
+    // Descriptor exhaustion fails every accept until a connection closes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 pub async fn serve(core: Arc<Core>, listener: TcpListener, kind: Kind) {
     let mut tasks = JoinSet::new();
+    let (mut warned, mut warned_full, mut refused) = (Throttle::new(), Throttle::new(), 0u64);
     loop {
         tokio::select! {
             _=core.stop.cancelled()=>break,
             _=tasks.join_next(),if !tasks.is_empty()=>{},
             accepted=listener.accept()=>{
-                let Ok((stream,peer))=accepted else{break;};
-                let Ok(permit)=core.slots.clone().try_acquire_owned()else{continue;};let core=core.clone();
+                let (stream,peer)=match accepted {
+                    Ok(accepted)=>accepted,
+                    Err(error)=>{accept_failed(&mut warned,"proxy",&error).await;continue;}
+                };
+                let Ok(permit)=core.slots.clone().try_acquire_owned()else{
+                    refused+=1;
+                    if warned_full.ready(){tracing::warn!(%peer,refused,"local connection refused: {CONNECTION_SLOTS} connections already open");refused=0;}
+                    continue;
+                };let core=core.clone();
                 tasks.spawn(async move {let _permit=permit;let result=handle(core.clone(),stream,peer,kind).await;if let Err(err)=result {tracing::debug!(error=%err,"local connection ended");}});
             }
         }
@@ -374,12 +416,16 @@ pub async fn dns_tcp_local(core: Arc<Core>, listener: TcpListener, local_ip: std
 }
 async fn dns_tcp_inner(core: Arc<Core>, listener: TcpListener, local_ip: Option<std::net::IpAddr>) {
     let mut tasks = JoinSet::new();
+    let mut warned = Throttle::new();
     loop {
         tokio::select! {
             _ = core.stop.cancelled() => break,
             _ = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept() => {
-                let Ok((mut stream, peer)) = accepted else { break; };
+                let (mut stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => { accept_failed(&mut warned, "DNS TCP", &error).await; continue; }
+                };
                 if local_ip.is_some_and(|ip| !peer.ip().is_loopback() && peer.ip() != ip) { continue; }
                 if tasks.len() >= 256 { continue; }
                 let core = core.clone();

@@ -799,6 +799,109 @@ async fn tcp_relay_survives_six_minutes_without_application_data() {
     assert!(core.connections().is_empty());
 }
 
+/// A relay in a hosted tunnel: client side, peer side and the relay task.
+fn hosted_relay() -> (
+    Arc<Core>,
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let config = Config {
+        internal_host_packet_io: true,
+        ..Config::default()
+    };
+    let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+    let (client, inbound) = tokio::io::duplex(1024);
+    let (outbound, peer) = tokio::io::duplex(1024);
+    let owner = core.clone();
+    let relay = tokio::spawn(async move {
+        owner
+            .relay(
+                Box::new(inbound),
+                Target::new("idle.test", 443).unwrap(),
+                Box::new(outbound),
+                "DIRECT".into(),
+            )
+            .await
+    });
+    (core, client, peer, relay)
+}
+
+async fn settle() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn hosted_relay_closes_after_thirty_silent_minutes() {
+    let (core, mut client, mut peer, relay) = hosted_relay();
+    client.write_all(b"ping").await.unwrap();
+    peer.read_exact(&mut [0; 4]).await.unwrap();
+    // Traffic restarts the idle period.
+    tokio::time::advance(Duration::from_secs(29 * 60)).await;
+    settle().await;
+    peer.write_all(b"pong").await.unwrap();
+    client.read_exact(&mut [0; 4]).await.unwrap();
+    tokio::time::advance(Duration::from_secs(29 * 60)).await;
+    settle().await;
+    assert!(!relay.is_finished(), "closed before 30 silent minutes");
+    tokio::time::advance(Duration::from_secs(61)).await;
+    settle().await;
+    assert!(relay.is_finished(), "silent relay outlived its idle limit");
+    relay.await.unwrap().unwrap();
+    assert!(core.connections().is_empty());
+    assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hosted_relay_ends_a_silent_half_close_but_not_a_busy_one() {
+    // The app finished sending and the download continues: kept open.
+    let (_core, mut client, mut peer, relay) = hosted_relay();
+    client.shutdown().await.unwrap();
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(20)).await;
+        settle().await;
+        peer.write_all(b"chunk").await.unwrap();
+        client.read_exact(&mut [0; 5]).await.unwrap();
+    }
+    assert!(
+        !relay.is_finished(),
+        "closed a half-closed relay still moving data"
+    );
+    // The peer then goes silent without closing: ended 30 s later.
+    tokio::time::advance(Duration::from_secs(29)).await;
+    settle().await;
+    assert!(!relay.is_finished());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    settle().await;
+    assert!(relay.is_finished(), "silent half-closed relay was kept");
+    relay.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_relay_keeps_a_silent_half_close() {
+    let core = Core::new(Config::default(), Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+    let (mut client, inbound) = tokio::io::duplex(1024);
+    let (outbound, mut peer) = tokio::io::duplex(1024);
+    let relay = tokio::spawn(async move {
+        core.relay(
+            Box::new(inbound),
+            Target::new("idle.test", 443).unwrap(),
+            Box::new(outbound),
+            "DIRECT".into(),
+        )
+        .await
+    });
+    client.shutdown().await.unwrap();
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+    settle().await;
+    assert!(!relay.is_finished(), "desktop relays have no silence limit");
+    relay.abort();
+}
+
 #[tokio::test]
 async fn proxy_status_reports_details_and_the_last_probe() {
     let config = clyntis_config::Config::parse(

@@ -63,8 +63,11 @@ struct Budget {
     close_above: u64,
 }
 impl Budget {
+    /// Browsers, IDEs and sync clients together keep several hundred
+    /// connections open; at 512 new ones were reset. Buffers are allocated
+    /// zeroed (lazily mapped), so idle flows cost little of the worst case.
     const DESKTOP: Self = Self {
-        max_tcp: 512,
+        max_tcp: 2048,
         max_udp: 512,
         max_ports: 256,
         tcp_buffer: 32 * 1024,
@@ -798,6 +801,9 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut drops_logged = ([0u64; 8], Instant::now());
     // TCP sessions that failed since the last summary, and the latest error.
     let mut tcp_failed = 0u64;
+    // SYNs smoltcp answered with a reset because the flow table was full or
+    // the memory guard was shedding; nothing else reports them.
+    let mut tcp_refused = 0u64;
     let mut last_tcp_error: Option<String> = None;
     let mut failures_logged = [0u64; 2];
     let mut tasks = JoinSet::new();
@@ -836,7 +842,11 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) else { continue; };
                 if let Some((flow, syn)) = sniff(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }
-                    if flow.tcp && syn && !guard.shedding && !tcp_flows.contains_key(&flow) && tcp_flows.len() < budget.max_tcp {
+                    let admit_tcp = flow.tcp && syn && !tcp_flows.contains_key(&flow);
+                    if admit_tcp && (guard.shedding || tcp_flows.len() >= budget.max_tcp) {
+                        tcp_refused += 1;
+                    }
+                    if admit_tcp && !guard.shedding && tcp_flows.len() < budget.max_tcp {
                         let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]), tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]));
                         socket.set_timeout(Some(NetDuration::from_secs(300)));
                         socket.set_keep_alive(Some(NetDuration::from_secs(30)));
@@ -915,18 +925,21 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     drops.dns_failed.load(Ordering::Relaxed),
                     drops.dns_timed_out.load(Ordering::Relaxed),
                 ];
-                if dns != failures_logged || tcp_failed != 0 {
+                if dns != failures_logged || tcp_failed != 0 || tcp_refused != 0 {
                     tracing::info!(
                         dns_failed = dns[0] - failures_logged[0],
                         dns_timed_out = dns[1] - failures_logged[1],
                         last_dns_error = drops.last_dns_error.lock().unwrap().take().as_deref(),
                         tcp_failed,
+                        tcp_refused,
+                        tcp_flows = tcp_flows.len(),
                         last_tcp_error = last_tcp_error.take().as_deref(),
                         "TUN DNS queries and TCP sessions failed in the last {}s",
                         DROPS_LOG_EVERY.as_secs()
                     );
                     failures_logged = dns;
                     tcp_failed = 0;
+                    tcp_refused = 0;
                 }
             }
         }

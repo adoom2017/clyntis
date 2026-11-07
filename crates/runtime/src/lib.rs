@@ -81,6 +81,57 @@ fn report_network(
     }
 }
 
+/// Notices that the machine slept. Waking on the same network changes no
+/// interface or address, yet NAT mappings and server sessions are gone; pooled
+/// gRPC connections, Hysteria2 clients and relays kept waiting on them until
+/// keepalive gave up, a minute or more after waking.
+struct SleepWatch {
+    wall: std::time::SystemTime,
+    monotonic: std::time::Instant,
+}
+impl SleepWatch {
+    /// Ticks come every few seconds; a sleep is assumed beyond this.
+    const GAP: std::time::Duration = std::time::Duration::from_secs(20);
+    fn new() -> Self {
+        Self {
+            wall: std::time::SystemTime::now(),
+            monotonic: std::time::Instant::now(),
+        }
+    }
+    fn slept(&mut self) -> Option<std::time::Duration> {
+        self.observe(std::time::SystemTime::now(), std::time::Instant::now())
+    }
+    fn observe(
+        &mut self,
+        wall: std::time::SystemTime,
+        monotonic: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let wall_gap = wall.duration_since(self.wall).unwrap_or_default();
+        let monotonic_gap = monotonic.saturating_duration_since(self.monotonic);
+        (self.wall, self.monotonic) = (wall, monotonic);
+        // macOS and Linux stop the monotonic clock during sleep, so only the
+        // wall clock shows it. Windows keeps counting: the tick itself is late.
+        let stopped = wall_gap.saturating_sub(monotonic_gap) > Self::GAP;
+        let late = cfg!(windows) && monotonic_gap > Self::GAP && wall_gap > Self::GAP;
+        (stopped || late).then_some(wall_gap)
+    }
+}
+
+/// IPv4 addresses and gateways of the default interface, for cores without
+/// a TUN, which otherwise never learn that Wi-Fi changed. IPv6 is left out:
+/// temporary addresses rotate on their own.
+fn default_route_identity() -> Vec<std::net::IpAddr> {
+    let facts = clyntis_platform::desktop::network_facts(None);
+    let mut identity: Vec<_> = facts
+        .addresses
+        .into_iter()
+        .chain(facts.gateways)
+        .filter(std::net::IpAddr::is_ipv4)
+        .collect();
+    identity.sort();
+    identity
+}
+
 fn physical_dns_upstreams(
     dns: &clyntis_config::Dns,
     overrides: &[clyntis_config::network::NetworkOverride],
@@ -568,12 +619,29 @@ pub async fn run(
     #[cfg(target_os = "macos")]
     let mut cooldowns = EgressCooldowns::default();
     let mut alias_failed = false;
+    let mut sleep = SleepWatch::new();
+    let mut route = desktop.is_none().then(default_route_identity);
     let result: Result<()> = async { loop {
             tokio::select! {
                 _ = stop.cancelled() => break Ok(()),
                 _ = core.stop.cancelled() => break Err(anyhow::anyhow!("proxy core stopped unexpectedly")),
-                _ = refresh.tick(), if desktop.is_some() || !core.config.networks.is_empty() => {
+                _ = refresh.tick() => {
+                    let slept = sleep.slept();
+                    if let Some(gap) = slept {
+                        core.network_changed().await;
+                        tracing::info!(gap_secs = gap.as_secs(), "system resumed from sleep; sessions closed for reconnect");
+                    }
                     if desktop.is_none() {
+                        let current = default_route_identity();
+                        // Reset once the new network is up, not when it drops.
+                        if let Some(known) = route.as_mut() && !current.is_empty() && *known != current {
+                            let first = known.is_empty();
+                            *known = current;
+                            if !first && slept.is_none() {
+                                core.network_changed().await;
+                                tracing::info!(network = ?known, "default network changed; sessions closed for reconnect");
+                            }
+                        }
                         report_network(&core, None, &mut reported);
                         continue;
                     }
@@ -635,7 +703,9 @@ pub async fn run(
                             if system_dns.is_some() {
                                 dns_pending = true;
                             }
-                            core.network_changed().await;
+                            if slept.is_none() {
+                                core.network_changed().await;
+                            }
                             tracing::info!(network = ?desktop.as_ref().unwrap().hooks.network(), "physical egress changed; sessions closed for reconnect");
                         },
                         Ok(false) => {},
@@ -686,7 +756,43 @@ pub async fn run(
         }
     }
     tracing::info!("proxy core stopped");
+    logging::flush();
     result.and(cleanup)
+}
+
+#[cfg(test)]
+mod sleep_tests {
+    use super::*;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn a_stopped_monotonic_clock_reveals_sleep() {
+        let (wall, monotonic) = (SystemTime::now(), Instant::now());
+        let mut watch = SleepWatch { wall, monotonic };
+        // Regular ticks.
+        let tick = Duration::from_secs(3);
+        assert_eq!(watch.observe(wall + tick, monotonic + tick), None);
+        // Slept for an hour: the wall clock moved on, the monotonic did not.
+        let woke = wall + tick + Duration::from_secs(3600);
+        assert_eq!(
+            watch.observe(woke, monotonic + 2 * tick),
+            Some(Duration::from_secs(3600))
+        );
+        // A clock set back is not a sleep.
+        assert_eq!(
+            watch.observe(woke - Duration::from_secs(600), monotonic + 3 * tick),
+            None
+        );
+    }
+
+    #[test]
+    fn a_late_tick_is_sleep_only_where_the_monotonic_clock_keeps_counting() {
+        let (wall, monotonic) = (SystemTime::now(), Instant::now());
+        let mut watch = SleepWatch { wall, monotonic };
+        let gap = Duration::from_secs(600);
+        let slept = watch.observe(wall + gap, monotonic + gap);
+        assert_eq!(slept, cfg!(windows).then_some(gap));
+    }
 }
 
 #[cfg(test)]
