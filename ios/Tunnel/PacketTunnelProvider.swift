@@ -769,17 +769,22 @@ private final class TunnelWatchdog {
     private let queue = DispatchQueue(label: "org.clyntis.ios.tunnel-watchdog")
     private let lock = NSLock()
     private var operation = "starting"
-    private var operationSince = Date()
-    private var answered = Date()
-    private var reported: Date?
+    private var operationSince = TunnelWatchdog.uptime()
+    private var answered = TunnelWatchdog.uptime()
+    private var reported: TimeInterval?
     private var timer: DispatchSourceTimer?
     private let heartbeat = ProfileStore.sharedContainer()?.appendingPathComponent("tunnel-heartbeat.json")
+
+    /// Seconds of uptime, which stands still while the device sleeps. With
+    /// wall-clock time a sleep of the extension (iOS suspends it) read as the
+    /// queue being blocked for that long when it woke.
+    private static func uptime() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// Called on the tunnel queue around work that could block it.
     func begin(_ name: String) {
         lock.lock()
         operation = name
-        operationSince = Date()
+        operationSince = Self.uptime()
         lock.unlock()
     }
 
@@ -805,7 +810,7 @@ private final class TunnelWatchdog {
         queue.sync {
             timer?.cancel()
             lock.lock()
-            answered = Date()
+            answered = Self.uptime()
             reported = nil
             lock.unlock()
             let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -829,15 +834,15 @@ private final class TunnelWatchdog {
         tunnelQueue.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            self.answered = Date()
+            self.answered = Self.uptime()
             self.lock.unlock()
         }
-        let now = Date()
+        let now = Self.uptime()
         lock.lock()
-        let blocked = now.timeIntervalSince(answered)
+        let blocked = now - answered
         let operation = self.operation
-        let busy = now.timeIntervalSince(operationSince)
-        let report = blocked > 10 && reported.map { now.timeIntervalSince($0) >= 30 } ?? true
+        let busy = now - operationSince
+        let report = blocked > 10 && reported.map { now - $0 >= 30 } ?? true
         if report { reported = now }
         if blocked <= 10 { reported = nil }
         lock.unlock()
@@ -847,7 +852,7 @@ private final class TunnelWatchdog {
         }
         guard let heartbeat else { return }
         let beat: [String: Any] = [
-            "time": ISO8601DateFormatter().string(from: now),
+            "time": ISO8601DateFormatter().string(from: Date()),
             "operation": operation,
             "memory": footprint,
             "blocked": Int(blocked),

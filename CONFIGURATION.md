@@ -360,6 +360,12 @@ apart, cycling through every address of `ntp.server`. A failed round keeps
 the current clock offset and is logged at debug level; a warning follows
 from the second consecutive failure.
 
+A TCP relay that ends other than by a normal close, or that lived five
+minutes or more, logs `[CLOSE] <target> using <node> after <seconds>s up=<bytes>
+down=<bytes> reason=<reason>` at info level; `reason` is `closed`, `cancelled`
+(network change, controller or stop), `idle`, `half-closed` or the I/O error.
+Short connections that close normally log the same line at debug level.
+
 On desktops, waking from sleep counts as a network change, as does a new
 IPv4 address or gateway on the default interface when TUN is off. Log lines
 are written by a background thread; if the destination (a file, or the desktop

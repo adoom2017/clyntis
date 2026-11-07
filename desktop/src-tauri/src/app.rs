@@ -991,8 +991,29 @@ pub async fn close_connection(state: State<'_, Desktop>, id: Option<String>) -> 
         .map_err(error)?;
     Ok(())
 }
+/// The core's own log (every rotated `clyntis-runner` file of each profile
+/// run by this app, oldest first) followed by the app's recent log lines,
+/// which hold only the last 2000 and are lost on exit. A core run by the
+/// network service (TUN) logs in the service's directory instead.
 #[tauri::command]
 pub fn export_logs(state: State<'_, Desktop>, path: String) -> Reply<()> {
+    use clyntis_desktop_service::diagnostics::log_files;
+    let mut output = Vec::new();
+    let mut directories = vec![state.store.root.clone()];
+    if let Ok(profiles) = state.store.list() {
+        directories.extend(profiles.iter().map(|p| state.store.runtime_dir(p.id)));
+    }
+    for directory in directories {
+        for file in log_files(&directory) {
+            if let Ok(bytes) = std::fs::read(&file) {
+                output.extend_from_slice(format!("==> {} <==\n", file.display()).as_bytes());
+                output.extend_from_slice(&bytes);
+                if !bytes.ends_with(b"\n") {
+                    output.push(b'\n');
+                }
+            }
+        }
+    }
     let lines: Vec<_> = state
         .logs
         .lock()
@@ -1000,8 +1021,11 @@ pub fn export_logs(state: State<'_, Desktop>, path: String) -> Reply<()> {
         .iter()
         .map(ToString::to_string)
         .collect();
-    clyntis_desktop_model::atomic_write(std::path::Path::new(&path), lines.join("\n").as_bytes())
-        .map_err(error)
+    if !output.is_empty() {
+        output.extend_from_slice(b"==> app <==\n");
+    }
+    output.extend_from_slice(lines.join("\n").as_bytes());
+    clyntis_desktop_model::atomic_write(std::path::Path::new(&path), &output).map_err(error)
 }
 #[tauri::command]
 pub async fn install_service(state: State<'_, Desktop>) -> Reply<String> {

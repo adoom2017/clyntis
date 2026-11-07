@@ -70,8 +70,10 @@ struct LogView: View {
                     .pickerStyle(.menu)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    if let url = LogFile.shared.url, !entries.isEmpty {
-                        ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
+                    if LogFile.shared.url != nil, !entries.isEmpty {
+                        ShareLink(item: LogExport(), preview: SharePreview("clyntis.log")) {
+                            Image(systemName: "square.and.arrow.up")
+                        }
                     }
                     Button(L("清空"), systemImage: "trash") { confirmClear = true }
                         .disabled(entries.isEmpty)

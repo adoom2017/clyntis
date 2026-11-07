@@ -40,5 +40,6 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dev-dependencies]
 route_manager = "=0.2.9"

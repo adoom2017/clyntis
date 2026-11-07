@@ -1,4 +1,6 @@
+import CoreTransferable
 import Foundation
+import UniformTypeIdentifiers
 
 /// One log line shown in the app's log page.
 struct LogEntry: Identifiable, Hashable {
@@ -11,14 +13,24 @@ struct LogEntry: Identifiable, Hashable {
 
 /// Log shared by the app and the tunnel extension, in the App Group container.
 /// Lines are appended with O_APPEND so both processes can write safely; the
-/// file rotates at 1 MiB, keeping one previous generation.
+/// file rotates at 4 MiB into `clyntis.1.log` … `clyntis.5.log`. At a busy
+/// phone's 0.5 MiB an hour that is about two days; 2 MiB held four hours,
+/// too little to look back at a problem noticed the next morning.
 final class LogFile: @unchecked Sendable {
     static let shared = LogFile()
 
     let url: URL?
-    private var previousURL: URL? { url?.deletingPathExtension().appendingPathExtension("1.log") }
     private let lock = NSLock()
-    private let limit = 1 << 20
+    private let limit = 4 << 20
+    private static let generations = 5
+    /// `clyntis.<n>.log`, n = 1 newest.
+    private func generation(_ n: Int) -> URL? {
+        url?.deletingPathExtension().appendingPathExtension("\(n).log")
+    }
+    /// Every file, oldest first.
+    private var files: [URL] {
+        (1...Self.generations).reversed().compactMap(generation(_:)) + [url].compactMap { $0 }
+    }
     private let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -43,9 +55,8 @@ final class LogFile: @unchecked Sendable {
         guard fd >= 0 else { return }
         defer { close(fd) }
         var size = stat()
-        if fstat(fd, &size) == 0, size.st_size > limit, let previous = previousURL {
-            try? FileManager.default.removeItem(at: previous)
-            try? FileManager.default.moveItem(at: url, to: previous)
+        if fstat(fd, &size) == 0, size.st_size > limit {
+            rotate()
             let fresh = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
             guard fresh >= 0 else { return }
             defer { close(fresh) }
@@ -55,12 +66,21 @@ final class LogFile: @unchecked Sendable {
         write(fd, line)
     }
 
+    /// Called with the lock held: drops the oldest file and shifts the rest.
+    private func rotate() {
+        let manager = FileManager.default
+        if let oldest = generation(Self.generations) { try? manager.removeItem(at: oldest) }
+        for n in stride(from: Self.generations - 1, through: 1, by: -1) {
+            if let from = generation(n), let to = generation(n + 1) { try? manager.moveItem(at: from, to: to) }
+        }
+        if let url, let newest = generation(1) { try? manager.moveItem(at: url, to: newest) }
+    }
+
     /// Newest entries last; reads at most `maxBytes` from the end of the log.
     func entries(maxBytes: Int = 512 * 1024) -> [LogEntry] {
-        guard let url else { return [] }
-        var data = tail(of: url, maxBytes: maxBytes)
-        if data.count < maxBytes, let previous = previousURL {
-            data = tail(of: previous, maxBytes: maxBytes - data.count) + data
+        var data = Data()
+        for file in files.reversed() where data.count < maxBytes {
+            data = tail(of: file, maxBytes: maxBytes - data.count) + data
         }
         let text = String(decoding: data, as: UTF8.self)
         return text.split(separator: "\n").enumerated().compactMap { index, line in
@@ -74,7 +94,29 @@ final class LogFile: @unchecked Sendable {
     func clear() {
         lock.lock()
         defer { lock.unlock() }
-        for file in [url, previousURL].compactMap({ $0 }) { try? FileManager.default.removeItem(at: file) }
+        for file in files { try? FileManager.default.removeItem(at: file) }
+    }
+
+    /// Every file joined, oldest first, in a temporary file for sharing.
+    func export() throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let target = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clyntis-\(formatter.string(from: Date())).log")
+        FileManager.default.createFile(atPath: target.path, contents: nil)
+        let output = try FileHandle(forWritingTo: target)
+        defer { try? output.close() }
+        lock.lock()
+        defer { lock.unlock() }
+        for file in files {
+            guard let input = try? FileHandle(forReadingFrom: file) else { continue }
+            defer { try? input.close() }
+            while let chunk = try input.read(upToCount: 1 << 20), !chunk.isEmpty {
+                try output.write(contentsOf: chunk)
+            }
+        }
+        return target
     }
 
     private func write(_ fd: Int32, _ line: String) {
@@ -103,5 +145,14 @@ final class LogFile: @unchecked Sendable {
         text = text.replacingOccurrences(of: "(https?://[^\\s?#]+)[?#][^\\s]*", with: "$1?…",
                                          options: .regularExpression)
         return text
+    }
+}
+
+/// Shares every log file as one, built when the share sheet asks for it.
+struct LogExport: Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .plainText) { _ in
+            SentTransferredFile(try LogFile.shared.export())
+        }
     }
 }

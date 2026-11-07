@@ -854,6 +854,58 @@ async fn hosted_relay_closes_after_thirty_silent_minutes() {
     assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
 }
 
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_relays_log_how_long_they_lived_and_why() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    // A short connection that both sides close normally: no info line.
+    let (_core, mut client, mut peer, relay) = hosted_relay();
+    client.write_all(b"ping").await.unwrap();
+    peer.read_exact(&mut [0; 4]).await.unwrap();
+    client.shutdown().await.unwrap();
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    peer.shutdown().await.unwrap();
+    assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
+    relay.await.unwrap().unwrap();
+    assert!(!captured.text().contains("[CLOSE]"), "{}", captured.text());
+    // One closed for silence: lifetime, bytes and reason.
+    let (_core, mut client, mut peer, relay) = hosted_relay();
+    client.write_all(b"ping").await.unwrap();
+    peer.read_exact(&mut [0; 4]).await.unwrap();
+    tokio::time::advance(Duration::from_secs(30 * 60 + 1)).await;
+    settle().await;
+    relay.await.unwrap().unwrap();
+    let text = captured.text();
+    assert!(
+        text.contains("[CLOSE] idle.test:443 using DIRECT after 1801s up=4 down=0 reason=idle"),
+        "{text}"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn hosted_relay_ends_a_silent_half_close_but_not_a_busy_one() {
     // The app finished sending and the download continues: kept open.

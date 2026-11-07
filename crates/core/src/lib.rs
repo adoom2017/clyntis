@@ -1455,17 +1455,49 @@ impl Core {
                 None => std::future::pending().await,
             }
         };
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::debug!(id = %state.snapshot().id, "TCP relay cancelled");
-            },
-            reason = expired => {
-                tracing::debug!(id = %state.snapshot().id, reason, "TCP relay closed after silence");
-            },
-            result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => { result?; },
-        }
-        Ok(())
+        let outcome = tokio::select! {
+            // Closed by a network change, the controller or a stopping core.
+            _ = cancel.cancelled() => Ok("cancelled"),
+            reason = expired => Ok(reason),
+            result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => result.map(|_| "closed"),
+        };
+        log_close(&state, &outcome);
+        outcome.map(drop).map_err(Into::into)
     }
+}
+/// Relays that lived this long are logged when they close, however they end.
+const LONG_RELAY: Duration = Duration::from_secs(5 * 60);
+/// One line per relay that ended other than by a normal close of a short
+/// connection: with only the opening lines in the log, a connection that an
+/// app kept reopening, or one that died after an hour, left no trace of how
+/// long it lasted, what it moved or why it ended.
+fn log_close(state: &traffic::State, outcome: &std::io::Result<&'static str>) {
+    let lifetime = state.lifetime();
+    let info = state.snapshot();
+    let node = info.chains.first().map(String::as_str).unwrap_or_default();
+    let reason = match outcome {
+        Ok(reason) => std::borrow::Cow::Borrowed(*reason),
+        Err(error) => std::borrow::Cow::Owned(error.to_string()),
+    };
+    let notable = !matches!(outcome, Ok("closed")) || lifetime >= LONG_RELAY;
+    let secs = lifetime.as_secs();
+    if notable {
+        tracing::info!(
+            "[CLOSE] {} using {node} after {secs}s up={} down={} reason={reason}",
+            info.metadata,
+            info.upload,
+            info.download
+        );
+    } else {
+        tracing::debug!(
+            "[CLOSE] {} using {node} after {secs}s up={} down={} reason={reason}",
+            info.metadata,
+            info.upload,
+            info.download
+        );
+    }
+}
+impl Core {
     /// Silence limits for TCP relays in a hosted (iOS) tunnel, whose memory
     /// limit cannot afford relays that outlive their use. The idle limit is
     /// a backstop well above push and messaging heartbeats (APNs, WeChat:

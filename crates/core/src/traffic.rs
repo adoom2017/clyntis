@@ -29,6 +29,10 @@ pub(crate) struct State {
     ended: Notify,
 }
 impl State {
+    /// Time since the connection was tracked.
+    pub(crate) fn lifetime(&self) -> Duration {
+        self.created.elapsed()
+    }
     /// How long no bytes moved either way.
     fn quiet(&self) -> Duration {
         self.created
