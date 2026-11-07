@@ -6,8 +6,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::broadcast;
 use tracing::{
@@ -32,43 +36,125 @@ pub fn init(config: &Log, directory: &Path, events: broadcast::Sender<String>) -
             config.clone(),
         )?)
     };
-    let writer = Arc::new(Mutex::new(writer));
+    let (queue, lines) = Queue::new(QUEUE_LINES);
+    let installed = queue.clone();
     tracing_subscriber::registry()
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(move || LogWriter(writer.clone())),
+                .with_writer(move || queue.clone()),
         )
         .with(EventLayer(events))
         .try_init()
         .context("cannot initialize logging")?;
+    let output: Box<dyn Write + Send> = match writer {
+        Some(file) => Box::new(file),
+        None => Box::new(io::stderr()),
+    };
+    std::thread::Builder::new()
+        .name("clyntis-log".into())
+        .spawn(move || lines.run(output))
+        .context("cannot start the log writer")?;
+    let _ = QUEUE.set(installed);
     Ok(())
 }
 
-struct LogWriter(Arc<Mutex<Option<RotatingFile>>>);
-impl Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut writer = self
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("log writer poisoned"))?;
-        if let Some(file) = writer.as_mut() {
-            file.write(bytes)
-        } else {
-            io::stderr().lock().write(bytes)
+/// Waits up to two seconds for queued log lines to be written, so the last
+/// lines before the process exits are not lost.
+pub fn flush() {
+    if let Some(queue) = QUEUE.get() {
+        queue.flush(Duration::from_secs(2));
+    }
+}
+
+/// Lines waiting for the writer thread before new ones are dropped.
+const QUEUE_LINES: usize = 8192;
+static QUEUE: OnceLock<Queue> = OnceLock::new();
+
+enum Message {
+    Line(Vec<u8>),
+    Flushed(mpsc::Sender<()>),
+}
+
+/// Log output for every thread of the core. Writing went straight to stderr
+/// or the log file under one lock: desktop runners log to a pipe that the
+/// app or service reads line by line, and when that reader lagged (antivirus
+/// scanning its file writes, an app throttled in the background) the full
+/// pipe blocked every thread that logged, the TUN packet loop included, and
+/// rotating a compressed file stalled them too. Lines now go to a bounded
+/// queue that a dedicated thread writes out; when it is full they are counted
+/// and dropped, never waited for.
+#[derive(Clone)]
+struct Queue {
+    sender: SyncSender<Message>,
+    dropped: Arc<AtomicU64>,
+}
+struct Lines {
+    receiver: Receiver<Message>,
+    dropped: Arc<AtomicU64>,
+}
+impl Queue {
+    fn new(capacity: usize) -> (Self, Lines) {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let queue = Self {
+            sender,
+            dropped: dropped.clone(),
+        };
+        (queue, Lines { receiver, dropped })
+    }
+    fn flush(&self, timeout: Duration) {
+        let (done, flushed) = mpsc::channel();
+        let deadline = Instant::now() + timeout;
+        let mut message = Message::Flushed(done);
+        loop {
+            match self.sender.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Full(again)) if Instant::now() < deadline => {
+                    message = again;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
         }
+        let _ = flushed.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+}
+impl Write for Queue {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // The formatter writes each event in one call.
+        if let Err(TrySendError::Full(_)) = self.sender.try_send(Message::Line(bytes.to_vec())) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        let mut writer = self
-            .0
-            .lock()
-            .map_err(|_| io::Error::other("log writer poisoned"))?;
-        if let Some(file) = writer.as_mut() {
-            file.flush()
-        } else {
-            io::stderr().lock().flush()
+        Ok(())
+    }
+}
+impl Lines {
+    fn run(self, mut output: Box<dyn Write + Send>) {
+        while let Ok(message) = self.receiver.recv() {
+            let dropped = self.dropped.swap(0, Ordering::Relaxed);
+            if dropped > 0 {
+                let _ = writeln!(
+                    output,
+                    "{} WARN {dropped} log lines dropped: the log output could not keep up",
+                    Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ")
+                );
+            }
+            match message {
+                Message::Line(line) => {
+                    let _ = output.write_all(&line);
+                }
+                Message::Flushed(done) => {
+                    let _ = output.flush();
+                    let _ = done.send(());
+                }
+            }
         }
+        let _ = output.flush();
     }
 }
 
@@ -245,7 +331,41 @@ impl Write for RotatingFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::{io::Read, sync::Mutex};
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stalled_log_output_drops_lines_instead_of_blocking_the_core() {
+        // Nobody reads yet, as when the pipe reader lags: logging returns at once.
+        let (mut queue, lines) = Queue::new(2);
+        for index in 0..5 {
+            // As the formatter does: one write per event.
+            queue
+                .write_all(format!("line {index}\n").as_bytes())
+                .unwrap();
+        }
+        assert_eq!(queue.dropped.load(Ordering::Relaxed), 3);
+        let output = Shared::default();
+        let written = output.clone();
+        let writer = std::thread::spawn(move || lines.run(Box::new(written)));
+        queue.flush(Duration::from_secs(2));
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("3 log lines dropped"), "{text}");
+        assert!(text.ends_with("line 0\nline 1\n"), "{text}");
+        drop(queue);
+        writer.join().unwrap();
+    }
 
     #[test]
     fn rotation_compresses_and_limits_only_owned_backups() {

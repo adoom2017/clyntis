@@ -9,13 +9,40 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
+/// Rotation size of `clyntis-runner.log`.
+const LOG_LIMIT: u64 = 1024 * 1024;
+
 #[derive(Clone, Default)]
-pub struct Diagnostics(Arc<Mutex<VecDeque<String>>>);
+pub struct Diagnostics(Arc<Mutex<Inner>>);
+#[derive(Default)]
+struct Inner {
+    lines: VecDeque<String>,
+    log: Option<LogFile>,
+}
+/// Kept open between lines. Reopening the file for every line of a busy
+/// runner (each one also scanned by antivirus software on Windows) let the
+/// reader fall behind, and a full stderr pipe stalls the runner.
+struct LogFile {
+    path: PathBuf,
+    file: std::fs::File,
+    size: u64,
+}
+impl LogFile {
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let size = file.metadata()?.len();
+        Ok(Self { path, file, size })
+    }
+}
 impl Diagnostics {
     pub fn tail(&self) -> String {
         self.0
             .lock()
             .unwrap()
+            .lines
             .iter()
             .cloned()
             .collect::<Vec<_>>()
@@ -23,23 +50,33 @@ impl Diagnostics {
     }
     pub fn record(&self, directory: &std::path::Path, message: &str) {
         let message = clyntis_desktop_model::redact(message);
-        let mut lines = self.0.lock().unwrap();
-        if lines.len() == 8 {
-            lines.pop_front();
+        let mut inner = self.0.lock().unwrap();
+        if inner.lines.len() == 8 {
+            inner.lines.pop_front();
         }
-        lines.push_back(message.clone());
+        inner.lines.push_back(message.clone());
         let path = directory.join("clyntis-runner.log");
+        let line = format!("{} {message}\n", clyntis_desktop_model::now());
         // Diagnostics must not interrupt network cleanup if the disk is full.
-        let _ = (|| -> std::io::Result<()> {
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() >= 1024 * 1024) {
-                std::fs::rename(&path, directory.join("clyntis-runner.previous.log"))?;
+        let written = (|| -> std::io::Result<()> {
+            if inner.log.as_ref().is_none_or(|log| log.path != path) {
+                inner.log = Some(LogFile::open(path.clone())?);
             }
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
-            writeln!(file, "{} {message}", clyntis_desktop_model::now())
+            if inner.log.as_ref().is_some_and(|log| log.size >= LOG_LIMIT) {
+                // Closed before the rename, which Windows refuses otherwise.
+                inner.log = None;
+                std::fs::rename(&path, directory.join("clyntis-runner.previous.log"))?;
+                inner.log = Some(LogFile::open(path.clone())?);
+            }
+            let log = inner.log.as_mut().unwrap();
+            log.file.write_all(line.as_bytes())?;
+            log.size += line.len() as u64;
+            Ok(())
         })();
+        if written.is_err() {
+            // Reopened on the next line, e.g. after the file was removed.
+            inner.log = None;
+        }
     }
     pub async fn capture(&self, stderr: impl AsyncRead + Unpin, directory: PathBuf) {
         let mut reader = BufReader::new(stderr);
@@ -88,6 +125,25 @@ mod tests {
         assert!(!output.contains("private"));
         assert!(output.contains("[过长日志已省略]"));
         assert!(diagnostics.tail().contains("final failure"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_runner_log_rotates_while_kept_open() {
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-diagnostics-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let diagnostics = Diagnostics::default();
+        let line = "x".repeat(1000);
+        for _ in 0..1100 {
+            diagnostics.record(&directory, &line);
+        }
+        diagnostics.record(&directory, "after rotation");
+        let current = std::fs::read_to_string(directory.join("clyntis-runner.log")).unwrap();
+        let previous = std::fs::metadata(directory.join("clyntis-runner.previous.log")).unwrap();
+        assert!(previous.len() >= LOG_LIMIT);
+        assert!(current.ends_with("after rotation\n"));
+        assert!((current.len() as u64) < LOG_LIMIT);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

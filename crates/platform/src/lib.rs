@@ -59,11 +59,7 @@ pub async fn tcp_connect_options(
     )?;
     socket.set_nonblocking(true)?;
     if keep_alive > 0 {
-        socket.set_tcp_keepalive(
-            &socket2::TcpKeepalive::new()
-                .with_time(std::time::Duration::from_secs(keep_alive))
-                .with_interval(std::time::Duration::from_secs(keep_alive)),
-        )?;
+        socket.set_tcp_keepalive(&keepalive(keep_alive))?;
     }
     #[cfg(windows)]
     if fast_open {
@@ -95,6 +91,27 @@ pub async fn tcp_connect_options(
     stream.set_nodelay(true)?;
     Ok(stream)
 }
+/// Unanswered probes before a peer counts as dead.
+#[cfg(not(windows))]
+const KEEPALIVE_PROBES: u32 = 3;
+/// Seconds between unanswered probes, at most.
+const KEEPALIVE_PROBE_INTERVAL: u64 = 15;
+/// Keepalive that probes after `idle` seconds of silence. Later probes only
+/// go out while the peer stays silent, so a short interval costs nothing on a
+/// live connection; with the system's probe count (8 on Darwin) and the iOS
+/// idle of 300 s as interval, a dead peer took 45 minutes to notice, holding
+/// its relay, TUN flow and buffers that long.
+fn keepalive(idle: u64) -> socket2::TcpKeepalive {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(idle))
+        .with_interval(std::time::Duration::from_secs(
+            idle.min(KEEPALIVE_PROBE_INTERVAL),
+        ));
+    // Windows before 10 1703 rejects TCP_KEEPCNT; it probes 10 times.
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(KEEPALIVE_PROBES);
+    keepalive
+}
 pub fn udp_bind(addr: SocketAddr, hooks: &dyn PlatformHooks) -> Result<tokio::net::UdpSocket> {
     udp_bind_for(addr, None, hooks)
 }
@@ -119,4 +136,45 @@ pub trait PacketIo: Send + Sync {
     /// Exactly one raw IP packet, without a Darwin address-family prefix.
     async fn recv(&self, packet: &mut [u8]) -> Result<usize>;
     async fn send(&self, packet: &[u8]) -> Result<()>;
+}
+
+#[cfg(all(test, unix))]
+mod keepalive_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn applied(idle: u64) -> (Duration, Duration, u32) {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        socket.set_tcp_keepalive(&keepalive(idle)).unwrap();
+        (
+            socket.tcp_keepalive_time().unwrap(),
+            socket.tcp_keepalive_interval().unwrap(),
+            socket.tcp_keepalive_retries().unwrap(),
+        )
+    }
+
+    #[test]
+    fn dead_peers_are_noticed_minutes_after_the_idle_period() {
+        // iOS: probing starts after 300 s of silence as before, but a dead
+        // peer is given up after 3 × 15 s more instead of 8 × 300 s.
+        assert_eq!(
+            applied(300),
+            (Duration::from_secs(300), Duration::from_secs(15), 3)
+        );
+        // Desktops keep their 30 s idle period.
+        assert_eq!(
+            applied(30),
+            (Duration::from_secs(30), Duration::from_secs(15), 3)
+        );
+        // A configured period under the probe interval is not lengthened.
+        assert_eq!(
+            applied(10),
+            (Duration::from_secs(10), Duration::from_secs(10), 3)
+        );
+    }
 }

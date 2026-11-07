@@ -111,6 +111,21 @@ fn pooled(key: &str, options: &clyntis_config::GrpcOptions) -> Option<Physical> 
     reuse_least_loaded(load, list.len(), options).then(|| least.clone())
 }
 
+/// How long a PING may go unanswered: the interval, within 5–20 s.
+fn ping_timeout(interval: Duration) -> Duration {
+    interval.clamp(Duration::from_secs(5), Duration::from_secs(20))
+}
+
+/// Forgets every pooled HTTP/2 connection so new streams dial afresh: after
+/// a network change the pooled ones may be bound to a gone interface, and
+/// HTTP/2 still reports them ready. A forgotten connection closes once its
+/// last stream ends.
+pub fn reset_pool() {
+    if let Some(pool) = POOL.get() {
+        pool.lock().unwrap().clear();
+    }
+}
+
 fn remove_physical(key: &str, id: u64) {
     let mut map = POOL.get_or_init(Default::default).lock().unwrap();
     let remove_key = if let Some(list) = map.get_mut(key) {
@@ -197,27 +212,50 @@ pub async fn connect(
                 sender: sender.clone(),
                 active: active.clone(),
             });
-        if options.ping_interval > 0
-            && let Some(mut ping) = connection.ping_pong()
-        {
-            let interval = options.ping_interval;
-            tokio::spawn(async move {
-                let mut timer = tokio::time::interval(Duration::from_secs(interval));
-                loop {
-                    timer.tick().await;
-                    if ping.ping(h2::Ping::opaque()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        let ping = (options.ping_interval > 0)
+            .then(|| connection.ping_pong())
+            .flatten();
         let cleanup_key = pool_key.clone();
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             if let Err(error) = connection.await {
                 tracing::debug!(%error, "gRPC HTTP/2 connection closed");
             }
             remove_physical(&cleanup_key, id);
         });
+        if let Some(mut ping) = ping {
+            let interval = Duration::from_secs(options.ping_interval);
+            let ping_key = pool_key.clone();
+            let driver = driver.abort_handle();
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(interval);
+                timer.tick().await;
+                loop {
+                    timer.tick().await;
+                    if driver.is_finished() {
+                        break;
+                    }
+                    // A dead link never answers: without a deadline the
+                    // pinger waited forever and new streams kept joining it.
+                    match tokio::time::timeout(
+                        ping_timeout(interval),
+                        ping.ping(h2::Ping::opaque()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            tracing::debug!("gRPC HTTP/2 ping unanswered; closing the connection");
+                            remove_physical(&ping_key, id);
+                            // Dropping the connection fails its streams now
+                            // instead of when TCP gives up.
+                            driver.abort();
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         let lease = ActiveLease::new(active);
         break (sender.ready().await?, lease);
     };
@@ -523,6 +561,111 @@ mod tests {
             .unwrap()
             .unwrap();
         task.await.unwrap();
+    }
+
+    /// Tests that inspect the process-wide pool, which `reset_pool` clears.
+    static POOL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A gRPC stream over an in-memory link whose server accepts one
+    /// stream and then either keeps serving the connection or stops reading
+    /// it, as a link that died without a reset looks.
+    async fn pooled_stream(
+        identity: &str,
+        options: &clyntis_config::GrpcOptions,
+        answer: bool,
+    ) -> (BoxStream, tokio::task::JoinHandle<()>) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            let _stream = connection.accept().await.unwrap().unwrap();
+            if answer {
+                while connection.accept().await.is_some() {}
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let stream = connect(
+            Box::new(client),
+            "unit.example:443",
+            "front.example",
+            options,
+            None,
+            identity,
+        )
+        .await
+        .unwrap();
+        (stream, server)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_ping_drops_the_pooled_connection_and_its_streams() {
+        let _pool = POOL_TESTS.lock().await;
+        let identity = format!("ping-{}", rand::random::<u64>());
+        let options = clyntis_config::GrpcOptions {
+            ping_interval: 1,
+            ..Default::default()
+        };
+        let pool_key = key(
+            &identity,
+            "unit.example:443",
+            "front.example",
+            &options,
+            false,
+        );
+        let (mut stream, server) = pooled_stream(&identity, &options, false).await;
+        assert!(pooled(&pool_key, &options).is_some());
+        // First ping after 1 s, given up 5 s later.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        assert!(
+            pooled(&pool_key, &options).is_none(),
+            "new streams would still join the dead connection"
+        );
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut [0; 8])).await;
+        assert!(
+            matches!(read, Ok(Err(_)) | Ok(Ok(0))),
+            "a stream on the dropped connection kept waiting: {read:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answered_pings_keep_the_connection_pooled() {
+        let _pool = POOL_TESTS.lock().await;
+        let identity = format!("ping-ok-{}", rand::random::<u64>());
+        let options = clyntis_config::GrpcOptions {
+            ping_interval: 1,
+            ..Default::default()
+        };
+        let pool_key = key(
+            &identity,
+            "unit.example:443",
+            "front.example",
+            &options,
+            false,
+        );
+        let (_stream, server) = pooled_stream(&identity, &options, true).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(pooled(&pool_key, &options).is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reset_pool_makes_new_streams_dial_afresh() {
+        let _pool = POOL_TESTS.lock().await;
+        let identity = format!("reset-{}", rand::random::<u64>());
+        let options = clyntis_config::GrpcOptions::default();
+        let pool_key = key(
+            &identity,
+            "unit.example:443",
+            "front.example",
+            &options,
+            false,
+        );
+        let (_stream, server) = pooled_stream(&identity, &options, true).await;
+        assert!(pooled(&pool_key, &options).is_some());
+        reset_pool();
+        assert!(pooled(&pool_key, &options).is_none());
+        server.abort();
     }
 
     #[tokio::test]

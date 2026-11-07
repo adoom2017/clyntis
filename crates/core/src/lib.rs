@@ -278,6 +278,8 @@ impl Running {
         self.core.stop.cancel();
         // Closes the Hysteria2 connections once their streams are gone.
         self.core.hysteria2.lock().unwrap().clear();
+        // The pool is process-wide: a later core must not reuse this one's.
+        clyntis_protocol::grpc::reset_pool();
         self.tasks.abort_all();
         self.system_dns_tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
@@ -288,6 +290,8 @@ impl Drop for Running {
     fn drop(&mut self) {
         self.core.stop.cancel();
         self.core.hysteria2.lock().unwrap().clear();
+        // The pool is process-wide: a later core must not reuse this one's.
+        clyntis_protocol::grpc::reset_pool();
         self.tasks.abort_all();
     }
 }
@@ -339,7 +343,7 @@ impl Core {
             connections: Default::default(),
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
-            slots: Arc::new(tokio::sync::Semaphore::new(4096)),
+            slots: Arc::new(tokio::sync::Semaphore::new(inbound::CONNECTION_SLOTS)),
             lifecycle: Mutex::new(false),
             events,
             resources: RwLock::new(Arc::new(resources::Resources::default())),
@@ -411,7 +415,32 @@ impl Core {
         let mut controller_address = None;
         if self.config.ntp.enable {
             let core = self.clone();
-            tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(core.config.ntp.interval.saturating_mul(60)));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}}tokio::select!{_=core.stop.cancelled()=>break,result=core.sync_ntp()=>{if let Err(error)=result {tracing::warn!(%error,"NTP synchronization failed; retaining current clock offset");}}}}});
+            tasks.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(core.config.ntp.interval.saturating_mul(60)));
+                let mut failed = 0u32;
+                loop {
+                    tokio::select! { _ = core.stop.cancelled() => break, _ = interval.tick() => {} }
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        result = core.sync_ntp() => match result {
+                            Ok(()) => {
+                                if failed >= ntp::WARN_AFTER {
+                                    tracing::info!(after_failures = failed, "NTP synchronization recovered");
+                                }
+                                failed = 0;
+                            }
+                            Err(error) => {
+                                failed += 1;
+                                if failed >= ntp::WARN_AFTER {
+                                    tracing::warn!(error = %format!("{error:#}"), consecutive = failed, "NTP synchronization failed; retaining current clock offset");
+                                } else {
+                                    tracing::debug!(error = %format!("{error:#}"), "NTP synchronization failed; retrying at the next interval");
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
         if self.config.adblock.enable {
             let core = self.clone();
@@ -1407,20 +1436,48 @@ impl Core {
         let target = self.restore_target(&target);
         let tracker = traffic::Tracker::new(self.clone(), target, node, "tcp")?;
         let cancel = tracker.cancel();
+        let state = tracker.state.clone();
         let mut outbound = traffic::Stream {
             inner: outbound,
             tracker,
         };
+        let mut inbound = traffic::EofWatch {
+            inner: &mut inbound,
+            state: state.clone(),
+        };
         // Application silence is valid for SSE and other long-lived streams.
         // TCP keepalive detects dead peers; only EOF, I/O errors or explicit
-        // cancellation should tear down an otherwise healthy relay.
+        // cancellation tear down an otherwise healthy relay on desktops.
+        let limits = self.relay_limits();
+        let expired = async {
+            match limits {
+                Some(limits) => traffic::idle_expired(&state, limits).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             _ = cancel.cancelled() => {
-                tracing::debug!(id = %outbound.tracker.state.snapshot().id, "TCP relay cancelled");
+                tracing::debug!(id = %state.snapshot().id, "TCP relay cancelled");
+            },
+            reason = expired => {
+                tracing::debug!(id = %state.snapshot().id, reason, "TCP relay closed after silence");
             },
             result = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => { result?; },
         }
         Ok(())
+    }
+    /// Silence limits for TCP relays in a hosted (iOS) tunnel, whose memory
+    /// limit cannot afford relays that outlive their use. The idle limit is
+    /// a backstop well above push and messaging heartbeats (APNs, WeChat:
+    /// minutes); a half-closed relay usually ends within seconds, and one
+    /// whose other side stays silent is waiting for nothing.
+    fn relay_limits(&self) -> Option<traffic::RelayLimits> {
+        self.config
+            .internal_host_packet_io
+            .then_some(traffic::RelayLimits {
+                idle: Duration::from_secs(30 * 60),
+                half_closed: Duration::from_secs(30),
+            })
     }
     /// Ad blocking state: whether it is on, the loaded lists and the counters
     /// (totals, most blocked domains, latest blocks).
@@ -1636,6 +1693,20 @@ impl Core {
     pub async fn network_changed(&self) {
         for connection in self.connections() {
             connection.cancel.cancel();
+        }
+        // Multiplexed transports outlive the cancelled connections: new
+        // streams on them would stall until the dead link timed out (30 s
+        // for Hysteria2, TCP keepalive for gRPC).
+        clyntis_protocol::grpc::reset_pool();
+        let slots: Vec<Hysteria2Slot> = self.hysteria2.lock().unwrap().values().cloned().collect();
+        for slot in slots {
+            // A slot being dialed holds its lock and is getting a fresh
+            // connection anyway; waiting for it would delay the change.
+            if let Ok(mut slot) = slot.try_lock()
+                && let Some(client) = slot.take()
+            {
+                client.close();
+            }
         }
         self.resolver.clear_cache();
         self.network_epoch

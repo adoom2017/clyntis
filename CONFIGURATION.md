@@ -346,6 +346,30 @@ five-minute application-idle cutoff. TCP keepalive and transport errors detect
 dead peers; explicit connection closure, shutdown and network changes still end
 sessions. Upstream servers and intermediate proxies may impose their own limits.
 
+Outbound TCP keepalive starts probing after `keep-alive-interval` seconds of
+silence (30 on desktops, 300 on iOS), then gives a peer that stops answering
+three probes at most 15 s apart before the connection fails. On iOS, where the
+tunnel runs under a memory limit, a relay also ends after 30 minutes with no
+data either way, or 30 s after one side closed if the other then stays silent.
+A network change also drops pooled gRPC and Hysteria2 connections, so new
+connections do not wait on a link bound to the old network. gRPC
+`ping-interval` connections that leave a ping unanswered (5–20 s) are closed.
+
+With `ntp.enable`, each synchronization sends up to three requests, 2 s
+apart, cycling through every address of `ntp.server`. A failed round keeps
+the current clock offset and is logged at debug level; a warning follows
+from the second consecutive failure.
+
+On desktops, waking from sleep counts as a network change, as does a new
+IPv4 address or gateway on the default interface when TUN is off. Log lines
+are written by a background thread; if the destination (a file, or the desktop
+app reading the core's output) falls behind by 8192 lines, further lines are
+dropped and a `log lines dropped` warning reports how many. A desktop TUN
+tracks up to 2048 TCP flows; connection attempts beyond that are reset and
+counted as `tcp_refused` in the periodic TUN failure log. A local listener
+that fails to accept a connection (for example when no file descriptors are
+left) logs a warning and keeps listening.
+
 ## TUN and recovery
 
 TUN is disabled unless `tun.enable: true` is set in the configuration. It
