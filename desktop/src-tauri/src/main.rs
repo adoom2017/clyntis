@@ -8,7 +8,6 @@ mod engine;
 mod keychain;
 mod platform;
 #[cfg(target_os = "macos")]
-mod tray;
 mod updates;
 #[cfg(windows)]
 mod windows_autostart;
@@ -143,9 +142,10 @@ fn main() {
             let menu = Menu::with_items(app, &entries)?;
             app.manage(TrayLabels(items));
             let tray_icon = tauri::image::Image::from_bytes(TRAY_ICON)?;
-            #[allow(unused_variables)] // Only the macOS icon is animated.
-            let tray = TrayIconBuilder::new()
-                .icon(tray_icon.clone())
+            // A still icon: animating it at 24 fps kept the app at ~16% CPU
+            // and out of App Nap for as long as it was connected.
+            TrayIconBuilder::new()
+                .icon(tray_icon)
                 .icon_as_template(cfg!(target_os = "macos"))
                 .tooltip("Clyntis")
                 .menu(&menu)
@@ -179,8 +179,6 @@ fn main() {
                     });
                 })
                 .build(app)?;
-            #[cfg(target_os = "macos")]
-            tray::animate(tray, tray_icon, app.state::<Desktop>().running());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 app::background(handle).await;

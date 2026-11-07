@@ -52,8 +52,6 @@ pub struct Desktop {
     #[cfg(windows)]
     autostart_error: Mutex<Option<String>>,
     subscription_lock: tokio::sync::Mutex<()>,
-    /// Whether the core is running; drives the menu-bar icon animation.
-    running: tokio::sync::watch::Sender<bool>,
 }
 impl Desktop {
     /// The saved interface language: `zh`, `en` or `system`.
@@ -104,7 +102,6 @@ impl Desktop {
             #[cfg(windows)]
             autostart_error: Mutex::new(None),
             subscription_lock: tokio::sync::Mutex::new(()),
-            running: tokio::sync::watch::Sender::new(false),
         })
     }
     fn snapshot(&self) -> Result<Snapshot> {
@@ -130,15 +127,7 @@ impl Desktop {
             view.status = value.into();
             view.error = message;
         }
-        self.running.send_if_modified(|running| {
-            let next = value == "running";
-            std::mem::replace(running, next) != next
-        });
         self.notify();
-    }
-    #[cfg(target_os = "macos")]
-    pub fn running(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.running.subscribe()
     }
     pub fn report(&self, error: &anyhow::Error) {
         let message = clyntis_desktop_model::redact(&format!("{error:#}"));

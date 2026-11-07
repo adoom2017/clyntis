@@ -347,7 +347,8 @@ dead peers; explicit connection closure, shutdown and network changes still end
 sessions. Upstream servers and intermediate proxies may impose their own limits.
 
 Outbound TCP keepalive starts probing after `keep-alive-interval` seconds of
-silence (30 on desktops, 300 on iOS), then gives a peer that stops answering
+silence (30 on desktops, 300 on iOS; desktops cap a larger value at 300),
+then gives a peer that stops answering
 three probes at most 15 s apart before the connection fails. On iOS, where the
 tunnel runs under a memory limit, a relay also ends after 30 minutes with no
 data either way, or 30 s after one side closed if the other then stays silent.
@@ -390,7 +391,8 @@ physical exits against `example.com:443` and configured proxy endpoints before
 and after installing routes, including when there is only one candidate,
 and reopens the TUN on a different exit when
 needed. Use `--test-egress` to run only the probe without TUN, or set
-`tun.auto-detect-interface` to keep probing exits every 15 seconds while running.
+`tun.auto-detect-interface` to keep probing exits every 15 seconds while running;
+that periodic probe is skipped while the current exit is the only candidate.
 Exits are ranked by internet reachability, then proxies reached, then a wired
 link over Wi-Fi; the current exit is kept unless another ranks higher, so one
 lost probe does not switch interfaces. An exit change updates routes and socket

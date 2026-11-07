@@ -302,6 +302,14 @@ pub async fn detect_macos_egress(
     if candidates.is_empty() {
         return Ok(None);
     }
+    // The periodic probe only chooses between exits: with the current one
+    // as the only candidate it would open a dozen connections every 15 s to
+    // learn nothing. Losing it is noticed by `refresh` without a probe.
+    if let [only] = candidates.as_slice()
+        && current == Some(only.name.as_str())
+    {
+        return Ok(Some(only.name.clone()));
+    }
     let mut proxy_targets: Vec<SocketAddr> = config
         .proxies
         .iter()

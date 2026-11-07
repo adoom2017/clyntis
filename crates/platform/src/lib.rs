@@ -96,12 +96,20 @@ pub async fn tcp_connect_options(
 const KEEPALIVE_PROBES: u32 = 3;
 /// Seconds between unanswered probes, at most.
 const KEEPALIVE_PROBE_INTERVAL: u64 = 15;
+/// Longest silence before probing on desktops. Profiles written for other
+/// clients set `keep-alive-interval: 1800`, which left a dead peer holding
+/// its relay and TUN flow for half an hour. iOS keeps the configured value:
+/// there each probe wakes the radio.
+#[cfg(not(target_os = "ios"))]
+const KEEPALIVE_IDLE_MAX: u64 = 300;
 /// Keepalive that probes after `idle` seconds of silence. Later probes only
 /// go out while the peer stays silent, so a short interval costs nothing on a
 /// live connection; with the system's probe count (8 on Darwin) and the iOS
 /// idle of 300 s as interval, a dead peer took 45 minutes to notice, holding
 /// its relay, TUN flow and buffers that long.
 fn keepalive(idle: u64) -> socket2::TcpKeepalive {
+    #[cfg(not(target_os = "ios"))]
+    let idle = idle.min(KEEPALIVE_IDLE_MAX);
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(std::time::Duration::from_secs(idle))
         .with_interval(std::time::Duration::from_secs(
@@ -175,6 +183,11 @@ mod keepalive_tests {
         assert_eq!(
             applied(10),
             (Duration::from_secs(10), Duration::from_secs(10), 3)
+        );
+        // Desktops do not wait half an hour on a long configured period.
+        assert_eq!(
+            applied(1800),
+            (Duration::from_secs(300), Duration::from_secs(15), 3)
         );
     }
 }
