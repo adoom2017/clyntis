@@ -7,7 +7,6 @@ mod app;
 mod engine;
 mod keychain;
 mod platform;
-#[cfg(target_os = "macos")]
 mod updates;
 #[cfg(windows)]
 mod windows_autostart;
