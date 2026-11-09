@@ -612,4 +612,43 @@ describe("Editor", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
     expect(screen.getByRole("button", { name: "保存" })).toBeEnabled();
   });
+  it("stops polling while the window is hidden and resumes when shown", async () => {
+    vi.useFakeTimers();
+    try {
+      const handlers: Record<string, (event: { payload: unknown }) => void> =
+        {};
+      listen.mockImplementation(async (event: string, handler) => {
+        handlers[event] = handler;
+        return vi.fn();
+      });
+      invoke.mockImplementation(async (command) =>
+        command === "connections"
+          ? { connections: [], uploadTotal: 0, downloadTotal: 0 }
+          : { ...structuredClone(initial), status: "running" },
+      );
+      await act(async () => {
+        render(<App />);
+      });
+      const polls = () =>
+        invoke.mock.calls.filter(([command]) => command === "connections")
+          .length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(polls()).toBeGreaterThanOrEqual(2);
+      act(() => handlers["window-visible"]({ payload: false }));
+      const hidden = polls();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20000);
+      });
+      expect(polls()).toBe(hidden);
+      act(() => handlers["window-visible"]({ payload: true }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(polls()).toBe(hidden + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

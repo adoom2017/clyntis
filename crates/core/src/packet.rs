@@ -38,6 +38,11 @@ use tokio_util::{sync::PollSender, task::AbortOnDropHandle};
 use udp_table::{Drops, UdpTable};
 
 const CHUNK: usize = 8192;
+/// How often the memory guard samples the footprint.
+const GUARD_EVERY: Duration = Duration::from_millis(250);
+/// Longest the packet loop sleeps with nothing due: the period of its
+/// housekeeping (fragment and UDP expiry, refusal cleanup, summaries).
+const IDLE_WAKE: Duration = Duration::from_secs(1);
 
 /// Per-flow limits. Hosted packet tunnels (the iOS Network Extension) are
 /// killed above ~50 MiB, and an app opening many QUIC/DNS destinations at once
@@ -56,6 +61,11 @@ struct Budget {
     udp_idle: Duration,
     /// Chunks of up to CHUNK bytes queued per direction for each TCP flow.
     tcp_queue: usize,
+    /// Datagrams queued for each UDP flow's session. A flow's opening burst
+    /// (a QUIC window, a game's state) lands here before the session first
+    /// runs, let alone has dialed; at 16, three quarters of a 64-datagram
+    /// burst were dropped. Queues allocate as they fill.
+    udp_queue: usize,
     /// Footprint levels in bytes (0 disables): log the load every second,
     /// refuse new flows, close every connection. See [`Guard`].
     trace_above: u64,
@@ -74,6 +84,7 @@ impl Budget {
         udp_buffer: 65535,
         udp_idle: Duration::from_secs(120),
         tcp_queue: 4,
+        udp_queue: 128,
         trace_above: 0,
         shed_above: 0,
         close_above: 0,
@@ -87,6 +98,7 @@ impl Budget {
         udp_buffer: 16 * 1024,
         udp_idle: Duration::from_secs(60),
         tcp_queue: 2,
+        udp_queue: 32,
         trace_above: 32 * MIB,
         shed_above: 40 * MIB,
         close_above: 45 * MIB,
@@ -205,7 +217,11 @@ impl Guard {
         }
     }
     fn due(&self) -> bool {
-        self.budget.trace_above > 0 && self.sampled.elapsed() >= Duration::from_millis(250)
+        self.next_due().is_some_and(|at| Instant::now() >= at)
+    }
+    /// When memory should next be sampled; never with tracing disabled.
+    fn next_due(&self) -> Option<Instant> {
+        (self.budget.trace_above > 0).then(|| self.sampled + GUARD_EVERY)
     }
     /// Samples memory and acts on it. Returns whether every connection was
     /// closed, so the loop releases its packet flows too.
@@ -349,7 +365,7 @@ impl TxToken for Transmit {
 
 /// A TCP flow as seen by its proxy session. Every queue change wakes the
 /// packet loop, so data queued between packets is forwarded at once instead
-/// of waiting for the next packet or the 2 ms tick.
+/// of waiting for the next packet or timer.
 struct ChannelStream {
     input: mpsc::Receiver<Vec<u8>>,
     pending: Option<(Vec<u8>, usize)>,
@@ -809,8 +825,16 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut tasks = JoinSet::new();
     let (replies, mut incoming_replies) = mpsc::channel::<Reply>(256);
     let wake = Arc::new(Notify::new());
-    let mut tick = tokio::time::interval(Duration::from_millis(2));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The loop sleeps until smoltcp's next timer (retransmission, delayed
+    // ACK, keepalive), housekeeping or an event: a packet, a queue change
+    // of a TCP session, a UDP reply, a finished session or room in the TUN
+    // writer's queue. A fixed 2 ms tick woke an idle machine 200 times a
+    // second, and UDP replies waited for it.
+    let sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(sleep);
+    let room = device.outgoing.clone();
+    let mut reply: Option<Reply> = None;
+    let mut finished = None;
     let mut packet = vec![0; 65535];
     let mut ipv6_dropped: u64 = 0;
     let mut fragments = ipv6::Reassembly::default();
@@ -887,7 +911,11 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 device.incoming.push_back(packet.into_owned());
             },
             _ = wake.notified() => {},
-            _ = tick.tick() => {},
+            received = incoming_replies.recv(), if reply.is_none() => reply = received,
+            result = tasks.join_next(), if !tasks.is_empty() && finished.is_none() => finished = result,
+            // Replies smoltcp could not transmit wait for room in the queue.
+            permit = room.reserve(), if room.capacity() == 0 => drop(permit),
+            _ = &mut sleep => {},
         }
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
@@ -968,7 +996,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             }
         }
         poll(&mut iface, now(), &mut device, &mut sockets);
-        while let Some(result) = tasks.try_join_next() {
+        while let Some(result) = finished.take().or_else(|| tasks.try_join_next()) {
             if let Ok((flow, generation, result)) = result {
                 if flow.tcp {
                     if let Err(error) = result {
@@ -1078,7 +1106,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             match udp.admit_session(&flow, dns, guard.shedding) {
                 Ok(false) => {}
                 Ok(true) => {
-                    let (input, receiver) = mpsc::channel(16);
+                    let (input, receiver) = mpsc::channel(budget.udp_queue);
                     let core = core.clone();
                     let replies = replies.clone();
                     let drops = drops.clone();
@@ -1106,28 +1134,72 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 drops.input_full.fetch_add(1, Ordering::Relaxed);
             }
         }
-        for _ in 0..256 {
-            let Ok(reply) = incoming_replies.try_recv() else {
+        // A destination's smoltcp socket queues 16 datagrams: a burst of
+        // replies is flushed to the TUN as it fills instead of dropped.
+        'replies: for _ in 0..256 {
+            let Some(next) = reply.take().or_else(|| incoming_replies.try_recv().ok()) else {
                 break;
             };
-            if udp.superseded(&reply.flow, reply.generation) {
+            if udp.superseded(&next.flow, next.generation) {
                 continue;
             }
-            if let Some(port) = udp.ports.get_mut(&reply.flow.target) {
-                let socket = sockets.get_mut::<udp::Socket>(port.handle);
-                if socket
-                    .send_slice(&reply.payload, reply.flow.source)
-                    .is_err()
-                {
-                    drops.socket_full.fetch_add(1, Ordering::Relaxed);
-                }
+            for flushed in [false, true] {
+                let Some(port) = udp.ports.get_mut(&next.flow.target) else {
+                    break;
+                };
                 port.last = Instant::now();
+                let socket = sockets.get_mut::<udp::Socket>(port.handle);
+                match socket.send_slice(&next.payload, next.flow.source) {
+                    Ok(()) => break,
+                    // Queued datagrams leave on a poll, if the writer has room.
+                    Err(udp::SendError::BufferFull) if socket.send_queue() > 0 => {
+                        if flushed && room.capacity() == 0 {
+                            // Retried once room frees (see `room` below).
+                            reply = Some(next);
+                            break 'replies;
+                        }
+                        if flushed {
+                            drops.socket_full.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    // Larger than the socket's whole buffer, or unaddressable.
+                    Err(_) => {
+                        drops.socket_full.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                poll(&mut iface, now(), &mut device, &mut sockets);
             }
         }
         udp.expire(budget.udp_idle, Instant::now(), &mut sockets);
         poll(&mut iface, now(), &mut device, &mut sockets);
         for handle in retired {
             sockets.remove(handle);
+        }
+        let mut delay = iface
+            .poll_delay(now(), &sockets)
+            .map_or(IDLE_WAKE, |delay| {
+                Duration::from_micros(delay.total_micros())
+            })
+            .min(IDLE_WAKE.saturating_sub(last_expiry.elapsed()));
+        if room.capacity() == 0 {
+            // smoltcp has segments to send but the writer's queue is full:
+            // its room wakes the loop; spinning on a zero delay would not.
+            delay = IDLE_WAKE.saturating_sub(last_expiry.elapsed());
+        } else if !device.incoming.is_empty() || reply.is_some() {
+            // Packets or a reply left over while the writer has room: go on
+            // at once.
+            delay = Duration::ZERO;
+        }
+        let mut deadline = Instant::now() + delay;
+        if let Some(due) = guard.next_due() {
+            deadline = deadline.min(due);
+        }
+        // Re-arming the timer on every pass cost a busy loop ~8% of its
+        // throughput; an earlier wake than needed is only an extra pass.
+        if sleep.is_elapsed() || deadline < sleep.deadline() {
+            sleep.as_mut().reset(deadline);
         }
     }
     tasks.abort_all();

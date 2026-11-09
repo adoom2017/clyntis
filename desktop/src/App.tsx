@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import brandIcon from "../src-tauri/icons/clyntis-v3/brand-128.png";
 import { UpdatesPanel, useUpdates, type UpdateController } from "./Updates";
+import { pageVisible, usePageVisible } from "./visibility";
 import {
   locale,
   resolveLanguage,
@@ -214,6 +215,21 @@ export default function App() {
     },
     [refresh],
   );
+  // Ticks and log lines that arrive while the page is hidden are kept here
+  // and applied when it is shown, instead of re-rendering every second.
+  const hidden = useRef<{ traffic: Traffic[]; logs: Log[] }>({
+    traffic: [],
+    logs: [],
+  });
+  const visible = usePageVisible();
+  useEffect(() => {
+    if (!visible) return;
+    const { traffic, logs } = hidden.current;
+    hidden.current = { traffic: [], logs: [] };
+    if (traffic.length)
+      setTraffic((values) => [...values, ...traffic].slice(-60));
+    if (logs.length) setLogs((values) => [...values, ...logs].slice(-2000));
+  }, [visible]);
   useEffect(() => {
     let alive = true;
     const unlisten: (() => void)[] = [];
@@ -230,12 +246,22 @@ export default function App() {
     void (async () => {
       await Promise.all([
         register<Snapshot>("state", (next) => setState(next)),
-        register<Traffic>("traffic", (tick) =>
-          setTraffic((values) => [...values.slice(-59), tick]),
-        ),
-        register<Log>("log", (entry) =>
-          setLogs((values) => [...values.slice(-1999), entry]),
-        ),
+        register<Traffic>("traffic", (tick) => {
+          if (pageVisible())
+            setTraffic((values) => [...values.slice(-59), tick]);
+          else {
+            const held = hidden.current;
+            held.traffic = [...held.traffic.slice(-59), tick];
+          }
+        }),
+        register<Log>("log", (entry) => {
+          if (pageVisible())
+            setLogs((values) => [...values.slice(-1999), entry]);
+          else {
+            const held = hidden.current;
+            held.logs = [...held.logs.slice(-1999), entry];
+          }
+        }),
       ]);
       const next = await invoke<Snapshot>("snapshot");
       if (alive) {
@@ -260,7 +286,10 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [notice]);
   useEffect(() => {
-    if (state.status === "stopped" || state.status === "failed") setTraffic([]);
+    if (state.status === "stopped" || state.status === "failed") {
+      setTraffic([]);
+      hidden.current.traffic = [];
+    }
   }, [state.status]);
   const running = state.status === "running";
   const transitioning =
@@ -979,12 +1008,14 @@ function ConnectionStats({ running }: { running: boolean }) {
     uploadTotal: 0,
     downloadTotal: 0,
   });
+  const visible = usePageVisible();
   useEffect(() => {
     let live = true;
     if (!running) {
       setValue({ connections: [], uploadTotal: 0, downloadTotal: 0 });
       return;
     }
+    if (!visible) return;
     const update = () =>
       void invoke<Connections>("connections")
         .then((v) => {
@@ -997,7 +1028,7 @@ function ConnectionStats({ running }: { running: boolean }) {
       live = false;
       clearInterval(timer);
     };
-  }, [running]);
+  }, [running, visible]);
   return (
     <>
       <Stat
@@ -1703,7 +1734,9 @@ export function Editor({
 /** The profile's networks the device is on, while the profile defines any. */
 function NetworkPanel() {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
+  const visible = usePageVisible();
   useEffect(() => {
+    if (!visible) return;
     const load = () =>
       void invoke<NetworkStatus>("network_status")
         .then(setStatus)
@@ -1711,7 +1744,7 @@ function NetworkPanel() {
     load();
     const timer = window.setInterval(load, 5000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [visible]);
   if (!status?.defined) return null;
   const facts = [
     status.info.type &&
@@ -1750,7 +1783,9 @@ function AdblockPanel({
 }) {
   const [status, setStatus] = useState<AdblockStatus | null>(null);
   const [open, setOpen] = useState(false);
+  const visible = usePageVisible();
   useEffect(() => {
+    if (!visible) return;
     const load = () =>
       void invoke<AdblockStatus>("adblock_status")
         .then(setStatus)
@@ -1758,7 +1793,7 @@ function AdblockPanel({
     load();
     const timer = window.setInterval(load, 3000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [visible]);
   const allow = (domain: string) => {
     const adblock = settings.overrides.adblock ?? defaultAdblock;
     if (adblock.allow.includes(domain)) return;
@@ -2278,15 +2313,16 @@ function Proxies({
     setNodes(data.proxies);
   }, []);
   // Status (connections, Tailscale paths) changes on its own: poll while shown.
+  const visible = usePageVisible();
   useEffect(() => {
-    if (!running) return;
+    if (!running || !visible) return;
     void refresh().catch(() => {});
     const timer = window.setInterval(
       () => void refresh().catch(() => {}),
       3000,
     );
     return () => window.clearInterval(timer);
-  }, [running, refresh]);
+  }, [running, visible, refresh]);
   const probe = async (name: string) => {
     setProbing((p) => (p.includes(name) ? p : [...p, name]));
     try {
@@ -2692,8 +2728,9 @@ function ConnectionPage({
     setItems(value.connections);
     setFailed(false);
   }, []);
+  const shown = usePageVisible();
   useEffect(() => {
-    if (!running) return;
+    if (!running || !shown) return;
     let alive = true;
     const tick = () =>
       void refresh().catch(() => {
@@ -2705,7 +2742,7 @@ function ConnectionPage({
       alive = false;
       clearInterval(timer);
     };
-  }, [running, refresh]);
+  }, [running, shown, refresh]);
   if (!running)
     return (
       <Empty

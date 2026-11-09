@@ -681,3 +681,258 @@ async fn full_udp_sessions_refuse_new_flows_but_keep_old_ones_and_dns() {
     .unwrap();
     BUDGET.set(None);
 }
+
+/// A new flow's opening burst (QUIC sends a window of datagrams) reaches its
+/// session before the session first runs, and its replies come back as a
+/// burst too: none of either may be dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_udp_burst_opening_a_flow_gets_every_reply() {
+    const BURST: u32 = 64;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buffer = [0; 1500];
+            while let Ok((n, from)) = echo.recv_from(&mut buffer).await {
+                let _ = echo.send_to(&buffer[..n], from).await;
+            }
+        });
+        let (device, host_io) = pair();
+        let mut config = CoreConfig::default();
+        config.tun.enable = true;
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let running = core.start_with_packets(Some(device)).await.unwrap();
+        for sequence in 0..BURST {
+            let mut payload = vec![0; 1200];
+            payload[..4].copy_from_slice(&sequence.to_be_bytes());
+            host_io
+                .send(&udp_datagram(
+                    ([10, 0, 0, 2], 40100),
+                    ([127, 0, 0, 1], echo_port),
+                    &payload,
+                ))
+                .await
+                .unwrap();
+        }
+        let mut answered = std::collections::BTreeSet::new();
+        while answered.len() < BURST as usize {
+            let reply = wait_for(&host_io, |p| udp_reply_to(p, 40100).is_some()).await;
+            let payload = udp_reply_to(&reply, 40100).unwrap();
+            answered.insert(u32::from_be_bytes(payload[..4].try_into().unwrap()));
+        }
+        running.shutdown().await;
+    })
+    .await
+    .expect("datagrams of the burst or their replies were dropped");
+}
+
+/// TUN benchmarks, ignored by default. Run with
+/// `cargo test --release -p clyntis-core tun_bench -- --ignored --nocapture --test-threads 1`.
+mod tun_bench {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn tun() -> (Arc<Packets>, crate::Running) {
+        let (device, host_io) = pair();
+        let mut config = CoreConfig::default();
+        config.tun.enable = true;
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let running = core.start_with_packets(Some(device)).await.unwrap();
+        (host_io, running)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn tun_bench_tcp_upload() {
+        const TOTAL: usize = 64 << 20;
+        let (host_io, running) = tun().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; 64 << 10];
+            let mut read = 0;
+            while read < TOTAL {
+                read += stream.read(&mut buffer).await.unwrap();
+            }
+            stream.write_all(b"k").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let started = Instant::now();
+        let reply = client_stream(host_io, target, vec![1; TOTAL], true, 1, None).await;
+        assert_eq!(reply, b"k");
+        println!(
+            "TUN TCP upload: {:.1} MB/s",
+            TOTAL as f64 / started.elapsed().as_secs_f64() / 1e6
+        );
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn tun_bench_tcp_download() {
+        const TOTAL: usize = 64 << 20;
+        let (host_io, running) = tun().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1];
+            stream.read_exact(&mut request).await.unwrap();
+            let chunk = vec![7u8; 16 << 10];
+            for _ in 0..TOTAL / chunk.len() {
+                stream.write_all(&chunk).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+        });
+        let started = Instant::now();
+        let reply = client_stream(host_io, target, vec![1], true, TOTAL, None).await;
+        assert_eq!(reply.len(), TOTAL);
+        println!(
+            "TUN TCP download: {:.1} MB/s",
+            TOTAL as f64 / started.elapsed().as_secs_f64() / 1e6
+        );
+        running.shutdown().await;
+    }
+
+    async fn udp_echo() -> SocketAddr {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 65535];
+            loop {
+                let (n, peer) = server.recv_from(&mut buffer).await.unwrap();
+                let _ = server.send_to(&buffer[..n], peer).await;
+            }
+        });
+        address
+    }
+
+    /// One datagram at a time, like DNS: each reply's delay is the latency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn tun_bench_udp_round_trip() {
+        const ROUNDS: usize = 500;
+        let (host_io, running) = tun().await;
+        let echo = udp_echo().await;
+        let mut times = vec![];
+        for round in 0..ROUNDS {
+            let payload = (round as u32).to_be_bytes();
+            let started = Instant::now();
+            host_io
+                .send(&udp_datagram(
+                    ([10, 0, 0, 2], 40000),
+                    ([127, 0, 0, 1], echo.port()),
+                    &payload,
+                ))
+                .await
+                .unwrap();
+            wait_for(&host_io, |p| {
+                udp_reply_to(p, 40000).as_deref() == Some(&payload[..])
+            })
+            .await;
+            times.push(started.elapsed());
+        }
+        times.sort();
+        println!(
+            "TUN UDP round trip: median {:?}, p99 {:?}, max {:?}",
+            times[ROUNDS / 2],
+            times[ROUNDS * 99 / 100],
+            times[ROUNDS - 1]
+        );
+        running.shutdown().await;
+    }
+
+    /// Up to 64 datagrams in flight, like a QUIC download window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn tun_bench_udp_burst() {
+        const COUNT: u32 = 50_000;
+        const WINDOW: u32 = 64;
+        let (host_io, running) = tun().await;
+        let echo = udp_echo().await;
+        let receiver = host_io.clone();
+        let (done, mut acked) = mpsc::unbounded_channel::<u32>();
+        tokio::spawn(async move {
+            let mut buffer = vec![0; 65535];
+            while let Ok(n) = receiver.recv(&mut buffer).await {
+                if let Some(payload) = udp_reply_to(&buffer[..n], 40001) {
+                    let _ = done.send(u32::from_be_bytes(payload[..4].try_into().unwrap()));
+                }
+            }
+        });
+        let mut payload = vec![0u8; 1200];
+        let started = Instant::now();
+        let (mut sent, mut received) = (0u32, 0u32);
+        while sent < COUNT {
+            while sent < COUNT && sent - received < WINDOW {
+                payload[..4].copy_from_slice(&sent.to_be_bytes());
+                host_io
+                    .send(&udp_datagram(
+                        ([10, 0, 0, 2], 40001),
+                        ([127, 0, 0, 1], echo.port()),
+                        &payload,
+                    ))
+                    .await
+                    .unwrap();
+                sent += 1;
+            }
+            // A lost datagram frees its slot after 20 ms.
+            match tokio::time::timeout(Duration::from_millis(20), acked.recv()).await {
+                Ok(Some(_)) => received += 1,
+                _ => received = received.max(sent.saturating_sub(WINDOW - 1)),
+            }
+        }
+        let mut replies = received;
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), acked.recv()).await
+        {
+            replies += 1;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        println!(
+            "TUN UDP burst: {:.1} MB/s each way, {:.0} datagrams/s, {} of {COUNT} answered",
+            f64::from(COUNT) * 1200.0 / elapsed / 1e6,
+            f64::from(COUNT) / elapsed,
+            replies.min(COUNT)
+        );
+        running.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    fn cpu_time() -> Duration {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        let time = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+        time(usage.ru_utime) + time(usage.ru_stime)
+    }
+
+    /// CPU the packet loop spends while no packet arrives.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn tun_bench_idle_cpu() {
+        let (host_io, running) = tun().await;
+        // One answered DNS-like flow leaves a UDP port behind, as on a host.
+        let echo = udp_echo().await;
+        host_io
+            .send(&udp_datagram(
+                ([10, 0, 0, 2], 40002),
+                ([127, 0, 0, 1], echo.port()),
+                b"ping",
+            ))
+            .await
+            .unwrap();
+        wait_for(&host_io, |p| udp_reply_to(p, 40002).is_some()).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (cpu, wall) = (cpu_time(), Instant::now());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let used = cpu_time() - cpu;
+        println!(
+            "TUN idle: {:?} CPU in {:?} ({:.2}%)",
+            used,
+            wall.elapsed(),
+            used.as_secs_f64() / wall.elapsed().as_secs_f64() * 100.0
+        );
+        running.shutdown().await;
+    }
+}

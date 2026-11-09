@@ -15,7 +15,7 @@ mod windows_diagnostics;
 
 use app::Desktop;
 use tauri::{
-    Manager, State, Wry,
+    Emitter, Manager, State, Wry,
     menu::{Menu, MenuItem},
     tray::{TrayIconBuilder, TrayIconEvent},
 };
@@ -190,6 +190,8 @@ fn main() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
+                // The page stops polling while nobody can see it.
+                let _ = window.emit("window-visible", false);
             }
         })
         .build(tauri::generate_context!())
@@ -230,6 +232,7 @@ fn show(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        let _ = window.emit("window-visible", true);
     }
 }
 
