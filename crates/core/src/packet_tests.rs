@@ -898,7 +898,7 @@ mod tun_bench {
         running.shutdown().await;
     }
 
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     fn cpu_time() -> Duration {
         let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
         unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -907,7 +907,7 @@ mod tun_bench {
     }
 
     /// CPU the packet loop spends while no packet arrives.
-    #[cfg(unix)]
+    #[cfg(target_vendor = "apple")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
     async fn tun_bench_idle_cpu() {
