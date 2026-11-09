@@ -436,6 +436,7 @@ export const en: Record<string, string> = {
   域名后缀: "Domain suffix",
   完整域名: "Full domain",
   域名关键字: "Domain keyword",
+  域名通配符: "Domain wildcard",
   "IPv4 段": "IPv4 range",
   "IPv6 段": "IPv6 range",
   目标端口: "Destination port",

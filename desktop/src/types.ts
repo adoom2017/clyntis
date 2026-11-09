@@ -339,6 +339,13 @@ export const ruleTypes: { type: string; label: string; placeholder: string }[] =
       placeholder: "example",
     },
     {
+      type: "DOMAIN-WILDCARD",
+      get label() {
+        return t("域名通配符");
+      },
+      placeholder: "*cdn*.example.com",
+    },
+    {
       type: "IP-CIDR",
       get label() {
         return t("IPv4 段");

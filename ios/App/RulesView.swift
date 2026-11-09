@@ -5,6 +5,7 @@ private let ruleTypes: [(type: String, label: String, placeholder: String)] = [
     ("DOMAIN-SUFFIX", L("域名后缀"), "example.com"),
     ("DOMAIN", L("完整域名"), "www.example.com"),
     ("DOMAIN-KEYWORD", L("域名关键字"), "example"),
+    ("DOMAIN-WILDCARD", L("域名通配符"), "*cdn*.example.com"),
     ("IP-CIDR", L("IPv4 段"), "10.0.0.0/8"),
     ("IP-CIDR6", L("IPv6 段"), "2001:db8::/32"),
     ("GEOSITE", "GeoSite", "cn"),

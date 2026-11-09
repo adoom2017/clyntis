@@ -188,6 +188,7 @@ fn describe_rule(raw: &str, target: &str) -> String {
         "DOMAIN-SUFFIX" => "DomainSuffix",
         "DOMAIN-KEYWORD" => "DomainKeyword",
         "DOMAIN-REGEX" => "DomainRegex",
+        "DOMAIN-WILDCARD" => "DomainWildcard",
         "IP-CIDR" => "IPCIDR",
         "IP-CIDR6" => "IPCIDR6",
         "GEOIP" => "GeoIP",

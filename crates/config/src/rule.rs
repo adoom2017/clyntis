@@ -482,6 +482,7 @@ impl Matcher {
             "DOMAIN-SUFFIX" => Self::Suffix(value.trim_matches('.').into()),
             "DOMAIN-KEYWORD" => Self::Keyword(value),
             "DOMAIN-REGEX" => Self::Regex(compile_regex(f[1])?),
+            "DOMAIN-WILDCARD" => Self::Regex(wildcard_regex(&value)?),
             "IP-CIDR" | "IP-CIDR6" => {
                 let n: ipnet::IpNet = value.parse()?;
                 ensure!(
@@ -656,6 +657,22 @@ impl Rule {
         ) == Some(true)
     }
 }
+/// mihomo's DOMAIN-WILDCARD: `*` stands for any run of characters, dots
+/// included, and `?` for one character; the pattern covers the whole host.
+fn wildcard_regex(pattern: &str) -> Result<regex::Regex> {
+    let p = pattern.trim().trim_end_matches('.');
+    ensure!(!p.is_empty(), "empty wildcard pattern");
+    let mut re = String::from("^");
+    for c in p.chars() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            c => re.push_str(&regex::escape(c.encode_utf8(&mut [0; 4]))),
+        }
+    }
+    re.push('$');
+    compile_regex(&re)
+}
 pub fn domain_pattern(pattern: &str) -> Result<Matcher> {
     let p = pattern.trim().to_ascii_lowercase();
     ensure!(!p.is_empty(), "empty domain pattern");
@@ -674,6 +691,25 @@ pub fn domain_pattern(pattern: &str) -> Result<Matcher> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn domain_wildcard_matches_like_mihomo() {
+        let rule = Rule::parse("DOMAIN-WILDCARD,*pcdn*.biliapi.net,REJECT").unwrap();
+        let hit = |host: &str| rule.matches(host, None, 443, "tcp");
+        assert!(hit("pcdn.biliapi.net"));
+        assert!(hit("upos-sz-pcdn01.biliapi.net"));
+        // `*` crosses dots, as in mihomo.
+        assert!(hit("xy1x2x3xpcdn.v.biliapi.net"));
+        assert!(hit("PCDN-ABC.BILIAPI.NET."));
+        assert!(!hit("pcdn.biliapi.com"));
+        assert!(!hit("api.biliapi.net"));
+        assert!(!hit("pcdn.biliapi.net.evil.com"));
+        let one = Rule::parse("DOMAIN-WILDCARD,cdn?.example.com,DIRECT").unwrap();
+        assert!(one.matches("cdn1.example.com", None, 443, "tcp"));
+        assert!(!one.matches("cdn12.example.com", None, 443, "tcp"));
+        // Dots and other regex characters are literal.
+        assert!(!one.matches("cdn1xexample.com", None, 443, "tcp"));
+        assert!(Rule::parse("DOMAIN-WILDCARD,,DIRECT").is_err());
+    }
     #[test]
     fn dot_prefix_matches_subdomains_only_like_mihomo() {
         let m = |p: &str, host: &str| {
