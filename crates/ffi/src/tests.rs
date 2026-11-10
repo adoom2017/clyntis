@@ -945,10 +945,12 @@ fn cos_targets_come_from_cos_urls_and_uploads_need_credentials() {
     );
 }
 
+/// One call with room to spare, as the apps make it: a new CA differs in
+/// length from call to call (its serial is random), so a size query followed
+/// by a second call does not always fit.
 fn read_json(call: impl Fn(*mut u8, usize, *mut usize) -> i32) -> serde_json::Value {
     let mut length = 0;
-    assert_eq!(call(std::ptr::null_mut(), 0, &mut length), BUFFER_TOO_SMALL);
-    let mut bytes = vec![0; length];
+    let mut bytes = vec![0; 64 * 1024];
     assert_eq!(call(bytes.as_mut_ptr(), bytes.len(), &mut length), OK);
     serde_json::from_slice(&bytes[..length]).unwrap()
 }
