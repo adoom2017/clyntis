@@ -202,11 +202,11 @@ pub async fn ca_trusted(cert: &std::path::Path, thumbprint: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         let _ = thumbprint;
+        // The trust is installed for SSL only (see `trust_ca`): the default
+        // basic policy would not count it.
         tokio::process::Command::new("/usr/bin/security")
-            .arg("verify-cert")
-            .arg("-c")
+            .args(["verify-cert", "-p", "ssl", "-q", "-c"])
             .arg(cert)
-            .arg("-q")
             .output()
             .await
             .is_ok_and(|output| output.status.success())
