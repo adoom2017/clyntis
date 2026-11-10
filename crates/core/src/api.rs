@@ -39,6 +39,11 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/proxies/{name}/delay", get(delay))
         .route("/connections", get(connections).delete(close_all))
         .route("/connections/{id}", delete(close))
+        .route("/requests", get(requests).delete(clear_requests))
+        .route("/requests/export", get(export_requests))
+        .route("/requests/{id}", get(request))
+        .route("/mitm", get(mitm))
+        .route("/mitm/bypass", delete(clear_mitm_bypass))
         .route("/traffic", get(traffic))
         .route("/logs", get(logs))
         .route("/ui", get(ui_index))
@@ -125,11 +130,16 @@ async fn config(State(core): State<Arc<Core>>) -> Json<Value> {
 async fn update(State(core): State<Arc<Core>>, Json(value): Json<Value>) -> ApiResult {
     let object = value.as_object().ok_or_else(|| error("expected object"))?;
     for key in object.keys() {
-        if key != "mode" && key != "rules" && key != "adblock-allow" {
+        if !["mode", "rules", "adblock-allow", "mitm"].contains(&key.as_str()) {
             return Err(error(
-                "only mode/rules/adblock-allow support online updates; restart for full configuration",
+                "only mode/rules/adblock-allow/mitm support online updates; restart for full configuration",
             ));
         }
+    }
+    if let Some(mitm) = value.get("mitm") {
+        let mitm: clyntis_config::mitm::Mitm =
+            serde_json::from_value(mitm.clone()).map_err(error)?;
+        core.set_mitm(mitm).map_err(error)?;
     }
     if let Some(allow) = value.get("adblock-allow") {
         let allow: Vec<String> = serde_json::from_value(allow.clone()).map_err(error)?;
@@ -260,6 +270,50 @@ async fn connections(State(core): State<Arc<Core>>) -> Json<Value> {
     Json(
         json!({"uploadTotal":core.upload.load(Ordering::Relaxed),"downloadTotal":core.download.load(Ordering::Relaxed),"connections":core.connections()}),
     )
+}
+/// `?after=<id>&limit=<n>`: entries newer than `after`, oldest first.
+async fn requests(
+    State(core): State<Arc<Core>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let number = |key: &str| query.get(key).and_then(|v| v.parse::<u64>().ok());
+    let after = number("after").unwrap_or(0);
+    let limit = number("limit").unwrap_or(1000).clamp(1, 5000) as usize;
+    let (requests, next) = core.requests.list(after, limit);
+    Json(json!({"requests": requests, "next": next}))
+}
+async fn request(State(core): State<Arc<Core>>, Path(id): Path<u64>) -> ApiResult {
+    core.requests
+        .detail(id)
+        .map(Json)
+        .ok_or_else(|| error("request not found"))
+}
+/// `?format=har` (HTTP requests with headers and bodies) or `csv` (every
+/// entry); HAR by default.
+async fn export_requests(
+    State(core): State<Arc<Core>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if query.get("format").map(String::as_str) == Some("csv") {
+        (
+            [("content-type", "text/csv; charset=utf-8")],
+            core.requests.export_csv(),
+        )
+            .into_response()
+    } else {
+        Json(core.requests.export_har()).into_response()
+    }
+}
+async fn clear_requests(State(core): State<Arc<Core>>) -> Json<Value> {
+    core.requests.clear();
+    Json(json!({}))
+}
+async fn mitm(State(core): State<Arc<Core>>) -> Json<Value> {
+    Json(core.mitm_status())
+}
+async fn clear_mitm_bypass(State(core): State<Arc<Core>>) -> Json<Value> {
+    core.clear_mitm_bypass();
+    Json(json!({}))
 }
 async fn close(State(core): State<Arc<Core>>, Path(id): Path<String>) -> Json<Value> {
     core.close_connection(&id);

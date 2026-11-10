@@ -71,7 +71,8 @@ int32_t meta_custom_rules_apply_v1(const uint8_t *config, size_t length,
     const uint8_t *rules, size_t rules_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
 /* App settings over a profile. overrides is JSON {"logLevel":"debug|info|
- * warning|error|silent","ipv6":bool,"sniffing":bool}, every key optional;
+ * warning|error|silent","ipv6":bool,"sniffing":bool,"adblock":{...},
+ * "tailscale":bool,"mitm":{"enable","hostnames","caCert","caKey"}}, every key optional;
  * absent keys keep the profile's value. Writes the resulting YAML; follows the
  * caller-buffer/size-query contract. */
 int32_t meta_overrides_apply_v1(const uint8_t *config, size_t length,
@@ -144,6 +145,33 @@ int32_t meta_snapshot_v1(meta_handle handle, uint8_t *buffer, size_t capacity, s
  * Use it instead of meta_snapshot_v1 when the configuration is not needed. */
 int32_t meta_status_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 int32_t meta_update_v1(meta_handle handle, const uint8_t *json, size_t length);
+/* Request log (connections, refused ones, and HTTP requests read from
+ * decrypted or plain HTTP connections): entries after id `after`, oldest
+ * first, at most `limit`: {"requests":[...],"next":id}. Pass `next` as
+ * `after` to get only new entries; a smaller `next` means a new core. */
+int32_t meta_requests_v1(meta_handle handle, uint64_t after, uint32_t limit,
+    uint8_t *buffer, size_t capacity, size_t *length);
+/* One entry with requestHeaders, responseHeaders, requestBody and
+ * responseBody ({size,truncated,decoded,text|base64}). */
+int32_t meta_request_detail_v1(meta_handle handle, uint64_t id,
+    uint8_t *buffer, size_t capacity, size_t *length);
+/* The log as a file: format 0 HAR (HTTP requests with headers and bodies,
+ * for Charles, Proxyman or browser tools), 1 CSV (every entry). */
+int32_t meta_requests_export_v1(meta_handle handle, uint32_t format,
+    uint8_t *buffer, size_t capacity, size_t *length);
+int32_t meta_clear_requests_v1(meta_handle handle);
+/* HTTPS decryption: settings change with meta_update_v1 {"mitm":{enable,
+ * hostname,ca-cert,ca-key}}; the snapshot's "mitm" holds the status and the
+ * hosts whose clients refused the certificate, which this clears. */
+int32_t meta_clear_mitm_bypass_v1(meta_handle handle);
+/* A new CA: {"cert":PEM,"key":PEM}. */
+int32_t meta_mitm_generate_ca_v1(uint8_t *buffer, size_t capacity, size_t *length);
+/* json {"cert":PEM,"key":PEM}: writes {"ca":{name,fingerprint,thumbprint,
+ * notAfter},"caDer":b64,"leaf":b64,"host":"..."}, the leaf a server
+ * certificate for host signed by the CA, to evaluate with the system's SSL
+ * policy (whether the user trusts the CA). */
+int32_t meta_mitm_check_ca_v1(const uint8_t *json, size_t length,
+    uint8_t *buffer, size_t capacity, size_t *length_out);
 int32_t meta_select_v1(meta_handle handle, const uint8_t *group, size_t group_length, const uint8_t *node, size_t node_length);
 /* Close connection `id` from meta_snapshot_v1's "connections" (unknown or
  * finished ids are ignored); meta_close_connections_v1 closes them all. */

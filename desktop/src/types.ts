@@ -31,6 +31,71 @@ export interface Overrides {
   sniffing?: boolean | null;
   tailscale?: boolean | null;
   adblock?: AdblockSettings | null;
+  mitm?: MitmSettings | null;
+}
+/** HTTPS decryption; the CA itself is kept by the backend. */
+export interface MitmSettings {
+  enable: boolean;
+  hostnames: string[];
+}
+export interface HttpSummary {
+  method: string;
+  url: string;
+  decrypted: boolean;
+  status?: number;
+  contentType?: string;
+  requestSize: number;
+  responseSize: number;
+  error?: string;
+}
+/** One entry of the core's request log. */
+export interface RequestEntry {
+  id: number;
+  time: number;
+  network: string;
+  source: string;
+  host: string;
+  port: number;
+  rule: string;
+  chain: string;
+  status: "rejected" | "closed" | "http";
+  duration: number;
+  upload: number;
+  download: number;
+  connection: string;
+  reason?: string;
+  requests: number;
+  http?: HttpSummary;
+}
+export interface BodyView {
+  size: number;
+  truncated: boolean;
+  decoded: boolean;
+  text?: string;
+  base64?: string;
+}
+export interface RequestDetail extends RequestEntry {
+  requestHeaders?: [string, string][];
+  responseHeaders?: [string, string][];
+  requestBody?: BodyView;
+  responseBody?: BodyView;
+}
+export interface CaInfo {
+  name: string;
+  fingerprint: string;
+  thumbprint: string;
+  notAfter: string;
+}
+export interface MitmInfo {
+  ca: CaInfo | null;
+  trusted: boolean;
+  core: {
+    enable: boolean;
+    hostname: string[];
+    active: boolean;
+    error: string | null;
+    bypassed: string[];
+  } | null;
 }
 export type AdListFormat = "clash" | "hosts" | "adguard";
 export interface AdList {

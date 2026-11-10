@@ -229,6 +229,52 @@ final class CoreSession {
         })
     }
 
+    /// The request log after id `after`, as the core's JSON `{requests, next}`.
+    func requests(after: UInt64, limit: UInt32 = 300) throws -> Data {
+        try Self.read(limit: 4 * 1024 * 1024) { meta_requests_v1(handle, after, limit, $0, $1, $2) }
+    }
+
+    /// One request log entry with its headers and bodies, as JSON.
+    func requestDetail(_ id: UInt64) throws -> Data {
+        try Self.read(limit: 4 * 1024 * 1024) { meta_request_detail_v1(handle, id, $0, $1, $2) }
+    }
+
+    /// The request log as a file: HAR (HTTP requests with headers and
+    /// bodies) or, with `csv`, every entry as CSV.
+    func exportRequests(csv: Bool) throws -> Data {
+        try Self.read(limit: 16 * 1024 * 1024) { meta_requests_export_v1(handle, csv ? 1 : 0, $0, $1, $2) }
+    }
+
+    func clearRequests() throws { try Self.check(meta_clear_requests_v1(handle)) }
+    func clearMitmBypass() throws { try Self.check(meta_clear_mitm_bypass_v1(handle)) }
+
+    /// Applies decryption settings (with the CA) without restarting.
+    func updateMitm(_ settings: MitmSettings) throws {
+        let data = try settings.coreUpdate()
+        try Self.check(data.withUnsafeBytes {
+            meta_update_v1(handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+        })
+    }
+
+    /// A new decryption CA as PEM.
+    static func generateAuthority() throws -> (cert: String, key: String) {
+        let data = try read { meta_mitm_generate_ca_v1($0, $1, $2) }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: String],
+              let cert = object["cert"], let key = object["key"] else {
+            throw ClientError.message(L("无法读取内核结果。"))
+        }
+        return (cert, key)
+    }
+
+    /// The CA's description and a server certificate it signs (see
+    /// meta_mitm_check_ca_v1), as JSON.
+    static func checkAuthority(cert: String, key: String) throws -> Data {
+        let request = try JSONSerialization.data(withJSONObject: ["cert": cert, "key": key])
+        return try request.withUnsafeBytes { request in
+            try read { meta_mitm_check_ca_v1(request.bindMemory(to: UInt8.self).baseAddress, request.count, $0, $1, $2) }
+        }
+    }
+
     /// Replaces the ad blocking allowlist without restarting.
     func updateAdblockAllow(_ allow: [String]) throws {
         let data = try JSONSerialization.data(withJSONObject: ["adblock-allow": allow])

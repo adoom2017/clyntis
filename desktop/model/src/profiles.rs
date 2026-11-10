@@ -76,6 +76,9 @@ impl Profile {
     }
 }
 
+const MITM_CERT: &str = "mitm-ca.pem";
+const MITM_KEY: &str = "mitm-ca.key";
+
 #[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
@@ -186,6 +189,33 @@ impl Store {
             &self.root.join("settings.json"),
             &serde_json::to_vec(settings)?,
         )
+    }
+    /// The HTTPS decryption CA (certificate and key, PEM), kept apart from
+    /// the settings so the key never reaches the window.
+    pub fn mitm_authority(&self) -> Result<Option<(String, String)>> {
+        let (cert, key) = (self.root.join(MITM_CERT), self.root.join(MITM_KEY));
+        if !cert.exists() || !key.exists() {
+            return Ok(None);
+        }
+        Ok(Some((
+            String::from_utf8(read_limited(&cert, 65536)?)?,
+            String::from_utf8(read_limited(&key, 65536)?)?,
+        )))
+    }
+    pub fn save_mitm_authority(&self, cert: &str, key: &str) -> Result<()> {
+        // Temporary files are created owner-only, and keep that when renamed.
+        atomic_write(&self.root.join(MITM_KEY), key.as_bytes())?;
+        atomic_write(&self.root.join(MITM_CERT), cert.as_bytes())
+    }
+    /// The settings with the CA filled in, for the core.
+    pub fn with_mitm_authority(&self, mut settings: Settings) -> Result<Settings> {
+        if let Some(mitm) = settings.overrides.mitm.as_mut()
+            && let Some((cert, key)) = self.mitm_authority()?
+        {
+            mitm.ca_cert = cert;
+            mitm.ca_key = key;
+        }
+        Ok(settings)
     }
     /// Rules added in the app, applied before every profile's own rules.
     pub fn custom_rules(&self) -> Result<Vec<String>> {
@@ -641,6 +671,39 @@ pub async fn download_source(url: &str) -> Result<String> {
 mod tests {
     use super::*;
     const YAML: &str = "mixed-port: 7890\nproxies:\n- name: test\n  type: vless\n  server: example.com\n  port: 443\n  uuid: 11111111-1111-4111-8111-111111111111\nrules:\n- MATCH,DIRECT\n";
+    #[test]
+    fn the_decryption_ca_stays_out_of_the_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        let mut settings = Settings::default();
+        settings.overrides.mitm = Some(clyntis_config::overrides::MitmSettings {
+            enable: true,
+            hostnames: vec!["*.ads.test".into()],
+            ..Default::default()
+        });
+        store.save_settings(&settings).unwrap();
+        // No CA yet: nothing to fill in.
+        let filled = store.with_mitm_authority(settings.clone()).unwrap();
+        assert!(filled.overrides.mitm.unwrap().ca_key.is_empty());
+        store.save_mitm_authority("CERT", "KEY").unwrap();
+        let filled = store.with_mitm_authority(settings).unwrap();
+        let mitm = filled.overrides.mitm.unwrap();
+        assert_eq!(
+            (mitm.ca_cert.as_str(), mitm.ca_key.as_str()),
+            ("CERT", "KEY")
+        );
+        let saved = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(!saved.contains("KEY"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("mitm-ca.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
     #[test]
     fn credentials_survive_runtime_overrides_and_disk_roundtrip() {
         let dir = tempfile::tempdir().unwrap();

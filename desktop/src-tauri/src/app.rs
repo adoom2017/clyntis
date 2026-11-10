@@ -352,8 +352,13 @@ impl Desktop {
         self.notify();
         Ok(())
     }
-    async fn settings(&self, settings: Settings) -> Result<()> {
+    async fn settings(&self, mut settings: Settings) -> Result<()> {
         settings.validate()?;
+        // The CA lives in its own files.
+        if let Some(mitm) = settings.overrides.mitm.as_mut() {
+            mitm.ca_cert.clear();
+            mitm.ca_key.clear();
+        }
         let mut op = self.operation.lock().await;
         let previous = self.store.settings()?;
         // An allowlist edit applies to the running core; everything else in
@@ -363,8 +368,11 @@ impl Desktop {
             if let Some(adblock) = overrides.adblock.as_mut() {
                 adblock.allow.clear();
             }
+            // Decryption settings apply to the running core too.
+            overrides.mitm = None;
             overrides
         };
+        let mitm_changed = settings.overrides.mitm != previous.overrides.mitm;
         let allow = |s: &Settings| s.overrides.adblock.as_ref().map(|a| a.allow.clone());
         let allow_changed = allow(&settings) != allow(&previous);
         let runtime_changed = settings.capture != previous.capture
@@ -381,15 +389,26 @@ impl Desktop {
             self.store.save_settings(&settings)?;
             if runtime_changed && let Some((profile, _)) = op.active.clone() {
                 self.replace(&mut op, profile, settings.clone()).await?;
-            } else if allow_changed && let Some(engine) = op.engine.as_ref() {
-                let allow = allow(&settings).unwrap_or_default();
-                engine
-                    .request(
-                        reqwest::Method::PATCH,
-                        &["configs"],
-                        Some(serde_json::json!({ "adblock-allow": allow })),
-                    )
-                    .await?;
+            } else if let Some(engine) = op.engine.as_ref() {
+                if allow_changed {
+                    let allow = allow(&settings).unwrap_or_default();
+                    engine
+                        .request(
+                            reqwest::Method::PATCH,
+                            &["configs"],
+                            Some(serde_json::json!({ "adblock-allow": allow })),
+                        )
+                        .await?;
+                }
+                if mitm_changed {
+                    engine
+                        .request(
+                            reqwest::Method::PATCH,
+                            &["configs"],
+                            Some(self.mitm_patch(&settings)?),
+                        )
+                        .await?;
+                }
             }
             Ok::<_, anyhow::Error>(())
         }
@@ -409,6 +428,36 @@ impl Desktop {
         }
         self.notify();
         result
+    }
+    /// The running core's decryption settings, with the CA.
+    fn mitm_patch(&self, settings: &Settings) -> Result<Value> {
+        let settings = self.store.with_mitm_authority(settings.clone())?;
+        let mitm = settings.overrides.mitm.unwrap_or_default().to_config();
+        Ok(json!({"mitm": {
+            "enable": mitm.enable,
+            "hostname": mitm.hostname,
+            "ca-cert": mitm.ca_cert,
+            "ca-key": mitm.ca_key,
+        }}))
+    }
+    /// Makes a new CA; a running core decrypting with the old one switches.
+    async fn generate_mitm_ca(&self) -> Result<()> {
+        let (cert, key) = clyntis_core::generate_authority()?;
+        let op = self.operation.lock().await;
+        self.store.save_mitm_authority(&cert, &key)?;
+        let settings = self.store.settings()?;
+        if settings.overrides.mitm.is_some()
+            && let Some(engine) = op.engine.as_ref()
+        {
+            engine
+                .request(
+                    reqwest::Method::PATCH,
+                    &["configs"],
+                    Some(self.mitm_patch(&settings)?),
+                )
+                .await?;
+        }
+        Ok(())
     }
     /// Saved rules plus, for the selected profile, its targets and the rules
     /// it cannot use.
@@ -976,6 +1025,111 @@ pub async fn close_connection(state: State<'_, Desktop>, id: Option<String>) -> 
         .with_context(|| tr!("内核未运行", "The core is not running"))
         .map_err(error)?
         .request(reqwest::Method::DELETE, &path, None)
+        .await
+        .map_err(error)?;
+    Ok(())
+}
+/// Recorded requests newer than `after` (see the core's `/requests`).
+#[tauri::command]
+pub async fn requests(state: State<'_, Desktop>, after: u64) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request_query(
+            reqwest::Method::GET,
+            &["requests"],
+            &[("after", after.to_string())],
+            None,
+        )
+        .await
+        .map_err(error)
+}
+#[tauri::command]
+pub async fn request_detail(state: State<'_, Desktop>, id: u64) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::GET, &["requests", &id.to_string()], None)
+        .await
+        .map_err(error)
+}
+/// Saves the request log to `path`: CSV (every entry) for a `.csv` path,
+/// HAR (HTTP requests with headers and bodies) otherwise.
+#[tauri::command]
+pub async fn export_requests(state: State<'_, Desktop>, path: String) -> Reply<()> {
+    let csv = std::path::Path::new(&path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+    let format = if csv { "csv" } else { "har" };
+    let bytes = controller(&state)
+        .await?
+        .download(&["requests", "export"], &[("format", format.into())])
+        .await
+        .map_err(error)?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub async fn clear_requests(state: State<'_, Desktop>) -> Reply<()> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::DELETE, &["requests"], None)
+        .await
+        .map_err(error)?;
+    Ok(())
+}
+/// The CA (name, fingerprints), whether the system trusts it, and the
+/// running core's decryption status.
+#[tauri::command]
+pub async fn mitm_info(state: State<'_, Desktop>) -> Reply<Value> {
+    let ca = state
+        .store
+        .mitm_authority()
+        .map_err(error)?
+        .and_then(|(cert, _)| clyntis_core::describe_authority(&cert));
+    let trusted = match &ca {
+        Some(ca) => {
+            platform::ca_trusted(
+                &state.store.root.join("mitm-ca.pem"),
+                ca["thumbprint"].as_str().unwrap_or_default(),
+            )
+            .await
+        }
+        None => false,
+    };
+    let core = match controller(&state).await {
+        Ok(controller) => controller
+            .request(reqwest::Method::GET, &["mitm"], None)
+            .await
+            .ok(),
+        Err(_) => None,
+    };
+    Ok(json!({"ca": ca, "trusted": trusted, "core": core}))
+}
+#[tauri::command]
+pub async fn generate_mitm_ca(state: State<'_, Desktop>) -> Reply<()> {
+    state.generate_mitm_ca().await.map_err(error)
+}
+#[tauri::command]
+pub async fn trust_mitm_ca(state: State<'_, Desktop>) -> Reply<()> {
+    let path = state.store.root.join("mitm-ca.pem");
+    if !path.exists() {
+        return Err(tr!("请先生成证书", "Create the certificate first"));
+    }
+    platform::trust_ca(&path).await.map_err(error)
+}
+/// Saves the CA certificate (not its key), for other devices or browsers.
+#[tauri::command]
+pub fn export_mitm_ca(state: State<'_, Desktop>, path: String) -> Reply<()> {
+    let (cert, _) = state
+        .store
+        .mitm_authority()
+        .map_err(error)?
+        .ok_or_else(|| tr!("请先生成证书", "Create the certificate first"))?;
+    std::fs::write(path, cert).map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub async fn clear_mitm_bypass(state: State<'_, Desktop>) -> Reply<()> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::DELETE, &["mitm", "bypass"], None)
         .await
         .map_err(error)?;
     Ok(())

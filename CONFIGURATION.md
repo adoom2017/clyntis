@@ -52,6 +52,38 @@ format. For building and running, see the [README](README.md).
   over immediately instead of waiting out their handshake timeout. `dns-answer: null` answers listed names
   with 0.0.0.0 / :: instead of NXDOMAIN; endpoint names always get NXDOMAIN,
   which Firefox's DoH canary and iCloud Private Relay require.
+- **Request log and HTTPS decryption** (for finding ads and trackers): the
+  core keeps recent connections, refused ones included, with their rule,
+  proxy, source, bytes, duration and why they ended (`GET /requests?after=<id>`,
+  oldest first; `DELETE /requests` clears it; 5000 entries on desktops, 500 in
+  the iOS tunnel; memory only; C ABI: `meta_requests_v1`,
+  `meta_request_detail_v1`). With the `mitm` section (written by the apps'
+  capture pages; the iOS app installs its CA as a configuration profile,
+  which the user then fully trusts in Settings) it also decrypts HTTPS to the listed hosts and
+  records each HTTP/1.x request: method, URL, status, headers and the start
+  of both bodies (`GET /requests/<id>`, decompressed when gzip, deflate, br
+  or zstd). Plain HTTP to those hosts is recorded without decryption.
+
+  ```yaml
+  mitm:
+    enable: true
+    hostname: ["*.biliapi.net", "api.example.com", "-*.apple.com"]
+    ca-cert: |   # PEM; the desktop app makes it and keeps it outside the profile
+      -----BEGIN CERTIFICATE-----
+    ca-key: |    # PEM; never returned by the controller
+      -----BEGIN PRIVATE KEY-----
+  ```
+
+  `*` matches any characters (dots too) and `?` one; a leading `-` excludes.
+  The server is verified against the bundled web PKI roots (not the system
+  store, so servers with private CAs fail) before the client is shown a
+  certificate for it; only HTTP/1.1 is offered to the client. A client that refuses the certificate (certificate pinning, or the
+  CA not trusted) fails once, and its host is then passed through untouched
+  until the list is cleared (`DELETE /mitm/bypass`; `GET /mitm` shows it).
+  UDP 443 to a decrypted host is refused so browsers use TCP instead of QUIC.
+  `PATCH /configs` with `mitm` applies new settings without a restart. The
+  CA can intercept any site the device visits while it is trusted: keep the
+  key private and turn decryption off when not analyzing.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
   redir-host modes. Real lookups also resolve Tailscale MagicDNS names; fake-IP
   answers keep the domain so domain rules still apply. Upstreams are asked at

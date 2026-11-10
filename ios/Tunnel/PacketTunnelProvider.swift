@@ -95,7 +95,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                 + skipped.map { "\($0.rule) (\($0.reason))" }.joined(separator: "; "))
                 }
                 step = "apply app settings"
-                let overrides = AppOverrides.load()
+                let overrides = AppOverrides.load().withMitmAuthority()
                 let configuration = try overrides.applied(to: withRules)
                 if !overrides.isEmpty {
                     log.info("start: app settings override the profile: log=\(overrides.logLevel ?? "profile") "
@@ -597,6 +597,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     try core.select(group: group, node: node)
                 case "adblock-allow":
                     try core.updateAdblockAllow(message.allow ?? [])
+                case "mitm":
+                    let settings = (message.mitm ?? MitmSettings()).withAuthority(MitmAuthority.load())
+                    try core.updateMitm(settings)
+                    log.info("mitm: enable=\(settings.enable) hosts=\(settings.hostnames.count)")
+                case "mitm-bypass-clear":
+                    try core.clearMitmBypass()
+                case "clear-requests":
+                    try core.clearRequests()
+                case "requests":
+                    completionHandler?(try core.requests(after: message.after ?? 0))
+                    return
+                case "export-requests":
+                    completionHandler?(try core.exportRequests(csv: message.format == "csv"))
+                    return
+                case "request-detail":
+                    guard let id = message.request else { throw ClientError.message(L("缺少请求编号。")) }
+                    completionHandler?(try core.requestDetail(id))
+                    return
                 case "close":
                     try core.closeConnection(message.id)
                 case "probe":

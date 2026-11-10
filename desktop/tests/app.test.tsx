@@ -521,6 +521,98 @@ describe("desktop workflows", () => {
     expect(invoke).not.toHaveBeenCalledWith("probe_proxy", { name: "Auto" });
     expect(await screen.findAllByText("88 ms")).toHaveLength(2);
   });
+  it("lists recorded requests, shows details and blocks a domain", async () => {
+    const entry = {
+      id: 1,
+      time: Date.now(),
+      network: "tcp",
+      source: "127.0.0.1:5000",
+      host: "ads.example.com",
+      port: 443,
+      rule: "Match",
+      chain: "DIRECT",
+      status: "http",
+      duration: 120,
+      upload: 0,
+      download: 10,
+      connection: "c1",
+      requests: 0,
+      http: {
+        method: "GET",
+        url: "https://ads.example.com/banner.js?id=1",
+        decrypted: true,
+        status: 200,
+        requestSize: 0,
+        responseSize: 10,
+      },
+    };
+    const rejected = {
+      ...entry,
+      id: 2,
+      host: "track.example.com",
+      status: "rejected",
+      rule: "DomainSuffix(example.com)",
+      chain: "REJECT",
+      http: undefined,
+    };
+    let served = false;
+    invoke.mockImplementation(async (command, args) => {
+      if (command === "requests") {
+        if (served) return { requests: [], next: 2 };
+        served = true;
+        expect(args).toEqual({ after: 0 });
+        return { requests: [entry, rejected], next: 2 };
+      }
+      if (command === "request_detail")
+        return {
+          ...entry,
+          requestHeaders: [["Host", "ads.example.com"]],
+          responseHeaders: [["Content-Type", "application/json"]],
+          requestBody: { size: 0, truncated: false, decoded: false },
+          responseBody: {
+            size: 10,
+            truncated: false,
+            decoded: true,
+            text: '{"ad":1}',
+          },
+        };
+      if (command === "mitm_info")
+        return { ca: null, trusted: false, core: null };
+      if (command === "connections")
+        return { connections: [], uploadTotal: 0, downloadTotal: 0 };
+      if (command === "custom_rules")
+        return { rules: ["DOMAIN,old.test,DIRECT"], targets: [], skipped: [] };
+      return { ...structuredClone(initial), status: "running" };
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "抓包" }));
+    expect(await screen.findByText("/banner.js?id=1")).toBeInTheDocument();
+    expect(screen.getByText("track.example.com")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /已拦截/ }));
+    expect(screen.queryByText("/banner.js?id=1")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /全部/ }));
+    save.mockResolvedValue("/tmp/requests.csv");
+    fireEvent.click(screen.getByRole("button", { name: "导出" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("export_requests", {
+        path: "/tmp/requests.csv",
+      }),
+    );
+    fireEvent.click(screen.getByText("/banner.js?id=1"));
+    expect(await screen.findByText(/"ad": 1/)).toBeInTheDocument();
+    expect(screen.getByText("https://ads.example.com/banner.js?id=1"));
+    fireEvent.click(screen.getByRole("button", { name: "屏蔽此域名" }));
+    fireEvent.click(screen.getByLabelText("同时屏蔽它的子域名"));
+    fireEvent.click(screen.getByRole("button", { name: "屏蔽" }));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("save_custom_rules", {
+        rules: [
+          "DOMAIN-SUFFIX,ads.example.com,REJECT",
+          "DOMAIN,old.test,DIRECT",
+        ],
+      }),
+    );
+  });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");
     expect(bytes(1024)).toBe("1.0 KB");

@@ -52,8 +52,39 @@ impl Controller {
         path: &[&str],
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        self.request_query(method, path, &[], body).await
+    }
+    /// A GET whose response is a file rather than JSON.
+    pub async fn download(&self, path: &[&str], query: &[(&str, String)]) -> Result<Vec<u8>> {
         let mut url = reqwest::Url::parse(&format!("http://{}/", self.address))?;
         url.path_segments_mut().unwrap().clear().extend(path);
+        url.query_pairs_mut().extend_pairs(query);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+            .with_context(|| tr!("内核控制接口无法连接", "Cannot reach the core controller"))?;
+        ensure!(
+            response.status().is_success(),
+            "{}",
+            tr!("内核请求失败", "The core request failed")
+        );
+        Ok(response.bytes().await?.to_vec())
+    }
+    pub async fn request_query(
+        &self,
+        method: reqwest::Method,
+        path: &[&str],
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut url = reqwest::Url::parse(&format!("http://{}/", self.address))?;
+        url.path_segments_mut().unwrap().clear().extend(path);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
         let mut request = self.client.request(method, url).bearer_auth(&self.secret);
         if let Some(body) = body {
             request = request.json(&body);
@@ -129,6 +160,7 @@ impl Engine {
         settings: &Settings,
     ) -> Result<Self> {
         let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let settings = &store.with_mitm_authority(settings.clone())?;
         let yaml = runtime_yaml(profile, settings, &secret, &store.custom_rules()?)?;
         let request = Request::Start {
             version: VERSION,

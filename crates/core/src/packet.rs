@@ -632,6 +632,9 @@ async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> 
     }
     let target = Target::new(flow.target.addr.to_string(), flow.target.port)?;
     let source = flow.source.to_string();
+    if core.inspects(&target) {
+        return core.inspect_tcp(stream, target, source).await;
+    }
     if core.wants_sniff(&core.restore_target(&target)) {
         let (route, destination, prefix) = core.sniff_target(&mut stream, &target).await?;
         let (mut outbound, name) = core

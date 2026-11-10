@@ -5,8 +5,8 @@ use clyntis_protocol::{Datagram, Target};
 use std::{
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -27,6 +27,19 @@ pub(crate) struct State {
     /// One side of a TCP relay reached EOF; `ended` wakes [`idle_expired`].
     half_closed: AtomicBool,
     ended: Notify,
+    /// Why the relay ended, for the request log.
+    reason: Mutex<Option<String>>,
+    /// HTTP requests recorded on this connection after decryption.
+    pub(crate) exchanges: AtomicU32,
+    /// Where the connection is recorded once it ends: when the last holder
+    /// lets go, after the relay noted why it ended.
+    log: Arc<crate::requests::Requests>,
+}
+impl Drop for State {
+    fn drop(&mut self) {
+        let log = self.log.clone();
+        log.finished(self);
+    }
 }
 impl State {
     /// Time since the connection was tracked.
@@ -44,6 +57,12 @@ impl State {
             self.ended.notify_one();
         }
     }
+    pub(crate) fn set_reason(&self, reason: &str) {
+        *self.reason.lock().unwrap() = Some(reason.to_owned());
+    }
+    pub(crate) fn reason(&self) -> Option<String> {
+        self.reason.lock().unwrap().clone()
+    }
     pub(crate) fn snapshot(&self) -> Connection {
         let mut info = self.info.clone();
         info.upload = self.upload.load(Ordering::Relaxed);
@@ -59,7 +78,7 @@ impl Tracker {
     pub(crate) fn new(
         core: Arc<Core>,
         target: Target,
-        node: String,
+        routed: crate::Routed,
         network: &str,
     ) -> Result<Self> {
         ensure!(!core.stop.is_cancelled(), "core stopped");
@@ -67,7 +86,9 @@ impl Tracker {
             id: uuid::Uuid::new_v4().to_string(),
             metadata: target,
             network: network.into(),
-            chains: vec![node],
+            chains: vec![routed.node],
+            rule: routed.rule,
+            source: routed.source,
             upload: 0,
             download: 0,
             start: std::time::SystemTime::now()
@@ -84,6 +105,9 @@ impl Tracker {
             active: AtomicU64::new(0),
             half_closed: AtomicBool::new(false),
             ended: Notify::new(),
+            reason: Mutex::new(None),
+            exchanges: AtomicU32::new(0),
+            log: core.requests.clone(),
         });
         {
             let mut connections = core.connections.lock().unwrap();

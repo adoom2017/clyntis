@@ -2,6 +2,7 @@ pub mod adblock;
 pub mod compat;
 pub mod crypto;
 pub mod custom;
+pub mod mitm;
 pub mod network;
 pub mod overrides;
 pub use compat::*;
@@ -65,6 +66,8 @@ pub struct Config {
     pub ntp: Ntp,
     pub sniffer: Sniffer,
     pub adblock: adblock::Adblock,
+    /// Clyntis only: HTTPS decryption for inspecting requests.
+    pub mitm: mitm::Mitm,
     /// Clyntis only: false keeps every `type: tailscale` proxy stopped (no
     /// control, DERP or tailnet names); connections routed to one fail.
     pub tailscale_enable: bool,
@@ -116,6 +119,7 @@ impl Default for Config {
             ntp: Ntp::default(),
             sniffer: Sniffer::default(),
             adblock: adblock::Adblock::default(),
+            mitm: mitm::Mitm::default(),
             tailscale_enable: true,
             directory: ".".into(),
             internal_allow_native_profile: false,

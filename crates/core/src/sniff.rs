@@ -20,7 +20,7 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
         && !host.contains("..")
 }
-fn tls(data: &[u8]) -> Option<String> {
+pub(crate) fn tls(data: &[u8]) -> Option<String> {
     let mut records = data;
     let mut hello = vec![];
     while !records.is_empty() {
@@ -77,7 +77,7 @@ fn tls(data: &[u8]) -> Option<String> {
     }
     None
 }
-fn http(data: &[u8]) -> Option<String> {
+pub(crate) fn http(data: &[u8]) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 128];
     let mut r = httparse::Request::new(&mut headers);
     r.parse(data).ok()?;
@@ -193,7 +193,7 @@ impl crate::Core {
         destination: &Target,
         dialed: &Target,
         source: &str,
-    ) -> anyhow::Result<(clyntis_protocol::BoxStream, String)> {
+    ) -> anyhow::Result<(clyntis_protocol::BoxStream, crate::Routed)> {
         let address = self.restore_target(dialed).ip();
         let decision = self
             .trace_route(route, address, "tcp", true)
@@ -201,11 +201,12 @@ impl crate::Core {
             .decision;
         if decision.node == "REJECT" {
             Self::log_connection("TCP", source, route, &decision);
+            self.requests.rejected("tcp", source, route, &decision);
             anyhow::bail!(crate::Rejected(decision));
         }
         let (stream, _) = self.dial(destination, Some(&decision.node)).await?;
         Self::log_connection("TCP", source, route, &decision);
-        Ok((stream, decision.node))
+        Ok((stream, crate::Routed::new(&decision, source)))
     }
 }
 fn domain(pattern: &str, host: &str) -> bool {

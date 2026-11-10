@@ -87,6 +87,20 @@ private struct ConnectionView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    if model.connected {
+                        NavigationLink { RequestsView(model: model) } label: {
+                            HStack {
+                                Label(L("抓包"), systemImage: "waveform.badge.magnifyingglass").foregroundStyle(.secondary)
+                                Spacer()
+                                Text(model.overrides.mitm?.enable == true ? L("HTTPS 解密已开启") : L("查看请求"))
+                                Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(.tertiary)
+                            }
+                            .font(.subheadline)
+                            .padding(14)
+                            .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 14))
+                        }
+                        .buttonStyle(.plain)
+                    }
                     if model.connected, let networks = model.currentNetworks {
                         HStack {
                             Label(L("当前网络"), systemImage: "wifi").foregroundStyle(.secondary)
@@ -171,6 +185,15 @@ private struct ProfilesView: View {
                             Text(model.overrides.adblock?.enabled == true ? L("已开启") : L("未开启"))
                         } label: {
                             Label(L("去广告"), systemImage: "nosign")
+                        }
+                    }
+                    NavigationLink {
+                        MitmView(model: model)
+                    } label: {
+                        LabeledContent {
+                            Text(model.overrides.mitm?.enable == true ? L("已开启") : L("未开启"))
+                        } label: {
+                            Label(L("HTTPS 解密"), systemImage: "lock.open")
                         }
                     }
                 } footer: {

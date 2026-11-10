@@ -12,6 +12,8 @@ struct AppOverrides: Codable, Equatable {
     /// Whether the profile's Tailscale proxies run.
     var tailscale: Bool?
     var adblock: AdblockSettings?
+    /// HTTPS decryption; the running tunnel takes changes live.
+    var mitm: MitmSettings?
 
     var isEmpty: Bool { self == AppOverrides() }
 
@@ -29,7 +31,17 @@ struct AppOverrides: Codable, Equatable {
         if let logLevel, !Self.logLevels.contains(logLevel) {
             throw ClientError.message(L("无效日志级别「{logLevel}」。", ["logLevel": logLevel]))
         }
-        try JSONEncoder().encode(self).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        var stored = self
+        // The CA lives in its own files (MitmAuthority).
+        stored.mitm = mitm?.withoutAuthority
+        try JSONEncoder().encode(stored).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    /// These settings with the decryption CA filled in, for the core.
+    func withMitmAuthority() -> AppOverrides {
+        var copy = self
+        copy.mitm = mitm?.withAuthority(MitmAuthority.load())
+        return copy
     }
 
     /// The configuration with these settings applied; unchanged when none is set.
@@ -68,4 +80,38 @@ struct AdblockSettings: Codable, Equatable {
         ("anti-ad", "anti-AD", L("覆盖面广，以国内为主，约 10 万条")),
         ("adguard-dns", "AdGuard DNS filter", L("偏海外的广告与追踪，约 18 万条，内存占用较大")),
     ]
+}
+
+/// HTTPS decryption settings (clyntis_config::overrides::MitmSettings).
+struct MitmSettings: Codable, Equatable {
+    var enable = false
+    var hostnames: [String] = []
+    /// The CA (PEM), filled in from MitmAuthority only on the way to the core.
+    var caCert: String?
+    var caKey: String?
+
+    var withoutAuthority: MitmSettings {
+        var copy = self
+        copy.caCert = nil
+        copy.caKey = nil
+        return copy
+    }
+
+    func withAuthority(_ authority: MitmAuthority?) -> MitmSettings {
+        var copy = self
+        copy.caCert = authority?.cert
+        copy.caKey = authority?.key
+        return copy
+    }
+
+    /// The update meta_update_v1 takes to apply these settings live.
+    func coreUpdate() throws -> Data {
+        var mitm: [String: Any] = [
+            "enable": enable,
+            "hostname": hostnames.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty },
+        ]
+        if let caCert { mitm["ca-cert"] = caCert }
+        if let caKey { mitm["ca-key"] = caKey }
+        return try JSONSerialization.data(withJSONObject: ["mitm": mitm])
+    }
 }

@@ -5,6 +5,14 @@ pub mod cos;
 pub mod dns;
 mod inbound;
 mod memory;
+mod mitm;
+mod observe;
+pub mod requests;
+pub use mitm::{check_authority, describe_authority, generate_authority};
+/// The host [`check_authority`] issues its certificate for.
+pub fn mitm_check_host() -> &'static str {
+    mitm::CHECK_HOST
+}
 mod ntp;
 mod packet;
 mod profile;
@@ -73,6 +81,10 @@ pub struct Core {
     /// The device network as the host last reported it, and the index of the
     /// network-overrides entry applied for it.
     network: RwLock<(clyntis_config::network::NetworkInfo, Option<usize>)>,
+    /// Recent connections and decrypted HTTP requests.
+    pub requests: Arc<requests::Requests>,
+    /// HTTPS decryption: the settings, the CA and the per-host certificates.
+    mitm: mitm::Interceptor,
 }
 struct Policy {
     mode: Mode,
@@ -93,6 +105,37 @@ impl std::fmt::Display for Rejected {
     }
 }
 impl std::error::Error for Rejected {}
+
+/// Where a relayed connection goes and why: the node, the rule that chose it
+/// and the client that opened it, for the connection list and request log.
+#[derive(Clone, Debug, Default)]
+pub struct Routed {
+    pub node: String,
+    pub rule: String,
+    pub source: String,
+}
+impl Routed {
+    pub(crate) fn new(decision: &RouteDecision, source: &str) -> Self {
+        Self {
+            node: decision.node.clone(),
+            rule: decision.rule.clone(),
+            source: source.to_owned(),
+        }
+    }
+}
+impl From<String> for Routed {
+    fn from(node: String) -> Self {
+        Self {
+            node,
+            ..Self::default()
+        }
+    }
+}
+impl From<&str> for Routed {
+    fn from(node: &str) -> Self {
+        node.to_owned().into()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RouteDecision {
@@ -232,6 +275,10 @@ pub struct Connection {
     pub metadata: Target,
     pub network: String,
     pub chains: Vec<String>,
+    /// The rule that chose the route, as the log shows it.
+    pub rule: String,
+    /// The client address, when the inbound knows it.
+    pub source: String,
     pub upload: u64,
     pub download: u64,
     pub start: String,
@@ -333,7 +380,11 @@ impl Core {
         let mut xudp_key = [0; 32];
         xudp_key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         xudp_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let requests = Arc::new(requests::Requests::new(config.internal_host_packet_io));
+        let mitm = mitm::Interceptor::new(&config.mitm, config.internal_host_packet_io);
         Ok(Arc::new(Self {
+            requests,
+            mitm,
             adblock_allow: RwLock::new(config.adblock.allow.clone()),
             saved_profile: Mutex::new(None),
             config,
@@ -1156,7 +1207,7 @@ impl Core {
         target: &Target,
         selected: Option<&str>,
         source: &str,
-    ) -> Result<(BoxStream, String)> {
+    ) -> Result<(BoxStream, Routed)> {
         let display_target = self.restore_target(target);
         let outcome = tokio::select! {
             biased;
@@ -1169,12 +1220,14 @@ impl Core {
                 // Refused connections are logged too, so REJECT rules show up.
                 if let Some(Rejected(decision)) = error.downcast_ref::<Rejected>() {
                     Self::log_connection("TCP", source, &display_target, decision);
+                    self.requests
+                        .rejected("tcp", source, &display_target, decision);
                 }
                 return Err(error);
             }
         };
         Self::log_connection("TCP", source, &display_target, &decision);
-        Ok((stream, decision.node))
+        Ok((stream, Routed::new(&decision, source)))
     }
     pub(crate) fn log_connection(
         network: &str,
@@ -1314,22 +1367,28 @@ impl Core {
             biased;
             _=self.stop.cancelled()=>bail!("core stopped"),
             result=tokio::time::timeout(Duration::from_secs(20),async {
-                let decision=self.route_decision(&target,"udp").await?;
+                let source=source.map(|source|source.split_once(':').map(|(_,value)|value).unwrap_or(source));
+                let mut decision=self.route_decision(&target,"udp").await?;
+                // QUIC to a decrypted host would bypass decryption: refusing
+                // it makes browsers fall back to TCP at once.
+                if target.port==443 && self.mitm.intercepts(&target.host) {
+                    decision=RouteDecision{node:"REJECT".into(),group:"REJECT".into(),rule:"MITM(QUIC)".into()};
+                }
                 if decision.node=="REJECT" {
                     if let Some(source)=source {
-                        let source=source.split_once(':').map(|(_,value)|value).unwrap_or(source);
                         Self::log_connection("UDP",source,&target,&decision);
                     }
+                    self.requests.rejected("udp",source.unwrap_or_default(),&target,&decision);
                     // Typed so the TUN can answer the app with an ICMP error.
                     return Err(Rejected(decision).into());
                 }
                 let inner=self.datagram_inner(&target,&decision.node,global_id).await?;
                 if let Some(source)=source {
-                    let source=source.split_once(':').map(|(_,value)|value).unwrap_or(source);
                     Self::log_connection("UDP",source,&target,&decision);
                 }
+                let routed=Routed::new(&decision,source.unwrap_or_default());
                 Ok::<Arc<dyn Datagram>,anyhow::Error>(Arc::new(traffic::PacketSession {
-                    inner,tracker:traffic::Tracker::new(self.clone(),target,decision.node,"udp")?
+                    inner,tracker:traffic::Tracker::new(self.clone(),target,routed,"udp")?
                 }))
             })=>result?,
         }
@@ -1421,21 +1480,21 @@ impl Core {
         inbound: BoxStream,
         target: Target,
         outbound: BoxStream,
-        node: String,
+        routed: Routed,
     ) -> Result<()> {
-        self.relay_io(inbound, target, outbound, node).await
+        self.relay_io(inbound, target, outbound, routed).await
     }
     pub(crate) async fn relay_io<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         self: &Arc<Self>,
         mut inbound: S,
         target: Target,
         outbound: BoxStream,
-        node: String,
+        routed: Routed,
     ) -> Result<()> {
         // Record the domain behind a fake IP: paths that did not sniff still
         // carry the fake address here, although the dial already restored it.
         let target = self.restore_target(&target);
-        let tracker = traffic::Tracker::new(self.clone(), target, node, "tcp")?;
+        let tracker = traffic::Tracker::new(self.clone(), target, routed, "tcp")?;
         let cancel = tracker.cancel();
         let state = tracker.state.clone();
         let mut outbound = traffic::Stream {
@@ -1472,7 +1531,7 @@ const LONG_RELAY: Duration = Duration::from_secs(5 * 60);
 /// connection: with only the opening lines in the log, a connection that an
 /// app kept reopening, or one that died after an hour, left no trace of how
 /// long it lasted, what it moved or why it ended.
-fn log_close(state: &traffic::State, outcome: &std::io::Result<&'static str>) {
+pub(crate) fn log_close(state: &traffic::State, outcome: &std::io::Result<&'static str>) {
     let lifetime = state.lifetime();
     let info = state.snapshot();
     let node = info.chains.first().map(String::as_str).unwrap_or_default();
@@ -1480,6 +1539,7 @@ fn log_close(state: &traffic::State, outcome: &std::io::Result<&'static str>) {
         Ok(reason) => std::borrow::Cow::Borrowed(*reason),
         Err(error) => std::borrow::Cow::Owned(error.to_string()),
     };
+    state.set_reason(&reason);
     let notable = !matches!(outcome, Ok("closed")) || lifetime >= LONG_RELAY;
     let secs = lifetime.as_secs();
     if notable {

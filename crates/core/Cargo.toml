@@ -20,6 +20,11 @@ base64.workspace = true
 bytes.workspace = true
 ipnet.workspace = true
 http.workspace = true
+boring.workspace = true
+tokio-boring.workspace = true
+flate2.workspace = true
+brotli.workspace = true
+zstd.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 hickory-proto = "0.25"

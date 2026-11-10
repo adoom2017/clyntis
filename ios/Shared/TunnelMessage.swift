@@ -14,4 +14,12 @@ struct TunnelMessage: Codable {
     var network: String?
     /// "dns-leak": also run the online bash.ws test.
     var online: Bool?
+    /// "requests": entries after this id.
+    var after: UInt64?
+    /// "request-detail": the entry's id.
+    var request: UInt64?
+    /// "export-requests": "har" or "csv".
+    var format: String?
+    /// "mitm": the decryption settings; the tunnel adds the CA.
+    var mitm: MitmSettings?
 }

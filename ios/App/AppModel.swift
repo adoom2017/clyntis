@@ -28,6 +28,8 @@ final class AppModel {
     var connections: [ConnectionInfo] = []
     /// Ad blocking state and counters from the snapshot.
     var adblock: AdblockStatus?
+    /// The running core's decryption status from the snapshot.
+    var mitm: MitmStatus?
     /// The profile's networks the device is on, while the profile defines
     /// any (see `networks` and `network-overrides`); nil otherwise.
     var currentNetworks: [String]?
@@ -105,7 +107,7 @@ final class AppModel {
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
                             self.proxies = []; self.nodeStatus = [:]; self.connections = []
-                            self.adblock = nil; self.currentNetworks = nil
+                            self.adblock = nil; self.currentNetworks = nil; self.mitm = nil
                         }
                     }
                 }
@@ -460,6 +462,74 @@ final class AppModel {
         _ = try await saveAdblock(settings)
     }
 
+    // MARK: Capture and HTTPS decryption
+
+    /// Saves the decryption settings; a connected tunnel applies them at once.
+    func saveMitm(_ value: MitmSettings) async throws {
+        var next = overrides
+        next.mitm = value
+        try saveOverrides(next)
+        if connected {
+            try applySnapshot(await send(TunnelMessage(command: "mitm", mitm: value)))
+        }
+    }
+
+    /// Makes a new CA; a tunnel decrypting with the old one switches to it.
+    func generateAuthority() async throws -> MitmAuthority {
+        let authority = try await Task.detached { try MitmAuthority.generate() }.value
+        if connected, let settings = overrides.mitm {
+            try applySnapshot(await send(TunnelMessage(command: "mitm", mitm: settings)))
+        }
+        return authority
+    }
+
+    func clearMitmBypass() async throws {
+        try applySnapshot(await send(TunnelMessage(command: "mitm-bypass-clear")))
+    }
+
+    /// Request log entries after `after` (see RequestsView).
+    func fetchRequests(after: UInt64) async throws -> RequestPage {
+        let data = try await send(TunnelMessage(command: "requests", after: after))
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let error = object["error"] as? String {
+            throw ClientError.message(error)
+        }
+        return try JSONDecoder().decode(RequestPage.self, from: data)
+    }
+
+    func requestDetail(_ id: UInt64) async throws -> RequestDetail {
+        let data = try await send(TunnelMessage(command: "request-detail", request: id))
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let error = object["error"] as? String {
+            throw ClientError.message(error)
+        }
+        return try JSONDecoder().decode(RequestDetail.self, from: data)
+    }
+
+    /// The tunnel's request log as a HAR or CSV file.
+    func exportRequests(csv: Bool) async throws -> Data {
+        guard connected else { throw ClientError.message(L("VPN 未连接。")) }
+        let data = try await send(TunnelMessage(command: "export-requests", format: csv ? "csv" : "har"), timeout: 15)
+        // A failure is a small JSON object with "error"; an export never is.
+        if data.count < 4096, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let error = object["error"] as? String {
+            throw ClientError.message(error)
+        }
+        return data
+    }
+
+    func clearRequests() async throws {
+        try applySnapshot(await send(TunnelMessage(command: "clear-requests")))
+    }
+
+    /// Adds a REJECT rule for `host` ahead of the others; it applies on the
+    /// next connection.
+    func blockDomain(_ host: String, subdomains: Bool) throws {
+        let rule = "\(subdomains ? "DOMAIN-SUFFIX" : "DOMAIN"),\(host),REJECT"
+        guard !customRules.contains(rule) else { return }
+        try saveCustomRules([rule] + customRules)
+    }
+
     func saveOverrides(_ value: AppOverrides) throws {
         try value.save()
         overrides = AppOverrides.load()
@@ -656,6 +726,7 @@ final class AppModel {
         connectionCount = (object["connections"] as? [Any])?.count ?? 0
         connections = ConnectionInfo.decode(object["connections"])
         adblock = AdblockStatus.decode(object["adblock"])
+        mitm = MitmStatus.decode(object["mitm"])
         if let config = object["config"] as? [String: Any] {
             mode = config["mode"] as? String ?? "rule"
             let selections = object["selections"] as? [String: String] ?? [:]

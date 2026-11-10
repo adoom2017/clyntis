@@ -249,7 +249,7 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
     })
 }
 
-/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing","adblock","tailscale"}`, each
+/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing","adblock","tailscale","mitm"}`, each
 /// optional) over `config`. Writes the resulting YAML; unset values keep the
 /// profile's own.
 ///
@@ -607,7 +607,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
 ) -> i32 {
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "network":handle.core.network_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "network":handle.core.network_status(), "mitm":handle.core.mitm_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }
@@ -646,9 +646,14 @@ pub unsafe extern "C" fn meta_update_v1(id: u64, data: *const u8, len: usize) ->
         ensure!(
             object
                 .keys()
-                .all(|k| k == "mode" || k == "rules" || k == "adblock-allow"),
-            "only mode, rules and adblock-allow can update online"
+                .all(|k| ["mode", "rules", "adblock-allow", "mitm"].contains(&k.as_str())),
+            "only mode, rules, adblock-allow and mitm can update online"
         );
+        if let Some(mitm) = object.get("mitm") {
+            handle(id)?
+                .core
+                .set_mitm(serde_json::from_value(mitm.clone())?)?;
+        }
         if let Some(allow) = object.get("adblock-allow") {
             handle(id)?
                 .core
@@ -666,6 +671,125 @@ pub unsafe extern "C" fn meta_update_v1(id: u64, data: *const u8, len: usize) ->
             handle(id)?.core.update_policy(mode, rules)?;
         }
         Ok(OK)
+    })
+}
+/// The request log after id `after`, oldest first, at most `limit` entries:
+/// JSON `{"requests": [...], "next": id}`.
+///
+/// # Safety
+/// The buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_requests_v1(
+    id: u64,
+    after: u64,
+    limit: u32,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let (requests, next) = handle(id)?
+            .core
+            .requests
+            .list(after, limit.clamp(1, 5000) as usize);
+        let value = serde_json::json!({"requests": requests, "next": next});
+        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
+/// One request log entry with headers and bodies, as JSON.
+///
+/// # Safety
+/// The buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_request_detail_v1(
+    id: u64,
+    request: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let value = handle(id)?
+            .core
+            .requests
+            .detail(request)
+            .context("request not found")?;
+        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
+/// The request log as a file: `format` 0 writes HAR (HTTP requests with
+/// headers and bodies), 1 CSV (every entry).
+///
+/// # Safety
+/// The buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_requests_export_v1(
+    id: u64,
+    format: u32,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let requests = &handle(id)?.core.requests;
+        let bytes = match format {
+            0 => serde_json::to_vec_pretty(&requests.export_har())?,
+            1 => requests.export_csv().into_bytes(),
+            _ => anyhow::bail!("unknown export format"),
+        };
+        unsafe { output(&bytes, buffer, capacity, length) }
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn meta_clear_requests_v1(id: u64) -> i32 {
+    boundary(|| {
+        handle(id)?.core.requests.clear();
+        Ok(OK)
+    })
+}
+/// Decrypts again hosts whose clients refused the certificate.
+#[unsafe(no_mangle)]
+pub extern "C" fn meta_clear_mitm_bypass_v1(id: u64) -> i32 {
+    boundary(|| {
+        handle(id)?.core.clear_mitm_bypass();
+        Ok(OK)
+    })
+}
+/// A new decryption CA: JSON `{"cert": PEM, "key": PEM}`.
+///
+/// # Safety
+/// The buffer and length output must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_mitm_generate_ca_v1(
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let (cert, key) = clyntis_core::generate_authority()?;
+        let value = serde_json::json!({"cert": cert, "key": key});
+        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
+/// Checks a CA (`json`: `{"cert": PEM, "key": PEM}`) and writes JSON with
+/// its description (`ca`), its DER (`caDer`) and a server certificate it
+/// signs for `host` (`leaf`), base64, for the system's trust evaluation.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_mitm_check_ca_v1(
+    json: *const u8,
+    len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let value: serde_json::Value = serde_json::from_slice(unsafe { input(json, len)? })?;
+        let field = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+        let check = clyntis_core::check_authority(&field("cert"), &field("key"))?;
+        unsafe { output(&serde_json::to_vec(&check)?, buffer, capacity, length) }
     })
 }
 /// # Safety

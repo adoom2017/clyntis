@@ -11,6 +11,7 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import brandIcon from "../src-tauri/icons/clyntis-v3/brand-128.png";
 import { UpdatesPanel, useUpdates, type UpdateController } from "./Updates";
 import { pageVisible, usePageVisible } from "./visibility";
+import { RequestsPage } from "./Requests";
 import {
   locale,
   resolveLanguage,
@@ -47,6 +48,7 @@ import {
   Wifi,
   RefreshCw,
   Route,
+  ScanSearch,
   Search,
   Settings2,
   ShieldCheck,
@@ -107,6 +109,7 @@ type Page =
   | "profiles"
   | "rules"
   | "connections"
+  | "requests"
   | "logs"
   | "settings";
 const pages: {
@@ -148,6 +151,13 @@ const pages: {
       return t("连接");
     },
     icon: Network,
+  },
+  {
+    id: "requests",
+    get label() {
+      return t("抓包");
+    },
+    icon: ScanSearch,
   },
   {
     id: "logs",
@@ -910,6 +920,14 @@ export default function App() {
           {page === "connections" && (
             <ConnectionPage running={running} perform={perform} />
           )}
+          {page === "requests" && (
+            <RequestsPage
+              running={running}
+              settings={state.settings}
+              perform={perform}
+              confirm={setModal}
+            />
+          )}
           {page === "logs" && <LogPage logs={logs} perform={perform} />}
           {page === "settings" && (
             <SettingsPage
@@ -977,7 +995,7 @@ function loadNodesView(): NodesView {
   }
 }
 
-type Perform = (
+export type Perform = (
   action: () => Promise<unknown>,
   success?: string,
 ) => Promise<boolean>;
@@ -1110,7 +1128,7 @@ function TrafficChart({ values }: { values: Traffic[] }) {
     </div>
   );
 }
-function Empty({
+export function Empty({
   icon,
   title,
   text,
@@ -3901,7 +3919,7 @@ function SettingsPage({
     </>
   );
 }
-function Setting({
+export function Setting({
   label,
   text,
   children,
@@ -3920,7 +3938,7 @@ function Setting({
     </div>
   );
 }
-function Toggle({
+export function Toggle({
   checked,
   onChange,
   label,

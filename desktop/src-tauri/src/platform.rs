@@ -196,3 +196,73 @@ pub async fn update_service() -> Result<String> {
         .await
     }
 }
+
+/// Whether the system trusts the CA in `cert` (a PEM file) for TLS servers.
+pub async fn ca_trusted(cert: &std::path::Path, thumbprint: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = thumbprint;
+        tokio::process::Command::new("/usr/bin/security")
+            .arg("verify-cert")
+            .arg("-c")
+            .arg(cert)
+            .arg("-q")
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
+    }
+    #[cfg(windows)]
+    {
+        let _ = cert;
+        tokio::process::Command::new("certutil")
+            .args(["-user", "-verifystore", "Root", thumbprint])
+            .creation_flags(0x08000000)
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = (cert, thumbprint);
+        false
+    }
+}
+
+/// Adds the CA in `cert` (a PEM file) to the user's trusted roots; the
+/// system asks the user to confirm.
+pub async fn trust_ca(cert: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let output = {
+        let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+        let keychain = std::path::Path::new(&home).join("Library/Keychains/login.keychain-db");
+        tokio::process::Command::new("/usr/bin/security")
+            .args(["add-trusted-cert", "-r", "trustRoot", "-p", "ssl", "-k"])
+            .arg(keychain)
+            .arg(cert)
+            .output()
+            .await?
+    };
+    #[cfg(windows)]
+    let output = tokio::process::Command::new("certutil")
+        .args(["-user", "-addstore", "Root"])
+        .arg(cert)
+        .creation_flags(0x08000000)
+        .output()
+        .await?;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = cert;
+        anyhow::bail!("not supported on this system");
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = if detail.trim().is_empty() {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        } else {
+            detail.into_owned()
+        };
+        ensure!(output.status.success(), "{}", detail.trim());
+        Ok(())
+    }
+}

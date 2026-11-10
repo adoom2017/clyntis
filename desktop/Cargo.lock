@@ -848,11 +848,14 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "boring",
+ "brotli 8.0.4",
  "bytes",
  "clyntis-config",
  "clyntis-platform",
  "clyntis-protocol",
  "clyntis-tailscale",
+ "flate2",
  "futures-util",
  "hickory-proto",
  "hmac",
@@ -873,9 +876,11 @@ dependencies = [
  "smoltcp",
  "socket2",
  "tokio",
+ "tokio-boring",
  "tokio-util",
  "tracing",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

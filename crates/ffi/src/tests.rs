@@ -944,3 +944,74 @@ fn cos_targets_come_from_cos_urls_and_uploads_need_credentials() {
         ERROR
     );
 }
+
+fn read_json(call: impl Fn(*mut u8, usize, *mut usize) -> i32) -> serde_json::Value {
+    let mut length = 0;
+    assert_eq!(call(std::ptr::null_mut(), 0, &mut length), BUFFER_TOO_SMALL);
+    let mut bytes = vec![0; length];
+    assert_eq!(call(bytes.as_mut_ptr(), bytes.len(), &mut length), OK);
+    serde_json::from_slice(&bytes[..length]).unwrap()
+}
+
+#[test]
+fn decryption_settings_change_live_and_the_request_log_is_readable() {
+    let ca = read_json(|b, c, l| unsafe { meta_mitm_generate_ca_v1(b, c, l) });
+    let check = serde_json::to_vec(&ca).unwrap();
+    let checked =
+        read_json(|b, c, l| unsafe { meta_mitm_check_ca_v1(check.as_ptr(), check.len(), b, c, l) });
+    assert_eq!(checked["host"], clyntis_core::mitm_check_host());
+    assert!(checked["leaf"].as_str().is_some_and(|s| !s.is_empty()));
+    let bad = br#"{"cert":"x","key":"y"}"#;
+    let mut length = 0;
+    assert_eq!(
+        unsafe {
+            meta_mitm_check_ca_v1(
+                bad.as_ptr(),
+                bad.len(),
+                std::ptr::null_mut(),
+                0,
+                &mut length,
+            )
+        },
+        ERROR
+    );
+
+    let id = create(b"mode: rule\n", std::ptr::null());
+    assert_eq!(snapshot(id)["mitm"]["active"], false);
+    let update = serde_json::to_vec(&serde_json::json!({"mitm": {
+        "enable": true, "hostname": ["*.ads.test"], "ca-cert": ca["cert"], "ca-key": ca["key"],
+    }}))
+    .unwrap();
+    assert_eq!(
+        unsafe { meta_update_v1(id, update.as_ptr(), update.len()) },
+        OK
+    );
+    let status = snapshot(id)["mitm"].clone();
+    assert_eq!(status["active"], true);
+    assert_eq!(status["hostname"][0], "*.ads.test");
+    let off = br#"{"mitm":{"enable":false}}"#;
+    assert_eq!(unsafe { meta_update_v1(id, off.as_ptr(), off.len()) }, OK);
+    assert_eq!(snapshot(id)["mitm"]["active"], false);
+
+    let log = read_json(|b, c, l| unsafe { meta_requests_v1(id, 0, 100, b, c, l) });
+    assert_eq!(log["requests"].as_array().unwrap().len(), 0);
+    let har = read_json(|b, c, l| unsafe { meta_requests_export_v1(id, 0, b, c, l) });
+    assert_eq!(har["log"]["version"], "1.2");
+    let mut csv = vec![0u8; 4096];
+    assert_eq!(
+        unsafe { meta_requests_export_v1(id, 1, csv.as_mut_ptr(), csv.len(), &mut length) },
+        OK
+    );
+    assert!(csv[..length].starts_with(b"id,time,"));
+    assert_eq!(
+        unsafe { meta_requests_export_v1(id, 9, csv.as_mut_ptr(), csv.len(), &mut length) },
+        ERROR
+    );
+    assert_eq!(meta_clear_requests_v1(id), OK);
+    assert_eq!(meta_clear_mitm_bypass_v1(id), OK);
+    assert_eq!(
+        unsafe { meta_request_detail_v1(id, 7, std::ptr::null_mut(), 0, &mut length) },
+        ERROR
+    );
+    assert_eq!(meta_destroy_v1(id), OK);
+}

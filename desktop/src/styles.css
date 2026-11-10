@@ -1935,3 +1935,159 @@ td.num {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Requests (capture) */
+.mitm-panel {
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+.mitm-panel > .panel-title {
+  margin: 0;
+}
+.mitm-title-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.mitm-body {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.mitm-body .service-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.mitm-hosts .field {
+  margin: 10px 0 4px;
+}
+.mitm-hosts textarea {
+  width: 100%;
+  resize: vertical;
+  color: var(--text);
+  font-family:
+    ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.mitm-bypassed {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.mitm-bypassed .panel-title {
+  margin: 8px 0 2px;
+}
+.requests-actions {
+  display: flex;
+  gap: 8px;
+}
+.requests-table {
+  table-layout: fixed;
+}
+.requests-table th:nth-child(1) {
+  width: 72px;
+}
+.requests-table th:nth-child(3) {
+  width: 84px;
+}
+.requests-table th:nth-child(4) {
+  width: 22%;
+}
+.requests-table th:nth-child(5),
+.requests-table th:nth-child(6) {
+  width: 72px;
+}
+.requests-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.requests-table td:last-child {
+  width: auto;
+}
+.request-row {
+  cursor: pointer;
+}
+.request-row:hover,
+.request-row:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+.request-row.rejected .request-url strong {
+  color: var(--danger, #d14343);
+}
+.request-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.request-target .tiny-tag {
+  flex-shrink: 0;
+}
+.request-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.request-detail h4 {
+  margin: 16px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.request-full-url {
+  font-family:
+    ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  margin: 0 0 12px;
+  user-select: text;
+}
+.request-detail-actions {
+  justify-content: flex-start;
+  margin: 12px 0 0;
+}
+.header-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  font-size: 12px;
+  user-select: text;
+}
+.header-list > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 28%) minmax(0, 1fr);
+  gap: 10px;
+}
+.header-list dt {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.header-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.body-block p {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+}
+.body-block pre,
+.rule-preview {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--hover);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.rule-preview {
+  margin: 8px 0 12px;
+}

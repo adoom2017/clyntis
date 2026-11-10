@@ -21,6 +21,35 @@ pub struct Overrides {
     pub adblock: Option<crate::adblock::Settings>,
     /// `tailscale-enable`: whether the profile's Tailscale proxies run.
     pub tailscale: Option<bool>,
+    /// HTTPS decryption; replaces the profile's `mitm`. The running core
+    /// takes changes without a restart.
+    pub mitm: Option<MitmSettings>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct MitmSettings {
+    pub enable: bool,
+    pub hostnames: Vec<String>,
+    /// The CA certificate and private key (PEM), made once by the app.
+    pub ca_cert: String,
+    pub ca_key: String,
+}
+
+impl MitmSettings {
+    pub fn to_config(&self) -> crate::mitm::Mitm {
+        crate::mitm::Mitm {
+            enable: self.enable,
+            hostname: self
+                .hostnames
+                .iter()
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+                .collect(),
+            ca_cert: self.ca_cert.clone(),
+            ca_key: self.ca_key.clone(),
+        }
+    }
 }
 
 impl Overrides {
@@ -57,6 +86,19 @@ impl Overrides {
         if let Some(ipv6) = self.ipv6 {
             map.insert(Value::from("ipv6"), Value::from(ipv6));
             nested(map, "dns")?.insert(Value::from("ipv6"), Value::from(ipv6));
+        }
+        if let Some(mitm) = &self.mitm {
+            let mitm = mitm.to_config();
+            let mut value = Mapping::new();
+            value.insert(Value::from("enable"), Value::from(mitm.enable));
+            value.insert(
+                Value::from("hostname"),
+                serde_yaml::to_value(&mitm.hostname)?,
+            );
+            value.insert(Value::from("ca-cert"), Value::from(mitm.ca_cert));
+            // `Mitm` never serializes its key, so it is written here.
+            value.insert(Value::from("ca-key"), Value::from(mitm.ca_key));
+            map.insert(Value::from("mitm"), Value::Mapping(value));
         }
         if let Some(tailscale) = self.tailscale {
             map.insert(Value::from("tailscale-enable"), Value::from(tailscale));
@@ -131,9 +173,21 @@ mod tests {
                 ..Default::default()
             }),
             tailscale: Some(false),
+            mitm: Some(MitmSettings {
+                enable: true,
+                hostnames: vec![" *.ads.test ".into(), "".into()],
+                ca_cert: "CERT".into(),
+                ca_key: "KEY".into(),
+            }),
         };
         let config = crate::Config::parse(overrides.apply(PROFILE).unwrap().as_bytes()).unwrap();
         assert!(!config.tailscale_enable);
+        assert!(config.mitm.enable);
+        assert_eq!(config.mitm.hostname, ["*.ads.test"]);
+        assert_eq!(
+            (config.mitm.ca_cert.as_str(), config.mitm.ca_key.as_str()),
+            ("CERT", "KEY")
+        );
         assert_eq!(config.log.log_level, "warning");
         assert!(config.ipv6 && config.dns.ipv6);
         assert!(config.sniffer.enable);
