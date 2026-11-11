@@ -541,7 +541,7 @@ struct MitmView: View {
                     ForEach(bypassed, id: \.self) { Text($0).font(.footnote.monospaced()) }
                     Button(L("重试这些域名")) { Task { await run { try await model.clearMitmBypass() } } }
                 } header: {
-                    Text(L("拒绝解密、已改为直接转发的域名"))
+                    Text(L("无法解密、已改为直接转发的域名（App 不接受证书，或服务器证书校验不通过）"))
                 }
             }
             if let failure {

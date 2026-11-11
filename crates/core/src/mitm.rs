@@ -383,6 +383,15 @@ impl Interceptor {
     }
 }
 
+/// How long the server gets to complete TLS with the core.
+const UPSTREAM_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a failed TLS handshake with the server means its certificate did
+/// not verify (rather than the network failing).
+fn untrusted(error: &str) -> bool {
+    error.contains("CERTIFICATE_VERIFY_FAILED") || error.contains("cert verification failed")
+}
+
 /// Bytes already read from a stream, served again before the rest of it.
 struct Prefixed<S> {
     prefix: Vec<u8>,
@@ -518,9 +527,27 @@ impl Core {
             offset: 0,
             inner: stream,
         };
-        self.observe(client, route, outbound, routed, tls).await
+        let Some(client) = self
+            .observe(client, route.clone(), outbound, routed, tls)
+            .await?
+        else {
+            return Ok(());
+        };
+        // The server's certificate did not verify: relay the client's own
+        // TLS, which then judges the certificate itself, as without the MITM.
+        let (outbound, routed) = if route != restored {
+            self.dial_sniffed(&route, &destination, &target, &source)
+                .await?
+        } else {
+            self.dial_logged(&target, None, &source).await?
+        };
+        self.relay_io(client, route, outbound, routed).await
     }
 
+    /// Decrypts and relays a connection. Returns the client untouched when
+    /// the server's certificate does not verify, for the caller to pass it
+    /// through instead: a client is never shown a certificate for a server
+    /// that could not be verified.
     async fn observe<S>(
         self: &Arc<Self>,
         client: S,
@@ -528,7 +555,7 @@ impl Core {
         outbound: BoxStream,
         routed: Routed,
         tls: bool,
-    ) -> Result<()>
+    ) -> Result<Option<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -542,10 +569,49 @@ impl Core {
         let tracker = traffic::Tracker::new(self.clone(), route, routed, "tcp")?;
         let cancel = tracker.cancel();
         let state = tracker.state.clone();
-        let upstream: BoxStream = Box::new(traffic::Stream {
+        let mut upstream: BoxStream = Box::new(traffic::Stream {
             inner: outbound,
             tracker,
         });
+        if tls {
+            let connector = SecureConnector::new(self.clock.clone());
+            let config = TlsConnectConfig {
+                server_name: host.clone(),
+                alpn: vec!["http/1.1".into()],
+                verify_cert: self
+                    .mitm
+                    .verify_upstream
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                fingerprint: TlsFingerprint::Native,
+                reality: None,
+            };
+            let connected = tokio::select! {
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+                result = tokio::time::timeout(UPSTREAM_HANDSHAKE, connector.connect(upstream, &config)) => {
+                    result.unwrap_or_else(|_| Err(anyhow::anyhow!("TLS handshake timed out")))
+                }
+            };
+            match connected {
+                Ok(stream) => upstream = stream,
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    if untrusted(&error) {
+                        self.mitm.refused(&host);
+                        tracing::warn!(
+                            "[MITM] the certificate of {host} does not verify ({error}); passing it through from now on"
+                        );
+                        crate::log_close(
+                            &state,
+                            &Ok("server certificate not verified; passed through"),
+                        );
+                        return Ok(Some(client));
+                    }
+                    let error = std::io::Error::other(format!("{host}: {error}"));
+                    crate::log_close(&state, &Err(std::io::Error::other(error.to_string())));
+                    return Err(error.into());
+                }
+            }
+        }
         let context = observe::Context {
             core: self.clone(),
             state: state.clone(),
@@ -563,24 +629,6 @@ impl Core {
             if !tls {
                 return observe::relay(client, upstream, &context).await;
             }
-            // The server first: a client is never shown a certificate for a
-            // server that could not be verified.
-            let upstream = SecureConnector::new(self.clock.clone())
-                .connect(
-                    upstream,
-                    &TlsConnectConfig {
-                        server_name: host.clone(),
-                        alpn: vec!["http/1.1".into()],
-                        verify_cert: self
-                            .mitm
-                            .verify_upstream
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        fingerprint: TlsFingerprint::Native,
-                        reality: None,
-                    },
-                )
-                .await
-                .map_err(|e| std::io::Error::other(format!("{host}: {e:#}")))?;
             let acceptor = self
                 .mitm
                 .active()
@@ -607,7 +655,7 @@ impl Core {
             result = relay => result.map(|_| "closed"),
         };
         crate::log_close(&state, &outcome);
-        outcome.map(drop).map_err(Into::into)
+        outcome.map(|_| None).map_err(Into::into)
     }
 }
 
@@ -831,6 +879,77 @@ mod tests {
         assert_eq!(core.mitm_status()["bypassed"][0], "ads.test");
         core.clear_mitm_bypass();
         assert!(core.mitm.intercepts("ads.test"));
+    }
+
+    #[tokio::test]
+    async fn a_server_certificate_that_does_not_verify_passes_through() {
+        // The server's certificate is self-signed: it does not verify.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (cert, key) = generate_authority().unwrap();
+        let server_cert = X509::from_pem(cert.as_bytes()).unwrap();
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        builder.set_certificate(&server_cert).unwrap();
+        builder
+            .set_private_key(&PKey::private_key_from_pem(key.as_bytes()).unwrap())
+            .unwrap();
+        let acceptor = builder.build();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                // The core's own attempt fails; the client's own TLS follows.
+                let Ok(mut tls) = tokio_boring::accept(&acceptor, tcp).await else {
+                    continue;
+                };
+                read_head(&mut tls).await;
+                tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+                tls.shutdown().await.unwrap();
+                break;
+            }
+        });
+
+        let core = core(test_settings(&["ads.test"]));
+        core.mitm
+            .verify_upstream
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let target = Target::new("ads.test", port).unwrap();
+        assert!(core.inspects(&target));
+        let (app, inbound) = tokio::io::duplex(1 << 16);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+        builder.set_verify(SslVerifyMode::NONE);
+        let config = builder.build().configure().unwrap();
+        let mut tls = tokio_boring::connect(config, "ads.test", app)
+            .await
+            .unwrap();
+        // The client sees the server's own certificate, not one the core made.
+        assert_eq!(
+            tls.ssl().peer_certificate().unwrap().to_der().unwrap(),
+            server_cert.to_der().unwrap()
+        );
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: ads.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response).await.unwrap();
+        assert!(response.ends_with(b"\r\n\r\nok"));
+        drop(tls);
+        let _ = relay.await.unwrap();
+        assert!(!core.mitm.intercepts("ads.test"));
+        assert_eq!(core.mitm_status()["bypassed"][0], "ads.test");
+        let (entries, _) = core.requests.list(0, 10);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.reason.as_deref()
+                    == Some("server certificate not verified; passed through")),
+            "{entries:?}"
+        );
     }
 
     /// Reads one response: its head and a Content-Length body.

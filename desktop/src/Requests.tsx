@@ -886,7 +886,9 @@ function MitmPanel({
             <div className="mitm-bypassed">
               <div className="panel-title">
                 <span className="small">
-                  {t("拒绝解密、已改为直接转发的域名")}
+                  {t(
+                    "无法解密、已改为直接转发的域名（App 不接受证书，或服务器证书校验不通过）",
+                  )}
                 </span>
                 <button
                   className="text-button"

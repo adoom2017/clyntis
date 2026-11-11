@@ -80,6 +80,10 @@ format. For building and running, see the [README](README.md).
   certificate for it; only HTTP/1.1 is offered to the client. A client that refuses the certificate (certificate pinning, or the
   CA not trusted) fails once, and its host is then passed through untouched
   until the list is cleared (`DELETE /mitm/bypass`; `GET /mitm` shows it).
+  A server whose certificate does not verify (some apps accept certificates
+  that miss the host name, such as `*.example.com` for `a.b.example.com`) is
+  not decrypted either: the connection is passed through for the app to judge,
+  and the host joins the same list.
   UDP 443 to a decrypted host is refused so browsers use TCP instead of QUIC.
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the

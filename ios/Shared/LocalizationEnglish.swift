@@ -363,7 +363,7 @@ let englishText: [String: String] = [
     "已添加规则，重新连接后生效。": "Rule added; it applies after reconnecting.",
     "已解压": "decompressed",
     "抓包": "Requests",
-    "拒绝解密、已改为直接转发的域名": "Domains that refused decryption, now passed through",
+    "无法解密、已改为直接转发的域名（App 不接受证书，或服务器证书校验不通过）": "Domains that cannot be decrypted, now passed through (the app refused the certificate, or the server's did not verify)",
     "搜索域名、URL 或规则": "Search domains, URLs or rules",
     "无内容": "Empty",
     "无匹配结果": "No matches",

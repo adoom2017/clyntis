@@ -514,8 +514,8 @@ export const en: Record<string, string> = {
   "解密的域名（每行一个）": "Domains to decrypt (one per line)",
   "* 匹配任意字符，以 - 开头表示排除。填 * 会解密所有 HTTPS 流量，不建议长期使用。":
     "* matches any characters; a leading - excludes. * alone decrypts all HTTPS traffic, which is not advisable for long.",
-  "拒绝解密、已改为直接转发的域名":
-    "Domains that refused decryption, now passed through",
+  "无法解密、已改为直接转发的域名（App 不接受证书，或服务器证书校验不通过）":
+    "Domains that cannot be decrypted, now passed through (the app refused the certificate, or the server's did not verify)",
   重试这些域名: "Try them again",
   "HAR 含请求和返回内容，可用 Charles、Proxyman 或浏览器开发者工具打开；CSV 含全部记录，可用 Excel 打开":
     "HAR has the requests with their content and opens in Charles, Proxyman or browser developer tools; CSV has every entry and opens in Excel",
