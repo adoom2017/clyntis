@@ -14,6 +14,8 @@ struct AppOverrides: Codable, Equatable {
     var adblock: AdblockSettings?
     /// HTTPS decryption; the running tunnel takes changes live.
     var mitm: MitmSettings?
+    /// Rewrite modules (clyntis_config::rewrite::Settings).
+    var rewrite: RewriteSettings?
 
     var isEmpty: Bool { self == AppOverrides() }
 
@@ -80,6 +82,19 @@ struct AdblockSettings: Codable, Equatable {
         ("anti-ad", "anti-AD", L("覆盖面广，以国内为主，约 10 万条")),
         ("adguard-dns", "AdGuard DNS filter", L("偏海外的广告与追踪，约 18 万条，内存占用较大")),
     ]
+}
+
+/// Rewrite modules for decrypted HTTP (clyntis_config::rewrite::Settings).
+struct RewriteSettings: Codable, Equatable {
+    struct Module: Codable, Equatable, Hashable {
+        var name: String
+        var url: String
+        var enabled = true
+    }
+    var enabled = true
+    var modules: [Module] = []
+    /// A module written by hand.
+    var custom = ""
 }
 
 /// HTTPS decryption settings (clyntis_config::overrides::MitmSettings).

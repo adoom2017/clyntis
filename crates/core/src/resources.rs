@@ -19,11 +19,21 @@ pub struct Resources {
     matchers: HashMap<(String, String), Matcher>,
     /// Ad blocking lists, when `adblock.enable`.
     pub adblock: Option<Arc<crate::adblock::Filter>>,
+    /// Rewrite modules, when `rewrite.enable`.
+    pub rewrite: Option<Arc<crate::rewrite::Rewriter>>,
     /// What the file-backed providers and the ad blocking lists were built
     /// from: a refresh that finds the same contents reuses them instead of
     /// parsing again while the active snapshot still holds the old copy.
     providers: HashMap<String, (ProviderSource, Matcher)>,
     adblock_sources: Vec<ListSource>,
+    rewrite_sources: Option<RewriteSource>,
+}
+/// What the rewrite modules were compiled from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RewriteSource {
+    custom: String,
+    modules: Vec<(clyntis_config::rewrite::Source, Option<Stamp>)>,
+    files: Vec<(String, bool)>,
 }
 
 /// A file's length and SHA-256: unchanged contents, whatever the mtime (a
@@ -363,6 +373,8 @@ impl Resources {
         out.rules(&config.rules)?;
         (out.adblock, out.adblock_sources) =
             adblock(config, refresh, &fetch, &mut pending, previous).await;
+        (out.rewrite, out.rewrite_sources) =
+            rewrite(config, refresh, &fetch, &mut pending, previous).await;
         pending.commit()?;
         Ok(out)
     }
@@ -485,6 +497,171 @@ async fn adblock(
     );
     (Some(Arc::new(filter)), sources)
 }
+/// Loads the rewrite modules and downloads their scripts and response
+/// files. Like ad blocking lists, a module that cannot be loaded is reported
+/// and left out.
+async fn rewrite(
+    config: &Config,
+    refresh: bool,
+    fetch: &Fetch<'_>,
+    pending: &mut Staged,
+    previous: &Resources,
+) -> (Option<Arc<crate::rewrite::Rewriter>>, Option<RewriteSource>) {
+    use clyntis_config::rewrite::{Action, Mock, MockBody, parse_module};
+    use futures_util::StreamExt;
+    let settings = &config.rewrite;
+    if !settings.enable {
+        return (None, None);
+    }
+    let mut parsed = Vec::new();
+    let mut failed = Vec::new();
+    let mut module_sources = Vec::new();
+    if !settings.custom.trim().is_empty() {
+        parsed.push((
+            clyntis_config::rewrite::CUSTOM.to_owned(),
+            parse_module(&settings.custom),
+            None,
+        ));
+    }
+    for source in &settings.modules {
+        let path = config.directory.join(source.file_name());
+        let data = asset(
+            &path,
+            &source.url,
+            Some(settings.interval),
+            refresh,
+            fetch,
+            pending,
+        )
+        .await;
+        let updated = std::fs::metadata(data.as_ref().unwrap_or(&path))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        module_sources.push((
+            source.clone(),
+            data.as_ref().ok().and_then(|data| Stamp::of(data).ok()),
+        ));
+        match data.and_then(|data| read_limited(&data)) {
+            Ok(bytes) => parsed.push((
+                source.name.clone(),
+                parse_module(&String::from_utf8_lossy(&bytes)),
+                updated,
+            )),
+            Err(error) => {
+                tracing::warn!(module = %source.name, error = %format!("{error:#}"), "rewrite module unavailable");
+                failed.push((source.name.clone(), updated, format!("{error:#}")));
+            }
+        }
+    }
+    // Scripts and response files, each once, several at a time.
+    let mut urls: Vec<String> = Vec::new();
+    for (_, module, _) in &parsed {
+        for rule in &module.rules {
+            let url = match &rule.action {
+                Action::Script(script) => &script.url,
+                Action::Mock(Mock {
+                    body: MockBody::Remote(url),
+                    ..
+                }) => url,
+                _ => continue,
+            };
+            if !urls.contains(url) {
+                urls.push(url.clone());
+            }
+        }
+    }
+    let downloads: Vec<(String, Result<PathBuf>, Staged)> =
+        futures_util::stream::iter(urls.into_iter().map(|url| async move {
+            let path = config
+                .directory
+                .join(clyntis_config::rewrite::cache_file(&url));
+            let mut staged = Staged::default();
+            let result = asset(
+                &path,
+                &url,
+                Some(settings.interval),
+                refresh,
+                fetch,
+                &mut staged,
+            )
+            .await
+            .map(|_| path);
+            (url, result, staged)
+        }))
+        .buffered(6)
+        .collect()
+        .await;
+    let mut files = std::collections::HashMap::new();
+    let mut missing = Vec::new();
+    let mut file_sources = Vec::new();
+    for (url, result, mut staged) in downloads {
+        pending.files.append(&mut staged.files);
+        file_sources.push((url.clone(), result.is_ok()));
+        match result {
+            Ok(path) => {
+                files.insert(url, path);
+            }
+            Err(error) => {
+                tracing::warn!(url = %url, error = %format!("{error:#}"), "rewrite script unavailable");
+                missing.push(url);
+            }
+        }
+    }
+    let source = RewriteSource {
+        custom: settings.custom.clone(),
+        modules: module_sources,
+        files: file_sources,
+    };
+    if let (Some(active), Some(before)) = (&previous.rewrite, &previous.rewrite_sources)
+        && *before == source
+    {
+        tracing::debug!("rewrite modules unchanged; reusing them");
+        return (Some(active.clone()), Some(source));
+    }
+    let loaded = parsed
+        .into_iter()
+        .map(|(name, module, updated)| {
+            let mut own = std::collections::HashMap::new();
+            let mut own_missing = Vec::new();
+            for rule in &module.rules {
+                let url = match &rule.action {
+                    Action::Script(script) => &script.url,
+                    Action::Mock(Mock {
+                        body: MockBody::Remote(url),
+                        ..
+                    }) => url,
+                    _ => continue,
+                };
+                match files.get(url) {
+                    Some(path) => {
+                        own.insert(url.clone(), path.clone());
+                    }
+                    None if missing.contains(url) && !own_missing.contains(url) => {
+                        own_missing.push(url.clone())
+                    }
+                    None => {}
+                }
+            }
+            crate::rewrite::Loaded {
+                name,
+                module,
+                files: own,
+                missing: own_missing,
+                updated,
+            }
+        })
+        .collect();
+    let rewriter = crate::rewrite::Rewriter::new(loaded, failed);
+    tracing::info!(
+        rules = rewriter.rule_count(),
+        modules = rewriter.modules.len(),
+        hostnames = rewriter.hostnames.len(),
+        "rewrite modules loaded"
+    );
+    (Some(Arc::new(rewriter)), Some(source))
+}
 /// Past its update interval (`interval` seconds, 0 or `None` never expires).
 fn expired(meta: Option<&std::fs::Metadata>, interval: Option<u64>) -> bool {
     interval.is_some_and(|v| v > 0)
@@ -561,6 +738,14 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
             check(
                 &config.directory.join(list.file_name()),
                 Some(config.adblock.interval),
+            );
+        }
+    }
+    if config.rewrite.enable {
+        for module in &config.rewrite.modules {
+            check(
+                &config.directory.join(module.file_name()),
+                Some(config.rewrite.interval),
             );
         }
     }

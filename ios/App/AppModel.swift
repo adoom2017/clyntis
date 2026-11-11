@@ -30,6 +30,7 @@ final class AppModel {
     var adblock: AdblockStatus?
     /// The running core's decryption status from the snapshot.
     var mitm: MitmStatus?
+    var rewrite: RewriteStatus?
     /// The profile's networks the device is on, while the profile defines
     /// any (see `networks` and `network-overrides`); nil otherwise.
     var currentNetworks: [String]?
@@ -107,7 +108,7 @@ final class AppModel {
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
                             self.proxies = []; self.nodeStatus = [:]; self.connections = []
-                            self.adblock = nil; self.currentNetworks = nil; self.mitm = nil
+                            self.adblock = nil; self.currentNetworks = nil; self.mitm = nil; self.rewrite = nil
                         }
                     }
                 }
@@ -462,6 +463,17 @@ final class AppModel {
         _ = try await saveAdblock(settings)
     }
 
+    /// Saves the rewrite modules; they apply on the next connection.
+    /// Returns whether a reconnect is needed for them to take effect.
+    @discardableResult
+    func saveRewrite(_ value: RewriteSettings?) throws -> Bool {
+        let previous = overrides.rewrite
+        var next = overrides
+        next.rewrite = value
+        try saveOverrides(next)
+        return active && previous != value
+    }
+
     // MARK: Capture and HTTPS decryption
 
     /// Saves the decryption settings; a connected tunnel applies them at once.
@@ -727,6 +739,7 @@ final class AppModel {
         connections = ConnectionInfo.decode(object["connections"])
         adblock = AdblockStatus.decode(object["adblock"])
         mitm = MitmStatus.decode(object["mitm"])
+        rewrite = RewriteStatus.decode(object["rewrite"])
         if let config = object["config"] as? [String: Any] {
             mode = config["mode"] as? String ?? "rule"
             let selections = object["selections"] as? [String: String] ?? [:]

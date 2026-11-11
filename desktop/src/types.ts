@@ -32,6 +32,42 @@ export interface Overrides {
   tailscale?: boolean | null;
   adblock?: AdblockSettings | null;
   mitm?: MitmSettings | null;
+  rewrite?: RewriteSettings | null;
+}
+/** Rewrite modules (Surge, Loon, Quantumult X) acting on decrypted HTTP. */
+export interface RewriteSettings {
+  enabled: boolean;
+  modules: RewriteModule[];
+  /** A module written by hand. */
+  custom: string;
+}
+export interface RewriteModule {
+  name: string;
+  url: string;
+  enabled: boolean;
+}
+/** The core's `/rewrite`. */
+export interface RewriteStatus {
+  enabled: boolean;
+  decrypting: boolean;
+  rules: number;
+  total: number;
+  hostnames: string[];
+  hits: Record<string, number>;
+  modules: {
+    name: string;
+    title?: string;
+    description?: string;
+    rules: number;
+    scripts: number;
+    hostnames: number;
+    reject: number;
+    skipped: { line: number; text: string }[];
+    missing: string[];
+    updated?: number;
+    error?: string;
+  }[];
+  recent: { time: number; url: string; action: string; module: string }[];
 }
 /** HTTPS decryption; the CA itself is kept by the backend. */
 export interface MitmSettings {
@@ -47,6 +83,8 @@ export interface HttpSummary {
   requestSize: number;
   responseSize: number;
   error?: string;
+  /** Rewrite rules that acted: `action (module)`, comma-separated. */
+  rewrite?: string;
 }
 /** One entry of the core's request log. */
 export interface RequestEntry {

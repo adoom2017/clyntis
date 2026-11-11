@@ -261,6 +261,8 @@ impl Authority {
 /// The decryption settings and state of a running core.
 pub(crate) struct Interceptor {
     settings: RwLock<Mitm>,
+    /// Hosts the rewrite modules decrypt, besides the user's.
+    module_hosts: RwLock<Vec<String>>,
     authority: RwLock<Option<Arc<Authority>>>,
     /// Why decryption is on but not working.
     error: RwLock<Option<String>>,
@@ -275,6 +277,7 @@ impl Interceptor {
     pub(crate) fn new(mitm: &Mitm, hosted: bool) -> Self {
         let interceptor = Self {
             settings: RwLock::default(),
+            module_hosts: RwLock::default(),
             authority: RwLock::default(),
             error: RwLock::default(),
             bypass: Mutex::default(),
@@ -315,11 +318,36 @@ impl Interceptor {
         }
         self.authority.read().unwrap().clone()
     }
+    /// Whether decryption is on and working.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active().is_some()
+    }
     /// Whether connections to `host` are decrypted now.
     pub(crate) fn intercepts(&self, host: &str) -> bool {
-        self.active().is_some()
-            && self.settings.read().unwrap().matches(host)
-            && !self.bypass.lock().unwrap().contains(host)
+        self.active().is_some() && self.listed(host) && !self.bypass.lock().unwrap().contains(host)
+    }
+    /// Listed by the user or a module; the user's exclusions win.
+    fn listed(&self, host: &str) -> bool {
+        let settings = self.settings.read().unwrap();
+        if settings.matches(host) {
+            return true;
+        }
+        let modules = self.module_hosts.read().unwrap();
+        if modules.is_empty() {
+            return false;
+        }
+        let excluded: Vec<String> = settings
+            .hostname
+            .iter()
+            .filter(|p| p.trim().starts_with('-'))
+            .cloned()
+            .collect();
+        let mut patterns = modules.clone();
+        patterns.extend(excluded);
+        clyntis_config::mitm::host_matches(&patterns, host)
+    }
+    pub(crate) fn set_module_hosts(&self, hosts: Vec<String>) {
+        *self.module_hosts.write().unwrap() = hosts;
     }
     fn refused(&self, host: &str) {
         let mut bypass = self.bypass.lock().unwrap();
@@ -346,6 +374,7 @@ impl Interceptor {
         json!({
             "enable": settings.enable,
             "hostname": settings.hostname,
+            "moduleHostnames": self.module_hosts.read().unwrap().len(),
             "active": settings.enable && self.authority.read().unwrap().is_some(),
             "ca": ca,
             "error": *self.error.read().unwrap(),
@@ -802,5 +831,162 @@ mod tests {
         assert_eq!(core.mitm_status()["bypassed"][0], "ads.test");
         core.clear_mitm_bypass();
         assert!(core.mitm.intercepts("ads.test"));
+    }
+
+    /// Reads one response: its head and a Content-Length body.
+    async fn read_response<S: AsyncRead + Unpin>(stream: &mut S) -> (String, Vec<u8>) {
+        let head = String::from_utf8(read_head(stream).await).unwrap();
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .map_or(0, |v| v.trim().parse().unwrap());
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).await.unwrap();
+        (head, body)
+    }
+
+    #[tokio::test]
+    async fn rewrites_decrypted_http_with_modules_and_scripts() {
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-rewrite-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let feed = directory.join("feed.js");
+        std::fs::write(
+            &feed,
+            r#"const b = JSON.parse($response.body);
+b.arg = $argument;
+b.stored = $persistentStore.read("k");
+$persistentStore.write("v1", "k");
+const headers = Object.assign({}, $response.headers, {"X-Script": String($response.status)});
+setTimeout(() => $done({body: JSON.stringify(b), headers}), 1);"#,
+        )
+        .unwrap();
+        let up = directory.join("up.js");
+        std::fs::write(
+            &up,
+            r#"if ($request.body !== "orig") throw new Error("body " + $request.body);
+Promise.resolve().then(() => $done({body: new TextEncoder().encode("changed")}));"#,
+        )
+        .unwrap();
+        let module = clyntis_config::rewrite::parse_module(
+            r#"[URL Rewrite]
+^http://ads\.test/ad - reject-dict
+[Header Rewrite]
+http-request ^http://ads\.test/up header-add X-Flag 1
+[Body Rewrite]
+http-response-jq ^http://ads\.test/feed 'del(.list[].ad)'
+[Script]
+feed = type=http-response,pattern=^http://ads\.test/feed,requires-body=1,script-path=https://s.test/feed.js,argument=hello
+up = type=http-request,pattern=^http://ads\.test/up,requires-body=1,script-path=https://s.test/up.js
+[MITM]
+hostname = ads.test
+"#,
+        );
+        assert!(module.skipped.is_empty(), "{:?}", module.skipped);
+        let rewriter = crate::rewrite::Rewriter::new(
+            vec![crate::rewrite::Loaded {
+                name: "ads".into(),
+                module,
+                files: [
+                    ("https://s.test/feed.js".to_owned(), feed),
+                    ("https://s.test/up.js".to_owned(), up),
+                ]
+                .into(),
+                missing: vec![],
+                updated: None,
+            }],
+            vec![],
+        );
+        assert_eq!(rewriter.rule_count(), 5);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            // The rejected request never arrives.
+            let head = String::from_utf8(read_head(&mut tcp).await).unwrap();
+            assert!(head.starts_with("GET /feed HTTP/1.1"), "{head}");
+            let body = gzip(br#"{"list":[{"ad":1,"id":1}],"ok":true}"#);
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            tcp.write_all(&response).await.unwrap();
+            let head = String::from_utf8(read_head(&mut tcp).await).unwrap();
+            assert!(head.starts_with("POST /up HTTP/1.1"), "{head}");
+            assert!(head.contains("X-Flag: 1\r\n"), "{head}");
+            assert!(head.contains("Content-Length: 7\r\n"), "{head}");
+            let mut body = [0u8; 7];
+            tcp.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"changed");
+            tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            tcp.shutdown().await.unwrap();
+        });
+
+        let mut config = clyntis_config::Config::parse(b"hosts: {ads.test: 127.0.0.1}\n").unwrap();
+        config.mitm = test_settings(&[]);
+        config.directory = directory.clone();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        core.mitm.set_module_hosts(rewriter.hostnames.clone());
+        {
+            let mut resources = crate::resources::Resources::default();
+            resources.rewrite = Some(Arc::new(rewriter));
+            *core.resources.write().unwrap() = Arc::new(resources);
+        }
+        let target = Target::new("ads.test", port).unwrap();
+        assert!(core.inspects(&target));
+        let (mut app, inbound) = tokio::io::duplex(1 << 16);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        app.write_all(b"GET /ad HTTP/1.1\r\nHost: ads.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = read_response(&mut app).await;
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert_eq!(body, b"{}");
+        app.write_all(b"GET /feed HTTP/1.1\r\nHost: ads.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = read_response(&mut app).await;
+        assert!(head.contains("X-Script: 200\r\n"), "{head}");
+        assert!(!head.contains("Content-Encoding"), "{head}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"list": [{"id": 1}], "ok": true, "arg": "hello", "stored": null})
+        );
+        app.write_all(b"POST /up HTTP/1.1\r\nHost: ads.test\r\nContent-Length: 4\r\n\r\norig")
+            .await
+            .unwrap();
+        let (_, body) = read_response(&mut app).await;
+        assert_eq!(body, b"ok");
+        drop(app);
+        server.await.unwrap();
+        let _ = relay.await.unwrap();
+
+        let (entries, _) = core.requests.list(0, 100);
+        let http: Vec<_> = entries.iter().filter_map(|e| e.http.as_ref()).collect();
+        assert_eq!(http.len(), 3, "{entries:?}");
+        assert_eq!(http[0].rewrite.as_deref(), Some("reject-dict (ads)"));
+        assert_eq!(
+            http[1].rewrite.as_deref(),
+            Some("json (ads), script feed (ads)")
+        );
+        assert_eq!(
+            http[2].rewrite.as_deref(),
+            Some("header (ads), script up (ads)")
+        );
+        let status = core.rewrite_status();
+        assert_eq!(status["total"], 5);
+        assert_eq!(status["modules"][0]["rules"], 5);
+        // The script's store persisted.
+        let store = std::fs::read_to_string(directory.join("rewrite/store.json")).unwrap();
+        assert_eq!(store, r#"{"k":"v1"}"#);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

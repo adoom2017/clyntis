@@ -249,7 +249,7 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
     })
 }
 
-/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing","adblock","tailscale","mitm"}`, each
+/// Apply app settings (`overrides`: JSON `{"logLevel","ipv6","sniffing","adblock","tailscale","mitm","rewrite"}`, each
 /// optional) over `config`. Writes the resulting YAML; unset values keep the
 /// profile's own.
 ///
@@ -607,7 +607,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
 ) -> i32 {
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "network":handle.core.network_status(), "mitm":handle.core.mitm_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
+        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "rewrite":handle.core.rewrite_status(), "network":handle.core.network_status(), "mitm":handle.core.mitm_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }

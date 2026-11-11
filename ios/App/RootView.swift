@@ -196,6 +196,15 @@ private struct ProfilesView: View {
                             Label(L("HTTPS 解密"), systemImage: "lock.open")
                         }
                     }
+                    NavigationLink {
+                        RewriteView(model: model)
+                    } label: {
+                        LabeledContent {
+                            Text(model.overrides.rewrite?.enabled == true ? L("已开启") : L("未开启"))
+                        } label: {
+                            Label(L("重写模块"), systemImage: "wand.and.stars")
+                        }
+                    }
                 } footer: {
                     Text(L("对所有配置生效，优先于配置文件自身的规则和设置"))
                 }

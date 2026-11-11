@@ -72,7 +72,8 @@ int32_t meta_custom_rules_apply_v1(const uint8_t *config, size_t length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
 /* App settings over a profile. overrides is JSON {"logLevel":"debug|info|
  * warning|error|silent","ipv6":bool,"sniffing":bool,"adblock":{...},
- * "tailscale":bool,"mitm":{"enable","hostnames","caCert","caKey"}}, every key optional;
+ * "tailscale":bool,"mitm":{"enable","hostnames","caCert","caKey"},
+ * "rewrite":{"enabled","modules":[{"name","url","enabled"}],"custom"}}, every key optional;
  * absent keys keep the profile's value. Writes the resulting YAML; follows the
  * caller-buffer/size-query contract. */
 int32_t meta_overrides_apply_v1(const uint8_t *config, size_t length,

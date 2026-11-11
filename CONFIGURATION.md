@@ -84,6 +84,42 @@ format. For building and running, see the [README](README.md).
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the
   key private and turn decryption off when not analyzing.
+- **Rewrite modules** (`rewrite` section, written by the apps' settings):
+  Surge modules (`.sgmodule`), Loon plugins (`.plugin`) and Quantumult X
+  rewrite snippets, subscribed by URL or written by hand (`custom`, applied
+  first), act on decrypted HTTP to remove ads:
+
+  ```yaml
+  rewrite:
+    enable: true
+    modules:
+      - {name: app-ads, url: https://example.com/app-ads.sgmodule}
+    custom: |
+      [URL Rewrite]
+      ^https?:\/\/api\.example\.com\/ad - reject-dict
+    interval: 86400        # seconds between module and script updates
+  ```
+
+  Supported: URL rewrites (`reject`, `reject-200`, `reject-img`,
+  `reject-dict`, `reject-array`, `reject-drop`, 301/302/307/308 redirects),
+  Map Local / `mock-response-body`, request and response header rewrites,
+  body regex replacement, JSON deletion and replacement (Loon
+  `response-body-json-*`, Surge jq `del(...)` only), scripts
+  (`http-request` / `http-response`, `requires-body`, `binary-body-mode`,
+  `max-size`, `timeout`, `argument`), `[MITM] hostname` (added to the hosts
+  decrypted while decryption is on) and `[Rule]` domain rules whose policy
+  rejects. Other lines are skipped and listed in the status. Scripts run in
+  QuickJS with `$request`, `$response`, `$argument`, `$done`,
+  `$persistentStore` / `$prefs`, `$notification` / `$notify`, `$httpClient`
+  (routed by the rules), timers, `console`, `TextEncoder` / `TextDecoder`
+  and `atob` / `btoa`; each run has a time and memory limit (one run at a
+  time in the iOS tunnel), and Android builds have no script engine. Bodies
+  over 8 MiB (2 MiB on iOS) pass through unchanged. Modules and scripts are
+  cached under the configuration directory (`rewrite/`); script storage is
+  `rewrite/store.json`. `GET /rewrite` (the FFI snapshot's `rewrite`) shows
+  each module's rules, scripts, skipped lines and download failures, and
+  counts hits; a rewritten request's log entry names the rules in
+  `http.rewrite`.
 - **DNS:** UDP, TCP, DNS-over-TLS and DNS-over-HTTPS upstreams; fake-IP and
   redir-host modes. Real lookups also resolve Tailscale MagicDNS names; fake-IP
   answers keep the domain so domain rules still apply. Upstreams are asked at

@@ -80,6 +80,9 @@ pub struct HttpSummary {
     pub response_size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The rewrite rules that acted on it: `action (module)`, comma-separated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rewrite: Option<String>,
 }
 
 /// Headers and the kept part of the bodies, as sent (still compressed).
@@ -530,6 +533,17 @@ fn render(body: &Body, headers: &[(String, String)]) -> Value {
 /// when a coding is unknown or nothing came out. A truncated body decodes
 /// as far as it goes.
 fn decode(encoding: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    decode_with(encoding, bytes, DECODED_CAP)
+}
+
+/// The whole decoded body, or `None` when a coding is unknown, the data is
+/// bad or it decodes to more than `limit` bytes.
+pub(crate) fn decode_limited(encoding: &str, bytes: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let plain = decode_with(encoding, bytes, limit as u64 + 1)?;
+    (plain.len() <= limit).then_some(plain)
+}
+
+fn decode_with(encoding: &str, bytes: &[u8], cap: u64) -> Option<Vec<u8>> {
     let mut data = bytes.to_vec();
     let mut changed = false;
     for coding in encoding.rsplit(',').map(|c| c.trim().to_ascii_lowercase()) {
@@ -549,7 +563,7 @@ fn decode(encoding: &str, bytes: &[u8]) -> Option<Vec<u8>> {
             "zstd" => Box::new(zstd::stream::read::Decoder::new(data.as_slice()).ok()?),
             _ => return None,
         };
-        let _ = reader.take(DECODED_CAP).read_to_end(&mut out);
+        let _ = reader.take(cap).read_to_end(&mut out);
         if out.is_empty() && !data.is_empty() {
             return None;
         }

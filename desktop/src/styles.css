@@ -1964,6 +1964,38 @@ td.num {
 .mitm-hosts .field {
   margin: 10px 0 4px;
 }
+.code-input {
+  display: block;
+  width: 100%;
+  margin: 8px 0 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--surface);
+  resize: vertical;
+  color: var(--text);
+  font-family:
+    ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rewrite-modules {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+.rewrite-module {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+}
+.rewrite-module strong {
+  font-weight: 600;
+}
+.rewrite-tag {
+  color: var(--accent);
+}
 .mitm-hosts textarea {
   width: 100%;
   resize: vertical;

@@ -522,4 +522,34 @@ export const en: Record<string, string> = {
   "HAR（HTTP 请求和内容）": "HAR (HTTP requests and content)",
   "CSV（全部记录）": "CSV (every entry)",
   已导出: "Exported",
+  启用重写模块: "Enable rewrite modules",
+  "用 Surge、Loon、Quantumult X 的模块去广告：拦截广告 URL、改写返回内容、运行脚本。模块里的主机名自动加入 HTTPS 解密":
+    "Remove ads with Surge, Loon and Quantumult X modules: block ad URLs, rewrite responses and run scripts. Hosts listed in modules are decrypted automatically",
+  "只作用于 HTTPS 解密的流量：先在「抓包」页开启 HTTPS 解密并信任证书":
+    "Works only on decrypted traffic: turn on HTTPS decryption on the Capture page and trust the certificate first",
+  添加模块: "Add module",
+  "Surge 模块（.sgmodule）、Loon 插件（.plugin）或 Quantumult X 重写的链接":
+    "A link to a Surge module (.sgmodule), Loon plugin (.plugin) or Quantumult X rewrite",
+  "{count} 行，排在所有模块之前": "{count} lines, applied before every module",
+  "用模块的写法手写规则，排在所有模块之前":
+    "Rules written in module syntax, applied before every module",
+  "例如：某 App 去广告": "For example: App ad removal",
+  "已有同名模块。": "A module with this name already exists.",
+  "保存设置后下载模块和其中的脚本，之后每天自动更新。脚本能读取和修改所匹配请求的内容，只添加信任的来源。":
+    "The module and its scripts download when you save and update daily. Scripts can read and change the requests they match, so add only sources you trust.",
+  "支持 Surge 模块、Loon 插件和 Quantumult X 重写的写法：URL 拦截（reject、reject-200、reject-img、reject-dict、reject-array）、重定向、Map Local、请求头和返回内容改写、JSON 字段删除、脚本，以及 [MITM] 主机名。":
+    "Surge module, Loon plugin and Quantumult X rewrite syntax: URL rejects (reject, reject-200, reject-img, reject-dict, reject-array), redirects, Map Local, header and body rewrites, JSON field deletion, scripts and [MITM] host names.",
+  重写模块: "Rewrite modules",
+  已重写: "Rewritten",
+  重写: "Rewrite",
+  "HTTPS 解密未开启，模块不生效": "HTTPS decryption is off; modules do nothing",
+  "{modules} 个模块，{rules} 条规则，已生效 {hits} 次":
+    "{modules} modules, {rules} rules, applied {hits} times",
+  "{count} 个有问题": "{count} with problems",
+  "规则只作用于解密的域名；模块的主机名已加入解密（共 {count} 个）。在设置里添加或移除模块。":
+    "Rules act only on decrypted hosts; the modules' {count} host names are decrypted. Add or remove modules in Settings.",
+  "{rules} 条规则 · {scripts} 个脚本 · {hosts} 个主机名 · 生效 {hits} 次":
+    "{rules} rules · {scripts} scripts · {hosts} host names · applied {hits} times",
+  "下载失败：{list}": "Download failed: {list}",
+  "{count} 行不支持，已跳过": "{count} unsupported lines skipped",
 };

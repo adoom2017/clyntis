@@ -24,6 +24,7 @@ import {
   type MitmInfo,
   type RequestDetail,
   type RequestEntry,
+  type RewriteStatus,
   type Settings,
 } from "./types";
 
@@ -32,7 +33,7 @@ const ROWS = 5000;
 const POLL_MS = 1500;
 
 type Row = RequestEntry & { key: string };
-type Filter = "all" | "http" | "rejected" | "connections";
+type Filter = "all" | "http" | "rewritten" | "rejected" | "connections";
 
 const time = (ms: number) =>
   new Date(ms).toLocaleTimeString(locale(), { hour12: false });
@@ -41,11 +42,12 @@ const duration = (ms: number) =>
 
 function matches(row: Row, filter: Filter, query: string) {
   if (filter === "http" && row.status !== "http") return false;
+  if (filter === "rewritten" && !row.http?.rewrite) return false;
   if (filter === "rejected" && row.status !== "rejected") return false;
   if (filter === "connections" && row.status !== "closed") return false;
   if (!query) return true;
   const text =
-    `${row.host} ${row.http?.url ?? ""} ${row.rule} ${row.chain} ${row.http?.contentType ?? ""}`.toLowerCase();
+    `${row.host} ${row.http?.url ?? ""} ${row.rule} ${row.chain} ${row.http?.contentType ?? ""} ${row.http?.rewrite ?? ""}`.toLowerCase();
   return query
     .toLowerCase()
     .split(/\s+/)
@@ -126,6 +128,7 @@ export function RequestsPage({
     () => ({
       all: rows.length,
       http: rows.filter((r) => r.status === "http").length,
+      rewritten: rows.filter((r) => r.http?.rewrite).length,
       rejected: rows.filter((r) => r.status === "rejected").length,
       connections: rows.filter((r) => r.status === "closed").length,
     }),
@@ -144,6 +147,9 @@ export function RequestsPage({
   return (
     <>
       <MitmPanel running={running} settings={settings} perform={perform} />
+      {running && settings.overrides.rewrite?.enabled && (
+        <RewritePanel decrypting={!!settings.overrides.mitm?.enable} />
+      )}
       {!running ? (
         <Empty
           icon={<ScanSearch />}
@@ -159,6 +165,9 @@ export function RequestsPage({
                   [
                     ["all", t("全部")],
                     ["http", "HTTP"],
+                    ...(settings.overrides.rewrite?.enabled || counts.rewritten
+                      ? ([["rewritten", t("已重写")]] as [Filter, string][])
+                      : []),
                     ["rejected", t("已拦截")],
                     ["connections", t("连接")],
                   ] as [Filter, string][]
@@ -353,6 +362,11 @@ function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
           {http?.decrypted ? `${kind} 🔓` : kind}
         </span>
         <span className="request-url">{target}</span>
+        {http?.rewrite && (
+          <span className="tiny-tag rewrite-tag" title={http.rewrite}>
+            {t("已重写")}
+          </span>
+        )}
       </td>
       <td>{state}</td>
       <td className="muted request-route">
@@ -481,6 +495,12 @@ function RequestModal({
               <dd>{http.contentType}</dd>
             </div>
           )}
+          {http?.rewrite && (
+            <div>
+              <dt>{t("重写")}</dt>
+              <dd>{http.rewrite}</dd>
+            </div>
+          )}
           {(http?.error || row.reason) && (
             <div>
               <dt>{t("结束原因")}</dt>
@@ -527,6 +547,109 @@ function RequestModal({
         )}
       </div>
     </Modal>
+  );
+}
+
+function RewritePanel({ decrypting }: { decrypting: boolean }) {
+  const [status, setStatus] = useState<RewriteStatus | null>(null);
+  const [open, setOpen] = useState(false);
+  const shown = usePageVisible();
+  useEffect(() => {
+    const load = () =>
+      void invoke<RewriteStatus>("rewrite_status")
+        .then(setStatus)
+        .catch(() => setStatus(null));
+    load();
+    if (!shown) return;
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, [shown]);
+  if (!status) return null;
+  const problems = status.modules.filter(
+    (m) => m.error || m.missing.length || m.skipped.length,
+  ).length;
+  const summary = !decrypting
+    ? t("HTTPS 解密未开启，模块不生效")
+    : t("{modules} 个模块，{rules} 条规则，已生效 {hits} 次", {
+        modules: status.modules.length,
+        rules: status.rules,
+        hits: status.total,
+      });
+  return (
+    <section className="panel mitm-panel">
+      <div className="panel-title">
+        <h3>{t("重写模块")}</h3>
+        <div className="mitm-title-actions">
+          <span className={`small ${decrypting ? "" : "muted"}`}>
+            {summary}
+            {problems > 0 && ` · ${t("{count} 个有问题", { count: problems })}`}
+          </span>
+          <button className="text-button" onClick={() => setOpen((o) => !o)}>
+            {open ? t("收起") : t("详情")}
+          </button>
+        </div>
+      </div>
+      {open && (
+        <div className="mitm-body">
+          <p className="muted small">
+            {t(
+              "规则只作用于解密的域名；模块的主机名已加入解密（共 {count} 个）。在设置里添加或移除模块。",
+              { count: status.hostnames.length },
+            )}
+          </p>
+          <div className="rewrite-modules">
+            {status.modules.map((module) => (
+              <div key={module.name} className="small">
+                <div className="rewrite-module">
+                  <strong>
+                    {module.name === "custom" ? t("自定义规则") : module.name}
+                  </strong>
+                  {module.title && module.title !== module.name && (
+                    <span className="muted">{module.title}</span>
+                  )}
+                  {module.error ? (
+                    <span className="danger-text">{module.error}</span>
+                  ) : (
+                    <span className="muted">
+                      {t(
+                        "{rules} 条规则 · {scripts} 个脚本 · {hosts} 个主机名 · 生效 {hits} 次",
+                        {
+                          rules: module.rules,
+                          scripts: module.scripts,
+                          hosts: module.hostnames,
+                          hits: status.hits[module.name] ?? 0,
+                        },
+                      )}
+                    </span>
+                  )}
+                </div>
+                {module.missing.length > 0 && (
+                  <p className="danger-text">
+                    {t("下载失败：{list}", {
+                      list: module.missing.join("、"),
+                    })}
+                  </p>
+                )}
+                {module.skipped.length > 0 && (
+                  <details>
+                    <summary className="muted">
+                      {t("{count} 行不支持，已跳过", {
+                        count: module.skipped.length,
+                      })}
+                    </summary>
+                    <pre className="rule-preview">
+                      {module.skipped
+                        .map((s) => `${s.line}: ${s.text}`)
+                        .join("\n")}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -639,7 +762,7 @@ function MitmPanel({
         ? core.error
         : !info?.trusted
           ? t("证书未被系统信任")
-          : !mitm.hostnames.length
+          : !mitm.hostnames.length && !settings.overrides.rewrite?.enabled
             ? t("还没有填写要解密的域名")
             : t("已开启");
   return (

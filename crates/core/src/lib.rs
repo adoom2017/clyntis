@@ -8,6 +8,8 @@ mod memory;
 mod mitm;
 mod observe;
 pub mod requests;
+mod rewrite;
+mod script;
 pub use mitm::{check_authority, describe_authority, generate_authority};
 /// The host [`check_authority`] issues its certificate for.
 pub fn mitm_check_host() -> &'static str {
@@ -85,6 +87,9 @@ pub struct Core {
     pub requests: Arc<requests::Requests>,
     /// HTTPS decryption: the settings, the CA and the per-host certificates.
     mitm: mitm::Interceptor,
+    /// Scripts of rewrite modules: the store and the runs at once.
+    scripts: script::Engine,
+    rewrite_stats: rewrite::Stats,
 }
 struct Policy {
     mode: Mode,
@@ -382,9 +387,12 @@ impl Core {
         xudp_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         let requests = Arc::new(requests::Requests::new(config.internal_host_packet_io));
         let mitm = mitm::Interceptor::new(&config.mitm, config.internal_host_packet_io);
+        let scripts = script::Engine::new(&config.directory, config.internal_host_packet_io);
         Ok(Arc::new(Self {
             requests,
             mitm,
+            scripts,
+            rewrite_stats: rewrite::Stats::default(),
             adblock_allow: RwLock::new(config.adblock.allow.clone()),
             saved_profile: Mutex::new(None),
             config,
@@ -517,10 +525,11 @@ impl Core {
         if self.config.geo_auto_update
             || !self.config.rule_providers.is_empty()
             || self.config.adblock.enable
+            || self.config.rewrite.enable
         {
             let core = self.clone();
             tasks.spawn(async move {
-                let seconds=core.config.rule_providers.values().filter(|p|p.interval>0).map(|p|p.interval).chain(core.config.adblock.enable.then_some(core.config.adblock.interval)).chain(std::iter::once(if core.config.geo_auto_update{core.config.geo_update_interval.saturating_mul(3600)}else{86400})).min().unwrap_or(86400).max(1);
+                let seconds=core.config.rule_providers.values().filter(|p|p.interval>0).map(|p|p.interval).chain(core.config.adblock.enable.then_some(core.config.adblock.interval)).chain(core.config.rewrite.enable.then_some(core.config.rewrite.interval)).chain(std::iter::once(if core.config.geo_auto_update{core.config.geo_update_interval.saturating_mul(3600)}else{86400})).min().unwrap_or(86400).max(1);
                 let mut interval=tokio::time::interval(Duration::from_secs(seconds));interval.tick().await;
                 loop {tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}};tokio::select!{_=core.stop.cancelled()=>break,result=core.prepare_resources(true)=>{if result.is_err(){tracing::warn!("routing resource refresh failed; retaining previous snapshot");}}}}
             });
@@ -770,6 +779,12 @@ impl Core {
         if let Some(filter) = &next.adblock {
             filter.set_allow(&self.adblock_allow.read().unwrap());
         }
+        self.mitm.set_module_hosts(
+            next.rewrite
+                .as_ref()
+                .map(|r| r.hostnames.clone())
+                .unwrap_or_default(),
+        );
         self.mark_networks(&rules);
         policy.rules = rules;
         *resources = next;
@@ -809,6 +824,12 @@ impl Core {
                     .record(&target.host, "connection");
             }
             return Ok(Trace::new("REJECT", "REJECT", block.matched(), None));
+        }
+        if self
+            .rewriter()
+            .is_some_and(|rewriter| rewriter.rejects(&target.host))
+        {
+            return Ok(Trace::new("REJECT", "REJECT", "Module(REJECT)", None));
         }
         let (mode, rules, raw_rules) = {
             let p = self.policy.read().unwrap();
@@ -1582,6 +1603,31 @@ impl Core {
         status["lists"] =
             serde_json::json!(filter.as_ref().map(|f| f.lists.clone()).unwrap_or_default());
         status
+    }
+    /// Rewrite modules: whether they are on, each module's rules and errors,
+    /// and the counters.
+    pub fn rewrite_status(&self) -> serde_json::Value {
+        let rewriter = self.rewriter();
+        let mut status = self.rewrite_stats.snapshot();
+        status["enabled"] = serde_json::json!(rewriter.is_some());
+        status["rules"] = serde_json::json!(rewriter.as_ref().map_or(0, |r| r.rule_count()));
+        status["hostnames"] = serde_json::json!(
+            rewriter
+                .as_ref()
+                .map(|r| r.hostnames.clone())
+                .unwrap_or_default()
+        );
+        status["modules"] = serde_json::json!(
+            rewriter
+                .as_ref()
+                .map(|r| r.modules.clone())
+                .unwrap_or_default()
+        );
+        status["decrypting"] = serde_json::json!(self.mitm.is_active());
+        status
+    }
+    pub(crate) fn rewriter(&self) -> Option<Arc<rewrite::Rewriter>> {
+        self.resources.read().unwrap().rewrite.clone()
     }
     /// Replaces the user's allowlist without restarting; validated like the
     /// configuration's `adblock.allow`.

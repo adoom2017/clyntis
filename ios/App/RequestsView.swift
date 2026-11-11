@@ -12,6 +12,8 @@ struct RequestEntry: Decodable, Equatable {
         let requestSize: Int64
         let responseSize: Int64
         let error: String?
+        /// Rewrite rules that acted: `action (module)`, comma-separated.
+        let rewrite: String?
     }
     let id: UInt64
     /// Unix milliseconds.
@@ -285,6 +287,9 @@ private struct RequestRow: View {
                     .padding(.horizontal, 5).padding(.vertical, 1)
                     .background(.tint.opacity(0.12), in: .capsule)
                 Text(state).foregroundStyle(stateColor)
+                if entry.http?.rewrite != nil {
+                    Text(L("已重写")).foregroundStyle(.tint)
+                }
                 Text("\(entry.rule) → \(entry.chain)").lineLimit(1)
                 Spacer()
                 Text(entry.date, format: .dateTime.hour().minute().second()).monospacedDigit()
@@ -335,6 +340,7 @@ struct RequestDetailView: View {
                 if !entry.source.isEmpty { LabeledContent(L("来源"), value: entry.source) }
                 if let status = entry.http?.status { LabeledContent(L("状态码"), value: "\(status)") }
                 if let type = entry.http?.contentType { LabeledContent(L("内容类型"), value: type) }
+                if let rewrite = entry.http?.rewrite { LabeledContent(L("重写"), value: rewrite) }
                 if let reason = entry.http?.error ?? entry.reason {
                     LabeledContent(L("结束原因"), value: reason)
                 }

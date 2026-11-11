@@ -934,6 +934,14 @@ pub async fn adblock_status(state: State<'_, Desktop>) -> Reply<Value> {
         .map_err(error)
 }
 #[tauri::command]
+pub async fn rewrite_status(state: State<'_, Desktop>) -> Reply<Value> {
+    controller(&state)
+        .await?
+        .request(reqwest::Method::GET, &["rewrite"], None)
+        .await
+        .map_err(error)
+}
+#[tauri::command]
 pub async fn network_status(state: State<'_, Desktop>) -> Reply<Value> {
     controller(&state)
         .await?

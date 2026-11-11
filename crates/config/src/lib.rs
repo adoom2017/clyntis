@@ -5,6 +5,7 @@ pub mod custom;
 pub mod mitm;
 pub mod network;
 pub mod overrides;
+pub mod rewrite;
 pub use compat::*;
 pub mod rule;
 pub mod syntax;
@@ -68,6 +69,9 @@ pub struct Config {
     pub adblock: adblock::Adblock,
     /// Clyntis only: HTTPS decryption for inspecting requests.
     pub mitm: mitm::Mitm,
+    /// Clyntis only: rewriting decrypted HTTP with Surge, Loon and
+    /// Quantumult X modules.
+    pub rewrite: rewrite::Rewrite,
     /// Clyntis only: false keeps every `type: tailscale` proxy stopped (no
     /// control, DERP or tailnet names); connections routed to one fail.
     pub tailscale_enable: bool,
@@ -120,6 +124,7 @@ impl Default for Config {
             sniffer: Sniffer::default(),
             adblock: adblock::Adblock::default(),
             mitm: mitm::Mitm::default(),
+            rewrite: rewrite::Rewrite::default(),
             tailscale_enable: true,
             directory: ".".into(),
             internal_allow_native_profile: false,
@@ -537,6 +542,7 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         self.adblock.validate()?;
+        self.rewrite.validate()?;
         ensure!(
             self.internal_allow_native_profile && self.global_client_fingerprint == "native"
                 || [

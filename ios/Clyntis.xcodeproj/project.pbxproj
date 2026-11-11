@@ -22,6 +22,7 @@
 		373A6B3B5B2BA99E3880A112 /* AdblockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D08EC32E73A5233E7F184719 /* AdblockView.swift */; };
 		3ADFC46836317B25A2D7E9F3 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08C48B38E9CA87387BC36EAC /* Diagnostics.swift */; };
 		3D5115C3453FFB91F945C0C2 /* RequestsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF66560672CF24112FE39508 /* RequestsView.swift */; };
+		3FB3EC33593D04A4EACEA6B8 /* RewriteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F7106A16AF8F52B1A240D33 /* RewriteView.swift */; };
 		450BD701860BB3F96BAD666A /* ClyntisTunnel.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7D33B6B66F8B436DE4160641 /* ClyntisTunnel.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		47D9ACFFD319A2B331E00A75 /* YAMLTextView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9EEBA8384375CA66C51E77BE /* YAMLTextView.swift */; };
 		47EE4B47F567953035197D7F /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4CD9F227C5DB6EE5B5BA41C5 /* Network.framework */; };
@@ -104,6 +105,7 @@
 		51B7F9DA68DB1DC03B419874 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		52D3D68422415E8BCBCE97E2 /* ClyntisApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClyntisApp.swift; sourceTree = "<group>"; };
 		53C84513DEDA35BA9798C686 /* LocalizationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalizationTests.swift; sourceTree = "<group>"; };
+		5F7106A16AF8F52B1A240D33 /* RewriteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RewriteView.swift; sourceTree = "<group>"; };
 		600592D7EE14E85760521851 /* CustomRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomRules.swift; sourceTree = "<group>"; };
 		62DC05775423F8BC051EDCE0 /* Clyntis.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Clyntis.entitlements; sourceTree = "<group>"; };
 		6B6DD8AA26D8E3F4058D9D9C /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
@@ -193,6 +195,7 @@
 				3EF5B7AE790C96FE38085975 /* RemoteConfigImporter.swift */,
 				4409D215D0A78072B9C08F80 /* RemoteImportView.swift */,
 				EF66560672CF24112FE39508 /* RequestsView.swift */,
+				5F7106A16AF8F52B1A240D33 /* RewriteView.swift */,
 				D05A537A88901961F3530892 /* RootView.swift */,
 				CAD28DC61A12504BD9B81416 /* RulesView.swift */,
 				9EEBA8384375CA66C51E77BE /* YAMLTextView.swift */,
@@ -435,6 +438,7 @@
 				6595D1D8F7B59AEBBCFAA8D8 /* RemoteConfigImporter.swift in Sources */,
 				E06208BA706DCD951ED3081E /* RemoteImportView.swift in Sources */,
 				3D5115C3453FFB91F945C0C2 /* RequestsView.swift in Sources */,
+				3FB3EC33593D04A4EACEA6B8 /* RewriteView.swift in Sources */,
 				A75F93E0C7BA4D03A76A0E87 /* RootView.swift in Sources */,
 				CE39C2445F5237173DD003B0 /* RulesView.swift in Sources */,
 				32AD2774235232663A36C194 /* TunnelMessage.swift in Sources */,

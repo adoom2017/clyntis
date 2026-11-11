@@ -24,6 +24,8 @@ pub struct Overrides {
     /// HTTPS decryption; replaces the profile's `mitm`. The running core
     /// takes changes without a restart.
     pub mitm: Option<MitmSettings>,
+    /// Rewrite modules; replaces the profile's `rewrite`.
+    pub rewrite: Option<crate::rewrite::Settings>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +65,9 @@ impl Overrides {
         if let Some(adblock) = &self.adblock {
             adblock.to_config()?;
         }
+        if let Some(rewrite) = &self.rewrite {
+            rewrite.to_config()?;
+        }
         Ok(())
     }
 
@@ -77,6 +82,12 @@ impl Overrides {
             map.insert(
                 Value::from("adblock"),
                 serde_yaml::to_value(adblock.to_config()?)?,
+            );
+        }
+        if let Some(rewrite) = &self.rewrite {
+            map.insert(
+                Value::from("rewrite"),
+                serde_yaml::to_value(rewrite.to_config()?)?,
             );
         }
         if let Some(level) = &self.log_level {
@@ -179,9 +190,21 @@ mod tests {
                 ca_cert: "CERT".into(),
                 ca_key: "KEY".into(),
             }),
+            rewrite: Some(crate::rewrite::Settings {
+                enabled: true,
+                modules: vec![crate::rewrite::ModuleSetting {
+                    name: "ads".into(),
+                    url: "https://a.test/ads.sgmodule".into(),
+                    enabled: true,
+                }],
+                custom: "^https://a\\.test/ad reject".into(),
+            }),
         };
         let config = crate::Config::parse(overrides.apply(PROFILE).unwrap().as_bytes()).unwrap();
         assert!(!config.tailscale_enable);
+        assert!(config.rewrite.enable);
+        assert_eq!(config.rewrite.modules[0].name, "ads");
+        assert_eq!(config.rewrite.custom, "^https://a\\.test/ad reject");
         assert!(config.mitm.enable);
         assert_eq!(config.mitm.hostname, ["*.ads.test"]);
         assert_eq!(

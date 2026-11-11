@@ -31,6 +31,7 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/configs", get(config).patch(update))
         .route("/proxies", get(proxies))
         .route("/adblock", get(adblock))
+        .route("/rewrite", get(rewrite))
         .route("/network", get(network))
         .route("/rules/test", post(test_route))
         .route("/dns/leak", get(dns_leak_audit))
@@ -183,6 +184,9 @@ fn proxy_map(core: &Core) -> serde_json::Map<String, Value> {
         }
     }
     output
+}
+async fn rewrite(State(core): State<Arc<Core>>) -> Json<Value> {
+    Json(core.rewrite_status())
 }
 async fn adblock(State(core): State<Arc<Core>>) -> Json<Value> {
     Json(core.adblock_status())
