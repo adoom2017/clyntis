@@ -318,6 +318,10 @@ impl Interceptor {
         }
         self.authority.read().unwrap().clone()
     }
+    /// Whether servers whose names only loosely cover the host are decrypted.
+    fn lenient(&self) -> bool {
+        self.settings.read().unwrap().lenient_upstream
+    }
     /// Whether decryption is on and working.
     pub(crate) fn is_active(&self) -> bool {
         self.active().is_some()
@@ -375,6 +379,7 @@ impl Interceptor {
             "enable": settings.enable,
             "hostname": settings.hostname,
             "moduleHostnames": self.module_hosts.read().unwrap().len(),
+            "lenientUpstream": settings.lenient_upstream,
             "active": settings.enable && self.authority.read().unwrap().is_some(),
             "ca": ca,
             "error": *self.error.read().unwrap(),
@@ -389,7 +394,9 @@ const UPSTREAM_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(2
 /// Whether a failed TLS handshake with the server means its certificate did
 /// not verify (rather than the network failing).
 fn untrusted(error: &str) -> bool {
-    error.contains("CERTIFICATE_VERIFY_FAILED") || error.contains("cert verification failed")
+    error.contains("CERTIFICATE_VERIFY_FAILED")
+        || error.contains("cert verification failed")
+        || error.contains("do not cover")
 }
 
 /// Bytes already read from a stream, served again before the rest of it.
@@ -585,9 +592,21 @@ impl Core {
                 fingerprint: TlsFingerprint::Native,
                 reality: None,
             };
+            // Lenient: the chain must verify; the names are judged here.
+            let handshake = async {
+                if config.verify_cert && self.mitm.lenient() {
+                    connector
+                        .connect_with_names(upstream, &config, |names| {
+                            clyntis_config::mitm::loosely_covers(names, &host)
+                        })
+                        .await
+                } else {
+                    connector.connect(upstream, &config).await
+                }
+            };
             let connected = tokio::select! {
                 _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
-                result = tokio::time::timeout(UPSTREAM_HANDSHAKE, connector.connect(upstream, &config)) => {
+                result = tokio::time::timeout(UPSTREAM_HANDSHAKE, handshake) => {
                     result.unwrap_or_else(|_| Err(anyhow::anyhow!("TLS handshake timed out")))
                 }
             };
@@ -667,6 +686,7 @@ pub(crate) fn test_settings(hosts: &[&str]) -> Mitm {
         hostname: hosts.iter().map(|h| h.to_string()).collect(),
         ca_cert,
         ca_key,
+        ..Mitm::default()
     }
 }
 
@@ -910,7 +930,11 @@ mod tests {
             }
         });
 
-        let core = core(test_settings(&["ads.test"]));
+        // Leniency covers names, never an untrusted chain.
+        let core = core(Mitm {
+            lenient_upstream: true,
+            ..test_settings(&["ads.test"])
+        });
         core.mitm
             .verify_upstream
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1094,7 +1118,7 @@ hostname = ads.test
         assert_eq!(http[0].rewrite.as_deref(), Some("reject-dict (ads)"));
         assert_eq!(
             http[1].rewrite.as_deref(),
-            Some("json (ads), script feed (ads)")
+            Some("jq (ads), script feed (ads)")
         );
         assert_eq!(
             http[2].rewrite.as_deref(),

@@ -54,6 +54,8 @@ pub(crate) struct Compiled {
     pub(crate) action: Action,
     /// Compiled regexes of body and header rewrites, in order.
     extra: Vec<fancy_regex::Regex>,
+    /// The compiled filter of a jq rewrite.
+    pub(crate) jq: Option<crate::jq::Filter>,
 }
 impl Compiled {
     /// `kind (module)`, for the request log.
@@ -245,6 +247,13 @@ fn compile(module: &str, rule: clyntis_config::rewrite::Rule) -> Result<Compiled
         }
         _ => vec![],
     };
+    let jq = match &rule.action {
+        Action::Jq(code) => Some(
+            crate::jq::Filter::compile(code)
+                .map_err(|error| (rule.line, format!("{error}: {code}")))?,
+        ),
+        _ => None,
+    };
     Ok(Compiled {
         module: module.to_owned(),
         line: rule.line,
@@ -252,6 +261,7 @@ fn compile(module: &str, rule: clyntis_config::rewrite::Rule) -> Result<Compiled
         pattern,
         action: rule.action,
         extra,
+        jq,
     })
 }
 
@@ -620,8 +630,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn matches_rules_in_order_and_answers() {
+    #[tokio::test]
+    async fn matches_rules_in_order_and_answers() {
         let rewriter = rewriter(
             r#"[URL Rewrite]
 ^https?:\/\/a\.test\/ad - reject-dict
@@ -677,7 +687,11 @@ http-response-jq ^https://a\.test/feed 'del(.list[].ad, .banner)'
         let mut body =
             br#"{"list":[{"ad":true,"id":1}],"banner":{"x":1},"keep":"\"ad\":true"}"#.to_vec();
         for rule in &body_rules {
-            assert!(apply_body(rewriter.rule(*rule), &mut body));
+            let rule = rewriter.rule(*rule);
+            match &rule.jq {
+                Some(filter) => body = filter.apply(body).await.unwrap(),
+                None => assert!(apply_body(rule, &mut body)),
+            }
         }
         assert_eq!(
             serde_json::from_slice::<Value>(&body).unwrap(),

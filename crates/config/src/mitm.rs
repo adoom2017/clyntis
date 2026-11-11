@@ -16,6 +16,27 @@ pub struct Mitm {
     /// Its private key (PEM). Never exported by the controller.
     #[serde(skip_serializing)]
     pub ca_key: String,
+    /// Also decrypt servers whose certificate chain verifies but whose names
+    /// do not strictly cover the host: a wildcard such as `*.example.com`
+    /// for `a.b.example.com`, which some apps accept. Off: those servers are
+    /// passed through.
+    pub lenient_upstream: bool,
+}
+
+/// Whether a certificate for `names` covers `host` under the lenient rule:
+/// a name equal to it, or a wildcard `*.domain` with `host` anywhere below
+/// `domain` (not only one level, as TLS requires).
+pub fn loosely_covers(names: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    names.iter().any(|name| {
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        match name.strip_prefix("*.") {
+            // At least two labels, so `*.com` covers nothing.
+            Some(domain) if domain.contains('.') => host.ends_with(&format!(".{domain}")),
+            Some(_) => false,
+            None => name == host,
+        }
+    })
 }
 
 impl Mitm {
@@ -73,6 +94,17 @@ mod tests {
 
     fn list(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn lenient_names_cover_deeper_hosts() {
+        let names = list(&["*.ximalaya.com", "ximalaya.com"]);
+        assert!(loosely_covers(&names, "new.c.ximalaya.com"));
+        assert!(loosely_covers(&names, "a.ximalaya.com"));
+        assert!(loosely_covers(&names, "XIMALAYA.com."));
+        assert!(!loosely_covers(&names, "ximalaya.com.evil.test"));
+        assert!(!loosely_covers(&names, "notximalaya.com"));
+        assert!(!loosely_covers(&list(&["*.com"]), "a.b.com"));
     }
 
     #[test]

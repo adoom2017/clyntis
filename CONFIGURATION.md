@@ -84,6 +84,10 @@ format. For building and running, see the [README](README.md).
   that miss the host name, such as `*.example.com` for `a.b.example.com`) is
   not decrypted either: the connection is passed through for the app to judge,
   and the host joins the same list.
+  `mitm.lenient-upstream: true` decrypts those servers too when their
+  certificate chain verifies and a name loosely covers the host: equal to
+  it, or a wildcard `*.domain` with the host anywhere below `domain`. A chain
+  that does not verify is still passed through.
   UDP 443 to a decrypted host is refused so browsers use TCP instead of QUIC.
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the
@@ -108,7 +112,10 @@ format. For building and running, see the [README](README.md).
   `reject-dict`, `reject-array`, `reject-drop`, 301/302/307/308 redirects),
   Map Local / `mock-response-body`, request and response header rewrites,
   body regex replacement, JSON deletion and replacement (Loon
-  `response-body-json-*`, Surge jq `del(...)` only), scripts
+  `response-body-json-*`), jq filters (Surge `http-response-jq` /
+  `http-request-jq`, Loon `response-body-json-jq`; full jq via jaq, without
+  `env` and `input`, 5 s per body; a filter in a separate `jq-path` file is
+  not supported), scripts
   (`http-request` / `http-response`, `requires-body`, `binary-body-mode`,
   `max-size`, `timeout`, `argument`), `[MITM] hostname` (added to the hosts
   decrypted while decryption is on) and `[Rule]` domain rules whose policy

@@ -438,6 +438,7 @@ impl Desktop {
             "hostname": mitm.hostname,
             "ca-cert": mitm.ca_cert,
             "ca-key": mitm.ca_key,
+            "lenient-upstream": mitm.lenient_upstream,
         }}))
     }
     /// Makes a new CA; a running core decrypting with the old one switches.

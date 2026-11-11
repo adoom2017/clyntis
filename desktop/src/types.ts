@@ -73,6 +73,8 @@ export interface RewriteStatus {
 export interface MitmSettings {
   enable: boolean;
   hostnames: string[];
+  /** Also decrypt servers whose certificate names only loosely match. */
+  lenientUpstream?: boolean;
 }
 export interface HttpSummary {
   method: string;

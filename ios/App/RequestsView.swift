@@ -536,6 +536,19 @@ struct MitmView: View {
             } footer: {
                 Text(L("* 匹配任意字符，以 - 开头表示排除。填 * 会解密所有 HTTPS 流量，不建议长期使用。"))
             }
+            Section {
+                Toggle(L("宽松校验服务器证书"), isOn: Binding(get: { settings.lenientUpstream ?? false }, set: { on in
+                    Task {
+                        await run {
+                            var next = settings
+                            next.lenientUpstream = on
+                            try await model.saveMitm(next)
+                        }
+                    }
+                }))
+            } footer: {
+                Text(L("部分 App 接受域名不完全匹配的证书，如用 *.example.com 访问 a.b.example.com。开启后这类服务器也会解密；证书本身不可信的仍直接转发。立即生效。"))
+            }
             if let bypassed = model.mitm?.bypassed, !bypassed.isEmpty {
                 Section {
                     ForEach(bypassed, id: \.self) { Text($0).font(.footnote.monospaced()) }

@@ -629,9 +629,18 @@ fn configure_ssl(
     config: &TlsConnectConfig,
     clock: &Arc<Clock>,
 ) -> Result<(boring::ssl::Ssl, BrowserProfile)> {
+    configure_ssl_with(config, clock, true)
+}
+
+/// `check_name: false` verifies the chain without the server name.
+fn configure_ssl_with(
+    config: &TlsConnectConfig,
+    clock: &Arc<Clock>,
+    check_name: bool,
+) -> Result<(boring::ssl::Ssl, BrowserProfile)> {
     let (connector, profile, alpn, session_key) = connector(config)?;
     let mut configured = connector.configure()?;
-    configured.set_verify_hostname(config.verify_cert && config.reality.is_none());
+    configured.set_verify_hostname(check_name && config.verify_cert && config.reality.is_none());
     let mut ssl = configured.into_ssl(&config.server_name)?;
     if let Some(key) = session_key.as_ref()
         && let Some(session) = take_session(key)
@@ -842,6 +851,39 @@ impl SecureConnector {
         Ok(Box::new(tls))
     }
 
+    /// Connects verifying the certificate chain but not the server name;
+    /// `names_ok` judges the certificate's DNS names instead. For servers
+    /// whose clients accept names that do not strictly match.
+    pub async fn connect_with_names(
+        &self,
+        stream: BoxStream,
+        config: &TlsConnectConfig,
+        names_ok: impl FnOnce(&[String]) -> bool,
+    ) -> Result<BoxStream> {
+        ensure!(
+            config.verify_cert && config.reality.is_none(),
+            "name checks need a verified chain"
+        );
+        // The chain is still verified against the roots; only the name check
+        // is left to `names_ok`.
+        let (ssl, _) = configure_ssl_with(config, &self.clock, false)?;
+        let tls = tokio_boring::SslStreamBuilder::new(ssl, stream)
+            .connect()
+            .await
+            .map_err(|error| anyhow::anyhow!("TLS handshake failed: {error}"))?;
+        let names = tls
+            .ssl()
+            .peer_certificate()
+            .map(|cert| certificate_names(&cert))
+            .unwrap_or_default();
+        ensure!(
+            names_ok(&names),
+            "TLS handshake failed: certificate names {names:?} do not cover {}",
+            config.server_name
+        );
+        Ok(Box::new(tls))
+    }
+
     pub async fn connect_xtls(
         &self,
         stream: BoxStream,
@@ -867,6 +909,27 @@ impl SecureConnector {
         }
         Ok(RecordStream::tls(tls, guard))
     }
+}
+
+/// The DNS names a certificate is for: its subject alternative names, else
+/// its common name.
+pub fn certificate_names(cert: &X509) -> Vec<String> {
+    let names: Vec<String> = cert
+        .subject_alt_names()
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.dnsname().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !names.is_empty() {
+        return names;
+    }
+    cert.subject_name()
+        .entries_by_nid(boring::nid::Nid::COMMONNAME)
+        .filter_map(|entry| entry.data().as_utf8().ok().map(|s| s.to_string()))
+        .collect()
 }
 
 pub async fn connect(

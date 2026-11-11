@@ -552,4 +552,7 @@ export const en: Record<string, string> = {
     "{rules} rules · {scripts} scripts · {hosts} host names · applied {hits} times",
   "下载失败：{list}": "Download failed: {list}",
   "{count} 行不支持，已跳过": "{count} unsupported lines skipped",
+  宽松校验服务器证书: "Lenient server certificate check",
+  "部分 App 接受域名不完全匹配的证书，如用 *.example.com 访问 a.b.example.com。开启后这类服务器也会解密；证书本身不可信的仍直接转发。立即生效。":
+    "Some apps accept certificates whose names do not strictly match, such as *.example.com for a.b.example.com. When on, those servers are decrypted too; certificates that are not trusted at all are still passed through. Applies at once.",
 };

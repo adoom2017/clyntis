@@ -157,6 +157,20 @@ async fn apply_rules(
                 message.head_changed = true;
                 true
             }
+            Action::Jq(_) => {
+                let output = match (&rule.jq, &message.body) {
+                    (Some(filter), Some(body)) => filter.apply(body.clone()).await,
+                    _ => None,
+                };
+                match output {
+                    Some(body) if message.body.as_ref() != Some(&body) => {
+                        message.body = Some(body);
+                        message.body_changed = true;
+                        true
+                    }
+                    _ => false,
+                }
+            }
             Action::BodyReplace(_) | Action::JsonDelete(_) | Action::JsonSet(_) => {
                 let changed = message
                     .body

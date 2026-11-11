@@ -22,6 +22,7 @@ import {
   type BodyView,
   type CustomRules,
   type MitmInfo,
+  type MitmSettings,
   type RequestDetail,
   type RequestEntry,
   type RewriteStatus,
@@ -732,7 +733,7 @@ function MitmPanel({
     const timer = window.setInterval(load, 10000);
     return () => window.clearInterval(timer);
   }, [load, shown, open, running]);
-  const update = (next: { enable: boolean; hostnames: string[] }) =>
+  const update = (next: MitmSettings) =>
     perform(async () => {
       await invoke("save_settings", {
         settings: {
@@ -882,6 +883,20 @@ function MitmPanel({
               </button>
             </div>
           </div>
+          <Setting
+            label={t("宽松校验服务器证书")}
+            text={t(
+              "部分 App 接受域名不完全匹配的证书，如用 *.example.com 访问 a.b.example.com。开启后这类服务器也会解密；证书本身不可信的仍直接转发。立即生效。",
+            )}
+          >
+            <Toggle
+              checked={!!mitm.lenientUpstream}
+              label={t("宽松校验服务器证书")}
+              onChange={(lenientUpstream) =>
+                void update({ ...mitm, lenientUpstream })
+              }
+            />
+          </Setting>
           {!!core?.bypassed.length && (
             <div className="mitm-bypassed">
               <div className="panel-title">

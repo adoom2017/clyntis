@@ -104,6 +104,9 @@ struct MitmSettings: Codable, Equatable {
     /// The CA (PEM), filled in from MitmAuthority only on the way to the core.
     var caCert: String?
     var caKey: String?
+    /// Also decrypt servers whose certificate names only loosely match;
+    /// optional so settings saved before it still decode.
+    var lenientUpstream: Bool?
 
     var withoutAuthority: MitmSettings {
         var copy = self
@@ -125,6 +128,7 @@ struct MitmSettings: Codable, Equatable {
             "enable": enable,
             "hostname": hostnames.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty },
         ]
+        mitm["lenient-upstream"] = lenientUpstream ?? false
         if let caCert { mitm["ca-cert"] = caCert }
         if let caKey { mitm["ca-key"] = caKey }
         return try JSONSerialization.data(withJSONObject: ["mitm": mitm])

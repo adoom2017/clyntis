@@ -36,6 +36,8 @@ pub struct MitmSettings {
     /// The CA certificate and private key (PEM), made once by the app.
     pub ca_cert: String,
     pub ca_key: String,
+    /// See `Mitm::lenient_upstream`.
+    pub lenient_upstream: bool,
 }
 
 impl MitmSettings {
@@ -50,6 +52,7 @@ impl MitmSettings {
                 .collect(),
             ca_cert: self.ca_cert.clone(),
             ca_key: self.ca_key.clone(),
+            lenient_upstream: self.lenient_upstream,
         }
     }
 }
@@ -107,6 +110,10 @@ impl Overrides {
                 serde_yaml::to_value(&mitm.hostname)?,
             );
             value.insert(Value::from("ca-cert"), Value::from(mitm.ca_cert));
+            value.insert(
+                Value::from("lenient-upstream"),
+                Value::from(mitm.lenient_upstream),
+            );
             // `Mitm` never serializes its key, so it is written here.
             value.insert(Value::from("ca-key"), Value::from(mitm.ca_key));
             map.insert(Value::from("mitm"), Value::Mapping(value));
@@ -189,6 +196,7 @@ mod tests {
                 hostnames: vec![" *.ads.test ".into(), "".into()],
                 ca_cert: "CERT".into(),
                 ca_key: "KEY".into(),
+                lenient_upstream: true,
             }),
             rewrite: Some(crate::rewrite::Settings {
                 enabled: true,
@@ -207,6 +215,7 @@ mod tests {
         assert_eq!(config.rewrite.custom, "^https://a\\.test/ad reject");
         assert!(config.mitm.enable);
         assert_eq!(config.mitm.hostname, ["*.ads.test"]);
+        assert!(config.mitm.lenient_upstream);
         assert_eq!(
             (config.mitm.ca_cert.as_str(), config.mitm.ca_key.as_str()),
             ("CERT", "KEY")

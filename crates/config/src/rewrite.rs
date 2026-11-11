@@ -193,6 +193,8 @@ pub enum Action {
     JsonDelete(Vec<String>),
     /// JSON paths and the JSON values to put there.
     JsonSet(Vec<(String, String)>),
+    /// A jq filter applied to the JSON body; its first output replaces it.
+    Jq(String),
     Mock(Mock),
     Script(Script),
 }
@@ -205,6 +207,7 @@ impl Action {
             Action::Header(_) => "header".into(),
             Action::BodyReplace(_) => "body".into(),
             Action::JsonDelete(_) | Action::JsonSet(_) => "json".into(),
+            Action::Jq(_) => "jq".into(),
             Action::Mock(_) => "mock".into(),
             Action::Script(script) => format!("script {}", script.name),
         }
@@ -212,7 +215,9 @@ impl Action {
     /// Whether it needs the whole body of its phase.
     pub fn needs_body(&self) -> bool {
         match self {
-            Action::BodyReplace(_) | Action::JsonDelete(_) | Action::JsonSet(_) => true,
+            Action::BodyReplace(_) | Action::JsonDelete(_) | Action::JsonSet(_) | Action::Jq(_) => {
+                true
+            }
             Action::Script(script) => script.requires_body,
             _ => false,
         }
@@ -634,8 +639,7 @@ fn rewrite_line(section: Section, line: &str, number: usize) -> Result<Rule, ()>
             tokens.remove(0);
             let pattern = take(&mut tokens)?;
             if jq {
-                let filter = tokens.join(" ");
-                return rule(pattern, phase, Action::JsonDelete(jq_delete(&filter)?));
+                return rule(pattern, phase, Action::Jq(jq_filter(&tokens)?));
             }
             rule(pattern, phase, Action::BodyReplace(pairs(tokens)?))
         }
@@ -767,6 +771,14 @@ fn keyword_action(
                 ),
             )
         }
+        "response-body-json-jq" | "request-body-json-jq" => (
+            if response {
+                Phase::Response
+            } else {
+                Phase::Request
+            },
+            Action::Jq(jq_filter(rest)?),
+        ),
         "mock-response-body" => (Phase::Request, Action::Mock(mock(rest)?)),
         "script-response-body"
         | "script-request-body"
@@ -840,23 +852,15 @@ fn json_path(path: &str) -> Result<String, ()> {
     Ok(path.trim_end_matches('?').replace("[]?", "[]"))
 }
 
-/// The one jq form that is common in ad modules: `del(.a, .b.c)`.
-fn jq_delete(filter: &str) -> Result<Vec<String>, ()> {
-    let filter = unquote(filter.trim());
-    let inner = filter
-        .strip_prefix("del(")
-        .and_then(|f| f.strip_suffix(')'))
-        .ok_or(())?;
-    inner
-        .split(',')
-        .map(|p| {
-            let p = p.trim();
-            if !p.starts_with('.') || p.contains(['(', '|', ' ', '"']) {
-                return Err(());
-            }
-            json_path(p)
-        })
-        .collect()
+/// A jq filter given after the pattern, usually quoted as one token.
+fn jq_filter(tokens: &[String]) -> Result<String, ()> {
+    let filter = tokens.join(" ");
+    let filter = unquote(filter.trim()).trim();
+    if filter.is_empty() || filter.starts_with("jq-path=") {
+        // A filter in a separate file is not supported.
+        return Err(());
+    }
+    Ok(filter.to_owned())
 }
 
 fn mock(tokens: &[String]) -> Result<Mock, ()> {
@@ -1070,7 +1074,7 @@ hostname = %APPEND% api.test, *.img.test, -skip.test
         );
         assert_eq!(
             actions[6],
-            &Action::JsonDelete(vec!["data.banner".into(), "data.list[].ad".into()])
+            &Action::Jq("del(.data.banner, .data.list[].ad)".into())
         );
         let Action::Mock(mock) = actions[7] else {
             panic!()

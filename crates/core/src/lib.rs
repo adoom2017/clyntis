@@ -4,6 +4,7 @@ mod api;
 pub mod cos;
 pub mod dns;
 mod inbound;
+mod jq;
 mod memory;
 mod mitm;
 mod observe;

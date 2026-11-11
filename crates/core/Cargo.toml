@@ -42,6 +42,9 @@ hmac = "0.12"
 smoltcp = { version = "=0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "fragmentation-buffer-size-65536", "reassembly-buffer-size-65536", "socket-tcp", "socket-tcp-cubic", "socket-tcp-reno", "socket-udp", "socket-icmp"] }
 fancy-regex = "0.20.1"
 regex = "1.13.1"
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = "2"
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
 # Scripts in rewrite modules. Android has no bundled QuickJS bindings, and
