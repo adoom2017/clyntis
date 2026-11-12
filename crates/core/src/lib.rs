@@ -53,6 +53,9 @@ const HOSTED_FAKE_CAPACITY: usize = 8192;
 type Hysteria2Slot = Arc<tokio::sync::Mutex<Option<Arc<clyntis_protocol::hysteria2::Client>>>>;
 /// How often the info log summarizes ad blocks.
 const ADBLOCK_SUMMARY_EVERY: Duration = Duration::from_secs(60);
+/// Retrying resources that were missing at start: first wait, then doubling.
+const MISSING_RETRY_FIRST: Duration = Duration::from_secs(5);
+const MISSING_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 pub struct Core {
     pub config: Config,
     pub resolver: Arc<dns::Resolver>,
@@ -533,6 +536,32 @@ impl Core {
                 let seconds=core.config.rule_providers.values().filter(|p|p.interval>0).map(|p|p.interval).chain(core.config.adblock.enable.then_some(core.config.adblock.interval)).chain(core.config.rewrite.enable.then_some(core.config.rewrite.interval)).chain(std::iter::once(if core.config.geo_auto_update{core.config.geo_update_interval.saturating_mul(3600)}else{86400})).min().unwrap_or(86400).max(1);
                 let mut interval=tokio::time::interval(Duration::from_secs(seconds));interval.tick().await;
                 loop {tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}};tokio::select!{_=core.stop.cancelled()=>break,result=core.prepare_resources(true)=>{if result.is_err(){tracing::warn!("routing resource refresh failed; retaining previous snapshot");}}}}
+            });
+        }
+        if self.resources_incomplete() {
+            // Lists, modules or scripts that could not be fetched before the
+            // proxy was usable: keep fetching them now that it is, and apply
+            // each success at once, as a restart would.
+            let core = self.clone();
+            tasks.spawn(async move {
+                let mut delay = MISSING_RETRY_FIRST;
+                while core.resources_incomplete() {
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        result = core.prepare_resources(false) => match result {
+                            Ok(()) if !core.resources_incomplete() => {
+                                tracing::info!("missing routing resources downloaded through the proxy; applied");
+                            }
+                            Ok(()) => tracing::debug!("some routing resources are still missing; retrying"),
+                            Err(error) => tracing::warn!(error = %format!("{error:#}"), "missing routing resource download failed; retrying"),
+                        }
+                    }
+                    delay = (delay * 2).min(MISSING_RETRY_MAX);
+                }
             });
         }
         if let Some(packets) = packets {
@@ -1626,6 +1655,20 @@ impl Core {
         );
         status["decrypting"] = serde_json::json!(self.mitm.is_active());
         status
+    }
+    /// Whether an ad blocking list, rewrite module, script or response file
+    /// of the active snapshot could not be loaded.
+    fn resources_incomplete(&self) -> bool {
+        let resources = self.resources.read().unwrap();
+        resources
+            .adblock
+            .as_ref()
+            .is_some_and(|f| f.lists.iter().any(|l| l.error.is_some()))
+            || resources.rewrite.as_ref().is_some_and(|r| {
+                r.modules
+                    .iter()
+                    .any(|m| m.error.is_some() || !m.missing.is_empty())
+            })
     }
     pub(crate) fn rewriter(&self) -> Option<Arc<rewrite::Rewriter>> {
         self.resources.read().unwrap().rewrite.clone()

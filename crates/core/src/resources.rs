@@ -822,26 +822,19 @@ async fn asset(
         "local routing resource is missing"
     );
     let (temp, mut file) = pending.create(path)?;
-    let mut result = download(url, fetch.resolver, fetch.hooks, None, &mut file).await;
-    if let (Err(error), Some((core, name))) = (&result, fetch.proxy) {
-        // Resource hosts (jsDelivr, GitHub) are often unreachable directly from
-        // the networks that need the proxy in the first place.
+    // Resource hosts (jsDelivr, GitHub) are often unreachable directly from
+    // the networks that need the proxy in the first place: use it first.
+    let mut result = download(url, fetch.resolver, fetch.hooks, fetch.proxy, &mut file).await;
+    if let (Err(error), Some((_, name))) = (&result, fetch.proxy) {
         tracing::warn!(
             error = %format!("{error:#}"),
             proxy = name,
-            "direct routing resource download failed; retrying through the proxy"
+            "routing resource download through the proxy failed; retrying directly"
         );
         use std::io::Seek;
         file.set_len(0)?;
         file.rewind()?;
-        result = download(
-            url,
-            fetch.resolver,
-            fetch.hooks,
-            Some((core, name)),
-            &mut file,
-        )
-        .await;
+        result = download(url, fetch.resolver, fetch.hooks, None, &mut file).await;
     }
     let result = result.and_then(|_| Ok(file.sync_all()?)).with_context(|| {
         format!(
@@ -869,7 +862,7 @@ async fn asset(
     }
 }
 
-/// How routing resources are fetched: direct first, then through `proxy`.
+/// How routing resources are fetched: through `proxy` first, then direct.
 struct Fetch<'a> {
     resolver: &'a crate::dns::Resolver,
     hooks: &'a clyntis_platform::Hooks,
