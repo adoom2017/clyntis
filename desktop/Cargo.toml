@@ -29,6 +29,13 @@ boring-sys = { path = "../third-party/boring-sys" }
 netdev = { path = "../third-party/netdev" }
 route_manager = { path = "../third-party/route_manager" }
 
+# Argon2id is far too slow unoptimized for tests that derive real keys.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

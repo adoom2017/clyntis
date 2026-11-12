@@ -42,7 +42,9 @@ typedef struct {
  * routes/DNS and lifecycle. Packets have no Darwin address-family prefix.
  */
 uint32_t meta_abi_version_v1(void);
-/* Decrypt legacy AES-CFB/Base64 with a UTF-8 password, then validate YAML.
+/* Decrypt Base64 configuration with a UTF-8 password, then validate YAML.
+ * Reads the authenticated v2 format (Argon2id + XChaCha20-Poly1305) and the
+ * legacy unauthenticated AES-CFB format.
  * Accepts ASCII whitespace in Base64. Ciphertext limit: 24 MiB; decrypted YAML:
  * 16 MiB. Returns original plaintext bytes (including comments/credentials),
  * not serialized/sanitized YAML. No handle or listener is created. Standard
@@ -51,8 +53,8 @@ uint32_t meta_abi_version_v1(void);
 int32_t meta_decrypt_config_v1(const uint8_t *config, size_t length,
     const uint8_t *password, size_t password_length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
-/* Encrypt validated YAML (<= 16 MiB) into the same legacy AES-CFB/Base64
- * format accepted by meta_decrypt_config_v1. Password must be non-empty UTF-8.
+/* Encrypt validated YAML (<= 16 MiB) into the authenticated v2 Base64 format
+ * accepted by meta_decrypt_config_v1. Password must be non-empty UTF-8.
  * Standard caller-buffer/size-query contract applies. */
 int32_t meta_encrypt_config_v1(const uint8_t *config, size_t length,
     const uint8_t *password, size_t password_length,

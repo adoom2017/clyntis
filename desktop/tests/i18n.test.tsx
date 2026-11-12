@@ -1,5 +1,6 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App";
 import { en } from "../src/locales/en";
@@ -37,13 +38,15 @@ afterEach(() => {
 
 describe("interface language", () => {
   it("has English for every text in the source, with the same placeholders", () => {
-    const source = [
-      "../src/App.tsx",
-      "../src/types.ts",
-      "../src/Updates.tsx",
-      "../src/Requests.tsx",
-    ]
-      .map((file) => readFileSync(new URL(file, import.meta.url), "utf8"))
+    const src = join(process.cwd(), "src");
+    const files = readdirSync(src, { recursive: true, encoding: "utf8" })
+      .map((file) => file.replaceAll("\\", "/"))
+      .filter((file) => /\.tsx?$/.test(file))
+      .filter((file) => !file.startsWith("locales"));
+    // The pages and sections live in their own files now.
+    expect(files).toContain("pages/Settings.tsx");
+    const source = files
+      .map((file) => readFileSync(join(src, file), "utf8"))
       .join("\n");
     const keys = new Set<string>();
     for (const m of source.matchAll(/\bt\(\s*"((?:[^"\\]|\\.)*)"/g))

@@ -364,8 +364,9 @@ pub fn looks_encrypted(source: &str) -> bool {
         })
 }
 
-/// CFB has no authentication tag, so a wrong password yields garbage rather
-/// than an error; anything that is not a UTF-8 YAML mapping is reported as such.
+/// The v2 format reports a wrong password itself; the legacy format has no
+/// authentication tag and yields garbage instead, so anything that is not a
+/// UTF-8 YAML mapping is reported as a wrong password too.
 pub fn decrypt_source(source: &str, password: &str) -> Result<String> {
     ensure!(
         !password.is_empty(),

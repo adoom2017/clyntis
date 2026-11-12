@@ -70,9 +70,13 @@ struct Args {
     /// Validate configuration and exit without opening listeners.
     #[arg(short = 't', long, conflicts_with = "action")]
     test: bool,
-    /// Encrypt or decrypt a configuration using the legacy Alpha format.
+    /// Encrypt (authenticated v2 format) or decrypt (v2 or legacy) a configuration.
     #[arg(long, value_enum)]
     action: Option<Action>,
+    /// With `--action encrypt`, write the unauthenticated legacy Alpha format
+    /// for clients older than the v2 format.
+    #[arg(long)]
+    legacy_encryption: bool,
     /// Configuration password; omitted action passwords are prompted securely.
     #[arg(short = 'p', long)]
     password: Option<String>,
@@ -219,6 +223,10 @@ fn run(mut args: Args) -> Result<()> {
             "--output is required for --config actions"
         );
     }
+    ensure!(
+        !args.legacy_encryption || args.action == Some(Action::Encrypt),
+        "--legacy-encryption requires --action encrypt"
+    );
     let input = read_input(&mut args)?;
     let password = password(&mut args)?;
     if let Some(action) = args.action {
@@ -226,7 +234,11 @@ fn run(mut args: Args) -> Result<()> {
         match action {
             Action::Encrypt => {
                 Config::parse(&input)?;
-                let ciphertext = crypto::encrypt(&input, password)?;
+                let ciphertext = if args.legacy_encryption {
+                    crypto::encrypt_legacy(&input, password)?
+                } else {
+                    crypto::encrypt(&input, password)?
+                };
                 write_output(&args, action, ciphertext.as_bytes())?;
             }
             Action::Decrypt => {

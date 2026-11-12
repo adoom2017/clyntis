@@ -60,7 +60,7 @@ fn version_stdin_and_unknown_configuration() {
 }
 
 #[test]
-fn legacy_encryption_roundtrip_wrong_password_and_no_overwrite() {
+fn encryption_roundtrip_wrong_password_and_no_overwrite() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("config.yaml");
     let encrypted = directory.path().join("config-encrypt.yaml");
@@ -121,4 +121,44 @@ fn legacy_encryption_roundtrip_wrong_password_and_no_overwrite() {
             .success()
     );
     assert_eq!(std::fs::read(source).unwrap(), plaintext);
+}
+
+#[test]
+fn encryption_formats() {
+    use clyntis_config::crypto::{Format, format};
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("config.yaml");
+    std::fs::write(&source, b"mode: rule\nrules: ['MATCH,DIRECT']\n").unwrap();
+    for (extra, expected) in [
+        (None, Format::V2),
+        (Some("--legacy-encryption"), Format::Legacy),
+    ] {
+        let mut command = command();
+        command.arg("-f").arg(&source).args([
+            "--action",
+            "encrypt",
+            "-p",
+            "test-password",
+            "-o",
+            "-",
+        ]);
+        command.args(extra);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(format(output.stdout.trim_ascii()).unwrap(), expected);
+    }
+    assert!(
+        !command()
+            .arg("-f")
+            .arg(&source)
+            .args(["-t", "--legacy-encryption"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
 }

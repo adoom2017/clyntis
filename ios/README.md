@@ -181,11 +181,13 @@ an optional password. An empty password means the response is **plain YAML**;
 a nonempty password means it must be decrypted before validation. The app does
 not guess encryption or retry an encrypted response as plaintext.
 
-Encrypted responses use the project's existing AES-CFB/Base64 configuration
-format, compatible with CLI `--action encrypt`. Wrapped Base64 and final ASCII
-whitespace are accepted. Passwords are used exactly as entered, including spaces
-and Unicode. The legacy format has no authentication tag, so successful
-decryption must also pass strict configuration validation before storage.
+Encrypted responses use the shared configuration encryption (authenticated v2
+or legacy AES-CFB, both Base64; see
+[CONFIGURATION.md](../CONFIGURATION.md#configuration-encryption)), compatible
+with CLI `--action encrypt`. Wrapped Base64 and final ASCII whitespace are
+accepted. Passwords are used exactly as entered, including spaces and Unicode.
+Decrypted YAML must also pass strict configuration validation before storage,
+since the legacy format cannot detect a wrong password.
 
 The importer accepts 2xx HTTP responses, rejects empty files, limits plaintext
 to 16 MiB and encrypted downloads to 24 MiB, and enforces limits while streaming

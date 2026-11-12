@@ -24,7 +24,7 @@ npm run desktop:dev
 
 ## 功能与配置行为
 
-- 七个页面：概览、节点、配置、规则、连接、日志、设置；浅色/深色/系统主题，
+- 八个页面：概览、节点、配置、规则、连接、抓包、日志、设置；浅色/深色/系统主题，
   配色采用 Apple 系统色。
 - 界面支持简体中文和英文：设置 → 通用 → 语言，可选跟随系统（系统语言不是中文或英文时用英文）
   或固定一种。托盘菜单、App 和辅助服务自身的提示随之切换；内核返回的报错原样显示。已连接时 macOS 状态栏图标缓慢旋转，并随浅色/深色菜单栏切换颜色。
@@ -33,7 +33,9 @@ npm run desktop:dev
   保存已开启的选项也会重新注册。若在任务管理器中禁用，启动时会提示，需在任务管理器启用或重新保存该选项。
 - 导入本地 YAML，或下载 HTTPS 完整 YAML 订阅；不转换 Base64 列表和单节点链接。
 - 配置可加密导出（设置密码）；导入加密文件或添加加密订阅时输入密码，订阅密码随配置保存，
-  每次更新自动解密。
+  每次更新自动解密。导出和发布使用带认证的 v2 格式（Argon2id + XChaCha20-Poly1305），
+  仍可读取旧版 AES-CFB 文件；格式与旧客户端兼容说明见
+  [CONFIGURATION.md](../CONFIGURATION.md#configuration-encryption)。
 - 导入文件或新增订阅时，只保留兼容项（VLESS、Hysteria2 与 Tailscale 节点）并生成独立的新配置，不覆盖原文件或已有配置。Trojan、未知字段和无效项会被跳过，并立即显示清单；失效的代理组成员与规则引用也会清理。兼容节点的凭据及规则集 URL 保留。无法解析的 YAML 仍会报错。
 - 编辑、启用及订阅更新继续严格校验内核支持范围。
 - 原始 YAML、待应用版本、上一版本保存在同一原子写入文档中；运行副本从 YAML 文档生成，
@@ -73,6 +75,25 @@ npm run desktop:dev
 应用数据：macOS 的 `~/Library/Application Support/org.clyntis.desktop`；Windows 的
 `%APPDATA%\org.clyntis.desktop`（以 Tauri `app_data_dir()` 为准）。配置包含凭据，属于本地私有数据，
 不是加密保险库；不要提交该目录。删除配置会一并删除其本地历史和普通模式缓存。
+
+## 前端结构
+
+```text
+src/
+├─ App.tsx            外壳：侧栏导航、状态轮询、通知、页面切换
+├─ pages/             每个页面一个文件（Overview、Proxies、Profiles、Rules、
+│                     Connections、Requests、Logs、Settings）
+├─ features/          页面内的独立功能区（去广告、DNS 泄漏检测、重写）
+├─ components/        通用组件：common.tsx（Modal、Confirm、Toggle、Setting、
+│                     Empty、Stat、Perform 类型）、Editor.tsx（YAML 编辑器）
+├─ types.ts           与 Tauri 命令对应的类型和格式化函数
+├─ i18n.ts、locales/  界面文案；中文原文即键，英文在 locales/en.ts
+├─ Updates.tsx        客户端自动更新
+└─ visibility.ts      窗口隐藏时暂停轮询
+```
+
+新增文案用 `t("中文")`，并在 `locales/en.ts` 补英文；`tests/i18n.test.tsx` 会扫描
+`src/` 下全部源文件检查遗漏。前端检查：`npx tsc -b`、`npm test`、`npx prettier --check src tests`。
 
 ## 进程与接口
 
@@ -198,7 +219,7 @@ Windows 的最后一条命令使用 `python` 和 `clyntis-runner.exe`。
 全新安装、升级、卸载，以及使用真实 VLESS 测试节点与 Tailscale tailnet（直连与 DERP 中继）的连通性验证。
 这些检查会改变系统网络，应在测试机执行，不能用回环测试或 CI 成功代替。
 
-首版不包含 Linux GUI、Windows ARM64、自动升级、云同步、订阅转换，以及 VLESS、Tailscale 以外的出站协议。
+当前不包含 Linux GUI、Windows ARM64、云同步、订阅转换，以及 VLESS、Hysteria2、Tailscale 以外的出站协议。
 
 ### 辅助服务自动更新
 

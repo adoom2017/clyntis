@@ -14,9 +14,15 @@ import {
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import { locale, t } from "./i18n";
-import { usePageVisible } from "./visibility";
-import { Empty, Modal, Setting, Toggle, type Perform } from "./App";
+import { locale, t } from "../i18n";
+import { usePageVisible } from "../visibility";
+import {
+  Empty,
+  Modal,
+  Setting,
+  Toggle,
+  type Perform,
+} from "../components/common";
 import {
   bytes,
   type BodyView,
@@ -27,7 +33,7 @@ import {
   type RequestEntry,
   type RewriteStatus,
   type Settings,
-} from "./types";
+} from "../types";
 
 /** Rows the page keeps; the core keeps its own, larger log. */
 const ROWS = 5000;

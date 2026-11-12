@@ -739,17 +739,21 @@ pub fn read_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<Profile> {
     Ok(profile)
 }
 #[tauri::command]
-pub fn export_encrypted(
+pub async fn export_encrypted(
     state: State<'_, Desktop>,
     id: Uuid,
     password: String,
     path: String,
 ) -> Reply<()> {
     let profile = state.store.get(id).map_err(error)?;
-    let encrypted = profiles::encrypt_yaml(&profile.yaml, &password).map_err(error)?;
-    std::fs::write(&path, encrypted)
-        .with_context(|| tr!("无法写入导出文件", "Cannot write the export file"))
-        .map_err(error)
+    tokio::task::spawn_blocking(move || {
+        let encrypted = profiles::encrypt_yaml(&profile.yaml, &password)?;
+        std::fs::write(&path, encrypted)
+            .with_context(|| tr!("无法写入导出文件", "Cannot write the export file"))
+    })
+    .await
+    .map_err(|e| error(e.into()))?
+    .map_err(error)
 }
 /// The saved COS SecretId, or None without saved keys. The SecretKey never
 /// leaves the keychain.

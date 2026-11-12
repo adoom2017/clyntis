@@ -91,7 +91,7 @@ pub extern "C" fn meta_abi_version_v1() -> u32 {
     1
 }
 
-/// Decrypt and validate the existing AES-CFB/Base64 configuration format.
+/// Decrypt (authenticated v2 or legacy AES-CFB, both Base64) and validate a configuration.
 ///
 /// # Safety
 /// Input buffers must be readable for their lengths. Output buffer and length
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn meta_decrypt_config_v1(
             !plaintext.is_empty() && plaintext.len() <= LIMIT,
             "decrypted configuration is empty or exceeds 16 MiB"
         );
-        // CFB has no authentication tag. Never expose unvalidated plaintext.
+        // The legacy format has no authentication tag. Never expose unvalidated plaintext.
         clyntis_config::Config::parse(&plaintext).map_err(|_| {
             anyhow::anyhow!("cannot decrypt configuration: check password and format")
         })?;

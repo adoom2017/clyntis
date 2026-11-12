@@ -24,6 +24,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 aes = "0.8"
 cfb-mode = "0.8"
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
 rand = "0.8"
@@ -44,6 +46,13 @@ clyntis-platform = { path = "crates/platform" }
 clyntis-core = { path = "crates/core" }
 clyntis-runtime = { path = "crates/runtime" }
 clyntis-tailscale = { path = "crates/tailscale" }
+
+# Argon2id is far too slow unoptimized for tests that derive real keys.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

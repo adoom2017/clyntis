@@ -8,7 +8,9 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App, { Editor, Modal } from "../src/App";
+import App from "../src/App";
+import { Editor } from "../src/components/Editor";
+import { Modal } from "../src/components/common";
 import { useState } from "react";
 import { bytes, initial } from "../src/types";
 

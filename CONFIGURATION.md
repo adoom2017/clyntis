@@ -527,19 +527,43 @@ dns:
 After changing a range, reconnect and clear Chrome's host cache
 (`chrome://net-internals/#dns`) or restart Chrome.
 
-## Legacy configuration encryption
+## Configuration encryption
 
-The CLI retains the previous AES-CFB128/Base64 configuration format:
+Profiles can be shared as a single Base64 text file protected by a password:
 
 ```sh
 clyntis -f config.yaml --action encrypt
 clyntis -f config-encrypt.yaml --action decrypt
+clyntis -f config-encrypt.yaml -p PASSWORD      # run an encrypted file directly
 ```
 
 The password is prompted when omitted; `-p` supplies it non-interactively.
 Outputs are written to `config-encrypt.yaml` or `config-decrypt.yaml` by default
-and never overwrite existing files. This legacy format is **not authenticated**;
-do not treat it as a modern secret-storage format.
+and never overwrite existing files. The desktop and iOS apps (encrypted export,
+publishing, encrypted subscriptions) and the C ABI (`meta_encrypt_config_v1`,
+`meta_decrypt_config_v1`) use the same code (`clyntis_config::crypto`).
+
+**v2 format (written by versions after 1.2.8).** Argon2id (64 MiB, 3 passes, 1 lane)
+derives a 256-bit key from the password and a random 16-byte salt;
+XChaCha20-Poly1305 encrypts under a random 24-byte nonce. The header,
+including the KDF cost, is authenticated, so a wrong password or a modified
+file is an error rather than garbage:
+
+```text
+base64( "CLYNTISE" | version 1 | m_cost KiB u32 LE | t_cost u32 LE | lanes u8
+        | salt[16] | nonce[24] | ciphertext | tag[16] )
+```
+
+Readers accept a cost of 8–256 MiB, 1–16 passes and 1–8 lanes, so a crafted
+header cannot exhaust memory.
+
+**Legacy format.** Files from earlier versions (Alpha AES-CFB128 with a fixed
+IV and the zero-padded password as the key) are still read, recognised by the
+missing `CLYNTISE` header. This format is **not authenticated**; the plaintext
+must pass strict configuration validation before it is used. Clients up to
+1.2.8 cannot read v2 files: for them, write the legacy format with
+`--action encrypt --legacy-encryption`, and re-export once every device is
+updated. Ciphertext is limited to 24 MiB and plaintext to 16 MiB.
 
 ## Publishing encrypted profiles to Tencent COS
 
@@ -557,6 +581,9 @@ subscribed to that URL get the new profile at their next update.
    the encryption password. When the profile's subscription URL is a COS
    object (`https://<bucket>.cos.<region>.myqcloud.com/<path>`), these are
    filled in from it; afterwards the profile remembers where it was published.
+
+Published files use the v2 encryption format, so subscribed devices running
+1.2.8 or earlier must update before the next publish.
 
 The upload is a single PUT Object request signed with COS's
 `q-sign-algorithm=sha1` scheme (`crates/core/src/cos.rs`), valid for ten

@@ -1,5 +1,5 @@
 //! Generated with Go crypto/aes + crypto/cipher using Alpha's key/IV rules.
-use clyntis_config::crypto::{decrypt, encrypt};
+use clyntis_config::crypto::{decrypt, encrypt_legacy};
 
 #[test]
 fn alpha_cfb128_golden_vectors() {
@@ -42,7 +42,7 @@ fn alpha_cfb128_golden_vectors() {
             "e4CyqWXnM5kvT1vEyi2o+QnIUY8w2q6JXZSweV5bfQ6m23IIuYeuiD1T7gz8VkTNSDvv4A==",
         ),
     ] {
-        assert_eq!(encrypt(plaintext, password).unwrap(), ciphertext);
+        assert_eq!(encrypt_legacy(plaintext, password).unwrap(), ciphertext);
         assert_eq!(
             &**decrypt(ciphertext.as_bytes(), password).unwrap(),
             plaintext

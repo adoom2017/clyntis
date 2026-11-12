@@ -96,7 +96,7 @@ A controller on a non-loopback address requires a `secret`.
 | `--test-egress` | macOS: probe physical exits without starting TUN |
 | `--auto-dns` | macOS: point system DNS at the core for this run |
 | `--ext-ctl`, `--secret` | Override the controller address and secret |
-| `--action encrypt\|decrypt` | Legacy AES-CFB configuration encryption (`-p`, `-o`) |
+| `--action encrypt\|decrypt` | Password-encrypt or decrypt a configuration (`-p`, `-o`; see [encryption](CONFIGURATION.md#configuration-encryption)) |
 
 Run `clyntis --help` for the full list.
 
@@ -122,3 +122,7 @@ that file relative to `-d`; otherwise to the terminal.
   settings, DNS, ad blocking, TUN details): [CONFIGURATION.md](CONFIGURATION.md)
 - Publishing encrypted profiles to Tencent COS:
   [CONFIGURATION.md](CONFIGURATION.md#publishing-encrypted-profiles-to-tencent-cos)
+- Configuration encryption format:
+  [CONFIGURATION.md](CONFIGURATION.md#configuration-encryption)
+- All other documents (runtime internals, protocols, acceptance records and
+  history): [docs/README.md](docs/README.md)

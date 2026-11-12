@@ -4,6 +4,8 @@ import XCTest
 final class RemoteConfigImportTests: XCTestCase {
     private static let plaintext = Data("mixed-port: 7890\nmode: rule\nrules: ['MATCH,DIRECT']\n".utf8)
     private static let encrypted = Data("fzpHye22WU1hKPevr2RwfVJhLri0X0NMDQS3D4iMfGPUsXSwpivnmPeok4ej8i4i8P8bgw==".utf8)
+    /// crates/config/tests/v2_vectors.rs (Argon2id 8 MiB, 1 pass).
+    private static let encryptedV2 = Data("Q0xZTlRJU0UBACAAAAEAAAABH2+xPpTlDWnwneIDDbYH/U88mN4SjPxzSKxskKxz0HerDX7u5PuHwVZmHqMSOXPmgMUK6wP6z3+8Ott0kVYSdtdqiE65RgZwP93yZOBcFH9pOSCP6dZJDSV2ClagKO9y72404ZuMdk75erMT".utf8)
     private static let responseStarted = Notification.Name("ClyntisRemoteImportTestResponseStarted")
 
     func testPlaintextWithoutPasswordIsStoredWithoutModification() async throws {
@@ -61,6 +63,9 @@ final class RemoteConfigImportTests: XCTestCase {
         XCTAssertFalse(ConfigCrypto.looksEncrypted(yaml))
         XCTAssertEqual(try ConfigCrypto.decrypt(encrypted, password: "导出密码"), yaml)
         XCTAssertThrowsError(try ConfigCrypto.decrypt(encrypted, password: "wrong"))
+        // Exports use the authenticated v2 format ("CLYNTISE" header).
+        XCTAssertTrue(String(decoding: encrypted, as: UTF8.self).hasPrefix("Q0xZTlRJU0"))
+        XCTAssertEqual(try ConfigCrypto.decrypt(Self.encryptedV2, password: "test-password"), Self.plaintext)
         XCTAssertThrowsError(try ConfigCrypto.encrypt(yaml, password: ""))
         XCTAssertThrowsError(try ConfigCrypto.encrypt(Data("not: [valid".utf8), password: "p"))
     }

@@ -1,6 +1,7 @@
 import Foundation
 
-/// Legacy AES-CFB/Base64 configuration encryption shared with the desktop app.
+/// Configuration encryption shared with the desktop app: writes the authenticated
+/// v2 format (Argon2id + XChaCha20-Poly1305) and reads v2 or legacy AES-CFB, all Base64.
 enum ConfigCrypto {
     static var decryptFailed: String { L("解密失败，请检查密码和文件格式。") }
 
