@@ -92,6 +92,15 @@ format. For building and running, see the [README](README.md).
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the
   key private and turn decryption off when not analyzing.
+- **Resource loading:** Connecting uses local caches only. Missing GeoIP/GeoSite,
+  rule-provider files, ad blocking lists, rewrite modules and their scripts do
+  not block startup. Conditions whose resources are unavailable are disabled
+  as a whole (including `NOT`/compound rules); remaining rules and the fallback
+  route continue to apply. After startup, missing resources are fetched through
+  the selected proxy, with direct fallback and retries (5 seconds initially,
+  doubling to 10 minutes). Successful resources update routing, DNS, ad blocking
+  and HTTPS rewrites without reconnecting. Each failed resource retains its
+  usable cached data and does not prevent other resources from being applied.
 - **Rewrite modules** (`rewrite` section, written by the apps' settings):
   Surge modules (`.sgmodule`), Loon plugins (`.plugin`) and Quantumult X
   rewrite snippets, subscribed by URL or written by hand (`custom`, applied

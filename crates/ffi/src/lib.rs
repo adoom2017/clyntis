@@ -375,8 +375,8 @@ pub unsafe extern "C" fn meta_drain_logs_v1(
 /// Download missing or expired routing resources (GeoIP/GeoSite, rule providers)
 /// referenced by `config` into `directory`, then validate them. Returns at once
 /// when every referenced file is present and current. Blocks until done. Hosts
-/// call this before starting a packet tunnel so the memory- and
-/// time-constrained tunnel process starts from local files.
+/// may call this as an optional cache warmup. Tunnel startup never requires
+/// prefetch: missing resources are fetched and applied after connecting.
 ///
 /// # Safety
 /// `data` and `directory` must be readable for their lengths; `directory` is
@@ -418,7 +418,7 @@ pub unsafe extern "C" fn meta_prefetch_resources_v1(
 /// Report whether the routing files `config` references exist in `directory`
 /// and are within their update intervals: `state` receives 0 (current),
 /// 1 (present but expired: usable, refresh when convenient) or 2 (missing:
-/// prefetch before starting). Cheap; parses no geo data.
+/// fetched after connecting). Cheap; parses no geo data.
 ///
 /// # Safety
 /// `data` and `directory` must be readable for their lengths; `state` writable.

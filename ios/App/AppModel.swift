@@ -45,8 +45,6 @@ final class AppModel {
     private static let autoReconnectKey = "autoReconnect"
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
-    /// The background refresh of expired routing files, if one is running.
-    private var resourceRefresh: Task<Void, Never>?
     private var startTimeout: Task<Void, Never>?
     private var store: ProfileStore?
     private var requestInFlight = false
@@ -137,7 +135,7 @@ final class AppModel {
         log.info("connect: begin profile=\(selected.id.uuidString) tunnel=\(self.tunnelIdentifier) existingManager=\(self.manager != nil)")
         var step = "read configuration"
         do {
-            // Validate and prefetch what the tunnel will run: the profile with
+            // Validate what the tunnel will run: the profile with
             // custom rules and app settings.
             let (withRules, skipped) = try CustomRules.applied(to: store.configuration(for: selected.id))
             let bytes = try overrides.applied(to: withRules)
@@ -145,33 +143,8 @@ final class AppModel {
             step = "validate configuration"
             log.info("connect: \(step) (\(bytes.count) bytes)")
             try await validate(bytes, directory: store.directory(for: selected.id))
-            // Fetch GeoIP/GeoSite and rule providers here, where neither the tunnel's
-            // ~50 MiB memory limit nor its start timeout applies. Only missing files
-            // hold up connecting: expired ones still work and are refreshed after the
-            // tunnel is up (the tunnel refreshes rule providers itself; geo files
-            // take effect on the next connect).
-            step = "check resources"
-            let directory = store.directory(for: selected.id)
-            let resources = (try? await Task.detached {
-                try CoreSession.resourceState(configuration: bytes, directory: directory)
-            }.value) ?? .missing
-            log.info("connect: routing resources \(String(describing: resources))")
-            if resources == .missing {
-                step = "prefetch resources"
-                phase = L("正在下载路由资源…")
-                let started = Date()
-                do {
-                    try await Task.detached {
-                        try CoreSession.prefetchResources(configuration: bytes, directory: directory)
-                    }.value
-                    log.info("connect: resources ready in \(String(format: "%.1f", Date().timeIntervalSince(started)))s")
-                } catch {
-                    // Not fatal: the tunnel can still fetch what is missing itself.
-                    log.warning("connect: prefetch failed: \(Diagnostics.describe(error))")
-                }
-                phase = nil
-            }
-            // Validation and prefetch ran a core in this process; keep its logs.
+            // The tunnel reads cached resources at startup and downloads missing
+            // data after connecting, then applies it without reconnecting.
             Diagnostics.collectCoreLogs()
             let manager = self.manager ?? NETunnelProviderManager()
             let proto = NETunnelProviderProtocol()
@@ -197,7 +170,6 @@ final class AppModel {
             status = manager.connection.status
             log.info("connect: start requested, status=\(self.status.rawValue)")
             if !active { awaitSystemStart() }
-            if resources == .expired { refreshResources(bytes, directory: directory) }
         } catch {
             log.error("connect: failed at \(step): \(Diagnostics.describe(error))")
             self.error = error.localizedDescription
@@ -390,24 +362,6 @@ final class AppModel {
         } onCancel: { worker.cancel() }
         profiles = try store.profiles()
         if !active { selectedID = profile.id }
-    }
-
-    /// Downloads expired routing files in the background for the next connect.
-    /// One at a time: each connect attempt would otherwise start another
-    /// download of the same files (geoip.dat alone is 16 MiB).
-    private func refreshResources(_ configuration: Data, directory: URL) {
-        guard resourceRefresh == nil else { return }
-        resourceRefresh = Task.detached(priority: .utility) { [weak self] in
-            defer { Task { @MainActor in self?.resourceRefresh = nil } }
-            let started = Date()
-            do {
-                try CoreSession.prefetchResources(configuration: configuration, directory: directory)
-                Diagnostics.app.info("resources refreshed in background in \(String(format: "%.1f", Date().timeIntervalSince(started)))s")
-            } catch {
-                Diagnostics.app.warning("background resource refresh failed: \(Diagnostics.describe(error))")
-            }
-            Diagnostics.collectCoreLogs()
-        }
     }
 
     // MARK: Custom rules

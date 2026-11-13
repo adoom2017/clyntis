@@ -339,8 +339,8 @@ impl Handle {
         })
     }
     pub(crate) fn start(&self) -> Result<()> {
-        // Start may still fetch missing routing resources; their downloads are
-        // bounded by progress timeouts, so allow far more than other commands.
+        // Startup reads only cached resources; allow time to parse large local
+        // geo files on mobile devices, without waiting for network downloads.
         self.command_within(Command::Start, Duration::from_secs(120))
     }
     pub(crate) fn check_packet_queue(&self) -> Result<()> {

@@ -26,9 +26,9 @@ connected. It also provides:
   their connections are refused, ahead of every rule. Statistics show blocks
   by DNS and connection, the most blocked domains and the latest blocks; swipe
   "放行" to allow one at once. Allowlist edits apply to the running tunnel;
-  switching lists needs a reconnect. Lists are fetched by the app before
-  connecting like other routing resources; the large AdGuard list costs several
-  MB of the tunnel's memory.
+  switching lists needs a reconnect. Cached lists are loaded at startup;
+  missing lists are fetched and applied by the core after connecting. The large
+  AdGuard list costs several MB of the tunnel's memory.
 - **Connections** (概览 → 连接): open connections with target (the domain
   behind a fake IP), protocol, proxy chain, traffic and age; search, swipe to
   close one, or close all.
@@ -205,13 +205,16 @@ imports through ATS configuration; HTTPS server certificate validation remains
 enabled. See Apple's [URLSession documentation](https://developer.apple.com/documentation/foundation/urlsession)
 and [ATS configuration](https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity).
 
-Before connecting, the app checks the profile's routing resources (GeoIP,
-GeoSite, rule providers) without parsing them. Missing files are downloaded
-first; expired ones are used as they are and refreshed in the background (the
-tunnel refreshes rule providers itself, new geo files apply on the next
-connect); current ones skip the step. The tunnel process never has to download
-or parse them twice within its ~50 MiB memory limit, and logs its memory and
-connection count every 30 seconds.
+Connecting validates the profile and starts the tunnel from locally cached
+routing resources. Missing GeoIP/GeoSite data, rule providers, ad blocking
+lists, rewrite modules and scripts do not delay or fail the connection.
+Conditions depending on unavailable data are skipped as a whole; other rules
+and the profile's fallback route remain active. After startup, the core fetches
+missing resources through the selected proxy (falling back to direct on failure),
+retries with backoff, and applies successful resources to routing, DNS and
+rewrites without reconnecting. Expired cached files remain usable while updates
+are fetched. Unchanged geo sets are shared to limit memory use in the tunnel;
+its memory and connection count are logged every 30 seconds.
 
 At runtime the host sets MTU 1280, installs the IPv4 default VPN route and DNS
 `198.18.0.1`, and intercepts port 53 in the packet core. IPv6 is routed through

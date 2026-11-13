@@ -31,7 +31,7 @@ final class CoreSession {
     }
 
     /// Downloads missing/expired routing resources into `directory`. Blocking; run
-    /// it in the app before starting the tunnel, whose process is memory-limited.
+    /// it as an optional cache warmup; connecting never waits for downloads.
     static func prefetchResources(configuration: Data, directory: URL) throws {
         let path = Data(directory.path.utf8)
         let result = configuration.withUnsafeBytes { config in
@@ -47,7 +47,7 @@ final class CoreSession {
         case current = 0
         /// Present but past an update interval: usable, refresh when convenient.
         case expired = 1
-        /// The core cannot start without fetching first.
+        /// Missing files are fetched asynchronously after connecting.
         case missing = 2
     }
 

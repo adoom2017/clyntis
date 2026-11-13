@@ -106,7 +106,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                             directory: store.directory(for: id), hooks: &hooks)
                 log.info("start: core created memory=\(memory())")
                 self.collectLogs()
-                // Loads routing resources (geoip/geosite/rule providers) and may download them.
+                // Loads cached resources only; downloads and hot updates run after startup.
                 step = "start core"
                 try self.core?.start()
                 log.info("start: core started memory=\(memory())")

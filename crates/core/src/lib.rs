@@ -69,6 +69,7 @@ pub struct Core {
     lifecycle: Mutex<bool>,
     pub events: tokio::sync::broadcast::Sender<String>,
     resources: RwLock<Arc<resources::Resources>>,
+    resource_loading: tokio::sync::Mutex<()>,
     /// The user's ad blocking allowlist: the configuration's until the apps
     /// replace it while running, and kept across resource refreshes.
     adblock_allow: RwLock<Vec<String>>,
@@ -411,6 +412,7 @@ impl Core {
             lifecycle: Mutex::new(false),
             events,
             resources: RwLock::new(Arc::new(resources::Resources::default())),
+            resource_loading: tokio::sync::Mutex::new(()),
             clock,
             xudp_pool: Default::default(),
             hysteria2: Default::default(),
@@ -458,12 +460,12 @@ impl Core {
         packets: Option<Arc<dyn clyntis_platform::PacketIo>>,
         system_dns: Option<SocketAddr>,
     ) -> Result<Running> {
-        // Hosted packet tunnels get their files from the host's prefetch (see
-        // meta_prefetch_resources_v1); start only downloads what is missing.
-        self.prepare_resources(false)
-            .await
-            .context("cannot prepare routing resources")?;
+        // Restore the selected node before any background download chooses an
+        // outbound. Startup uses local files only and never waits for a server.
         self.load_profile().context("cannot load saved profile")?;
+        self.prepare_resources_with(false, resources::LoadMode::Cached)
+            .await
+            .context("cannot load cached routing resources")?;
         for range in self.config.dns.browser_local_fake_ranges(self.config.ipv6) {
             tracing::warn!(
                 %range,
@@ -525,44 +527,6 @@ impl Core {
         if self.config.profile.store_fake_ip || self.config.profile.store_selected {
             let core = self.clone();
             tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(5));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{if core.save_profile().is_err(){tracing::warn!("cannot save profile");}}}}});
-        }
-        if self.config.geo_auto_update
-            || !self.config.rule_providers.is_empty()
-            || self.config.adblock.enable
-            || self.config.rewrite.enable
-        {
-            let core = self.clone();
-            tasks.spawn(async move {
-                let seconds=core.config.rule_providers.values().filter(|p|p.interval>0).map(|p|p.interval).chain(core.config.adblock.enable.then_some(core.config.adblock.interval)).chain(core.config.rewrite.enable.then_some(core.config.rewrite.interval)).chain(std::iter::once(if core.config.geo_auto_update{core.config.geo_update_interval.saturating_mul(3600)}else{86400})).min().unwrap_or(86400).max(1);
-                let mut interval=tokio::time::interval(Duration::from_secs(seconds));interval.tick().await;
-                loop {tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{}};tokio::select!{_=core.stop.cancelled()=>break,result=core.prepare_resources(true)=>{if result.is_err(){tracing::warn!("routing resource refresh failed; retaining previous snapshot");}}}}
-            });
-        }
-        if self.resources_incomplete() {
-            // Lists, modules or scripts that could not be fetched before the
-            // proxy was usable: keep fetching them now that it is, and apply
-            // each success at once, as a restart would.
-            let core = self.clone();
-            tasks.spawn(async move {
-                let mut delay = MISSING_RETRY_FIRST;
-                while core.resources_incomplete() {
-                    tokio::select! {
-                        _ = core.stop.cancelled() => break,
-                        _ = tokio::time::sleep(delay) => {}
-                    }
-                    tokio::select! {
-                        _ = core.stop.cancelled() => break,
-                        result = core.prepare_resources(false) => match result {
-                            Ok(()) if !core.resources_incomplete() => {
-                                tracing::info!("missing routing resources downloaded through the proxy; applied");
-                            }
-                            Ok(()) => tracing::debug!("some routing resources are still missing; retrying"),
-                            Err(error) => tracing::warn!(error = %format!("{error:#}"), "missing routing resource download failed; retrying"),
-                        }
-                    }
-                    delay = (delay * 2).min(MISSING_RETRY_MAX);
-                }
-            });
         }
         if let Some(packets) = packets {
             let core = self.clone();
@@ -717,6 +681,8 @@ impl Core {
                 }
             });
         }
+        // Recovery and periodic updates share one cancellable worker.
+        tasks.spawn(self.clone().maintain_resources());
         Ok(Running {
             system_dns_tasks,
             core: self.clone(),
@@ -725,7 +691,80 @@ impl Core {
             controller_address,
         })
     }
-    /// Proxy for routing-resource downloads when a direct download fails: the
+    /// Fetch after startup, apply successes independently and retry failures.
+    async fn maintain_resources(self: Arc<Self>) {
+        let seconds = self
+            .config
+            .rule_providers
+            .values()
+            .filter(|p| p.interval > 0)
+            .map(|p| p.interval)
+            .chain(
+                self.config
+                    .adblock
+                    .enable
+                    .then_some(self.config.adblock.interval),
+            )
+            .chain(
+                self.config
+                    .rewrite
+                    .enable
+                    .then_some(self.config.rewrite.interval),
+            )
+            .chain(std::iter::once(if self.config.geo_auto_update {
+                self.config.geo_update_interval.saturating_mul(3600)
+            } else {
+                86400
+            }))
+            .min()
+            .unwrap_or(86400)
+            .max(1);
+        let interval = Duration::from_secs(seconds);
+        let mut retry = MISSING_RETRY_FIRST;
+        // Expired caches are usable immediately, but refresh them shortly after
+        // connecting rather than waiting another complete update interval.
+        let first_refresh = if self.resource_freshness().ok() == Some(Freshness::Expired) {
+            MISSING_RETRY_FIRST
+        } else {
+            interval
+        };
+        let mut periodic = tokio::time::Instant::now() + first_refresh;
+        loop {
+            let missing = self.resources_incomplete();
+            let until_refresh = periodic.saturating_duration_since(tokio::time::Instant::now());
+            let delay = if missing {
+                retry.min(until_refresh)
+            } else {
+                until_refresh
+            };
+            tokio::select! {
+                _ = self.stop.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            let refresh = tokio::time::Instant::now() >= periodic;
+            tokio::select! {
+                _ = self.stop.cancelled() => break,
+                result = self.prepare_resources_with(refresh, resources::LoadMode::Available) => {
+                    match result {
+                        Ok(()) if missing && !self.resources_incomplete() => {
+                            tracing::info!("missing routing resources downloaded; applied without reconnecting");
+                        }
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(error = %format!("{error:#}"), "routing resource refresh failed; retaining previous snapshot"),
+                    }
+                }
+            }
+            if refresh {
+                periodic = tokio::time::Instant::now() + interval;
+            }
+            retry = if self.resources_incomplete() {
+                (retry * 2).min(MISSING_RETRY_MAX)
+            } else {
+                MISSING_RETRY_FIRST
+            };
+        }
+    }
+    /// Preferred proxy for routing-resource downloads: the
     /// MATCH rule's target, else the first group, else the first proxy. Only a
     /// name that resolves to a real proxy (not DIRECT/REJECT) qualifies. Rules
     /// cannot decide this: they may depend on the resources being fetched.
@@ -780,17 +819,23 @@ impl Core {
         resources::freshness(&config)
     }
     pub async fn prepare_resources(&self, refresh: bool) -> Result<()> {
+        self.prepare_resources_with(refresh, resources::LoadMode::Required)
+            .await
+    }
+    async fn prepare_resources_with(&self, refresh: bool, mode: resources::LoadMode) -> Result<()> {
+        let _loading = self.resource_loading.lock().await;
         let mut config = self.config.clone();
         config.rules = self.policy.read().unwrap().raw_rules.clone();
         let previous = self.resources.read().unwrap().clone();
         let next = Arc::new(
-            resources::Resources::load(
+            resources::Resources::load_with(
                 &config,
                 &self.resolver,
                 &self.hooks,
                 refresh,
                 &previous,
                 Some(self),
+                mode,
             )
             .await?,
         );
@@ -1656,19 +1701,9 @@ impl Core {
         status["decrypting"] = serde_json::json!(self.mitm.is_active());
         status
     }
-    /// Whether an ad blocking list, rewrite module, script or response file
-    /// of the active snapshot could not be loaded.
+    /// Includes routing data, lists, modules and their dependent files.
     fn resources_incomplete(&self) -> bool {
-        let resources = self.resources.read().unwrap();
-        resources
-            .adblock
-            .as_ref()
-            .is_some_and(|f| f.lists.iter().any(|l| l.error.is_some()))
-            || resources.rewrite.as_ref().is_some_and(|r| {
-                r.modules
-                    .iter()
-                    .any(|m| m.error.is_some() || !m.missing.is_empty())
-            })
+        self.resources.read().unwrap().incomplete()
     }
     pub(crate) fn rewriter(&self) -> Option<Arc<rewrite::Rewriter>> {
         self.resources.read().unwrap().rewrite.clone()

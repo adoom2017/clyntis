@@ -107,9 +107,8 @@ impl Controller {
     }
 }
 /// Download missing routing resources into the profile's runtime directory as
-/// the desktop user, over the ordinary network. TUN sessions upload these files
-/// to the service, so the core never has to fetch them while TUN routing is
-/// being brought up.
+/// the desktop user. This optional import-time warmup never gates connecting;
+/// TUN sessions upload available files and fetch any others after startup.
 pub async fn prefetch(store: &Store, profile: &Profile, settings: &Settings) -> Result<()> {
     let yaml = runtime_yaml(profile, settings, &"x".repeat(64), &store.custom_rules()?)?;
     let mut config = validate(&yaml)?;

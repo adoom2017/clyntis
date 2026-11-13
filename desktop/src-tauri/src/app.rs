@@ -185,22 +185,8 @@ impl Desktop {
             &"x".repeat(64),
             &self.store.custom_rules()?,
         )?;
-        // Fetch before stopping the current engine: the network still works
-        // normally, and the TUN session can then start from local files.
-        if settings.capture == Capture::Tun {
-            self.status("starting", None);
-            if let Err(error) = engine::prefetch(&self.store, &profile, &settings).await {
-                engine::log(
-                    &self.app,
-                    &self.logs,
-                    "warning",
-                    &clyntis_desktop_model::redact(&tr!(
-                        "路由资源预下载失败，将由内核重试：{error:#}",
-                        "Prefetching routing resources failed; the core will retry: {error:#}"
-                    )),
-                );
-            }
-        }
+        // The core starts from local resources and fetches missing data after
+        // the proxy is up; prefetch must never hold up connecting.
         let previous = operation.active.clone();
         if let Some(mut engine) = operation.engine.take() {
             self.status("stopping", None);

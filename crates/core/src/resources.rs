@@ -14,8 +14,20 @@ use std::{
 };
 
 const LIMIT: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadMode {
+    /// Explicit prefetch/validation: all routing data must be usable.
+    Required,
+    /// Startup: read local files only; unavailable resources never block it.
+    Cached,
+    /// Running: fetch independently, keeping usable data on each failure.
+    Available,
+}
 #[derive(Default)]
 pub struct Resources {
+    partial: bool,
+    routing_incomplete: bool,
     matchers: HashMap<(String, String), Matcher>,
     /// Ad blocking lists, when `adblock.enable`.
     pub adblock: Option<Arc<crate::adblock::Filter>>,
@@ -67,6 +79,33 @@ struct ListSource {
     stamp: Option<Stamp>,
 }
 impl Resources {
+    /// A failed geo file must not prevent other resources from being applied.
+    fn recover_geo(
+        &mut self,
+        result: Result<()>,
+        kind: &str,
+        tags: &[String],
+        previous: &Self,
+        pending: &mut Staged,
+        checkpoint: usize,
+    ) -> Result<()> {
+        if let Err(error) = result {
+            if !self.partial {
+                return Err(error);
+            }
+            pending.rollback(checkpoint);
+            self.routing_incomplete = true;
+            tracing::warn!(resource = kind, error = %format!("{error:#}"), "routing data unavailable; retaining cached rules or skipping");
+            for tag in tags {
+                let key = (kind.to_owned(), tag.clone());
+                self.matchers.remove(&key);
+                if let Some(matcher) = previous.matchers.get(&key) {
+                    self.matchers.insert(key, matcher.clone());
+                }
+            }
+        }
+        Ok(())
+    }
     /// Copies the `kind` matchers for every tag in `tags` into `out` when this
     /// snapshot has all of them; matchers share their data through `Arc`.
     fn reuse(&self, kind: &str, tags: &[String], out: &mut Resources) -> bool {
@@ -81,7 +120,28 @@ impl Resources {
         out.matchers.extend(found);
         true
     }
+    pub fn incomplete(&self) -> bool {
+        self.routing_incomplete
+            || self
+                .adblock
+                .as_ref()
+                .is_some_and(|f| f.lists.iter().any(|l| l.error.is_some()))
+            || self.rewrite.as_ref().is_some_and(|r| {
+                r.modules
+                    .iter()
+                    .any(|m| m.error.is_some() || !m.missing.is_empty())
+            })
+    }
     pub fn bind(&self, matcher: &Matcher) -> Result<Matcher> {
+        match self.bind_required(matcher) {
+            Ok(bound) => Ok(bound),
+            // Disable the WHOLE condition, including NOT and compound rules.
+            // Replacing only a missing child with false could turn NOT into true.
+            Err(_) if self.partial => Ok(Matcher::Or(Arc::from([]))),
+            Err(error) => Err(error),
+        }
+    }
+    fn bind_required(&self, matcher: &Matcher) -> Result<Matcher> {
         matcher.bind(&|m| {
             let key = match m {
                 Matcher::GeoIp(v) => ("geoip", v),
@@ -115,58 +175,99 @@ impl Resources {
         previous: &Resources,
         via: Option<&crate::Core>,
     ) -> Result<Self> {
+        Self::load_with(
+            config,
+            resolver,
+            hooks,
+            refresh,
+            previous,
+            via,
+            LoadMode::Required,
+        )
+        .await
+    }
+    pub(crate) async fn load_with(
+        config: &Config,
+        resolver: &crate::dns::Resolver,
+        hooks: &clyntis_platform::Hooks,
+        refresh: bool,
+        previous: &Resources,
+        via: Option<&crate::Core>,
+        mode: LoadMode,
+    ) -> Result<Self> {
         let proxy = via.and_then(|core| core.resource_proxy().map(|name| (core, name)));
         let fetch = Fetch {
             resolver,
             hooks,
             proxy: proxy.as_ref().map(|(core, name)| (*core, name.as_str())),
+            download: mode != LoadMode::Cached,
         };
-        // Rebuilding geo data while the old snapshot is alive doubles its memory,
-        // which the ~50 MiB iOS tunnel extension cannot afford; there, the host
-        // refreshes geo files before each start (meta_prefetch_resources_v1).
-        let geo_refresh =
-            refresh && (!config.internal_host_packet_io || previous.matchers.is_empty());
+        let refresh = refresh && fetch.download;
+        // Unchanged geo data shares its compiled sets with the live snapshot.
+        let geo_refresh = refresh;
         let mut refs = references(config)?;
         let mut pending = Staged::default();
         let mut providers = HashMap::new();
-        let mut provider_sources = HashMap::new();
+        let mut out = Self {
+            partial: mode != LoadMode::Required,
+            ..Self::default()
+        };
         for (name, p) in &config.rule_providers {
-            let matcher = if p.kind == "inline" {
-                provider_matcher(p, &p.payload)?
-            } else {
-                let path = asset_path(&config.directory, &p.path)?;
-                let data = asset(
-                    &path,
-                    &p.url,
-                    if p.kind == "http" {
-                        Some(p.interval)
-                    } else {
-                        None
-                    },
-                    refresh,
-                    &fetch,
-                    &mut pending,
-                )
-                .await?;
-                let source = ProviderSource {
-                    behavior: p.behavior.clone(),
-                    format: p.format.clone(),
-                    stamp: Stamp::of(&data)?,
+            let checkpoint = pending.files.len();
+            let loaded: Result<Matcher> = async {
+                let matcher = if p.kind == "inline" {
+                    provider_matcher(p, &p.payload)?
+                } else {
+                    let path = asset_path(&config.directory, &p.path)?;
+                    let data = asset(
+                        &path,
+                        &p.url,
+                        if p.kind == "http" {
+                            Some(p.interval)
+                        } else {
+                            None
+                        },
+                        refresh,
+                        &fetch,
+                        &mut pending,
+                    )
+                    .await?;
+                    let source = ProviderSource {
+                        behavior: p.behavior.clone(),
+                        format: p.format.clone(),
+                        stamp: Stamp::of(&data)?,
+                    };
+                    let matcher = match previous.providers.get(name) {
+                        Some((built, matcher)) if *built == source => matcher.clone(),
+                        _ => {
+                            provider_matcher(p, &parse_payload(&read_limited(&data)?, &p.format)?)?
+                        }
+                    };
+                    out.providers
+                        .insert(name.clone(), (source, matcher.clone()));
+                    matcher
                 };
-                let matcher = match previous.providers.get(name) {
-                    Some((built, matcher)) if *built == source => matcher.clone(),
-                    _ => provider_matcher(p, &parse_payload(&read_limited(&data)?, &p.format)?)?,
-                };
-                provider_sources.insert(name.clone(), (source, matcher.clone()));
-                matcher
+                Ok(matcher)
+            }
+            .await;
+            let matcher = match loaded {
+                Ok(matcher) => matcher,
+                Err(error) if mode != LoadMode::Required => {
+                    pending.rollback(checkpoint);
+                    out.routing_incomplete = true;
+                    tracing::warn!(provider = %name, error = %format!("{error:#}"), "rule provider unavailable; retaining cached rules or skipping");
+                    let Some((source, matcher)) = previous.providers.get(name) else {
+                        continue;
+                    };
+                    out.providers
+                        .insert(name.clone(), (source.clone(), matcher.clone()));
+                    matcher.clone()
+                }
+                Err(error) => return Err(error),
             };
             matcher.references(&mut refs);
             providers.insert(name.clone(), matcher);
         }
-        let mut out = Self {
-            providers: provider_sources,
-            ..Self::default()
-        };
         let mut seen = HashSet::new();
         refs.retain(|r| seen.insert(r.clone()));
         let ip_refs: Vec<_> = refs
@@ -175,111 +276,124 @@ impl Resources {
             .map(|r| r.1.clone())
             .collect();
         if !ip_refs.is_empty() {
-            if config.geodata_mode {
-                let path = config.directory.join("geoip.dat");
-                let data = asset(
-                    &path,
-                    &config.geox_url.geoip,
-                    geo_interval(config),
-                    geo_refresh,
-                    &fetch,
-                    &mut pending,
-                )
-                .await?;
-                if data == path && previous.reuse("geoip", &ip_refs, &mut out) {
-                    // Unchanged file: the matchers were carried over.
-                } else {
-                    let wanted: HashSet<String> = ip_refs
-                        .iter()
-                        .map(|tag| tag.trim_start_matches('!').to_ascii_lowercase())
-                        .collect();
-                    let list = wire::read_entries(&data, |code| {
-                        wanted.contains(&code.to_ascii_lowercase())
-                    })
-                    .and_then(|entries| {
-                        entries
-                            .iter()
-                            .map(|bytes| Ok(GeoIp::decode(bytes.as_slice())?))
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .context("invalid geoip.dat")?;
-                    for tag in ip_refs {
-                        let (key, inverse) = tag
-                            .strip_prefix('!')
-                            .map_or((tag.as_str(), false), |s| (s, true));
-                        let entry = list
-                            .iter()
-                            .find(|e| e.country_code.eq_ignore_ascii_case(key))
-                            .context("GEOIP category missing from data")?;
-                        let nets = entry
-                            .cidr
-                            .iter()
-                            .map(|c| {
-                                let ip = match c.ip.len() {
-                                    4 => IpAddr::from(<[u8; 4]>::try_from(c.ip.as_slice())?),
-                                    16 => IpAddr::from(<[u8; 16]>::try_from(c.ip.as_slice())?),
-                                    _ => bail!("invalid GeoIP address"),
-                                };
-                                Ok(ipnet::IpNet::new(ip, u8::try_from(c.prefix)?)?)
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        out.matchers.insert(
-                            ("geoip".into(), tag),
-                            Matcher::Nets(Arc::new(IpSet::new(
-                                nets,
-                                entry.inverse_match ^ inverse,
-                            ))),
-                        );
-                    }
-                }
-            } else {
-                let path = config.directory.join("Country.mmdb");
-                let data = asset(
-                    &path,
-                    &config.geox_url.mmdb,
-                    geo_interval(config),
-                    geo_refresh,
-                    &fetch,
-                    &mut pending,
-                )
-                .await?;
-                let db = Arc::new(
-                    maxminddb::Reader::from_source(read_limited(&data)?)
-                        .context("invalid Country.mmdb")?,
-                );
-                for tag in ip_refs {
-                    if tag == "private" {
-                        let nets = [
-                            "0.0.0.0/8",
-                            "10.0.0.0/8",
-                            "100.64.0.0/10",
-                            "127.0.0.0/8",
-                            "169.254.0.0/16",
-                            "172.16.0.0/12",
-                            "192.168.0.0/16",
-                            "::/128",
-                            "::1/128",
-                            "fc00::/7",
-                            "fe80::/10",
-                        ]
-                        .into_iter()
-                        .map(str::parse)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                        out.matchers.insert(
-                            ("geoip".into(), tag),
-                            Matcher::Nets(Arc::new(IpSet::new(nets, false))),
-                        );
+            let checkpoint = pending.files.len();
+            let result: Result<()> = async {
+                if config.geodata_mode {
+                    let path = config.directory.join("geoip.dat");
+                    let data = asset(
+                        &path,
+                        &config.geox_url.geoip,
+                        geo_interval(config),
+                        geo_refresh,
+                        &fetch,
+                        &mut pending,
+                    )
+                    .await?;
+                    if data == path && previous.reuse("geoip", &ip_refs, &mut out) {
+                        // Unchanged file: the matchers were carried over.
                     } else {
-                        out.matchers.insert(
-                            ("geoip".into(), tag.clone()),
-                            Matcher::ExternalIp(Arc::new(Country {
-                                db: db.clone(),
-                                tag,
-                            })),
-                        );
+                        let wanted: HashSet<String> = ip_refs
+                            .iter()
+                            .map(|tag| tag.trim_start_matches('!').to_ascii_lowercase())
+                            .collect();
+                        let list = wire::read_entries(&data, |code| {
+                            wanted.contains(&code.to_ascii_lowercase())
+                        })
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .map(|bytes| Ok(GeoIp::decode(bytes.as_slice())?))
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .context("invalid geoip.dat")?;
+                        for tag in ip_refs.iter().cloned() {
+                            let (key, inverse) = tag
+                                .strip_prefix('!')
+                                .map_or((tag.as_str(), false), |s| (s, true));
+                            let entry = list
+                                .iter()
+                                .find(|e| e.country_code.eq_ignore_ascii_case(key))
+                                .context("GEOIP category missing from data")?;
+                            let nets = entry
+                                .cidr
+                                .iter()
+                                .map(|c| {
+                                    let ip = match c.ip.len() {
+                                        4 => IpAddr::from(<[u8; 4]>::try_from(c.ip.as_slice())?),
+                                        16 => IpAddr::from(<[u8; 16]>::try_from(c.ip.as_slice())?),
+                                        _ => bail!("invalid GeoIP address"),
+                                    };
+                                    Ok(ipnet::IpNet::new(ip, u8::try_from(c.prefix)?)?)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            out.matchers.insert(
+                                ("geoip".into(), tag),
+                                Matcher::Nets(Arc::new(IpSet::new(
+                                    nets,
+                                    entry.inverse_match ^ inverse,
+                                ))),
+                            );
+                        }
+                    }
+                } else {
+                    let path = config.directory.join("Country.mmdb");
+                    let data = asset(
+                        &path,
+                        &config.geox_url.mmdb,
+                        geo_interval(config),
+                        geo_refresh,
+                        &fetch,
+                        &mut pending,
+                    )
+                    .await?;
+                    let db = Arc::new(
+                        maxminddb::Reader::from_source(read_limited(&data)?)
+                            .context("invalid Country.mmdb")?,
+                    );
+                    for tag in ip_refs.iter().cloned() {
+                        if tag == "private" {
+                            let nets = [
+                                "0.0.0.0/8",
+                                "10.0.0.0/8",
+                                "100.64.0.0/10",
+                                "127.0.0.0/8",
+                                "169.254.0.0/16",
+                                "172.16.0.0/12",
+                                "192.168.0.0/16",
+                                "::/128",
+                                "::1/128",
+                                "fc00::/7",
+                                "fe80::/10",
+                            ]
+                            .into_iter()
+                            .map(str::parse)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                            out.matchers.insert(
+                                ("geoip".into(), tag),
+                                Matcher::Nets(Arc::new(IpSet::new(nets, false))),
+                            );
+                        } else {
+                            out.matchers.insert(
+                                ("geoip".into(), tag.clone()),
+                                Matcher::ExternalIp(Arc::new(Country {
+                                    db: db.clone(),
+                                    tag,
+                                })),
+                            );
+                        }
                     }
                 }
+                Ok(())
             }
+            .await;
+            out.recover_geo(
+                result,
+                "geoip",
+                &ip_refs,
+                previous,
+                &mut pending,
+                checkpoint,
+            )?;
         }
         let site_refs: Vec<_> = refs
             .iter()
@@ -287,88 +401,110 @@ impl Resources {
             .map(|r| r.1.clone())
             .collect();
         if !site_refs.is_empty() {
-            let path = config.directory.join("geosite.dat");
-            let data = asset(
-                &path,
-                &config.geox_url.geosite,
-                geo_interval(config),
-                geo_refresh,
-                &fetch,
-                &mut pending,
-            )
-            .await?;
-            if data == path && previous.reuse("geosite", &site_refs, &mut out) {
-                // Unchanged file: the matchers were carried over.
-            } else {
-                let wanted: HashSet<String> = site_refs
-                    .iter()
-                    .map(|tag| tag.split('@').next().unwrap_or("").to_ascii_lowercase())
-                    .collect();
-                // Keep entries as raw bytes and decode one domain at a time: large
-                // categories (cn, geolocation-!cn) would otherwise exist twice, as
-                // decoded structs and as the resulting domain set.
-                let mut entries = HashMap::new();
-                for bytes in
-                    wire::read_entries(&data, |code| wanted.contains(&code.to_ascii_lowercase()))
-                        .context("invalid geosite.dat")?
-                {
-                    let mut code = String::new();
-                    wire::each_field(&bytes, 1, |value| {
-                        code = std::str::from_utf8(value)?.to_ascii_lowercase();
-                        Ok(())
+            let checkpoint = pending.files.len();
+            let result: Result<()> = async {
+                let path = config.directory.join("geosite.dat");
+                let data = asset(
+                    &path,
+                    &config.geox_url.geosite,
+                    geo_interval(config),
+                    geo_refresh,
+                    &fetch,
+                    &mut pending,
+                )
+                .await?;
+                if data == path && previous.reuse("geosite", &site_refs, &mut out) {
+                    // Unchanged file: the matchers were carried over.
+                } else {
+                    let wanted: HashSet<String> = site_refs
+                        .iter()
+                        .map(|tag| tag.split('@').next().unwrap_or("").to_ascii_lowercase())
+                        .collect();
+                    // Keep entries as raw bytes and decode one domain at a time: large
+                    // categories (cn, geolocation-!cn) would otherwise exist twice, as
+                    // decoded structs and as the resulting domain set.
+                    let mut entries = HashMap::new();
+                    for bytes in wire::read_entries(&data, |code| {
+                        wanted.contains(&code.to_ascii_lowercase())
                     })
-                    .context("invalid geosite.dat")?;
-                    entries.insert(code, bytes);
-                }
-                // Release each category's raw bytes once its last tag is built,
-                // so large categories do not all stay in memory until the end.
-                let mut remaining: HashMap<String, usize> = HashMap::new();
-                for tag in &site_refs {
-                    let code = tag.split('@').next().unwrap_or("").to_ascii_lowercase();
-                    *remaining.entry(code).or_default() += 1;
-                }
-                for tag in site_refs {
-                    let parts: Vec<_> = tag.split('@').collect();
-                    let code = parts[0].to_ascii_lowercase();
-                    let entry = entries
-                        .get(&code)
-                        .context("GEOSITE category missing from data")?;
-                    let mut set = DomainSetBuilder::default();
-                    wire::each_field(entry, 2, |bytes| {
-                        let d = Domain::decode(bytes).context("invalid geosite.dat")?;
-                        if !parts[1..].iter().all(|attr| {
-                            let (name, inverse) =
-                                attr.strip_prefix('!').map_or((*attr, false), |v| (v, true));
-                            d.attribute.iter().any(|a| a.key.eq_ignore_ascii_case(name)) ^ inverse
-                        }) {
-                            return Ok(());
-                        }
-                        match d.kind {
-                            0 => set.keyword(&d.value),
-                            1 => set.regex(&d.value)?,
-                            2 => set.suffix(&d.value),
-                            3 => set.exact(&d.value),
-                            _ => bail!("invalid geosite domain type"),
-                        }
-                        Ok(())
-                    })?;
-                    if let Some(count) = remaining.get_mut(&code) {
-                        *count -= 1;
-                        if *count == 0 {
-                            entries.remove(&code);
-                        }
+                    .context("invalid geosite.dat")?
+                    {
+                        let mut code = String::new();
+                        wire::each_field(&bytes, 1, |value| {
+                            code = std::str::from_utf8(value)?.to_ascii_lowercase();
+                            Ok(())
+                        })
+                        .context("invalid geosite.dat")?;
+                        entries.insert(code, bytes);
                     }
-                    out.matchers.insert(
-                        ("geosite".into(), tag),
-                        Matcher::Domains(Arc::new(set.build())),
-                    );
+                    // Release each category's raw bytes once its last tag is built,
+                    // so large categories do not all stay in memory until the end.
+                    let mut remaining: HashMap<String, usize> = HashMap::new();
+                    for tag in &site_refs {
+                        let code = tag.split('@').next().unwrap_or("").to_ascii_lowercase();
+                        *remaining.entry(code).or_default() += 1;
+                    }
+                    for tag in site_refs.iter().cloned() {
+                        let parts: Vec<_> = tag.split('@').collect();
+                        let code = parts[0].to_ascii_lowercase();
+                        let entry = entries
+                            .get(&code)
+                            .context("GEOSITE category missing from data")?;
+                        let mut set = DomainSetBuilder::default();
+                        wire::each_field(entry, 2, |bytes| {
+                            let d = Domain::decode(bytes).context("invalid geosite.dat")?;
+                            if !parts[1..].iter().all(|attr| {
+                                let (name, inverse) =
+                                    attr.strip_prefix('!').map_or((*attr, false), |v| (v, true));
+                                d.attribute.iter().any(|a| a.key.eq_ignore_ascii_case(name))
+                                    ^ inverse
+                            }) {
+                                return Ok(());
+                            }
+                            match d.kind {
+                                0 => set.keyword(&d.value),
+                                1 => set.regex(&d.value)?,
+                                2 => set.suffix(&d.value),
+                                3 => set.exact(&d.value),
+                                _ => bail!("invalid geosite domain type"),
+                            }
+                            Ok(())
+                        })?;
+                        if let Some(count) = remaining.get_mut(&code) {
+                            *count -= 1;
+                            if *count == 0 {
+                                entries.remove(&code);
+                            }
+                        }
+                        out.matchers.insert(
+                            ("geosite".into(), tag),
+                            Matcher::Domains(Arc::new(set.build())),
+                        );
+                    }
                 }
+                Ok(())
             }
+            .await;
+            out.recover_geo(
+                result,
+                "geosite",
+                &site_refs,
+                previous,
+                &mut pending,
+                checkpoint,
+            )?;
         }
         // Classical providers can refer to geo data, but not recursively to providers.
         for (name, m) in providers {
-            let bound = out.bind(&m)?;
-            out.matchers.insert(("rule-set".into(), name), bound);
+            match out.bind_required(&m) {
+                Ok(bound) => {
+                    out.matchers.insert(("rule-set".into(), name), bound);
+                }
+                Err(_) if out.partial => {
+                    out.routing_incomplete = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
         out.rules(&config.rules)?;
         (out.adblock, out.adblock_sources) =
@@ -682,6 +818,12 @@ fn references(config: &Config) -> Result<Vec<(String, String)>> {
         .nameserver_policy
         .keys()
         .chain(config.dns.fake_ip_filter.iter())
+        .chain(
+            config
+                .network_overrides
+                .iter()
+                .flat_map(|network| network.nameserver_policy.keys()),
+        )
     {
         if let Some(tags) = key.strip_prefix("geosite:") {
             for tag in tags.split(',') {
@@ -703,7 +845,7 @@ pub enum Freshness {
     Current,
     /// Present but past an update interval: usable until replaced.
     Expired,
-    /// Some file does not exist; the core cannot start without it.
+    /// Some file does not exist; start from cache and download it after connecting.
     Missing,
 }
 
@@ -821,6 +963,10 @@ async fn asset(
         interval.is_some() && !url.is_empty(),
         "local routing resource is missing"
     );
+    ensure!(
+        fetch.download,
+        "routing resource is not cached; download deferred until connected"
+    );
     let (temp, mut file) = pending.create(path)?;
     // Resource hosts (jsDelivr, GitHub) are often unreachable directly from
     // the networks that need the proxy in the first place: use it first.
@@ -858,7 +1004,10 @@ async fn asset(
             tracing::warn!(error = %format!("{error:#}"), "keeping the current routing resource");
             Ok(path.into())
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            pending.discard(&temp);
+            Err(error)
+        }
     }
 }
 
@@ -867,6 +1016,7 @@ struct Fetch<'a> {
     resolver: &'a crate::dns::Resolver,
     hooks: &'a clyntis_platform::Hooks,
     proxy: Option<(&'a crate::Core, &'a str)>,
+    download: bool,
 }
 
 fn read_limited(path: &Path) -> Result<Vec<u8>> {
@@ -901,6 +1051,11 @@ impl Staged {
     fn discard(&mut self, temp: &Path) {
         self.files.retain(|(staged, _)| staged != temp);
         let _ = std::fs::remove_file(temp);
+    }
+    fn rollback(&mut self, checkpoint: usize) {
+        for (temp, _) in self.files.drain(checkpoint..) {
+            let _ = std::fs::remove_file(temp);
+        }
     }
     fn commit(mut self) -> Result<()> {
         for (temp, path) in std::mem::take(&mut self.files) {
@@ -1385,6 +1540,265 @@ struct Attribute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cold_start_downloads_via_proxy_and_applies_resources_without_reconnecting() {
+        use clyntis_protocol::Target;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("meta-cold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let site = GeoSiteList {
+            entry: vec![GeoSite {
+                country_code: "test".into(),
+                domain: vec![Domain {
+                    kind: 2,
+                    value: "site.test".into(),
+                    attribute: vec![],
+                }],
+            }],
+        }
+        .encode_to_vec();
+        let ip = GeoIpList {
+            entry: vec![GeoIp {
+                country_code: "ZZ".into(),
+                cidr: vec![Cidr {
+                    ip: vec![192, 0, 2, 0],
+                    prefix: 24,
+                }],
+                inverse_match: false,
+            }],
+        }
+        .encode_to_vec();
+        let files: HashMap<&str, Vec<u8>> = HashMap::from([
+            ("/site", site),
+            ("/ip", ip),
+            ("/provider", b"provider.test\n".to_vec()),
+            // A malformed provider must not roll back the successful resources.
+            ("/bad", b"not-a-yaml-payload".to_vec()),
+            ("/ads", b"0.0.0.0 ads.test\n".to_vec()),
+            ("/module", br"[Map Local]
+^https://rewrite\.test/ad data-type=text data=http://resources.invalid/body
+[Script]
+ads = type=http-response,pattern=^https://rewrite\.test/script,requires-body=true,script-path=http://resources.invalid/script
+[MITM]
+hostname = rewrite.test
+".to_vec()),
+            ("/script", b"$done({body: 'blocked'});".to_vec()),
+            ("/body", b"blocked".to_vec()),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = calls.clone();
+        // A VLESS outbound serving a hostname which cannot resolve directly.
+        let server = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let files = files.clone();
+                let requests = requests.clone();
+                handlers.spawn(async move {
+                    let mut header = [0; 19];
+                    socket.read_exact(&mut header).await.unwrap();
+                    assert_eq!(&header[17..], &[0, 1]);
+                    assert_eq!(socket.read_u16().await.unwrap(), 80);
+                    assert_eq!(socket.read_u8().await.unwrap(), 2);
+                    let n = socket.read_u8().await.unwrap();
+                    let mut host = vec![0; n as usize];
+                    socket.read_exact(&mut host).await.unwrap();
+                    assert_eq!(host, b"resources.invalid");
+                    let mut request = vec![];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                    }
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let request = String::from_utf8(request).unwrap();
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let body = &files[path];
+                    socket.write_all(&[0, 0]).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                });
+            }
+        });
+        let yaml = format!(
+            r#"
+proxies:
+  - {{name: node, type: vless, server: 127.0.0.1, port: {port}, uuid: 11111111-1111-4111-8111-111111111111}}
+proxy-groups:
+  - {{name: Proxy, type: select, proxies: [DIRECT, node]}}
+profile: {{store-selected: true}}
+geodata-mode: true
+geox-url: {{geoip: 'http://resources.invalid/ip', geosite: 'http://resources.invalid/site'}}
+rule-providers:
+  remote: {{type: http, url: 'http://resources.invalid/provider', path: provider.txt, behavior: domain, format: text}}
+  broken: {{type: http, url: 'http://resources.invalid/bad', path: bad.yaml, behavior: domain, format: yaml}}
+adblock:
+  enable: true
+  lists: [{{name: ads, url: 'http://resources.invalid/ads', format: hosts}}]
+rewrite:
+  enable: true
+  modules: [{{name: ads, url: 'http://resources.invalid/module'}}]
+dns:
+  enhanced-mode: fake-ip
+  nameserver-policy:
+    'geosite:test': [1.1.1.1]
+    'rule-set:remote': [1.1.1.1]
+  fake-ip-filter: ['geosite:test', 'rule-set:remote']
+rules:
+  - GEOSITE,test,REJECT
+  - GEOIP,ZZ,REJECT,no-resolve
+  - RULE-SET,remote,REJECT
+  - DOMAIN,local.test,REJECT
+  - MATCH,Proxy
+"#
+        );
+        let mut config = Config::parse(yaml.as_bytes()).unwrap();
+        config.directory = dir.clone();
+        let dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = dns.local_addr().unwrap().to_string();
+        for servers in config.dns.nameserver_policy.values_mut() {
+            *servers = clyntis_config::Strings::Many(vec![upstream.clone()]);
+        }
+        let dns_server = tokio::spawn(async move {
+            use hickory_proto::{
+                op::Message,
+                rr::{RData, Record, rdata::A},
+            };
+            for _ in 0..2 {
+                let mut bytes = [0; 4096];
+                let (len, peer) = dns.recv_from(&mut bytes).await.unwrap();
+                let mut message = Message::from_vec(&bytes[..len]).unwrap();
+                let name = message.queries()[0].name().clone();
+                message.set_message_type(hickory_proto::op::MessageType::Response);
+                message.add_answer(Record::from_rdata(
+                    name,
+                    30,
+                    RData::A(A("203.0.113.22".parse().unwrap())),
+                ));
+                dns.send_to(&message.to_vec().unwrap(), peer).await.unwrap();
+            }
+        });
+        // Resource downloads must use the restored selection, not DIRECT.
+        std::fs::write(
+            dir.join(".meta-profile.json"),
+            br#"{"selection":{"Proxy":"node"}}"#,
+        )
+        .unwrap();
+        let core = crate::Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let running = tokio::time::timeout(Duration::from_secs(1), core.start())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "startup must not download");
+        assert!(core.resources_incomplete());
+        let query = |host: &str| {
+            let mut message = hickory_proto::op::Message::new();
+            message.set_id(7).add_query(hickory_proto::op::Query::query(
+                hickory_proto::rr::Name::from_ascii(host).unwrap(),
+                hickory_proto::rr::RecordType::A,
+            ));
+            message.to_vec().unwrap()
+        };
+        let answer_ip = |bytes: Vec<u8>| {
+            let message = hickory_proto::op::Message::from_vec(&bytes).unwrap();
+            message.answers()[0].data().ip_addr().unwrap()
+        };
+        let fake = answer_ip(core.resolver.answer(&query("site.test")).await.unwrap());
+        assert!(core.resolver.original(fake).is_some());
+        let route = |host: &str| Target::new(host, 443).unwrap();
+        assert_eq!(
+            core.route(&route("local.test"), "tcp").await.unwrap(),
+            "REJECT"
+        );
+        for host in ["site.test", "provider.test", "192.0.2.7", "ads.test"] {
+            assert_eq!(core.route(&route(host), "tcp").await.unwrap(), "node");
+        }
+        // Allow the actual background worker to run; no manual prepare/restart.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if core
+                    .rewriter()
+                    .is_some_and(|r| r.modules.iter().any(|m| m.rules == 2))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for host in ["site.test", "provider.test", "192.0.2.7", "ads.test"] {
+            assert_eq!(
+                core.route(&route(host), "tcp").await.unwrap(),
+                "REJECT",
+                "{host}"
+            );
+        }
+        assert!(core.resources_incomplete(), "bad provider remains pending");
+        assert!(
+            !dir.join("bad.yaml").exists(),
+            "invalid downloads must not be committed"
+        );
+        assert!(dir.join("geosite.dat").exists());
+        let rewriter = core.rewriter().unwrap();
+        assert!(rewriter.hostnames.iter().any(|h| h == "rewrite.test"));
+        assert_eq!(
+            rewriter
+                .matching(
+                    clyntis_config::rewrite::Phase::Request,
+                    "https://rewrite.test/ad"
+                )
+                .len(),
+            1
+        );
+        assert!(rewriter.file("http://resources.invalid/script").is_some());
+        // Both fake-IP filters and nameserver policies now use the new sets.
+        for host in ["site.test", "provider.test"] {
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), core.resolver.answer(&query(host)))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                answer_ip(response),
+                "203.0.113.22".parse::<IpAddr>().unwrap()
+            );
+        }
+        assert!(rewriter.file("http://resources.invalid/body").is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+        running.shutdown().await;
+        server.abort();
+        dns_server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_resources_disable_entire_negated_and_compound_conditions() {
+        let resources = Resources {
+            partial: true,
+            ..Resources::default()
+        };
+        for condition in [
+            "NOT,((GEOSITE,missing)),REJECT",
+            "OR,((DOMAIN,local.test),(RULE-SET,missing)),REJECT",
+            "AND,((DOMAIN,local.test),(NOT,((GEOIP,ZZ)))),REJECT",
+        ] {
+            let rule = resources.rules(&[condition.into()]).unwrap().remove(0);
+            assert!(
+                !rule.matches("local.test", Some("192.0.2.7".parse().unwrap()), 443, "tcp"),
+                "{condition}"
+            );
+        }
+        assert!(
+            resources
+                .rules(&["DOMAIN,local.test,REJECT".into()])
+                .unwrap()[0]
+                .matches("local.test", None, 443, "tcp")
+        );
+    }
+
     /// Serves a body in timed chunks: (delay before chunk, bytes).
     async fn slow_server(chunks: Vec<(u64, &'static [u8])>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1654,7 +2068,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
     #[tokio::test]
-    async fn hosted_tunnels_refresh_geo_data_only_at_start() {
+    async fn hosted_tunnels_can_refresh_geo_data_while_running() {
         let (config, attempts) = expired_geosite(true).await;
         let dns =
             crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
@@ -1665,11 +2079,11 @@ mod tests {
             .unwrap();
         let at_start = attempts.load(std::sync::atomic::Ordering::SeqCst);
         assert!(at_start > 0);
-        // While running: no download, the matcher is carried over.
+        // While running: updates are attempted too; failed updates reuse the set.
         let second = Resources::load(&config, &dns, &hooks, true, &first, None)
             .await
             .unwrap();
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), at_start);
+        assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) > at_start);
         assert!(Arc::ptr_eq(&domains(&first), &domains(&second)));
         std::fs::remove_dir_all(&config.directory).unwrap();
     }

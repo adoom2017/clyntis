@@ -105,13 +105,13 @@ int32_t meta_drain_logs_v1(uint8_t *buffer, size_t capacity, size_t *output_leng
 /* Download missing or expired routing resources referenced by config into
  * directory (UTF-8 absolute existing path) and validate them; an expired file
  * is kept when its update fails. Blocking; creates no handle or listener.
- * Call before meta_create_packet_tunnel_v1 so the tunnel starts from local
- * files instead of downloading inside the constrained tunnel process. */
+ * Optional cache warmup: startup uses local files and fetches missing ones
+ * asynchronously after connecting, applying them without reconnecting. */
 int32_t meta_prefetch_resources_v1(const uint8_t *config, size_t length,
     const uint8_t *directory, size_t directory_length);
 /* Whether the routing files a configuration references exist in directory
  * and are current: *state is 0 current, 1 expired (usable; refresh later),
- * 2 missing (prefetch before starting). Cheap; parses no geo data. */
+ * 2 missing (fetched after connecting). Cheap; parses no geo data. */
 int32_t meta_resources_state_v1(const uint8_t *config, size_t length,
     const uint8_t *directory, size_t directory_length, uint32_t *state);
 int32_t meta_create_v1(const uint8_t *config, size_t length, const meta_hooks_v1 *hooks, meta_handle *out);
