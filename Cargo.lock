@@ -650,7 +650,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clyntis"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-config"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "aes",
  "anyhow",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-core"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-ffi"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-platform"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -782,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-protocol"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -831,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-runtime"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "clyntis-tailscale"
-version = "1.2.8"
+version = "1.2.9"
 dependencies = [
  "anyhow",
  "async-trait",
