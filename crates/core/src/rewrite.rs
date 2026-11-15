@@ -8,12 +8,16 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+const PATTERN_BATCH_LIMIT: usize = 256;
+const PATTERN_SET_LIMIT: usize = 2 << 20;
+const PATTERN_CACHE_LIMIT: usize = 64 << 10;
 
 /// One module as loaded, for status displays.
 #[derive(Clone, Debug, Serialize)]
@@ -50,12 +54,45 @@ pub(crate) struct Compiled {
     pub(crate) module: String,
     pub(crate) line: usize,
     pub(crate) phase: Phase,
-    pattern: fancy_regex::Regex,
+    /// Retained after construction only for lookaround, set-build fallbacks
+    /// and redirect captures. Other patterns live only in the batched sets.
+    pattern: Option<UrlPattern>,
     pub(crate) action: Action,
     /// Compiled regexes of body and header rewrites, in order.
     extra: Vec<fancy_regex::Regex>,
     /// The compiled filter of a jq rewrite.
     pub(crate) jq: Option<crate::jq::Filter>,
+}
+
+enum UrlPattern {
+    /// Validated, but not retained as a second compiled regex while its set
+    /// is being built. Redirects keep captures in `Regular` instead.
+    Source(String),
+    Regular(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+impl UrlPattern {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Source(source) => source,
+            Self::Regular(regex) => regex.as_str(),
+            Self::Fancy(regex) => regex.as_str(),
+        }
+    }
+    fn is_match(&self, url: &str) -> bool {
+        match self {
+            Self::Source(_) => unreachable!("source patterns are compiled before matching"),
+            Self::Regular(regex) => regex.is_match(url),
+            Self::Fancy(regex) => regex.is_match(url).unwrap_or(false),
+        }
+    }
+    fn replace<'a>(&self, url: &'a str, replacement: &str) -> std::borrow::Cow<'a, str> {
+        match self {
+            Self::Source(_) => unreachable!("redirect patterns retain captures"),
+            Self::Regular(regex) => regex.replace(url, replacement),
+            Self::Fancy(regex) => regex.replace(url, replacement),
+        }
+    }
 }
 impl Compiled {
     /// `kind (module)`, for the request log.
@@ -66,24 +103,100 @@ impl Compiled {
 
 /// The compiled modules of a snapshot.
 pub struct Rewriter {
-    rules: Vec<Compiled>,
-    /// Rules whose pattern the `regex` crate compiles, matched in one pass;
-    /// `fancy` lists the others (lookaround and the like).
-    set: regex::RegexSet,
-    set_index: Vec<usize>,
-    fancy: Vec<usize>,
+    compiled: Arc<CompiledRules>,
     pub(crate) hostnames: Vec<String>,
-    reject: DomainSet,
     pub modules: Vec<ModuleInfo>,
-    /// Downloaded scripts and response bodies by URL.
-    files: HashMap<String, PathBuf>,
+    /// Downloaded scripts and response bodies, pinned to this snapshot.
+    files: HashMap<String, Arc<RewriteFile>>,
+}
+
+struct CompiledRules {
+    rules: Vec<Compiled>,
+    /// Small sets bound compilation peaks in the iOS tunnel. `fancy` lists
+    /// the rules that must be matched individually.
+    sets: Vec<PatternSet>,
+    fancy: Vec<usize>,
+    reject: DomainSet,
+}
+
+/// A hard link keeps the snapshot's bytes alive when the URL cache is replaced.
+pub(crate) struct RewriteFile {
+    path: PathBuf,
+}
+impl RewriteFile {
+    pub(crate) fn pin(cache: &Path) -> std::io::Result<Arc<Self>> {
+        let path = cache.with_extension(format!("{}.snapshot", uuid::Uuid::new_v4()));
+        std::fs::hard_link(cache, &path)?;
+        Ok(Arc::new(Self { path }))
+    }
+}
+impl Drop for RewriteFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+struct PatternSet {
+    set: regex::RegexSet,
+    indices: Vec<usize>,
+}
+
+/// Flush while compiling, so a large module never holds every individual
+/// regex alongside its combined sets. A failed batch retains its matchers.
+fn flush_patterns(
+    rules: &mut [Compiled],
+    indices: &mut Vec<usize>,
+    sets: &mut Vec<PatternSet>,
+    fancy: &mut Vec<usize>,
+) {
+    if indices.is_empty() {
+        return;
+    }
+    let patterns = indices
+        .iter()
+        .map(|&i| rules[i].pattern.as_ref().unwrap().as_str());
+    match regex::RegexSetBuilder::new(patterns)
+        .size_limit(PATTERN_SET_LIMIT)
+        .dfa_size_limit(PATTERN_CACHE_LIMIT)
+        .build()
+    {
+        Ok(set) => {
+            for &i in indices.iter() {
+                if !matches!(rules[i].action, Action::Redirect { .. }) {
+                    rules[i].pattern = None;
+                }
+            }
+            sets.push(PatternSet {
+                set,
+                indices: std::mem::take(indices),
+            });
+        }
+        Err(_) if indices.len() > 1 => {
+            // One expensive pattern must not make all the others keep their
+            // individual regexes. Split until the remaining batches fit.
+            let mut rest = indices.split_off(indices.len() / 2);
+            flush_patterns(rules, indices, sets, fancy);
+            flush_patterns(rules, &mut rest, sets, fancy);
+        }
+        Err(_) => {
+            let i = indices[0];
+            if let Some(UrlPattern::Source(source)) = &rules[i].pattern {
+                let regex = regex::RegexBuilder::new(source)
+                    .dfa_size_limit(PATTERN_CACHE_LIMIT)
+                    .build()
+                    .expect("pattern was validated before batching");
+                rules[i].pattern = Some(UrlPattern::Regular(regex));
+            }
+            fancy.append(indices);
+        }
+    }
 }
 
 /// A module's rules, its name, and where its downloads went.
 pub(crate) struct Loaded {
     pub(crate) name: String,
     pub(crate) module: Module,
-    pub(crate) files: HashMap<String, PathBuf>,
+    pub(crate) files: HashMap<String, Arc<RewriteFile>>,
     pub(crate) missing: Vec<String>,
     pub(crate) updated: Option<u64>,
 }
@@ -93,6 +206,7 @@ impl Rewriter {
     /// loaded at all (name, error).
     pub(crate) fn new(loaded: Vec<Loaded>, failed: Vec<(String, Option<u64>, String)>) -> Self {
         let mut rules = Vec::new();
+        let (mut sets, mut batch, mut fancy) = (Vec::new(), Vec::new(), Vec::new());
         let mut hostnames = Vec::new();
         let mut reject = DomainSetBuilder::default();
         let mut modules = Vec::new();
@@ -128,7 +242,19 @@ impl Rewriter {
                             scripts += 1;
                         }
                         count += 1;
+                        let index = rules.len();
+                        if matches!(
+                            compiled.pattern,
+                            Some(UrlPattern::Source(_) | UrlPattern::Regular(_))
+                        ) {
+                            batch.push(index);
+                        } else {
+                            fancy.push(index);
+                        }
                         rules.push(compiled);
+                        if batch.len() == PATTERN_BATCH_LIMIT {
+                            flush_patterns(&mut rules, &mut batch, &mut sets, &mut fancy);
+                        }
                     }
                     Err((line, text)) => skipped.push(Skipped { line, text }),
                 }
@@ -156,94 +282,127 @@ impl Rewriter {
                 error: None,
             });
         }
-        for (name, updated, error) in failed {
-            modules.push(ModuleInfo {
-                name,
-                title: None,
-                description: None,
-                rules: 0,
-                scripts: 0,
-                hostnames: 0,
-                reject: 0,
-                skipped: vec![],
-                missing: vec![],
-                updated,
-                error: Some(error),
-            });
-        }
-        let (mut set_patterns, mut set_index, mut fancy) = (Vec::new(), Vec::new(), Vec::new());
-        for (index, rule) in rules.iter().enumerate() {
-            let source = rule.pattern.as_str();
-            if regex::Regex::new(source).is_ok() {
-                set_patterns.push(source.to_owned());
-                set_index.push(index);
-            } else {
-                fancy.push(index);
-            }
-        }
-        let set = regex::RegexSet::new(&set_patterns).unwrap_or_else(|_| {
-            // Too large together: match each one instead.
-            fancy.append(&mut set_index);
-            fancy.sort_unstable();
-            regex::RegexSet::empty()
-        });
+        modules.extend(failed.into_iter().map(failed_module));
+        flush_patterns(&mut rules, &mut batch, &mut sets, &mut fancy);
         Self {
-            rules,
-            set,
-            set_index,
-            fancy,
+            compiled: Arc::new(CompiledRules {
+                rules,
+                sets,
+                fancy,
+                reject: reject.build(),
+            }),
             hostnames,
-            reject: reject.build(),
             modules,
             files,
         }
     }
 
+    /// Sources and file availability are unchanged. Update download status and
+    /// file versions without compiling a second copy of the active matchers.
+    pub(crate) fn reloaded(
+        &self,
+        loaded: Vec<Loaded>,
+        failed: Vec<(String, Option<u64>, String)>,
+    ) -> Self {
+        let mut modules: Vec<_> = self
+            .modules
+            .iter()
+            .filter(|module| module.error.is_none())
+            .cloned()
+            .collect();
+        let mut files = HashMap::new();
+        for (info, loaded) in modules.iter_mut().zip(loaded) {
+            info.updated = loaded.updated;
+            info.missing = loaded.missing;
+            files.extend(loaded.files);
+        }
+        modules.extend(failed.into_iter().map(failed_module));
+        Self {
+            compiled: self.compiled.clone(),
+            hostnames: self.hostnames.clone(),
+            modules,
+            files,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_rules(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.compiled, &other.compiled)
+    }
+
     /// The rules of `phase` that match `url`, in module order.
     pub(crate) fn matching(&self, phase: Phase, url: &str) -> Vec<usize> {
         let mut found: Vec<usize> = self
-            .set
-            .matches(url)
-            .into_iter()
-            .map(|i| self.set_index[i])
-            .chain(
-                self.fancy
-                    .iter()
-                    .copied()
-                    .filter(|&i| self.rules[i].pattern.is_match(url).unwrap_or(false)),
-            )
-            .filter(|&i| self.rules[i].phase == phase)
+            .compiled
+            .sets
+            .iter()
+            .flat_map(|batch| batch.set.matches(url).into_iter().map(|i| batch.indices[i]))
+            .chain(self.compiled.fancy.iter().copied().filter(|&i| {
+                self.compiled.rules[i]
+                    .pattern
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.is_match(url))
+            }))
+            .filter(|&i| self.compiled.rules[i].phase == phase)
             .collect();
         found.sort_unstable();
         found
     }
     pub(crate) fn rule(&self, index: usize) -> &Compiled {
-        &self.rules[index]
+        &self.compiled.rules[index]
     }
     pub(crate) fn file(&self, url: &str) -> Option<&PathBuf> {
-        self.files.get(url)
+        self.files.get(url).map(|file| &file.path)
     }
     /// Whether a module's domain rule rejects `host`.
     pub fn rejects(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.');
-        !self.reject.is_empty() && self.reject.matches(&host.to_ascii_lowercase())
+        !self.compiled.reject.is_empty() && self.compiled.reject.matches(&host.to_ascii_lowercase())
     }
     pub fn rule_count(&self) -> usize {
-        self.rules.len()
+        self.compiled.rules.len()
+    }
+}
+
+fn failed_module((name, updated, error): (String, Option<u64>, String)) -> ModuleInfo {
+    ModuleInfo {
+        name,
+        title: None,
+        description: None,
+        rules: 0,
+        scripts: 0,
+        hostnames: 0,
+        reject: 0,
+        skipped: vec![],
+        missing: vec![],
+        updated,
+        error: Some(error),
     }
 }
 
 fn compile(module: &str, rule: clyntis_config::rewrite::Rule) -> Result<Compiled, (usize, String)> {
     let failed = |what: &str| (rule.line, format!("{what}: {}", rule.pattern));
-    let pattern = fancy_regex::Regex::new(&rule.pattern).map_err(|_| failed("bad pattern"))?;
+    let regex = |source: &str| {
+        fancy_regex::RegexBuilder::new(source)
+            .delegate_dfa_size_limit(PATTERN_CACHE_LIMIT)
+            .build()
+    };
+    let pattern = match regex::RegexBuilder::new(&rule.pattern)
+        .dfa_size_limit(PATTERN_CACHE_LIMIT)
+        .build()
+    {
+        Ok(regex) if matches!(rule.action, Action::Redirect { .. }) => UrlPattern::Regular(regex),
+        Ok(_) => UrlPattern::Source(rule.pattern.clone()),
+        Err(_) => UrlPattern::Fancy(regex(&rule.pattern).map_err(|_| failed("bad pattern"))?),
+    };
     let extra = match &rule.action {
         Action::BodyReplace(pairs) => pairs
             .iter()
-            .map(|(regex, _)| fancy_regex::Regex::new(regex))
+            .map(|(source, _)| regex(source))
             .collect::<Result<_, _>>()
             .map_err(|_| failed("bad body regex"))?,
-        Action::Header(HeaderOp::ReplaceRegex(_, regex, _)) => {
-            vec![fancy_regex::Regex::new(regex).map_err(|_| failed("bad header regex"))?]
+        Action::Header(HeaderOp::ReplaceRegex(_, source, _)) => {
+            vec![regex(source).map_err(|_| failed("bad header regex"))?]
         }
         _ => vec![],
     };
@@ -258,7 +417,7 @@ fn compile(module: &str, rule: clyntis_config::rewrite::Rule) -> Result<Compiled
         module: module.to_owned(),
         line: rule.line,
         phase: rule.phase,
-        pattern,
+        pattern: Some(pattern),
         action: rule.action,
         extra,
         jq,
@@ -357,6 +516,8 @@ pub(crate) fn answer(rewriter: &Rewriter, rule: &Compiled, url: &str) -> Option<
         Action::Redirect { status, location } => {
             let location = rule
                 .pattern
+                .as_ref()
+                .expect("redirect patterns retain captures")
                 .replace(url, replacement(location).as_str())
                 .into_owned();
             let mut answer = Answer::new(*status, "", vec![]);
@@ -616,6 +777,77 @@ impl Stats {
 mod tests {
     use super::*;
     use clyntis_config::rewrite::parse_module;
+
+    #[test]
+    fn oversized_pattern_batches_split_and_retain_individual_fallbacks() {
+        let rewriter = rewriter(
+            "[URL Rewrite]\n^https://a\\.test/a{100000}$ - reject\n^https://a\\.test/small$ - reject\n",
+        );
+        assert_eq!(rewriter.rule_count(), 2);
+        assert_eq!(rewriter.compiled.fancy, [0]);
+        assert_eq!(
+            rewriter.matching(Phase::Request, "https://a.test/small"),
+            [1]
+        );
+        let url = format!("https://a.test/{}", "a".repeat(100000));
+        assert_eq!(rewriter.matching(Phase::Request, &url), [0]);
+    }
+
+    #[test]
+    fn batched_patterns_preserve_order_phases_unicode_and_redirect_captures() {
+        let mut text = String::new();
+        for i in 0..300 {
+            let pattern = if i % 17 == 0 {
+                format!(r"^https://a\.test/(?!keep)(shared|item{i})/(\w+)$")
+            } else {
+                format!(r"^https://a\.test/(shared|item{i})/(\w+)$")
+            };
+            let line = match i % 3 {
+                0 => format!("[URL Rewrite]\n{pattern} https://new.test/$1/$2 302\n"),
+                1 => format!("[URL Rewrite]\n{pattern} - reject\n"),
+                _ => format!("[Body Rewrite]\nhttp-response {pattern} ad yes\n"),
+            };
+            text.push_str(&line);
+        }
+        let module = parse_module(&text);
+        assert_eq!(module.rules.len(), 300);
+        let expected = module.rules.clone();
+        let rewriter = rewriter(&text);
+        assert_eq!(rewriter.rule_count(), expected.len());
+        for url in [
+            "https://a.test/shared/中文",
+            "https://a.test/item257/test",
+            "https://a.test/keep/x",
+        ] {
+            for phase in [Phase::Request, Phase::Response] {
+                let reference: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, rule)| {
+                        (rule.phase == phase
+                            && fancy_regex::Regex::new(&rule.pattern)
+                                .unwrap()
+                                .is_match(url)
+                                .unwrap())
+                        .then_some(i)
+                    })
+                    .collect();
+                assert_eq!(rewriter.matching(phase, url), reference, "{url} {phase:?}");
+            }
+        }
+        for index in [0, 3] {
+            let answer = answer(
+                &rewriter,
+                rewriter.rule(index),
+                "https://a.test/shared/中文",
+            )
+            .unwrap();
+            assert_eq!(
+                find(&answer.headers, "location"),
+                Some("https://new.test/shared/中文")
+            );
+        }
+    }
 
     fn rewriter(text: &str) -> Rewriter {
         Rewriter::new(

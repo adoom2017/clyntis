@@ -45,6 +45,7 @@ pub struct Resources {
 struct RewriteSource {
     custom: String,
     modules: Vec<(clyntis_config::rewrite::Source, Option<Stamp>)>,
+    // Availability affects which rules compile; file bytes are rebound on reload.
     files: Vec<(String, bool)>,
 }
 
@@ -509,8 +510,7 @@ impl Resources {
         out.rules(&config.rules)?;
         (out.adblock, out.adblock_sources) =
             adblock(config, refresh, &fetch, &mut pending, previous).await;
-        (out.rewrite, out.rewrite_sources) =
-            rewrite(config, refresh, &fetch, &mut pending, previous).await;
+        (out.rewrite, out.rewrite_sources) = rewrite(config, refresh, &fetch, previous).await;
         pending.commit()?;
         Ok(out)
     }
@@ -577,6 +577,7 @@ async fn adblock(
     }
     if let Some(active) = &previous.adblock
         && previous.adblock_sources == sources
+        && resolved.iter().all(|resolved| resolved.data.is_ok())
     {
         let lists = active
             .lists
@@ -640,7 +641,6 @@ async fn rewrite(
     config: &Config,
     refresh: bool,
     fetch: &Fetch<'_>,
-    pending: &mut Staged,
     previous: &Resources,
 ) -> (Option<Arc<crate::rewrite::Rewriter>>, Option<RewriteSource>) {
     use clyntis_config::rewrite::{Action, Mock, MockBody, parse_module};
@@ -661,13 +661,16 @@ async fn rewrite(
     }
     for source in &settings.modules {
         let path = config.directory.join(source.file_name());
+        // Rewrite caches are independent of the routing snapshot. Preserve
+        // completed downloads even if another script stalls or loading stops.
+        let mut staged = Staged::default();
         let data = asset(
             &path,
             &source.url,
             Some(settings.interval),
             refresh,
             fetch,
-            pending,
+            &mut staged,
         )
         .await;
         let updated = std::fs::metadata(data.as_ref().unwrap_or(&path))
@@ -675,17 +678,20 @@ async fn rewrite(
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        module_sources.push((
-            source.clone(),
-            data.as_ref().ok().and_then(|data| Stamp::of(data).ok()),
-        ));
-        match data.and_then(|data| read_limited(&data)) {
-            Ok(bytes) => parsed.push((
-                source.name.clone(),
-                parse_module(&String::from_utf8_lossy(&bytes)),
-                updated,
-            )),
+        let loaded = data.and_then(|data| {
+            let stamp = Stamp::of(&data)?;
+            let bytes = read_limited(&data)?;
+            let module = parse_module(&String::from_utf8_lossy(&bytes));
+            staged.commit()?;
+            Ok((module, stamp))
+        });
+        match loaded {
+            Ok((module, stamp)) => {
+                module_sources.push((source.clone(), Some(stamp)));
+                parsed.push((source.name.clone(), module, updated));
+            }
             Err(error) => {
+                module_sources.push((source.clone(), None));
                 tracing::warn!(module = %source.name, error = %format!("{error:#}"), "rewrite module unavailable");
                 failed.push((source.name.clone(), updated, format!("{error:#}")));
             }
@@ -708,7 +714,7 @@ async fn rewrite(
             }
         }
     }
-    let downloads: Vec<(String, Result<PathBuf>, Staged)> =
+    let downloads: Vec<(String, Result<Arc<crate::rewrite::RewriteFile>>)> =
         futures_util::stream::iter(urls.into_iter().map(|url| async move {
             let path = config
                 .directory
@@ -723,8 +729,12 @@ async fn rewrite(
                 &mut staged,
             )
             .await
-            .map(|_| path);
-            (url, result, staged)
+            .and_then(|data| {
+                let file = crate::rewrite::RewriteFile::pin(&data)?;
+                staged.commit()?;
+                Ok(file)
+            });
+            (url, result)
         }))
         .buffered(6)
         .collect()
@@ -732,8 +742,7 @@ async fn rewrite(
     let mut files = std::collections::HashMap::new();
     let mut missing = Vec::new();
     let mut file_sources = Vec::new();
-    for (url, result, mut staged) in downloads {
-        pending.files.append(&mut staged.files);
+    for (url, result) in downloads {
         file_sources.push((url.clone(), result.is_ok()));
         match result {
             Ok(path) => {
@@ -750,12 +759,6 @@ async fn rewrite(
         modules: module_sources,
         files: file_sources,
     };
-    if let (Some(active), Some(before)) = (&previous.rewrite, &previous.rewrite_sources)
-        && *before == source
-    {
-        tracing::debug!("rewrite modules unchanged; reusing them");
-        return (Some(active.clone()), Some(source));
-    }
     let loaded = parsed
         .into_iter()
         .map(|(name, module, updated)| {
@@ -789,7 +792,15 @@ async fn rewrite(
             }
         })
         .collect();
-    let rewriter = crate::rewrite::Rewriter::new(loaded, failed);
+    let rewriter = if let (Some(active), Some(before)) =
+        (&previous.rewrite, &previous.rewrite_sources)
+        && *before == source
+    {
+        tracing::debug!("rewrite modules unchanged; reusing compiled rules");
+        active.reloaded(loaded, failed)
+    } else {
+        crate::rewrite::Rewriter::new(loaded, failed)
+    };
     tracing::info!(
         rules = rewriter.rule_count(),
         modules = rewriter.modules.len(),
@@ -993,7 +1004,7 @@ async fn asset(
             tracing::info!(
                 file = %path.file_name().unwrap_or_default().to_string_lossy(),
                 bytes = file.metadata().map(|m| m.len()).unwrap_or(0),
-                replaced = meta.is_some(),
+                had_cached_file = meta.is_some(),
                 "routing resource downloaded"
             );
             Ok(temp)
@@ -1028,9 +1039,9 @@ fn read_limited(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Downloads stream straight to disk under a temporary name (so a 16 MiB
-/// geoip.dat is never held in memory) and replace the real files only after
-/// the whole snapshot loaded. Dropping without `commit` removes the temporary
-/// files, so a failed load never changes the files on disk.
+/// geoip.dat is never held in memory). Routing files commit after validation;
+/// independent rewrite caches commit per download. Dropping without `commit`
+/// removes the temporary files.
 #[derive(Default)]
 struct Staged {
     files: Vec<(PathBuf, PathBuf)>,
@@ -1058,9 +1069,12 @@ impl Staged {
         }
     }
     fn commit(mut self) -> Result<()> {
-        for (temp, path) in std::mem::take(&mut self.files) {
-            std::fs::rename(&temp, &path)?;
+        for (temp, path) in &self.files {
+            std::fs::rename(temp, path)
+                .with_context(|| format!("cannot commit routing resource {}", path.display()))?;
+            tracing::debug!(file = %path.display(), "routing resource cached");
         }
+        self.files.clear();
         Ok(())
     }
 }
@@ -1540,6 +1554,330 @@ struct Attribute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn load_rewrites(
+        config: &Config,
+        previous: &Resources,
+        refresh: bool,
+        mode: LoadMode,
+    ) -> Resources {
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
+        let dns = crate::dns::Resolver::new(Default::default(), hooks.clone());
+        Resources::load_with(config, &dns, &hooks, refresh, previous, None, mode)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn canceled_refresh_keeps_active_script_and_response_versions() {
+        use axum::{Router, routing::get};
+        let dir = std::env::temp_dir().join(format!("meta-rewrite-pin-{}", uuid::Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let fast_url = format!("{base}/fast");
+        let slow_url = format!("{base}/slow");
+        let first = format!(
+            "#!name=v1\n[Script]\nfast = type=http-response,pattern=^https://test/fast,script-path={fast_url},argument=v1\n[Map Local]\n^https://test/body data-type=text data={fast_url}\n"
+        );
+        let second = format!(
+            "#!name=v2\n[Script]\nfast = type=http-response,pattern=^https://test/fast,script-path={fast_url},argument=v2\nslow = type=http-response,pattern=^https://test/slow,script-path={slow_url}\n"
+        );
+        let app = Router::new()
+            .route("/module", get(move || async move { second }))
+            .route("/fast", get(|| async { "v2" }))
+            .route("/slow", get(std::future::pending::<&'static str>));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = Config::parse(
+            format!("rewrite:\n  enable: true\n  interval: 3600\n  modules: [{{name: test, url: '{base}/module'}}]\n").as_bytes(),
+        ).unwrap();
+        config.directory = dir.clone();
+        let module_path = dir.join(config.rewrite.modules[0].file_name());
+        let cache_path = dir.join(clyntis_config::rewrite::cache_file(&fast_url));
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&module_path, first).unwrap();
+        std::fs::write(&cache_path, "v1").unwrap();
+        let previous = load_rewrites(&config, &Resources::default(), false, LoadMode::Cached).await;
+        let active = previous.rewrite.as_ref().unwrap().clone();
+        let pinned = active.file(&fast_url).unwrap().clone();
+        for path in [&module_path, &cache_path] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+                )
+                .unwrap();
+        }
+        let updated_config = config.clone();
+        let refresh = tokio::spawn(async move {
+            load_rewrites(&updated_config, &previous, true, LoadMode::Available).await
+        });
+        let completed = tokio::time::timeout(Duration::from_secs(3), async {
+            while std::fs::read_to_string(&cache_path).unwrap() != "v2" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(!refresh.is_finished());
+        let during_refresh = std::fs::read_to_string(&pinned).unwrap();
+        refresh.abort();
+        let _ = refresh.await;
+        server.abort();
+        let _ = server.await;
+        completed.unwrap();
+        assert_eq!(during_refresh, "v1");
+        assert_eq!(active.modules[0].title.as_deref(), Some("v1"));
+        assert_eq!(std::fs::read_to_string(&pinned).unwrap(), "v1");
+        let rule = active.matching(clyntis_config::rewrite::Phase::Request, "https://test/body")[0];
+        assert_eq!(
+            crate::rewrite::answer(&active, active.rule(rule), "https://test/body")
+                .unwrap()
+                .body,
+            b"v1"
+        );
+        let restarted =
+            load_rewrites(&config, &Resources::default(), false, LoadMode::Cached).await;
+        let latest = restarted.rewrite.as_ref().unwrap();
+        assert_eq!(latest.modules[0].title.as_deref(), Some("v2"));
+        assert_eq!(
+            std::fs::read_to_string(latest.file(&fast_url).unwrap()).unwrap(),
+            "v2"
+        );
+        assert_eq!(latest.modules[0].missing, [slow_url]);
+        drop(active);
+        assert!(
+            !pinned.exists(),
+            "the final snapshot owner releases its hard link"
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchanged_rules_rebind_refreshed_files() {
+        use axum::{Router, routing::get};
+        let dir =
+            std::env::temp_dir().join(format!("meta-rewrite-rebind-{}", uuid::Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/script", listener.local_addr().unwrap());
+        let app = Router::new().route("/script", get(|| async { "v2" }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = Config {
+            directory: dir.clone(),
+            rewrite: clyntis_config::rewrite::Rewrite {
+                enable: true,
+                interval: 3600,
+                custom: format!(
+                    "[Script]\nfast = type=http-response,pattern=^https://test/fast,script-path={url}\n"
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cache = dir.join(clyntis_config::rewrite::cache_file(&url));
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "v1").unwrap();
+        let first = load_rewrites(&config, &Resources::default(), false, LoadMode::Cached).await;
+        std::fs::File::options()
+            .write(true)
+            .open(&cache)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+            )
+            .unwrap();
+        let second = load_rewrites(&config, &first, true, LoadMode::Available).await;
+        let before = first.rewrite.as_ref().unwrap();
+        let after = second.rewrite.as_ref().unwrap();
+        assert!(before.shares_rules(after));
+        assert_eq!(
+            std::fs::read_to_string(before.file(&url).unwrap()).unwrap(),
+            "v1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(after.file(&url).unwrap()).unwrap(),
+            "v2"
+        );
+        server.abort();
+        let _ = server.await;
+        drop((first, second));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewrite_downloads_survive_cancellation_and_restart_with_a_stalled_script() {
+        use axum::{Router, routing::get};
+        let dir = std::env::temp_dir().join(format!("meta-rewrite-cache-{}", uuid::Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let fast_url = format!("{base}/fast");
+        let slow_url = format!("{base}/slow");
+        let module = format!(
+            "[URL Rewrite]\n^https://example\\.test/ad - reject\n[Script]\nfast = type=http-response,pattern=^https://example\\.test/fast,script-path={fast_url}\nslow = type=http-response,pattern=^https://example\\.test/slow,script-path={slow_url}\n"
+        );
+        let app = Router::new()
+            .route("/module", get(move || async move { module }))
+            .route("/fast", get(|| async { "$done({body: 'cached'});" }))
+            .route("/slow", get(std::future::pending::<&'static str>));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = Config::parse(
+            format!(
+                "rewrite:\n  enable: true\n  modules: [{{name: test, url: '{base}/module'}}]\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        let core =
+            crate::Core::new(config.clone(), Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let load = tokio::spawn(async move { core.prepare_resources(false).await });
+        let fast_path = dir.join(clyntis_config::rewrite::cache_file(&fast_url));
+        let completed = tokio::time::timeout(Duration::from_secs(3), async {
+            while !fast_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Cancel before the slow script completes, just as stopping the VPN
+        // cancels its background refresh. Always stop the tasks on failure too.
+        assert!(!load.is_finished());
+        load.abort();
+        let _ = load.await;
+        server.abort();
+        let _ = server.await;
+        completed.expect("completed rewrite downloads must commit before their stalled sibling");
+        assert!(dir.join(config.rewrite.modules[0].file_name()).exists());
+        assert_eq!(
+            std::fs::read_to_string(&fast_path).unwrap(),
+            "$done({body: 'cached'});"
+        );
+        let files: Vec<_> = std::fs::read_dir(dir.join("rewrite/files"))
+            .unwrap()
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "cancellation must clean up the unfinished download"
+        );
+
+        // A fresh process can use the downloaded rules without the server.
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
+        let dns = crate::dns::Resolver::new(Default::default(), hooks.clone());
+        let restarted = Resources::load_with(
+            &config,
+            &dns,
+            &hooks,
+            false,
+            &Resources::default(),
+            None,
+            LoadMode::Cached,
+        )
+        .await
+        .unwrap();
+        let module = &restarted.rewrite.as_ref().unwrap().modules[0];
+        assert!(module.error.is_none());
+        assert_eq!(module.rules, 2);
+        assert_eq!(module.scripts, 1);
+        assert_eq!(module.missing, vec![slow_url]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewrite_retry_replaces_deferred_error_and_recovers_from_cache() {
+        let dir = std::env::temp_dir().join(format!("meta-retry-{}", uuid::Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/module", listener.local_addr().unwrap());
+        drop(listener);
+        let mut config = Config::parse(
+            format!("rewrite:\n  enable: true\n  modules: [{{name: test, url: '{url}'}}]\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        config.rewrite.custom = "[URL Rewrite]\n^https://example\\.test/ad - reject\n".into();
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
+        let dns = crate::dns::Resolver::new(Default::default(), hooks.clone());
+        let cached = Resources::load_with(
+            &config,
+            &dns,
+            &hooks,
+            false,
+            &Resources::default(),
+            None,
+            LoadMode::Cached,
+        )
+        .await
+        .unwrap();
+        let error = |resources: &Resources| {
+            resources
+                .rewrite
+                .as_ref()
+                .unwrap()
+                .modules
+                .iter()
+                .find(|module| module.name == "test")
+                .unwrap()
+                .error
+                .clone()
+                .unwrap()
+        };
+        assert!(error(&cached).contains("download deferred"));
+        let retried = Resources::load_with(
+            &config,
+            &dns,
+            &hooks,
+            false,
+            &cached,
+            None,
+            LoadMode::Available,
+        )
+        .await
+        .unwrap();
+        assert!(error(&retried).contains("routing resource download failed"));
+        assert!(!error(&retried).contains("download deferred"));
+        assert!(retried.incomplete());
+        let before = cached.rewrite.as_ref().unwrap();
+        let after = retried.rewrite.as_ref().unwrap();
+        assert!(before.shares_rules(after));
+        assert_eq!(after.rule_count(), 1);
+        assert_eq!(
+            after.matching(
+                clyntis_config::rewrite::Phase::Request,
+                "https://example.test/ad"
+            ),
+            [0]
+        );
+        assert!(error(&cached).contains("download deferred"));
+        let repeated = load_rewrites(&config, &retried, false, LoadMode::Available).await;
+        assert!(after.shares_rules(repeated.rewrite.as_ref().unwrap()));
+        std::fs::write(
+            dir.join(config.rewrite.modules[0].file_name()),
+            "[URL Rewrite]\n^https://example\\.test/ad - reject\n",
+        )
+        .unwrap();
+        let recovered = Resources::load_with(
+            &config,
+            &dns,
+            &hooks,
+            false,
+            &retried,
+            None,
+            LoadMode::Available,
+        )
+        .await
+        .unwrap();
+        assert!(!recovered.incomplete());
+        assert!(!after.shares_rules(recovered.rewrite.as_ref().unwrap()));
+        assert!(
+            recovered.rewrite.as_ref().unwrap().modules[1]
+                .error
+                .is_none()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn cold_start_downloads_via_proxy_and_applies_resources_without_reconnecting() {

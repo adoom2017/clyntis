@@ -1031,8 +1031,14 @@ hostname = ads.test
                 name: "ads".into(),
                 module,
                 files: [
-                    ("https://s.test/feed.js".to_owned(), feed),
-                    ("https://s.test/up.js".to_owned(), up),
+                    (
+                        "https://s.test/feed.js".to_owned(),
+                        crate::rewrite::RewriteFile::pin(&feed).unwrap(),
+                    ),
+                    (
+                        "https://s.test/up.js".to_owned(),
+                        crate::rewrite::RewriteFile::pin(&up).unwrap(),
+                    ),
                 ]
                 .into(),
                 missing: vec![],
