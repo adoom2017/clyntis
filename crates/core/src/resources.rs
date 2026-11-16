@@ -548,7 +548,10 @@ fn populate_geoip(
             let (key, inverse) = tag
                 .strip_prefix('!')
                 .map_or((tag.as_str(), false), |s| (s, true));
-            let Some(entry) = list.iter().find(|e| e.country_code.eq_ignore_ascii_case(key)) else {
+            let Some(entry) = list
+                .iter()
+                .find(|e| e.country_code.eq_ignore_ascii_case(key))
+            else {
                 if !out.partial {
                     bail!("GEOIP category missing from data");
                 }
@@ -584,10 +587,7 @@ fn populate_geoip(
         }
     } else {
         let db = if reuse_db {
-            out.mmdb
-                .as_ref()
-                .or(previous.mmdb.as_ref())
-                .cloned()
+            out.mmdb.as_ref().or(previous.mmdb.as_ref()).cloned()
         } else {
             None
         };
@@ -691,8 +691,7 @@ fn populate_geosite(
         wire::each_field(entry, 2, |bytes| {
             let d = Domain::decode(bytes).context("invalid geosite.dat")?;
             if !parts[1..].iter().all(|attr| {
-                let (name, inverse) =
-                    attr.strip_prefix('!').map_or((*attr, false), |v| (v, true));
+                let (name, inverse) = attr.strip_prefix('!').map_or((*attr, false), |v| (v, true));
                 d.attribute.iter().any(|a| a.key.eq_ignore_ascii_case(name)) ^ inverse
             }) {
                 return Ok(());
@@ -1142,7 +1141,9 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
         }
         for url in rewrite_file_urls(&modules) {
             check(
-                &config.directory.join(clyntis_config::rewrite::cache_file(&url)),
+                &config
+                    .directory
+                    .join(clyntis_config::rewrite::cache_file(&url)),
                 Some(config.rewrite.interval),
             );
         }
@@ -3046,7 +3047,11 @@ rules:
         .unwrap();
         let mut config = config;
         config.directory = dir.clone();
-        std::fs::write(dir.join("adblock/good.list"), "payload:\n  - '+.ads.test'\n").unwrap();
+        std::fs::write(
+            dir.join("adblock/good.list"),
+            "payload:\n  - '+.ads.test'\n",
+        )
+        .unwrap();
 
         let first = load_rewrites(&config, &Resources::default(), false, LoadMode::Cached).await;
         let first_filter = first.adblock.as_ref().unwrap();
@@ -3101,7 +3106,10 @@ rules:
                     300,
                     RData::A(A("203.0.113.50".parse().unwrap())),
                 ));
-                dns_socket.send_to(&msg.to_vec().unwrap(), peer).await.unwrap();
+                dns_socket
+                    .send_to(&msg.to_vec().unwrap(), peer)
+                    .await
+                    .unwrap();
             }
         });
         let yaml = format!(
@@ -3195,9 +3203,12 @@ rules:
         .unwrap();
         assert!(!core.resources_incomplete());
         assert_eq!(
-            core.route(&clyntis_protocol::Target::new("sub.cn.test", 443).unwrap(), "tcp")
-                .await
-                .unwrap(),
+            core.route(
+                &clyntis_protocol::Target::new("sub.cn.test", 443).unwrap(),
+                "tcp"
+            )
+            .await
+            .unwrap(),
             "REJECT"
         );
         running.shutdown().await;
