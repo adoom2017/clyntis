@@ -12,7 +12,10 @@ use hickory_proto::{
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
-    sync::{Mutex, RwLock},
+    sync::{
+        Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,6 +191,7 @@ pub struct Resolver {
     adblock: RwLock<Option<std::sync::Arc<crate::adblock::Filter>>>,
     /// Kept across resource refreshes so counts survive list updates.
     pub(crate) adblock_stats: std::sync::Arc<crate::adblock::Stats>,
+    configured: AtomicBool,
 }
 /// MagicDNS names of the running Tailscale proxies.
 pub type TailnetNames = std::sync::Arc<dyn Fn(&str) -> Option<IpAddr> + Send + Sync>;
@@ -219,12 +223,16 @@ impl Resolver {
             tailnet: RwLock::new(None),
             adblock: RwLock::new(None),
             adblock_stats: Default::default(),
+            configured: AtomicBool::new(false),
             cache: Mutex::new(Cache::default()),
             fake: Mutex::new(FakeMap::new(FAKE_CAPACITY)),
         }
     }
     pub fn clock(&self) -> std::sync::Arc<clyntis_protocol::tls::Clock> {
         self.clock.clone()
+    }
+    pub(crate) fn is_configured(&self) -> bool {
+        self.configured.load(Ordering::Relaxed)
     }
     /// Applies hosts and nameserver-policy, with `network`'s (the override
     /// for the current network) taking precedence over the global ones.
@@ -233,6 +241,15 @@ impl Resolver {
         hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>,
         network: Option<&clyntis_config::network::NetworkOverride>,
         resources: &crate::resources::Resources,
+    ) -> Result<()> {
+        self.configure_with(hosts, network, resources, true)
+    }
+    pub(crate) fn configure_with(
+        &self,
+        hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>,
+        network: Option<&clyntis_config::network::NetworkOverride>,
+        resources: &crate::resources::Resources,
+        clear_cache: bool,
     ) -> Result<()> {
         *self.adblock.write().unwrap() = resources.adblock.clone();
         fn matcher(
@@ -297,7 +314,10 @@ impl Resolver {
             nameservers,
             filters,
         };
-        self.clear_cache();
+        self.configured.store(true, Ordering::Relaxed);
+        if clear_cache {
+            self.clear_cache();
+        }
         Ok(())
     }
     /// Real lookups (DIRECT dials, non-fake-ip answers) resolve tailnet names

@@ -164,9 +164,10 @@ impl Filter {
     pub fn set_allow(&self, patterns: &[String]) {
         *self.user_allow.write().unwrap() = allow_set(patterns);
     }
-    #[cfg(test)]
-    pub fn shares_lists(&self, other: &Self) -> bool {
+    pub(crate) fn shares_lists(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.block, &other.block)
+            && Arc::ptr_eq(&self.list_allow, &other.list_allow)
+            && Arc::ptr_eq(&self.addresses, &other.addresses)
     }
     /// Listed domains and addresses.
     pub fn entries(&self) -> usize {

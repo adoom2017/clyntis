@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -119,15 +119,104 @@ struct CompiledRules {
     reject: DomainSet,
 }
 
+const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+static SNAPSHOT_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<std::fs::File>>>> =
+    LazyLock::new(Default::default);
+
+fn snapshot_lock(snapshot_dir: &Path) -> std::io::Result<Arc<std::fs::File>> {
+    let lock_dir = snapshot_dir.parent().unwrap_or(snapshot_dir);
+    let lock_path = lock_dir.join(".snapshots.lock");
+    let mut locks = SNAPSHOT_LOCKS.lock().unwrap();
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(lock) = locks.get(&lock_path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    file.lock_shared()?;
+    let lock = Arc::new(file);
+    locks.insert(lock_path, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn is_uuid_artifact(path: &Path, extension: &str) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some(extension)
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.rsplit('.').next())
+            .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok())
+}
+
+/// Removes aged `.tmp` files and orphaned `.snapshot` files left in `directory`
+/// by prior abnormal exits, without disturbing active downloads or live
+/// snapshots held by any running instance in this or another process.
+pub(crate) fn clean_stale_files(directory: &Path) {
+    let snapshot_dir = directory.join("rewrite/files");
+    let snapshot_guard = if snapshot_dir.is_dir() {
+        let lock_path = snapshot_dir
+            .parent()
+            .unwrap_or(&snapshot_dir)
+            .join(".snapshots.lock");
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .ok()
+            .and_then(|file| file.try_lock().ok().map(|()| file))
+    } else {
+        None
+    };
+
+    let mut dirs = vec![directory.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                dirs.push(path);
+            } else if file_type.is_file() {
+                let stale_tmp = is_uuid_artifact(&path, "tmp")
+                    && entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age >= STALE_TMP_AGE);
+                let stale_snapshot = snapshot_guard.is_some()
+                    && dir == snapshot_dir
+                    && is_uuid_artifact(&path, "snapshot");
+                if stale_tmp || stale_snapshot {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+}
+
 /// A hard link keeps the snapshot's bytes alive when the URL cache is replaced.
 pub(crate) struct RewriteFile {
     path: PathBuf,
+    _lock: Arc<std::fs::File>,
 }
 impl RewriteFile {
     pub(crate) fn pin(cache: &Path) -> std::io::Result<Arc<Self>> {
+        let lock = snapshot_lock(cache.parent().unwrap_or_else(|| Path::new(".")))?;
         let path = cache.with_extension(format!("{}.snapshot", uuid::Uuid::new_v4()));
         std::fs::hard_link(cache, &path)?;
-        Ok(Arc::new(Self { path }))
+        Ok(Arc::new(Self { path, _lock: lock }))
     }
 }
 impl Drop for RewriteFile {
@@ -225,7 +314,7 @@ impl Rewriter {
             let mut scripts = 0;
             for rule in module.rules {
                 match compile(&loaded.name, rule) {
-                    Ok(compiled) => {
+                    Ok((compiled, batchable)) => {
                         // A rule whose file is missing cannot act.
                         let file = match &compiled.action {
                             Action::Script(script) => Some(&script.url),
@@ -243,10 +332,7 @@ impl Rewriter {
                         }
                         count += 1;
                         let index = rules.len();
-                        if matches!(
-                            compiled.pattern,
-                            Some(UrlPattern::Source(_) | UrlPattern::Regular(_))
-                        ) {
+                        if batchable {
                             batch.push(index);
                         } else {
                             fancy.push(index);
@@ -380,20 +466,35 @@ fn failed_module((name, updated, error): (String, Option<u64>, String)) -> Modul
     }
 }
 
-fn compile(module: &str, rule: clyntis_config::rewrite::Rule) -> Result<Compiled, (usize, String)> {
+fn compile(
+    module: &str,
+    rule: clyntis_config::rewrite::Rule,
+) -> Result<(Compiled, bool), (usize, String)> {
     let failed = |what: &str| (rule.line, format!("{what}: {}", rule.pattern));
     let regex = |source: &str| {
         fancy_regex::RegexBuilder::new(source)
             .delegate_dfa_size_limit(PATTERN_CACHE_LIMIT)
             .build()
     };
-    let pattern = match regex::RegexBuilder::new(&rule.pattern)
+    let (pattern, batchable) = match regex::RegexBuilder::new(&rule.pattern)
+        .size_limit(PATTERN_SET_LIMIT)
         .dfa_size_limit(PATTERN_CACHE_LIMIT)
         .build()
     {
-        Ok(regex) if matches!(rule.action, Action::Redirect { .. }) => UrlPattern::Regular(regex),
-        Ok(_) => UrlPattern::Source(rule.pattern.clone()),
-        Err(_) => UrlPattern::Fancy(regex(&rule.pattern).map_err(|_| failed("bad pattern"))?),
+        Ok(regex) if matches!(rule.action, Action::Redirect { .. }) => {
+            (UrlPattern::Regular(regex), true)
+        }
+        Ok(_) => (UrlPattern::Source(rule.pattern.clone()), true),
+        Err(_) => match regex::RegexBuilder::new(&rule.pattern)
+            .dfa_size_limit(PATTERN_CACHE_LIMIT)
+            .build()
+        {
+            Ok(regex) => (UrlPattern::Regular(regex), false),
+            Err(_) => (
+                UrlPattern::Fancy(regex(&rule.pattern).map_err(|_| failed("bad pattern"))?),
+                false,
+            ),
+        },
     };
     let extra = match &rule.action {
         Action::BodyReplace(pairs) => pairs
@@ -413,15 +514,18 @@ fn compile(module: &str, rule: clyntis_config::rewrite::Rule) -> Result<Compiled
         ),
         _ => None,
     };
-    Ok(Compiled {
-        module: module.to_owned(),
-        line: rule.line,
-        phase: rule.phase,
-        pattern: Some(pattern),
-        action: rule.action,
-        extra,
-        jq,
-    })
+    Ok((
+        Compiled {
+            module: module.to_owned(),
+            line: rule.line,
+            phase: rule.phase,
+            pattern: Some(pattern),
+            action: rule.action,
+            extra,
+            jq,
+        },
+        batchable,
+    ))
 }
 
 /// A JavaScript replacement (`$1`, `$&`) in the `regex` crate's syntax.
@@ -781,16 +885,36 @@ mod tests {
     #[test]
     fn oversized_pattern_batches_split_and_retain_individual_fallbacks() {
         let rewriter = rewriter(
-            "[URL Rewrite]\n^https://a\\.test/a{100000}$ - reject\n^https://a\\.test/small$ - reject\n",
+            "[URL Rewrite]\n^https://a\\.test/a{100000}$ - reject\n^https://a\\.test/a{35000}$ - reject\n^https://a\\.test/b{35000}$ - reject\n^https://a\\.test/small$ - reject\n",
         );
-        assert_eq!(rewriter.rule_count(), 2);
+        assert_eq!(rewriter.rule_count(), 4);
         assert_eq!(rewriter.compiled.fancy, [0]);
+        assert!(rewriter.compiled.sets.len() >= 2);
         assert_eq!(
             rewriter.matching(Phase::Request, "https://a.test/small"),
-            [1]
+            [3]
         );
         let url = format!("https://a.test/{}", "a".repeat(100000));
         assert_eq!(rewriter.matching(Phase::Request, &url), [0]);
+        let medium = format!("https://a.test/{}", "a".repeat(35000));
+        assert_eq!(rewriter.matching(Phase::Request, &medium), [1]);
+        let other = format!("https://a.test/{}", "b".repeat(35000));
+        assert_eq!(rewriter.matching(Phase::Request, &other), [2]);
+    }
+
+    #[test]
+    fn large_body_and_header_regexes_retain_compatibility() {
+        let rewriter = rewriter(
+            "[Body Rewrite]\nhttp-response ^https://a\\.test/ ^a{100000}$ ok\n[Header Rewrite]\n^https://a\\.test/ header-replace-regex X-Test ^a{100000}$ ok\n",
+        );
+        assert_eq!(rewriter.rule_count(), 2);
+        assert!(rewriter.modules[0].skipped.is_empty());
+        let mut body = "a".repeat(100000).into_bytes();
+        assert!(apply_body(rewriter.rule(0), &mut body));
+        assert_eq!(body, b"ok");
+        let mut headers = vec![("x-test".to_owned(), "a".repeat(100000))];
+        apply_header(rewriter.rule(1), &mut headers);
+        assert_eq!(headers[0].1, "ok");
     }
 
     #[test]

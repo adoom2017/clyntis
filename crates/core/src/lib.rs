@@ -70,6 +70,7 @@ pub struct Core {
     pub events: tokio::sync::broadcast::Sender<String>,
     resources: RwLock<Arc<resources::Resources>>,
     resource_loading: tokio::sync::Mutex<()>,
+    resource_notify: tokio::sync::Notify,
     /// The user's ad blocking allowlist: the configuration's until the apps
     /// replace it while running, and kept across resource refreshes.
     adblock_allow: RwLock<Vec<String>>,
@@ -413,6 +414,7 @@ impl Core {
             events,
             resources: RwLock::new(Arc::new(resources::Resources::default())),
             resource_loading: tokio::sync::Mutex::new(()),
+            resource_notify: tokio::sync::Notify::new(),
             clock,
             xudp_pool: Default::default(),
             hysteria2: Default::default(),
@@ -723,16 +725,15 @@ impl Core {
         let mut retry = MISSING_RETRY_FIRST;
         // Expired caches are usable immediately, but refresh them shortly after
         // connecting rather than waiting another complete update interval.
-        let first_refresh = if self.resource_freshness().ok() == Some(Freshness::Expired) {
-            MISSING_RETRY_FIRST
-        } else {
+        let first_refresh = if self.resource_freshness().ok() == Some(Freshness::Current) {
             interval
+        } else {
+            MISSING_RETRY_FIRST
         };
         let mut periodic = tokio::time::Instant::now() + first_refresh;
         loop {
-            let missing = self.resources_incomplete();
             let until_refresh = periodic.saturating_duration_since(tokio::time::Instant::now());
-            let delay = if missing {
+            let delay = if self.resources_incomplete() {
                 retry.min(until_refresh)
             } else {
                 until_refresh
@@ -740,7 +741,9 @@ impl Core {
             tokio::select! {
                 _ = self.stop.cancelled() => break,
                 _ = tokio::time::sleep(delay) => {}
+                _ = self.resource_notify.notified() => {}
             }
+            let missing = self.resources_incomplete();
             let refresh = tokio::time::Instant::now() >= periodic;
             tokio::select! {
                 _ = self.stop.cancelled() => break,
@@ -789,7 +792,20 @@ impl Core {
             .or_else(|| self.config.proxy_groups.first().map(|g| g.name.clone()))
             .or_else(|| self.config.proxies.first().map(|p| p.name.clone()))?;
         let leaf = self.leaf(&candidate).ok()?;
-        (leaf != "DIRECT" && leaf != "REJECT").then_some(candidate)
+        if leaf == "DIRECT" || leaf == "REJECT" {
+            return None;
+        }
+        if self
+            .config
+            .proxies
+            .iter()
+            .find(|p| p.name == leaf)
+            .is_some_and(|p| p.kind == ProxyKind::Tailscale)
+            && !self.tailscale.lock().unwrap().contains_key(&leaf)
+        {
+            return None;
+        }
+        Some(candidate)
     }
     /// Fails at once for a fake-IP address with no domain: dialing it would only
     /// time out, while a refusal makes the client resolve the name again.
@@ -819,6 +835,9 @@ impl Core {
         resources::freshness(&config)
     }
     pub async fn prepare_resources(&self, refresh: bool) -> Result<()> {
+        if !*self.lifecycle.lock().unwrap() {
+            let _ = self.load_profile();
+        }
         self.prepare_resources_with(refresh, resources::LoadMode::Required)
             .await
     }
@@ -839,30 +858,35 @@ impl Core {
             )
             .await?,
         );
+        let loaded_shares_dns = self.resolver.is_configured() && next.shares_dns(&previous);
         drop(previous);
         let mut resources = self.resources.write().unwrap();
         let mut policy = self.policy.write().unwrap();
-        let rules = next.rules(&policy.raw_rules)?;
+        let next_with_geo = next.with_cached_geo(&config, &policy.raw_rules);
+        let clear_dns = !loaded_shares_dns || !Arc::ptr_eq(&next, &next_with_geo);
+        let rules = next_with_geo.rules(&policy.raw_rules)?;
         let network = self.network.read().unwrap().1;
-        self.resolver.configure(
+        self.resolver.configure_with(
             &config.hosts,
             network.map(|index| &config.network_overrides[index]),
-            &next,
+            &next_with_geo,
+            clear_dns,
         )?;
         // Read after the new lists are live, so a concurrent change of the
         // allowlist reaches them either here or in set_adblock_allow.
-        if let Some(filter) = &next.adblock {
+        if let Some(filter) = &next_with_geo.adblock {
             filter.set_allow(&self.adblock_allow.read().unwrap());
         }
         self.mitm.set_module_hosts(
-            next.rewrite
+            next_with_geo
+                .rewrite
                 .as_ref()
                 .map(|r| r.hostnames.clone())
                 .unwrap_or_default(),
         );
         self.mark_networks(&rules);
         policy.rules = rules;
-        *resources = next;
+        *resources = next_with_geo;
         Ok(())
     }
     pub(crate) async fn route_decision(
@@ -1030,12 +1054,31 @@ impl Core {
             cfg.mode = mode.clone();
         }
         cfg.validate()?;
-        let rules = self.resources.read().unwrap().rules(&cfg.rules)?;
+        let prepared = if update_rules {
+            let current = self.resources.read().unwrap().clone();
+            let updated = current.with_cached_geo(&cfg, &cfg.rules);
+            Some((current, updated))
+        } else {
+            None
+        };
+        let mut resources = self.resources.write().unwrap();
         let mut policy = self.policy.write().unwrap();
+        let next_resources = match prepared {
+            Some((current, updated)) if Arc::ptr_eq(&*resources, &current) => updated,
+            Some(_) => resources.with_cached_geo(&cfg, &cfg.rules),
+            None => resources.clone(),
+        };
+        let rules = next_resources.rules(&cfg.rules)?;
         if update_rules {
+            if !Arc::ptr_eq(&*resources, &next_resources) {
+                *resources = next_resources;
+            }
             self.mark_networks(&rules);
             policy.rules = rules;
             policy.raw_rules = cfg.rules;
+            if resources.incomplete() {
+                self.resource_notify.notify_one();
+            }
         }
         if let Some(mode) = mode {
             policy.mode = mode;
