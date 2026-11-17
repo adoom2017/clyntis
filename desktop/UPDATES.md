@@ -2,7 +2,7 @@
 
 ## 用户行为
 
-支持 Windows x64（NSIS 安装版）、macOS Apple Silicon 和 Intel（macOS 13 及以上）。
+支持 Windows x64（NSIS 安装版）、macOS Apple Silicon（macOS 13 及以上）。
 
 - 默认在启动约 20 秒后检查，之后每 6 小时检查一次。离线等检查失败会在约 15 分钟后重试。
 - 在“设置 → 通用”关闭“自动检查客户端更新”后点击“保存”，即可停止后续后台检查。手动检查仍可使用。
@@ -87,7 +87,6 @@ macOS 在已导入并解锁 Developer ID 证书、设置公钥/更新私钥及 A
 
 ```sh
 node packaging/build.mjs --updater --target aarch64-apple-darwin --bundles app,dmg
-node packaging/build.mjs --updater --target x86_64-apple-darwin --bundles app,dmg
 ```
 
 `--updater` 控制更新包生成。Tauri 的 `--no-sign` 会同时跳过平台代码签名和更新包签名，因此脚本在所有平台拒绝 `--unsigned/--no-sign` 与 `--updater` 组合。Windows 不配置 Authenticode 证书时仍可生成 minisign 签名的更新包；macOS 更新发布还必须使用 Developer ID 签名。缺少更新公钥或私钥时，`--updater` 会在构建前报错。
@@ -97,12 +96,12 @@ node packaging/build.mjs --updater --target x86_64-apple-darwin --bundles app,dm
 正式发布使用 `.github/workflows/release-desktop.yml`，替代原来的 Windows 单平台发布工作流：
 
 1. 使用现有 `scripts/set-version.sh` 同步应用和 Rust crate 版本，再创建对应的稳定 `vX.Y.Z` tag。
-2. 三个构建任务生成 Windows x64 NSIS、macOS arm64、macOS x64 更新包及 `.sig`。macOS 主包和辅助程序使用同一 Team ID 签名并公证；Windows CLI/C 库压缩包仍保留。
-3. 收集器将同名的两个 macOS `.app.tar.gz` 重命名为包含架构的文件，避免覆盖；同时保留 `.dmg` 手动安装包。
-4. 只有三个任务全部成功，才执行汇总发布。生成器检查三种平台的包和签名都存在且非空，生成统一 `latest.json`。
+2. 两个构建任务生成 Windows x64 NSIS、macOS arm64 更新包及 `.sig`。macOS 主包和辅助程序使用同一 Team ID 签名并公证；Windows CLI/C 库压缩包仍保留。
+3. 收集器将 macOS `.app.tar.gz` 重命名为包含架构的文件，同时保留 `.dmg` 手动安装包。
+4. 只有两个任务全部成功，才执行汇总发布。生成器检查两种平台的包和签名都存在且非空，生成统一 `latest.json`。
 5. 上传全部产物，再上传清单，最后发布 draft release。不会在任一平台构建失败时发布部分平台的新清单。
 
-清单的平台键是 `windows-x86_64`、`darwin-aarch64`、`darwin-x86_64`。URL 指向固定版本 tag 的附件；只有清单入口使用 `latest`。重新运行失败的工作流可覆盖同一版本附件，已经正式使用的版本应保持不可变，优先递增 patch 版本发布修复。
+清单的平台键是 `windows-x86_64`、`darwin-aarch64`。URL 指向固定版本 tag 的附件；只有清单入口使用 `latest`。重新运行失败的工作流可覆盖同一版本附件，已经正式使用的版本应保持不可变，优先递增 patch 版本发布修复。
 
 首次带更新能力的版本需要手动安装。旧版客户端不包含此入口，无法自行升级为支持自动更新的版本。未配置正式签名凭据时，普通本地构建仍可运行，但不能成为正式更新分发包。
 
@@ -123,7 +122,7 @@ cargo test --workspace --locked
 
 本次 Windows 开发机验证结果：43 项前端测试、39 项 Rust 测试、TypeScript/Vite 生产构建、Rust fmt/Clippy 和发布工作流 actionlint 均通过。已使用临时测试密钥生成 Windows NSIS 安装器及 `.sig`，使用与客户端相同的 `minisign-verify` 库验证签名和绑定版本，并确认篡改安装器会被拒绝；包收集器已在真实产物上执行通过。临时私钥已删除，测试包不可作为正式发布包。未执行实际覆盖安装，也未在此 Windows 环境验证 macOS 签名、公证和设备升级。
 
-正式启用前需要在三种目标平台，用相同正式密钥签名的连续两个版本进行真实升级验收：
+正式启用前需要在两种目标平台，用相同正式密钥签名的连续两个版本进行真实升级验收：
 
 | 场景 | 预期 |
 | --- | --- |

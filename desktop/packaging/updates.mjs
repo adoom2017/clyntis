@@ -13,7 +13,6 @@ import { pathToFileURL } from "node:url";
 export const updatePlatforms = {
   "windows-x86_64": "x64-setup.exe",
   "darwin-aarch64": "aarch64.app.tar.gz",
-  "darwin-x86_64": "x86_64.app.tar.gz",
 };
 
 export function updaterBuildConfig(enabled, env, mac, unsigned) {

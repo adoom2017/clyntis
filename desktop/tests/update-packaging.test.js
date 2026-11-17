@@ -74,7 +74,7 @@ describe("update release packaging", () => {
     expect(() => updaterBuildConfig(true, env, false, false)).toThrow("HTTPS");
   });
 
-  it("collects architecture-specific macOS packages without filename collisions", () => {
+  it("collects signed Apple Silicon macOS packages", () => {
     const directory = temporary();
     const bundle = join(directory, "bundle");
     const output = join(directory, "assets");
@@ -86,17 +86,14 @@ describe("update release packaging", () => {
     const signature = signatureFor("1.3.0");
     writeFileSync(join(bundle, "Clyntis.app.tar.gz.sig"), signature);
     collectUpdates(bundle, output, "darwin-aarch64", "1.3.0");
-    collectUpdates(bundle, output, "darwin-x86_64", "1.3.0");
-    for (const platform of ["darwin-aarch64", "darwin-x86_64"]) {
-      const name = updateFilename(platform, "1.3.0");
-      expect(readFileSync(join(output, name), "utf8")).toBe("signed app");
-      expect(readFileSync(join(output, `${name}.sig`), "utf8")).toBe(
-        signature + "\n",
-      );
-    }
+    const name = updateFilename("darwin-aarch64", "1.3.0");
+    expect(readFileSync(join(output, name), "utf8")).toBe("signed app");
+    expect(readFileSync(join(output, `${name}.sig`), "utf8")).toBe(
+      signature + "\n",
+    );
   });
 
-  it("refuses partial releases and writes all three platform URLs and signatures", () => {
+  it("refuses partial releases and publishes only Windows and Apple Silicon", () => {
     const directory = temporary();
     expect(() =>
       createManifest(directory, "1.3.0", "adoom2017/clyntis"),
@@ -105,6 +102,11 @@ describe("update release packaging", () => {
       const name = updateFilename(platform, "1.3.0");
       writeFileSync(join(directory, name), "installer");
       writeFileSync(join(directory, `${name}.sig`), signatureFor("1.3.0"));
+      if (platform === "windows-x86_64") {
+        expect(() =>
+          createManifest(directory, "1.3.0", "adoom2017/clyntis"),
+        ).toThrow();
+      }
     }
     const result = createManifest(
       directory,
@@ -113,7 +115,10 @@ describe("update release packaging", () => {
       "Release notes",
       new Date("2026-11-04T00:00:00Z"),
     );
-    expect(Object.keys(result.platforms)).toHaveLength(3);
+    expect(Object.keys(result.platforms).sort()).toEqual([
+      "darwin-aarch64",
+      "windows-x86_64",
+    ]);
     expect(result.pub_date).toBe("2026-11-04T00:00:00.000Z");
     expect(result.platforms["windows-x86_64"]).toEqual({
       signature: signatureFor("1.3.0"),

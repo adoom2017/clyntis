@@ -19,9 +19,6 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-aarch64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            platform: darwin-x86_64
     runs-on: ${{ matrix.os }}
     env:
       CLYNTIS_UPDATER_PUBLIC_KEY: ${{ vars.CLYNTIS_UPDATER_PUBLIC_KEY }}
