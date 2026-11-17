@@ -46,8 +46,8 @@ struct Pending {
     answer: Option<Answer>,
     /// Rewrite rules for the response.
     response_rules: Vec<usize>,
-    /// Labels of the rewrite rules that acted.
-    applied: Vec<String>,
+    /// `(label, action)` of the rewrite rules that acted.
+    applied: Vec<(String, String)>,
 }
 
 enum Head {
@@ -115,7 +115,7 @@ where
             Err(error) => error.to_string(),
             Ok(_) => "no response".into(),
         };
-        record(context, request, None, Body::default(), Some(error));
+        record(context, request, None, Body::default(), Some(error), false);
     }
     result.map(drop)
 }
@@ -146,7 +146,7 @@ async fn apply_rules(
     phase: Phase,
     request: (&str, &str, &[(String, String)]),
     message: &mut Message,
-    applied: &mut Vec<String>,
+    applied: &mut Vec<(String, String)>,
 ) -> Verdict {
     let (method, request_url, request_headers) = request;
     for &index in rules {
@@ -225,12 +225,12 @@ async fn apply_rules(
                     Ok(outcome) => {
                         if outcome.abort {
                             context.core.rewrite_stats.record(rule, request_url);
-                            applied.push(rule.label());
+                            applied.push((rule.label(), rule.action.kind()));
                             return Verdict::Drop;
                         }
                         if let Some(answer) = outcome.response.filter(|_| phase == Phase::Request) {
                             context.core.rewrite_stats.record(rule, request_url);
-                            applied.push(rule.label());
+                            applied.push((rule.label(), rule.action.kind()));
                             return Verdict::Answer(answer);
                         }
                         if let Some(url) = outcome.url.filter(|u| *u != message.url) {
@@ -263,7 +263,7 @@ async fn apply_rules(
         };
         if acted {
             context.core.rewrite_stats.record(rule, request_url);
-            applied.push(rule.label());
+            applied.push((rule.label(), rule.action.kind()));
         }
     }
     Verdict::Continue
@@ -476,7 +476,7 @@ where
             let rule = rewrites.rewriter.rule(index);
             if rule.action.answers() {
                 context.core.rewrite_stats.record(rule, &pending.url);
-                pending.applied.push(rule.label());
+                pending.applied.push((rule.label(), rule.action.kind()));
                 verdict = match rewrite::answer(&rewrites.rewriter, rule, &pending.url) {
                     Some(answer) => Verdict::Answer(answer),
                     None => Verdict::Drop,
@@ -527,6 +527,7 @@ where
                     None,
                     Body::default(),
                     Some("closed by a rewrite rule".into()),
+                    false,
                 );
                 return Err(io::Error::other("closed by a rewrite rule"));
             }
@@ -653,6 +654,7 @@ where
                 Some((answer.status, answer.headers)),
                 body,
                 None,
+                true,
             );
             continue;
         }
@@ -667,6 +669,7 @@ where
                         None,
                         Body::default(),
                         Some("no response".into()),
+                        false,
                     );
                     return writer.shutdown().await;
                 }
@@ -677,6 +680,7 @@ where
                         None,
                         Body::default(),
                         Some("not HTTP".into()),
+                        false,
                     );
                     tokio::io::copy_buf(&mut reader, &mut writer).await?;
                     return writer.shutdown().await;
@@ -691,6 +695,7 @@ where
                     None,
                     Body::default(),
                     Some("bad response".into()),
+                    false,
                 );
                 writer.write_all(&head).await?;
                 tokio::io::copy_buf(&mut reader, &mut writer).await?;
@@ -770,6 +775,7 @@ where
                         Some((code, headers)),
                         Body::default(),
                         Some("closed by a rewrite rule".into()),
+                        false,
                     );
                     return Err(io::Error::other("closed by a rewrite rule"));
                 }
@@ -825,6 +831,7 @@ where
             Some((status, headers)),
             body,
             copied.as_ref().err().map(ToString::to_string),
+            false,
         );
         copied?;
         writer.flush().await?;
@@ -845,12 +852,14 @@ fn record(
     response: Option<(u16, Vec<(String, String)>)>,
     response_body: Body,
     error: Option<String>,
+    answered: bool,
 ) {
     let request_body = std::mem::take(&mut *request.body.lock().unwrap());
     let (status, response_headers) = match response {
         Some((code, headers)) => (Some(code), headers),
         None => (None, vec![]),
     };
+    let (labels, rewrite_actions): (Vec<String>, Vec<String>) = request.applied.into_iter().unzip();
     let summary = HttpSummary {
         method: request.method,
         url: request.url,
@@ -860,7 +869,9 @@ fn record(
         request_size: request_body.size,
         response_size: response_body.size,
         error,
-        rewrite: (!request.applied.is_empty()).then(|| request.applied.join(", ")),
+        rewrite: (!labels.is_empty()).then(|| labels.join(", ")),
+        rewrite_actions,
+        answered,
     };
     context.core.requests.exchange(
         &context.state,

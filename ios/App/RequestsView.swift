@@ -14,6 +14,10 @@ struct RequestEntry: Decodable, Equatable {
         let error: String?
         /// Rewrite rules that acted: `action (module)`, comma-separated.
         let rewrite: String?
+        /// Structured action kinds of the rewrite rules that acted.
+        let rewriteActions: [String]?
+        /// Answered locally by a rewrite rule without reaching the server.
+        let answered: Bool?
     }
     let id: UInt64
     /// Unix milliseconds.
@@ -79,11 +83,12 @@ private struct Row: Identifiable, Equatable {
 }
 
 private enum Filter: String, CaseIterable {
-    case all, http, rejected, connections
+    case all, http, rewritten, rejected, connections
     var title: String {
         switch self {
         case .all: L("全部")
         case .http: "HTTP"
+        case .rewritten: L("已重写")
         case .rejected: L("已拦截")
         case .connections: L("连接")
         }
@@ -92,6 +97,7 @@ private enum Filter: String, CaseIterable {
         switch self {
         case .all: true
         case .http: entry.status == "http"
+        case .rewritten: entry.http?.rewrite != nil || entry.rule == "Module(REJECT)"
         case .rejected: entry.status == "rejected"
         case .connections: entry.status == "closed"
         }
@@ -129,7 +135,7 @@ struct RequestsView: View {
             guard filter.matches(row.entry) else { return false }
             guard !words.isEmpty else { return true }
             let e = row.entry
-            let text = "\(e.host) \(e.http?.url ?? "") \(e.rule) \(e.chain) \(e.http?.contentType ?? "")".lowercased()
+            let text = "\(e.host) \(e.http?.url ?? "") \(e.rule) \(e.chain) \(e.http?.contentType ?? "") \(e.http?.rewrite ?? "")".lowercased()
             return words.allSatisfy(text.contains)
         }
     }
@@ -286,9 +292,20 @@ private struct RequestRow: View {
                     .font(.caption2.weight(.semibold)).foregroundStyle(.tint)
                     .padding(.horizontal, 5).padding(.vertical, 1)
                     .background(.tint.opacity(0.12), in: .capsule)
+                let rewriteInfo = describeRewriteSummary(entry.http?.rewriteActions, rewrite: entry.http?.rewrite)
                 Text(state).foregroundStyle(stateColor)
-                if entry.http?.rewrite != nil {
-                    Text(L("已重写")).foregroundStyle(.tint)
+                if entry.http?.answered == true {
+                    Text(rewriteInfo?.isReject == true ? L("本地拦截") : L("本地响应"))
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(.orange.opacity(0.14), in: .capsule)
+                }
+                if let info = rewriteInfo {
+                    Text(info.label.isEmpty ? L("已重写") : L("已重写 · {action}", ["action": info.label]))
+                        .foregroundStyle(info.isReject ? Color.red : Color.accentColor)
+                } else if entry.rule == "Module(REJECT)" {
+                    Text(L("模块域名拦截")).foregroundStyle(.red)
                 }
                 Text("\(entry.rule) → \(entry.chain)").lineLimit(1)
                 Spacer()
@@ -338,7 +355,11 @@ struct RequestDetailView: View {
                 LabeledContent(L("时间"), value: entry.date.formatted(date: .abbreviated, time: .standard))
                 LabeledContent(L("规则"), value: "\(entry.rule) → \(entry.chain)")
                 if !entry.source.isEmpty { LabeledContent(L("来源"), value: entry.source) }
-                if let status = entry.http?.status { LabeledContent(L("状态码"), value: "\(status)") }
+                if let status = entry.http?.status {
+                    let rewriteInfo = describeRewriteSummary(entry.http?.rewriteActions, rewrite: entry.http?.rewrite)
+                    let answeredLabel = rewriteInfo?.isReject == true ? L("本地拦截") : L("本地响应")
+                    LabeledContent(L("状态码"), value: entry.http?.answered == true ? "\(status) · \(answeredLabel)" : "\(status)")
+                }
                 if let type = entry.http?.contentType { LabeledContent(L("内容类型"), value: type) }
                 if let rewrite = entry.http?.rewrite { LabeledContent(L("重写"), value: rewrite) }
                 if let reason = entry.http?.error ?? entry.reason {

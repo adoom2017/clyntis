@@ -353,6 +353,33 @@ impl Interceptor {
     pub(crate) fn set_module_hosts(&self, hosts: Vec<String>) {
         *self.module_hosts.write().unwrap() = hosts;
     }
+    /// Bypassed hosts that belong to loaded rewrite modules' `[MITM] hostname` rules.
+    pub(crate) fn bypassed_module_hosts(&self) -> Vec<String> {
+        let excluded: Vec<String> = self
+            .settings
+            .read()
+            .unwrap()
+            .hostname
+            .iter()
+            .filter(|p| p.trim().starts_with('-'))
+            .cloned()
+            .collect();
+        let mut patterns = self.module_hosts.read().unwrap().clone();
+        if patterns.is_empty() {
+            return vec![];
+        }
+        patterns.extend(excluded);
+        let mut out: Vec<String> = self
+            .bypass
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|host| clyntis_config::mitm::host_matches(&patterns, host))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
     fn refused(&self, host: &str) {
         let mut bypass = self.bypass.lock().unwrap();
         if bypass.len() < BYPASS {
@@ -897,8 +924,11 @@ mod tests {
         );
         assert!(!core.mitm.intercepts("ads.test"));
         assert_eq!(core.mitm_status()["bypassed"][0], "ads.test");
+        core.mitm.set_module_hosts(vec!["ads.test".into()]);
+        assert_eq!(core.mitm.bypassed_module_hosts(), ["ads.test"]);
         core.clear_mitm_bypass();
         assert!(core.mitm.intercepts("ads.test"));
+        assert!(core.mitm.bypassed_module_hosts().is_empty());
     }
 
     #[tokio::test]
@@ -1122,16 +1152,26 @@ hostname = ads.test
         let http: Vec<_> = entries.iter().filter_map(|e| e.http.as_ref()).collect();
         assert_eq!(http.len(), 3, "{entries:?}");
         assert_eq!(http[0].rewrite.as_deref(), Some("reject-dict (ads)"));
+        assert_eq!(http[0].rewrite_actions, ["reject-dict"]);
+        assert!(http[0].answered);
         assert_eq!(
             http[1].rewrite.as_deref(),
             Some("jq (ads), script feed (ads)")
         );
+        assert_eq!(http[1].rewrite_actions, ["jq", "script feed"]);
+        assert!(!http[1].answered);
         assert_eq!(
             http[2].rewrite.as_deref(),
             Some("header (ads), script up (ads)")
         );
+        assert_eq!(http[2].rewrite_actions, ["header", "script up"]);
+        assert!(!http[2].answered);
         let status = core.rewrite_status();
         assert_eq!(status["total"], 5);
+        assert_eq!(status["rejects"], 1);
+        assert_eq!(status["rewrites"], 4);
+        assert_eq!(status["rejectRules"], 0);
+        assert_eq!(status["bypassed"], json!([]));
         assert_eq!(status["modules"][0]["rules"], 5);
         // The script's store persisted.
         let store = std::fs::read_to_string(directory.join("rewrite/store.json")).unwrap();

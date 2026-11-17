@@ -924,10 +924,13 @@ impl Core {
             }
             return Ok(Trace::new("REJECT", "REJECT", block.matched(), None));
         }
-        if self
-            .rewriter()
-            .is_some_and(|rewriter| rewriter.rejects(&target.host))
+        if let Some(rewriter) = self.rewriter()
+            && let Some(module) = rewriter.rejecting_module(&target.host)
         {
+            if record {
+                self.rewrite_stats
+                    .record_action(module, "module-reject", &target.host);
+            }
             return Ok(Trace::new("REJECT", "REJECT", "Module(REJECT)", None));
         }
         let (mode, rules, raw_rules) = {
@@ -1729,6 +1732,8 @@ impl Core {
         let mut status = self.rewrite_stats.snapshot();
         status["enabled"] = serde_json::json!(rewriter.is_some());
         status["rules"] = serde_json::json!(rewriter.as_ref().map_or(0, |r| r.rule_count()));
+        status["rejectRules"] =
+            serde_json::json!(rewriter.as_ref().map_or(0, |r| r.reject_count()));
         status["hostnames"] = serde_json::json!(
             rewriter
                 .as_ref()
@@ -1742,6 +1747,7 @@ impl Core {
                 .unwrap_or_default()
         );
         status["decrypting"] = serde_json::json!(self.mitm.is_active());
+        status["bypassed"] = serde_json::json!(self.mitm.bypassed_module_hosts());
         status
     }
     /// Includes routing data, lists, modules and their dependent files.

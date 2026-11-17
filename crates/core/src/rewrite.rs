@@ -116,7 +116,7 @@ struct CompiledRules {
     /// the rules that must be matched individually.
     sets: Vec<PatternSet>,
     fancy: Vec<usize>,
-    reject: DomainSet,
+    reject: Vec<(String, DomainSet)>,
 }
 
 const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(600);
@@ -297,7 +297,7 @@ impl Rewriter {
         let mut rules = Vec::new();
         let (mut sets, mut batch, mut fancy) = (Vec::new(), Vec::new(), Vec::new());
         let mut hostnames = Vec::new();
-        let mut reject = DomainSetBuilder::default();
+        let mut reject = Vec::new();
         let mut modules = Vec::new();
         let mut files = HashMap::new();
         for loaded in loaded {
@@ -345,12 +345,16 @@ impl Rewriter {
                     Err((line, text)) => skipped.push(Skipped { line, text }),
                 }
             }
-            for (kind, value) in &module.reject {
-                match kind {
-                    DomainKind::Exact => reject.exact(value),
-                    DomainKind::Suffix => reject.suffix(value),
-                    DomainKind::Keyword => reject.keyword(value),
+            if !module.reject.is_empty() {
+                let mut module_reject = DomainSetBuilder::default();
+                for (kind, value) in &module.reject {
+                    match kind {
+                        DomainKind::Exact => module_reject.exact(value),
+                        DomainKind::Suffix => module_reject.suffix(value),
+                        DomainKind::Keyword => module_reject.keyword(value),
+                    }
                 }
+                reject.push((loaded.name.clone(), module_reject.build()));
             }
             hostnames.extend(module.hostnames.iter().cloned());
             files.extend(loaded.files);
@@ -375,7 +379,7 @@ impl Rewriter {
                 rules,
                 sets,
                 fancy,
-                reject: reject.build(),
+                reject,
             }),
             hostnames,
             modules,
@@ -440,10 +444,25 @@ impl Rewriter {
     pub(crate) fn file(&self, url: &str) -> Option<&PathBuf> {
         self.files.get(url).map(|file| &file.path)
     }
+    /// Which module's domain rule rejects `host`, if any.
+    pub fn rejecting_module(&self, host: &str) -> Option<&str> {
+        if self.compiled.reject.is_empty() {
+            return None;
+        }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.compiled
+            .reject
+            .iter()
+            .find(|(_, set)| !set.is_empty() && set.matches(&host))
+            .map(|(module, _)| module.as_str())
+    }
     /// Whether a module's domain rule rejects `host`.
     pub fn rejects(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.');
-        !self.compiled.reject.is_empty() && self.compiled.reject.matches(&host.to_ascii_lowercase())
+        self.rejecting_module(host).is_some()
+    }
+    /// Total domain-level reject rules across all loaded modules.
+    pub fn reject_count(&self) -> usize {
+        self.modules.iter().map(|m| m.reject).sum()
     }
     pub fn rule_count(&self) -> usize {
         self.compiled.rules.len()
@@ -843,18 +862,29 @@ struct Hit {
 #[derive(Default)]
 pub struct Stats {
     total: AtomicU64,
+    rejects: AtomicU64,
+    rewrites: AtomicU64,
     modules: Mutex<HashMap<String, u64>>,
     recent: Mutex<VecDeque<Hit>>,
 }
 impl Stats {
     pub(crate) fn record(&self, rule: &Compiled, url: &str) {
+        self.record_action(&rule.module, rule.action.kind(), url);
+    }
+    pub(crate) fn record_action(&self, module: &str, action: impl Into<String>, url: &str) {
+        let action = action.into();
         self.total.fetch_add(1, Ordering::Relaxed);
+        if action.starts_with("reject") || action == "module-reject" {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.rewrites.fetch_add(1, Ordering::Relaxed);
+        }
         {
             let mut modules = self.modules.lock().unwrap();
-            if let Some(count) = modules.get_mut(&rule.module) {
+            if let Some(count) = modules.get_mut(module) {
                 *count += 1;
             } else if modules.len() < TRACKED {
-                modules.insert(rule.module.clone(), 1);
+                modules.insert(module.to_owned(), 1);
             }
         }
         let mut recent = self.recent.lock().unwrap();
@@ -864,13 +894,15 @@ impl Stats {
         recent.push_front(Hit {
             time: crate::requests::now_ms() / 1000,
             url: url.chars().take(300).collect(),
-            action: rule.action.kind(),
-            module: rule.module.clone(),
+            action,
+            module: module.to_owned(),
         });
     }
     pub(crate) fn snapshot(&self) -> Value {
         json!({
             "total": self.total.load(Ordering::Relaxed),
+            "rejects": self.rejects.load(Ordering::Relaxed),
+            "rewrites": self.rewrites.load(Ordering::Relaxed),
             "hits": *self.modules.lock().unwrap(),
             "recent": self.recent.lock().unwrap().iter().cloned().collect::<Vec<_>>(),
         })
@@ -1003,8 +1035,22 @@ http-response-jq ^https://a\.test/feed 'del(.list[].ad, .banner)'
 "#,
         );
         assert_eq!(rewriter.rule_count(), 6);
+        assert_eq!(rewriter.reject_count(), 1);
+        assert_eq!(rewriter.rejecting_module("x.ads.test"), Some("test"));
+        assert_eq!(rewriter.rejecting_module("a.test"), None);
         assert!(rewriter.modules[0].skipped.is_empty());
         assert!(rewriter.rejects("x.ads.test") && !rewriter.rejects("a.test"));
+        let stats = Stats::default();
+        stats.record_action("test", "module-reject", "x.ads.test");
+        stats.record(rewriter.rule(0), "https://a.test/ad");
+        stats.record(rewriter.rule(3), "https://a.test/feed");
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot["total"], 3);
+        assert_eq!(snapshot["rejects"], 2);
+        assert_eq!(snapshot["rewrites"], 1);
+        assert_eq!(snapshot["hits"]["test"], 3);
+        assert_eq!(snapshot["recent"][0]["action"], "header");
+        assert_eq!(snapshot["recent"][2]["action"], "module-reject");
         let hits = rewriter.matching(Phase::Request, "https://a.test/ad?x=1");
         assert_eq!(hits.len(), 2);
         let first = rewriter.rule(hits[0]);

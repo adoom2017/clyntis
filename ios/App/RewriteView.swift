@@ -12,23 +12,80 @@ struct RewriteStatus: Decodable, Equatable {
         let rules: Int
         let scripts: Int
         let hostnames: Int
+        let reject: Int?
         let skipped: [Skipped]
         let missing: [String]
         let updated: Double?
         let error: String?
     }
+    struct Hit: Decodable, Equatable {
+        let time: Double
+        let url: String
+        let action: String
+        let module: String
+    }
     let enabled: Bool
     let decrypting: Bool
     let rules: Int
+    let rejectRules: Int?
     let total: Int
+    let rejects: Int?
+    let rewrites: Int?
     let hostnames: [String]
+    let bypassed: [String]?
     let hits: [String: Int]
     let modules: [Module]
+    let recent: [Hit]?
 
     static func decode(_ object: Any?) -> RewriteStatus? {
         guard let object, let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
         return try? JSONDecoder().decode(RewriteStatus.self, from: data)
     }
+}
+
+func isRejectRewriteAction(_ action: String) -> Bool {
+    let normalized = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return normalized.hasPrefix("reject") || normalized == "module-reject"
+}
+
+func rewriteActionLabel(_ action: String) -> (title: String, isReject: Bool) {
+    let normalized = action.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let reject = isRejectRewriteAction(normalized)
+    let title: String = switch normalized {
+    case "module-reject": L("域名拦截")
+    case "reject": L("拦截 404")
+    case "reject-200": L("拦截 200")
+    case "reject-img": L("拦截图片")
+    case "reject-dict": L("拦截 JSON")
+    case "reject-array": L("拦截数组")
+    case "reject-drop": L("断开连接")
+    case "302", "307": L("重定向")
+    case "mock": L("本地映射")
+    case "header": L("请求头改写")
+    case "body": L("正文改写")
+    case "json": L("JSON 改写")
+    case "jq": L("JQ 改写")
+    default:
+        if normalized == "script" || normalized.hasPrefix("script ") {
+            L("脚本改写")
+        } else {
+            action
+        }
+    }
+    return (title, reject)
+}
+
+func describeRewriteSummary(_ actions: [String]?, rewrite: String?) -> (label: String, isReject: Bool)? {
+    if let actions, !actions.isEmpty {
+        let rejectAction = actions.first(where: isRejectRewriteAction)
+        let primary = rejectAction ?? actions[0]
+        let info = rewriteActionLabel(primary)
+        return (info.title, rejectAction != nil)
+    }
+    if let rewrite, !rewrite.isEmpty {
+        return ("", false)
+    }
+    return nil
 }
 
 /// Surge, Loon and Quantumult X modules that rewrite decrypted HTTP to remove
@@ -117,15 +174,65 @@ struct RewriteView: View {
 
     @ViewBuilder private var statusSection: some View {
         if let status = model.rewrite, status.enabled {
+            let recent = status.recent ?? []
+            let rejectCount = status.rejects ?? recent.filter { isRejectRewriteAction($0.action) }.count
+            let rewriteCount = status.rewrites ?? max(0, status.total - rejectCount)
+            let rejectRules = status.rejectRules ?? status.modules.reduce(0) { $0 + ($1.reject ?? 0) }
             Section {
-                LabeledContent(L("规则"), value: status.rules.formatted())
-                LabeledContent(L("生效次数"), value: status.total.formatted())
+                LabeledContent(L("总生效次数"), value: status.total.formatted())
+                LabeledContent(L("URL / 域名拦截"), value: rejectCount.formatted())
+                LabeledContent(L("内容 / 脚本改写"), value: rewriteCount.formatted())
+                LabeledContent(L("重写 / 域名规则"), value: "\(status.rules.formatted()) / \(rejectRules.formatted())")
                 LabeledContent(L("模块主机名"), value: status.hostnames.count.formatted())
                 if !status.decrypting {
                     Text(L("HTTPS 解密未开启，模块不生效")).foregroundStyle(.orange)
                 }
             } header: {
                 Text(L("本次连接"))
+            }
+            if let bypassed = status.bypassed, !bypassed.isEmpty {
+                Section {
+                    ForEach(bypassed, id: \.self) { Text($0).font(.footnote.monospaced()) }
+                    Button(L("重试解密")) { Task { try? await model.clearMitmBypass() } }
+                } header: {
+                    Text(L("无法解密、已改为直接转发的模块域名"))
+                } footer: {
+                    Text(L("证书校验或解密握手失败，已直接转发。"))
+                }
+            }
+            if !recent.isEmpty {
+                Section {
+                    ForEach(Array(recent.prefix(50).enumerated()), id: \.offset) { _, hit in
+                        let info = rewriteActionLabel(hit.action)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(info.title)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(info.isReject ? Color.red : Color.accentColor)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1)
+                                    .background((info.isReject ? Color.red : Color.accentColor).opacity(0.12), in: .capsule)
+                                Text(displayName(hit.module))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(Date(timeIntervalSince1970: hit.time), format: .dateTime.hour().minute().second())
+                                    .font(.caption)
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(hit.url)
+                                .font(.caption.monospaced())
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
+                        }
+                    }
+                } header: {
+                    Text(L("最近生效记录"))
+                } footer: {
+                    Text(L("包含 HTTP 重写规则与模块内的域名拦截。"))
+                }
             }
             let problems = status.modules.filter { !$0.skipped.isEmpty }
             if !problems.isEmpty {
@@ -160,8 +267,8 @@ struct RewriteView: View {
     private func moduleLine(_ name: String) -> String? {
         guard let info = model.rewrite?.modules.first(where: { $0.name == name }) else { return nil }
         if let error = info.error { return L("不可用：{error}", ["error": error]) }
-        var line = L("{rules} 条规则 · {scripts} 个脚本 · 生效 {hits} 次", [
-            "rules": info.rules, "scripts": info.scripts, "hits": model.rewrite?.hits[name] ?? 0,
+        var line = L("{rules} 条重写 · {rejects} 条域名拦截 · {scripts} 个脚本 · 生效 {hits} 次", [
+            "rules": info.rules, "rejects": info.reject ?? 0, "scripts": info.scripts, "hits": model.rewrite?.hits[name] ?? 0,
         ])
         if !info.missing.isEmpty {
             line += " · " + L("{count} 个脚本下载失败", ["count": info.missing.count])

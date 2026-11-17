@@ -51,8 +51,12 @@ export interface RewriteStatus {
   enabled: boolean;
   decrypting: boolean;
   rules: number;
+  rejectRules?: number;
   total: number;
+  rejects?: number;
+  rewrites?: number;
   hostnames: string[];
+  bypassed?: string[];
   hits: Record<string, number>;
   modules: {
     name: string;
@@ -87,6 +91,10 @@ export interface HttpSummary {
   error?: string;
   /** Rewrite rules that acted: `action (module)`, comma-separated. */
   rewrite?: string;
+  /** Structured action kinds of the rewrite rules that acted. */
+  rewriteActions?: string[];
+  /** Answered locally by a rewrite rule without reaching the server. */
+  answered?: boolean;
 }
 /** One entry of the core's request log. */
 export interface RequestEntry {

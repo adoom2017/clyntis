@@ -1979,22 +1979,278 @@ td.num {
   font-size: 12px;
   line-height: 1.5;
 }
-.rewrite-modules {
+.rewrite-hero {
+  margin-top: 12px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.rewrite-hero:first-child,
+.mitm-panel + .rewrite-hero {
+  margin-top: 0;
+}
+.rewrite-hero-grid {
   display: grid;
-  gap: 6px;
-  margin-top: 8px;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
 }
-.rewrite-module {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  align-items: baseline;
+.rewrite-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
-.rewrite-module strong {
+.rewrite-metrics > div {
+  padding: 2px 14px;
+}
+.rewrite-metrics > div:first-child {
+  padding-left: 0;
+}
+.rewrite-metrics > div + div {
+  border-left: 1px solid var(--border);
+}
+.rewrite-metrics strong {
+  display: block;
+  font-size: 20px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
 }
-.rewrite-tag {
+.rewrite-metrics small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.rewrite-recent-quick {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.rewrite-recent-quick > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.quick-hit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  padding: 3px 6px;
+  margin: 0 -6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.quick-hit-row:hover {
+  background: var(--hover);
+}
+.quick-hit-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family:
+    ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+}
+.quick-hit-meta {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--success-soft);
+  color: var(--success);
+}
+.status-chip.warning {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: var(--warning);
+}
+.tiny-tag.danger {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+.action-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.action-badge.reject {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+.action-badge.rewrite {
+  background: var(--accent-soft);
   color: var(--accent);
+}
+.local-mock-tag {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+}
+.bypass-banner {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+.bypass-banner-copy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.bypass-banner-copy svg {
+  color: var(--warning);
+  flex-shrink: 0;
+}
+.rewrite-expanded {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: minmax(260px, 0.95fr) minmax(0, 1.35fr);
+  gap: 18px;
+}
+.sub-heading {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.rewrite-hits-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.rewrite-hits-header .sub-heading {
+  margin-bottom: 0;
+}
+.module-cards {
+  display: grid;
+  gap: 8px;
+}
+.module-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--hover) 45%, var(--surface));
+}
+.module-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.module-card-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.module-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.module-dot.ok {
+  background: var(--success);
+}
+.module-dot.error {
+  background: var(--danger);
+}
+.module-card-stats {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+.module-skipped {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.module-skipped summary {
+  cursor: pointer;
+}
+.hits-list {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+.hit-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.hit-item + .hit-item {
+  border-top: 1px solid var(--border);
+}
+.hit-item:hover {
+  background: var(--hover);
+}
+.hit-item-main {
+  flex: 1;
+  min-width: 0;
+}
+.hit-item-url {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family:
+    ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+}
+.hit-item-sub {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 1px;
+}
+@media (max-width: 900px) {
+  .rewrite-hero-grid,
+  .rewrite-expanded {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rewrite-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .rewrite-metrics > div {
+    padding: 2px 0;
+  }
+  .rewrite-metrics > div + div {
+    border-left: 0;
+  }
 }
 .mitm-hosts textarea {
   width: 100%;
@@ -2022,7 +2278,7 @@ td.num {
   width: 72px;
 }
 .requests-table th:nth-child(3) {
-  width: 84px;
+  width: 118px;
 }
 .requests-table th:nth-child(4) {
   width: 22%;

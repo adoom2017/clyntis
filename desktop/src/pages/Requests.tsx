@@ -23,6 +23,7 @@ import {
   Toggle,
   type Perform,
 } from "../components/common";
+import { describeRewrite, RewritePanel } from "../features/Rewrite";
 import {
   bytes,
   type BodyView,
@@ -31,7 +32,6 @@ import {
   type MitmSettings,
   type RequestDetail,
   type RequestEntry,
-  type RewriteStatus,
   type Settings,
 } from "../types";
 
@@ -47,9 +47,13 @@ const time = (ms: number) =>
 const duration = (ms: number) =>
   ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`;
 
+function isRewritten(row: RequestEntry) {
+  return Boolean(row.http?.rewrite || row.rule === "Module(REJECT)");
+}
+
 function matches(row: Row, filter: Filter, query: string) {
   if (filter === "http" && row.status !== "http") return false;
-  if (filter === "rewritten" && !row.http?.rewrite) return false;
+  if (filter === "rewritten" && !isRewritten(row)) return false;
   if (filter === "rejected" && row.status !== "rejected") return false;
   if (filter === "connections" && row.status !== "closed") return false;
   if (!query) return true;
@@ -135,7 +139,7 @@ export function RequestsPage({
     () => ({
       all: rows.length,
       http: rows.filter((r) => r.status === "http").length,
-      rewritten: rows.filter((r) => r.http?.rewrite).length,
+      rewritten: rows.filter((r) => isRewritten(r)).length,
       rejected: rows.filter((r) => r.status === "rejected").length,
       connections: rows.filter((r) => r.status === "closed").length,
     }),
@@ -154,9 +158,7 @@ export function RequestsPage({
   return (
     <>
       <MitmPanel running={running} settings={settings} perform={perform} />
-      {running && settings.overrides.rewrite?.enabled && (
-        <RewritePanel decrypting={!!settings.overrides.mitm?.enable} />
-      )}
+      {running && <RewritePanel perform={perform} />}
       {!running ? (
         <Empty
           icon={<ScanSearch />}
@@ -306,6 +308,7 @@ export function RequestsPage({
 
 function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
   const http = row.http;
+  const rewriteInfo = describeRewrite(http?.rewriteActions, http?.rewrite);
   let kind: string;
   let target: React.ReactNode;
   let state: React.ReactNode;
@@ -328,9 +331,16 @@ function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
     state = http.error ? (
       <span className="danger-text">{http.status ?? t("失败")}</span>
     ) : (
-      <span className={(http.status ?? 0) >= 400 ? "danger-text" : ""}>
-        {http.status ?? "—"}
-      </span>
+      <>
+        <span className={(http.status ?? 0) >= 400 ? "danger-text" : ""}>
+          {http.status ?? "—"}
+        </span>
+        {http.answered && (
+          <span className="local-mock-tag">
+            {rewriteInfo?.reject ? t("本地拦截") : t("本地响应")}
+          </span>
+        )}
+      </>
     );
   } else {
     kind = row.network.toUpperCase();
@@ -369,9 +379,19 @@ function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
           {http?.decrypted ? `${kind} 🔓` : kind}
         </span>
         <span className="request-url">{target}</span>
-        {http?.rewrite && (
-          <span className="tiny-tag rewrite-tag" title={http.rewrite}>
-            {t("已重写")}
+        {rewriteInfo && (
+          <span
+            className={`action-badge ${rewriteInfo.kind}`}
+            title={http?.rewrite}
+          >
+            {rewriteInfo.label
+              ? t("已重写 · {action}", { action: rewriteInfo.label })
+              : t("已重写")}
+          </span>
+        )}
+        {!http && row.rule === "Module(REJECT)" && (
+          <span className="action-badge reject" title={row.rule}>
+            {t("模块域名拦截")}
           </span>
         )}
       </td>
@@ -460,6 +480,7 @@ function RequestModal({
       .catch(() => setMissing(true));
   }, [row, current]);
   const http = row.http;
+  const rewriteInfo = describeRewrite(http?.rewriteActions, http?.rewrite);
   const copy = (text: string) =>
     void navigator.clipboard?.writeText(text).then(() => {
       setCopied(true);
@@ -493,7 +514,14 @@ function RequestModal({
           {http?.status !== undefined && (
             <div>
               <dt>{t("状态码")}</dt>
-              <dd>{http.status}</dd>
+              <dd>
+                {http.status}
+                {http.answered && (
+                  <span className="local-mock-tag">
+                    {rewriteInfo?.reject ? t("本地拦截") : t("本地响应")}
+                  </span>
+                )}
+              </dd>
             </div>
           )}
           {http?.contentType && (
@@ -505,7 +533,15 @@ function RequestModal({
           {http?.rewrite && (
             <div>
               <dt>{t("重写")}</dt>
-              <dd>{http.rewrite}</dd>
+              <dd>
+                {rewriteInfo ? (
+                  <span className={`action-badge ${rewriteInfo.kind}`}>
+                    {http.rewrite}
+                  </span>
+                ) : (
+                  http.rewrite
+                )}
+              </dd>
             </div>
           )}
           {(http?.error || row.reason) && (
@@ -554,109 +590,6 @@ function RequestModal({
         )}
       </div>
     </Modal>
-  );
-}
-
-function RewritePanel({ decrypting }: { decrypting: boolean }) {
-  const [status, setStatus] = useState<RewriteStatus | null>(null);
-  const [open, setOpen] = useState(false);
-  const shown = usePageVisible();
-  useEffect(() => {
-    const load = () =>
-      void invoke<RewriteStatus>("rewrite_status")
-        .then(setStatus)
-        .catch(() => setStatus(null));
-    load();
-    if (!shown) return;
-    const timer = window.setInterval(load, 5000);
-    return () => window.clearInterval(timer);
-  }, [shown]);
-  if (!status) return null;
-  const problems = status.modules.filter(
-    (m) => m.error || m.missing.length || m.skipped.length,
-  ).length;
-  const summary = !decrypting
-    ? t("HTTPS 解密未开启，模块不生效")
-    : t("{modules} 个模块，{rules} 条规则，已生效 {hits} 次", {
-        modules: status.modules.length,
-        rules: status.rules,
-        hits: status.total,
-      });
-  return (
-    <section className="panel mitm-panel">
-      <div className="panel-title">
-        <h3>{t("重写模块")}</h3>
-        <div className="mitm-title-actions">
-          <span className={`small ${decrypting ? "" : "muted"}`}>
-            {summary}
-            {problems > 0 && ` · ${t("{count} 个有问题", { count: problems })}`}
-          </span>
-          <button className="text-button" onClick={() => setOpen((o) => !o)}>
-            {open ? t("收起") : t("详情")}
-          </button>
-        </div>
-      </div>
-      {open && (
-        <div className="mitm-body">
-          <p className="muted small">
-            {t(
-              "规则只作用于解密的域名；模块的主机名已加入解密（共 {count} 个）。在设置里添加或移除模块。",
-              { count: status.hostnames.length },
-            )}
-          </p>
-          <div className="rewrite-modules">
-            {status.modules.map((module) => (
-              <div key={module.name} className="small">
-                <div className="rewrite-module">
-                  <strong>
-                    {module.name === "custom" ? t("自定义规则") : module.name}
-                  </strong>
-                  {module.title && module.title !== module.name && (
-                    <span className="muted">{module.title}</span>
-                  )}
-                  {module.error ? (
-                    <span className="danger-text">{module.error}</span>
-                  ) : (
-                    <span className="muted">
-                      {t(
-                        "{rules} 条规则 · {scripts} 个脚本 · {hosts} 个主机名 · 生效 {hits} 次",
-                        {
-                          rules: module.rules,
-                          scripts: module.scripts,
-                          hosts: module.hostnames,
-                          hits: status.hits[module.name] ?? 0,
-                        },
-                      )}
-                    </span>
-                  )}
-                </div>
-                {module.missing.length > 0 && (
-                  <p className="danger-text">
-                    {t("下载失败：{list}", {
-                      list: module.missing.join("、"),
-                    })}
-                  </p>
-                )}
-                {module.skipped.length > 0 && (
-                  <details>
-                    <summary className="muted">
-                      {t("{count} 行不支持，已跳过", {
-                        count: module.skipped.length,
-                      })}
-                    </summary>
-                    <pre className="rule-preview">
-                      {module.skipped
-                        .map((s) => `${s.line}: ${s.text}`)
-                        .join("\n")}
-                    </pre>
-                  </details>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </section>
   );
 }
 

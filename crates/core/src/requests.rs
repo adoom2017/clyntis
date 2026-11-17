@@ -83,6 +83,12 @@ pub struct HttpSummary {
     /// The rewrite rules that acted on it: `action (module)`, comma-separated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rewrite: Option<String>,
+    /// Structured action kinds of the rewrite rules that acted on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewrite_actions: Vec<String>,
+    /// Whether a rewrite rule answered locally without reaching the server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answered: bool,
 }
 
 /// Headers and the kept part of the bodies, as sent (still compressed).

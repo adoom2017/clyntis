@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { type Perform, Stat } from "../components/common";
 import { AdblockPanel } from "../features/Adblock";
+import { RewritePanel } from "../features/Rewrite";
 import { t } from "../i18n";
 import {
   bytes,
@@ -319,6 +320,7 @@ export function OverviewPage({
       </div>
       {running && <NetworkPanel />}
       {running && <AdblockPanel settings={state.settings} perform={perform} />}
+      {running && <RewritePanel compact perform={perform} />}
     </>
   );
 }

@@ -615,6 +615,134 @@ describe("desktop workflows", () => {
       }),
     );
   });
+  it("uses core decryption status, structured rewrite actions, and accurate local response labels", async () => {
+    const base = {
+      time: Date.now(),
+      network: "tcp",
+      source: "127.0.0.1:5000",
+      host: "api.example.com",
+      port: 443,
+      rule: "Match",
+      chain: "DIRECT",
+      status: "http",
+      duration: 12,
+      upload: 0,
+      download: 10,
+      connection: "c1",
+      requests: 0,
+    };
+    invoke.mockImplementation(async (command) => {
+      if (command === "rewrite_status")
+        return {
+          enabled: true,
+          decrypting: true,
+          rules: 4,
+          rejectRules: 0,
+          total: 4,
+          rejects: 1,
+          rewrites: 3,
+          hostnames: ["api.example.com"],
+          bypassed: ["pinned.example.com"],
+          hits: { "去广告 (测试版)": 4 },
+          modules: [
+            {
+              name: "去广告 (测试版)",
+              rules: 4,
+              scripts: 0,
+              hostnames: 1,
+              reject: 0,
+              skipped: [],
+              missing: [],
+            },
+          ],
+          recent: [],
+        };
+      if (command === "requests")
+        return {
+          requests: [
+            {
+              ...base,
+              id: 1,
+              http: {
+                method: "GET",
+                url: "https://api.example.com/feed",
+                decrypted: true,
+                status: 200,
+                requestSize: 0,
+                responseSize: 10,
+                rewrite: "body (去广告 (测试版))",
+                rewriteActions: ["body"],
+                answered: false,
+              },
+            },
+            {
+              ...base,
+              id: 2,
+              http: {
+                method: "GET",
+                url: "https://api.example.com/hdr",
+                decrypted: true,
+                status: 200,
+                requestSize: 0,
+                responseSize: 10,
+                rewrite: "header (ads, reject list)",
+                rewriteActions: ["header"],
+                answered: false,
+              },
+            },
+            {
+              ...base,
+              id: 3,
+              http: {
+                method: "GET",
+                url: "https://api.example.com/redir",
+                decrypted: true,
+                status: 302,
+                requestSize: 0,
+                responseSize: 0,
+                rewrite: "302 (ads)",
+                rewriteActions: ["302"],
+                answered: true,
+              },
+            },
+            {
+              ...base,
+              id: 4,
+              http: {
+                method: "GET",
+                url: "https://api.example.com/ad",
+                decrypted: true,
+                status: 200,
+                requestSize: 0,
+                responseSize: 2,
+                rewrite: "reject-dict (ads)",
+                rewriteActions: ["reject-dict"],
+                answered: true,
+              },
+            },
+          ],
+          next: 4,
+        };
+      if (command === "mitm_info")
+        return { ca: null, trusted: false, core: null };
+      if (command === "connections")
+        return { connections: [], uploadTotal: 0, downloadTotal: 0 };
+      return { ...structuredClone(initial), status: "running" };
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "抓包" }));
+    expect(await screen.findByText("已加载 1 个模块")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "重试解密" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/证书校验或解密握手失败/)).toBeInTheDocument();
+    expect(screen.getByText("已重写 · 正文改写")).toHaveClass("rewrite");
+    expect(screen.getByText("已重写 · 请求头改写")).toHaveClass("rewrite");
+    expect(screen.getByText("已重写 · 重定向")).toHaveClass("rewrite");
+    expect(screen.getByText("已重写 · 拦截 JSON")).toHaveClass("reject");
+    expect(screen.getByText("本地响应")).toBeInTheDocument();
+    expect(screen.getByText("本地拦截")).toBeInTheDocument();
+  });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");
     expect(bytes(1024)).toBe("1.0 KB");
