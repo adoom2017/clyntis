@@ -600,4 +600,28 @@ export const en: Record<string, string> = {
   宽松校验服务器证书: "Lenient server certificate check",
   "部分 App 接受域名不完全匹配的证书，如用 *.example.com 访问 a.b.example.com。开启后这类服务器也会解密；证书本身不可信的仍直接转发。立即生效。":
     "Some apps accept certificates whose names do not strictly match, such as *.example.com for a.b.example.com. When on, those servers are decrypted too; certificates that are not trusted at all are still passed through. Applies at once.",
+  流量详情: "Traffic details",
+  "活跃 {active} / 共 {total}": "{active} active / {total} total",
+  "自 {since} 起，共统计 {hosts} 个目标":
+    "Since {since}, across {hosts} destination hosts",
+  按目标: "By destination",
+  按连接: "By connection",
+  活跃: "Active",
+  已结束: "Closed",
+  "搜索目标、规则或代理": "Search hosts, rules or proxies",
+  搜索流量记录: "Search traffic records",
+  "目标：{host}": "Destination: {host}",
+  清除目标筛选: "Clear destination filter",
+  "正在读取流量详情…": "Loading traffic details…",
+  总计: "Total",
+  其他目标: "Other destinations",
+  暂无流量记录: "No traffic recorded yet",
+  查看活跃连接: "View active connections",
+  查看流量详情: "View traffic details",
+  "自 {since} 起，当前保留 {hosts} 个主要目标（其余归入「其他目标」）":
+    "Since {since}, keeping {hosts} main destination hosts (the rest are grouped under Other destinations)",
+  "活跃连接按流量显示前 {shown} / {total} 条":
+    "Showing top {shown} of {total} active connections by traffic",
+  "已结束连接仅保留高流量记录，显示 {shown} / {total} 条":
+    "Only high-traffic closed connections are kept; showing {shown} of {total}",
 };

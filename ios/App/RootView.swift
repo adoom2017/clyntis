@@ -66,8 +66,14 @@ private struct ConnectionView: View {
                     .frame(maxWidth: .infinity).padding(.vertical, 32)
                     .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 20))
                     HStack(spacing: 12) {
-                        TrafficStat(title: L("上传"), value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)))
-                        TrafficStat(title: L("下载"), value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)))
+                        NavigationLink { TrafficDetailsView(model: model) } label: {
+                            TrafficStat(title: L("上传"), value: Int64(clamping: model.upload).formatted(.byteCount(style: .binary, spellsOutZero: false)), disclosure: true)
+                        }
+                        .buttonStyle(.plain)
+                        NavigationLink { TrafficDetailsView(model: model) } label: {
+                            TrafficStat(title: L("下载"), value: Int64(clamping: model.download).formatted(.byteCount(style: .binary, spellsOutZero: false)), disclosure: true)
+                        }
+                        .buttonStyle(.plain)
                         NavigationLink { ConnectionsView(model: model) } label: {
                             TrafficStat(title: L("连接"), value: "\(model.connectionCount)", disclosure: true)
                         }

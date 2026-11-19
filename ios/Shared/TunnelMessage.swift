@@ -22,4 +22,6 @@ struct TunnelMessage: Codable {
     var format: String?
     /// "mitm": the decryption settings; the tunnel adds the CA.
     var mitm: MitmSettings?
+    /// Optional host filter for "traffic-details".
+    var host: String?
 }

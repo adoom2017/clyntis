@@ -341,6 +341,7 @@ export default function App() {
               disabled={disabled}
               perform={perform}
               onAddProfile={() => setPage("profiles")}
+              onOpenConnections={() => setPage("connections")}
             />
           )}
           {page === "profiles" && (

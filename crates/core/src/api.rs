@@ -46,6 +46,7 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/mitm", get(mitm))
         .route("/mitm/bypass", delete(clear_mitm_bypass))
         .route("/traffic", get(traffic))
+        .route("/traffic/details", get(traffic_details))
         .route("/logs", get(logs))
         .route("/ui", get(ui_index))
         .route("/ui/", get(ui_index))
@@ -274,6 +275,13 @@ async fn connections(State(core): State<Arc<Core>>) -> Json<Value> {
     Json(
         json!({"uploadTotal":core.upload.load(Ordering::Relaxed),"downloadTotal":core.download.load(Ordering::Relaxed),"connections":core.connections()}),
     )
+}
+async fn traffic_details(
+    State(core): State<Arc<Core>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let host = query.get("host").map(String::as_str);
+    Json(serde_json::to_value(core.traffic_details(host)).expect("TrafficDetails serializes"))
 }
 /// `?after=<id>&limit=<n>`: entries newer than `after`, oldest first.
 async fn requests(

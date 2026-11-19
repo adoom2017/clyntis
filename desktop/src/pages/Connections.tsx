@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Network, Search, X } from "lucide-react";
+import { TrafficDetailsModal } from "../features/TrafficDetails";
 import { t } from "../i18n";
 import { bytes, type Connection, type Connections } from "../types";
 import { usePageVisible } from "../visibility";
@@ -14,11 +15,14 @@ export function ConnectionPage({
   perform: Perform;
 }) {
   const [items, setItems] = useState<Connection[]>([]);
+  const [totals, setTotals] = useState({ upload: 0, download: 0 });
+  const [trafficOpen, setTrafficOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [failed, setFailed] = useState(false);
   const refresh = useCallback(async () => {
     const value = await invoke<Connections>("connections");
     setItems(value.connections);
+    setTotals({ upload: value.uploadTotal, download: value.downloadTotal });
     setFailed(false);
   }, []);
   const shown = usePageVisible();
@@ -44,11 +48,18 @@ export function ConnectionPage({
         text={t("连接后显示活跃连接。")}
       />
     );
-  const visible = items.filter((item) =>
-    `${item.metadata.host} ${item.chains.join(" ")}`
-      .toLowerCase()
-      .includes(query.toLowerCase()),
-  );
+  const visible = items
+    .filter((item) =>
+      `${item.metadata.host} ${item.chains.join(" ")}`
+        .toLowerCase()
+        .includes(query.toLowerCase()),
+    )
+    .sort(
+      (a, b) =>
+        b.download + b.upload - (a.download + a.upload) ||
+        Number(b.start) - Number(a.start) ||
+        a.id.localeCompare(b.id),
+    );
   return (
     <>
       <div className="toolbar">
@@ -61,18 +72,27 @@ export function ConnectionPage({
             onChange={(e) => setQuery(e.target.value)}
           />
         </label>
-        <button
-          className="button secondary"
-          disabled={!items.length}
-          onClick={() =>
-            void perform(async () => {
-              await invoke("close_connection", { id: null });
-              await refresh();
-            })
-          }
-        >
-          {t("全部断开")}
-        </button>
+        <div className="connections-actions">
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => setTrafficOpen(true)}
+          >
+            {t("流量详情")}
+          </button>
+          <button
+            className="button secondary"
+            disabled={!items.length}
+            onClick={() =>
+              void perform(async () => {
+                await invoke("close_connection", { id: null });
+                await refresh();
+              })
+            }
+          >
+            {t("全部断开")}
+          </button>
+        </div>
       </div>
       {failed && (
         <p className="inline-error" role="alert">
@@ -87,6 +107,7 @@ export function ConnectionPage({
               <th>{t("协议 / 代理链")}</th>
               <th className="num">{t("下载")}</th>
               <th className="num">{t("上传")}</th>
+              <th className="num">{t("总计")}</th>
               <th />
             </tr>
           </thead>
@@ -107,6 +128,9 @@ export function ConnectionPage({
                 </td>
                 <td className="num">{bytes(item.download)}</td>
                 <td className="num">{bytes(item.upload)}</td>
+                <td className="num">
+                  <strong>{bytes(item.download + item.upload)}</strong>
+                </td>
                 <td>
                   <button
                     className="icon-button"
@@ -134,8 +158,17 @@ export function ConnectionPage({
         )}
       </div>
       <p className="small muted table-note">
-        {t("{count} 个连接", { count: items.length })}
+        {t("{count} 个连接", { count: items.length })} · {t("总流量")}{" "}
+        {bytes(totals.upload + totals.download)}（↓ {bytes(totals.download)} / ↑{" "}
+        {bytes(totals.upload)}）
       </p>
+      {trafficOpen && (
+        <TrafficDetailsModal
+          running={running}
+          perform={perform}
+          onClose={() => setTrafficOpen(false)}
+        />
+      )}
     </>
   );
 }

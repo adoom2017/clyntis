@@ -187,6 +187,18 @@ final class CoreSession {
         try Self.read { meta_status_v1(handle, $0, $1, $2) }
     }
 
+    /// Traffic breakdown by destination host and connection, optionally filtered
+    /// to `host` in the core before truncation. Uses its own read limit so large
+    /// breakdowns never affect periodic `snapshot()` refreshes.
+    func trafficDetails(host: String? = nil) throws -> Data {
+        let bytes = Data((host ?? "").utf8)
+        return try bytes.withUnsafeBytes { raw in
+            try Self.read(limit: 2 * 1024 * 1024) {
+                meta_traffic_details_v1(handle, raw.bindMemory(to: UInt8.self).baseAddress, raw.count, $0, $1, $2)
+            }
+        }
+    }
+
     /// Delay through `name` in milliseconds; blocks, so never call it on the
     /// packet queue. The outcome also lands in the snapshot's `proxies`.
     func probe(_ name: String, timeoutMs: UInt32 = 8000) throws -> UInt32 {

@@ -107,6 +107,7 @@ fn main() {
             app::select_proxy,
             app::probe_proxy,
             app::connections,
+            app::traffic_details,
             app::close_connection,
             app::requests,
             app::request_detail,

@@ -30,6 +30,7 @@ mod tailscale;
 #[cfg(test)]
 mod tests;
 mod traffic;
+pub use traffic::{ConnectionTraffic, HostTraffic, TrafficDetails};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -62,7 +63,7 @@ pub struct Core {
     hooks: Hooks,
     policy: RwLock<Policy>,
     pub stop: CancellationToken,
-    connections: Mutex<HashMap<String, Arc<traffic::State>>>,
+    traffic: Mutex<traffic::Ledger>,
     pub upload: AtomicU64,
     pub download: AtomicU64,
     slots: Arc<tokio::sync::Semaphore>,
@@ -394,6 +395,7 @@ impl Core {
         let requests = Arc::new(requests::Requests::new(config.internal_host_packet_io));
         let mitm = mitm::Interceptor::new(&config.mitm, config.internal_host_packet_io);
         let scripts = script::Engine::new(&config.directory, config.internal_host_packet_io);
+        let traffic = Mutex::new(traffic::Ledger::new(config.internal_host_packet_io));
         Ok(Arc::new(Self {
             requests,
             mitm,
@@ -406,7 +408,7 @@ impl Core {
             hooks,
             policy: RwLock::new(policy),
             stop: CancellationToken::new(),
-            connections: Default::default(),
+            traffic,
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
             slots: Arc::new(tokio::sync::Semaphore::new(inbound::CONNECTION_SLOTS)),
@@ -1862,15 +1864,13 @@ impl Core {
         }
     }
     pub fn connections(&self) -> Vec<Connection> {
-        self.connections
-            .lock()
-            .unwrap()
-            .values()
-            .map(|s| s.snapshot())
-            .collect()
+        self.traffic.lock().unwrap().active_snapshots()
     }
     pub fn connection_count(&self) -> usize {
-        self.connections.lock().unwrap().len()
+        self.traffic.lock().unwrap().active_count()
+    }
+    pub fn traffic_details(&self, host: Option<&str>) -> TrafficDetails {
+        self.traffic.lock().unwrap().details(host)
     }
     /// Cancels every proxied connection; returns how many.
     pub fn close_connections(&self) -> usize {
@@ -1881,8 +1881,8 @@ impl Core {
         connections.len()
     }
     pub fn close_connection(&self, id: &str) {
-        if let Some(c) = self.connections.lock().unwrap().get(id) {
-            c.snapshot().cancel.cancel();
+        if let Some(cancel) = self.traffic.lock().unwrap().active_cancel(id) {
+            cancel.cancel();
         }
     }
     /// Records the device network reported by the host and applies the

@@ -596,6 +596,8 @@ pub unsafe extern "C" fn meta_error_v1(
             .with(|text| unsafe { output(text.borrow().as_bytes(), buffer, capacity, length) })
     })
 }
+const TRAFFIC_DETAILS_JSON_CAP: usize = 512 * 1024;
+
 /// # Safety
 /// Buffer and length output must be writable and nonoverlapping.
 #[unsafe(no_mangle)]
@@ -609,6 +611,32 @@ pub unsafe extern "C" fn meta_snapshot_v1(
         let handle = handle(id)?;
         let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "rewrite":handle.core.rewrite_status(), "network":handle.core.network_status(), "mitm":handle.core.mitm_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    })
+}
+/// Traffic breakdown by destination host and connection, as UTF-8 JSON.
+/// When `host_len > 0`, `connections` is filtered in the core to that host
+/// before truncation. Serialized output is capped at 512 KiB.
+///
+/// # Safety
+/// `host` must be readable for `host_len` bytes when non-zero; `buffer` and
+/// `length` must be writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_traffic_details_v1(
+    id: u64,
+    host: *const u8,
+    host_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let host = std::str::from_utf8(unsafe { input_with_limit(host, host_len, 4096)? })?;
+        let host = (!host.trim().is_empty()).then_some(host);
+        let bytes = handle(id)?
+            .core
+            .traffic_details(host)
+            .to_capped_json_vec(TRAFFIC_DETAILS_JSON_CAP)?;
+        unsafe { output(&bytes, buffer, capacity, length) }
     })
 }
 /// The few figures a host checks periodically, as JSON: `stopped`,

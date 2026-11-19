@@ -147,6 +147,13 @@ int32_t meta_snapshot_v1(meta_handle handle, uint8_t *buffer, size_t capacity, s
 /* Cheap periodic check: {"stopped":bool,"connections":n,"upload":n,"download":n}.
  * Use it instead of meta_snapshot_v1 when the configuration is not needed. */
 int32_t meta_status_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
+/* Traffic breakdown by destination host and connection, as UTF-8 JSON.
+ * Pass host (length 0 for global breakdown, or a host name to filter
+ * connections for drill-down). Response size is capped separately from
+ * meta_snapshot_v1. Follows the caller-buffer contract. */
+int32_t meta_traffic_details_v1(meta_handle handle,
+    const uint8_t *host, size_t host_length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 int32_t meta_update_v1(meta_handle handle, const uint8_t *json, size_t length);
 /* Request log (connections, refused ones, and HTTP requests read from
  * decrypted or plain HTTP connections): entries after id `after`, oldest

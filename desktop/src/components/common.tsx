@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
-import { X } from "lucide-react";
+import { ChevronRight, X } from "lucide-react";
 import { t } from "../i18n";
 
 export type Perform = (
@@ -11,12 +11,33 @@ export function Stat({
   value,
   icon,
   tone = "neutral",
+  onClick,
+  title,
 }: {
   label: string;
   value: string;
   icon: ReactNode;
   tone?: string;
+  onClick?: () => void;
+  title?: string;
 }) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className="panel stat stat-clickable"
+        onClick={onClick}
+        title={title}
+      >
+        <span>
+          <span className={`stat-icon ${tone}`}>{icon}</span>
+          {label}
+          <ChevronRight size={14} className="stat-chevron" />
+        </span>
+        <strong>{value}</strong>
+      </button>
+    );
+  }
   return (
     <section className="panel stat">
       <span>

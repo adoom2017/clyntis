@@ -1443,3 +1443,94 @@ async fn network_name_rules_follow_the_reported_network() {
     core.set_network(on("10.88.1.2")).unwrap();
     assert_eq!(route(&core).await, "REJECT");
 }
+
+#[tokio::test]
+async fn traffic_details_tracks_active_and_closed_connections() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let core = Core::new(Config::default(), Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let (mut client, inbound) = tokio::io::duplex(1024);
+        let (outbound, mut peer) = tokio::io::duplex(1024);
+        let owner = core.clone();
+        let relay = tokio::spawn(async move {
+            owner
+                .relay(
+                    Box::new(inbound),
+                    Target::new("api.example.test", 443).unwrap(),
+                    Box::new(outbound),
+                    Routed {
+                        node: "ProxyA".into(),
+                        rule: "DomainSuffix(example.test)".into(),
+                        source: "127.0.0.1".into(),
+                    },
+                )
+                .await
+        });
+
+        client.write_all(b"hello!").await.unwrap();
+        let mut buf = [0u8; 6];
+        peer.read_exact(&mut buf).await.unwrap();
+        peer.write_all(b"world!").await.unwrap();
+        client.read_exact(&mut buf).await.unwrap();
+
+        let (status, active_body) =
+            api_call(core.clone(), "GET", "/traffic/details", "", false).await;
+        assert_eq!(status, 200);
+        assert_eq!(active_body["uploadTotal"], 6);
+        assert_eq!(active_body["downloadTotal"], 6);
+        assert_eq!(active_body["activeConnections"], 1);
+        assert_eq!(active_body["totalConnections"], 1);
+        assert_eq!(active_body["totalHosts"], 1);
+        assert_eq!(active_body["hosts"][0]["host"], "api.example.test");
+        assert_eq!(active_body["hosts"][0]["upload"], 6);
+        assert_eq!(active_body["hosts"][0]["download"], 6);
+        assert_eq!(active_body["hosts"][0]["activeConnections"], 1);
+        assert_eq!(active_body["hosts"][0]["totalConnections"], 1);
+        assert_eq!(active_body["connections"][0]["active"], true);
+
+        let conn_id = active_body["connections"][0]["id"].as_str().unwrap();
+        let (close_status, _) = api_call(
+            core.clone(),
+            "DELETE",
+            &format!("/connections/{conn_id}"),
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(close_status, 200);
+        relay.await.unwrap().unwrap();
+
+        let (status, closed_body) =
+            api_call(core.clone(), "GET", "/traffic/details", "", false).await;
+        assert_eq!(status, 200);
+        assert_eq!(closed_body["uploadTotal"], 6);
+        assert_eq!(closed_body["downloadTotal"], 6);
+        assert_eq!(closed_body["activeConnections"], 0);
+        assert_eq!(closed_body["totalConnections"], 1);
+        assert_eq!(closed_body["totalHosts"], 1);
+        assert_eq!(closed_body["hostsEvicted"], false);
+        assert_eq!(closed_body["matchingActiveConnections"], 0);
+        assert_eq!(closed_body["matchingClosedConnections"], 1);
+        assert_eq!(closed_body["retainedClosedConnections"], 1);
+        assert_eq!(closed_body["hosts"][0]["host"], "api.example.test");
+        assert_eq!(closed_body["hosts"][0]["activeConnections"], 0);
+        assert_eq!(closed_body["hosts"][0]["totalConnections"], 1);
+        assert_eq!(closed_body["connections"][0]["active"], false);
+
+        let (drill_status, drill_body) = api_call(
+            core,
+            "GET",
+            "/traffic/details?host=API.example.test.",
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(drill_status, 200);
+        assert_eq!(drill_body["connectionHost"], "api.example.test");
+        assert_eq!(drill_body["matchingActiveConnections"], 0);
+        assert_eq!(drill_body["matchingClosedConnections"], 1);
+        assert_eq!(drill_body["retainedClosedConnections"], 1);
+        assert_eq!(drill_body["connections"][0]["host"], "api.example.test");
+    })
+    .await
+    .unwrap();
+}

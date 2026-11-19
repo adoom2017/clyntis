@@ -24,7 +24,7 @@ final class AppModel {
     /// The profile's `proxies`, in profile order: the servers that carry traffic.
     var proxies: [String] = []
     var nodeStatus: [String: NodeStatus] = [:]
-    /// Open connections from the core snapshot, newest first.
+    /// Open connections from the core snapshot, highest traffic first.
     var connections: [ConnectionInfo] = []
     /// Ad blocking state and counters from the snapshot.
     var adblock: AdblockStatus?
@@ -651,7 +651,7 @@ final class AppModel {
         return try JSONDecoder().decode(RouteTest.self, from: data)
     }
 
-    /// The configuration review, plus the online bash.ws test when `online`.
+    /// Online DNS leak test, or cached config review when `online` is false.
     func dnsLeak(online: Bool) async throws -> DnsLeakResult {
         guard connected else { throw ClientError.message(L("VPN 未连接。")) }
         let data = try await send(TunnelMessage(command: "dns-leak", online: online), timeout: online ? 45 : 5)
@@ -660,6 +660,18 @@ final class AppModel {
             throw ClientError.message(error)
         }
         return try JSONDecoder().decode(DnsLeakResult.self, from: data)
+    }
+
+    /// On-demand traffic breakdown by host and connection, filtered to `host`
+    /// in the core when drilling down.
+    func fetchTrafficDetails(host: String? = nil) async throws -> TrafficDetails {
+        guard connected else { throw ClientError.message(L("VPN 未连接。")) }
+        let data = try await send(TunnelMessage(command: "traffic-details", host: host))
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let error = object["error"] as? String {
+            throw ClientError.message(error)
+        }
+        return try JSONDecoder().decode(TrafficDetails.self, from: data)
     }
 
     private func send(_ message: TunnelMessage, timeout: Double = 5) async throws -> Data {

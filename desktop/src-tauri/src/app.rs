@@ -1013,6 +1013,19 @@ pub async fn connections(state: State<'_, Desktop>) -> Reply<Value> {
         .map_err(error)
 }
 #[tauri::command]
+pub async fn traffic_details(state: State<'_, Desktop>, host: Option<String>) -> Reply<Value> {
+    let query: Vec<(&str, String)> = host
+        .into_iter()
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| ("host", h))
+        .collect();
+    controller(&state)
+        .await?
+        .request_query(reqwest::Method::GET, &["traffic", "details"], &query, None)
+        .await
+        .map_err(error)
+}
+#[tauri::command]
 pub async fn close_connection(state: State<'_, Desktop>, id: Option<String>) -> Reply<()> {
     let op = state.operation.lock().await;
     let mut path = vec!["connections"];

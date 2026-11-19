@@ -13,6 +13,7 @@ import {
 import { type Perform, Stat } from "../components/common";
 import { AdblockPanel } from "../features/Adblock";
 import { RewritePanel } from "../features/Rewrite";
+import { TrafficDetailsModal } from "../features/TrafficDetails";
 import { t } from "../i18n";
 import {
   bytes,
@@ -29,7 +30,15 @@ import {
 } from "../types";
 import { usePageVisible } from "../visibility";
 
-export function ConnectionStats({ running }: { running: boolean }) {
+export function ConnectionStats({
+  running,
+  onOpenConnections,
+  onOpenTraffic,
+}: {
+  running: boolean;
+  onOpenConnections?: () => void;
+  onOpenTraffic?: () => void;
+}) {
   const [value, setValue] = useState<Connections>({
     connections: [],
     uploadTotal: 0,
@@ -62,11 +71,15 @@ export function ConnectionStats({ running }: { running: boolean }) {
         label={t("连接数")}
         value={String(value.connections.length)}
         icon={<Network size={14} />}
+        onClick={running ? onOpenConnections : undefined}
+        title={running ? t("查看活跃连接") : undefined}
       />
       <Stat
         label={t("总流量")}
         value={bytes(value.uploadTotal + value.downloadTotal)}
         icon={<Activity size={14} />}
+        onClick={running ? onOpenTraffic : undefined}
+        title={running ? t("查看流量详情") : undefined}
       />
     </>
   );
@@ -190,6 +203,7 @@ export function OverviewPage({
   disabled,
   perform,
   onAddProfile,
+  onOpenConnections,
 }: {
   state: Snapshot;
   traffic: Traffic[];
@@ -199,7 +213,12 @@ export function OverviewPage({
   disabled: boolean;
   perform: Perform;
   onAddProfile: () => void;
+  onOpenConnections?: () => void;
 }) {
+  const [trafficOpen, setTrafficOpen] = useState(false);
+  useEffect(() => {
+    if (!running) setTrafficOpen(false);
+  }, [running]);
   return (
     <>
       <section className={`panel connect-card ${running ? "is-running" : ""}`}>
@@ -262,23 +281,38 @@ export function OverviewPage({
           icon={<ArrowUp size={14} />}
           tone="blue"
         />
-        <ConnectionStats running={running} />
+        <ConnectionStats
+          running={running}
+          onOpenConnections={onOpenConnections}
+          onOpenTraffic={() => setTrafficOpen(true)}
+        />
       </div>
       <div className="overview-grid">
         <section className="panel traffic-panel">
           <div className="panel-title">
             <h3>{t("流量")}</h3>
-            <div className="chart-legend">
-              <span>
-                <i className="legend-dot green" />
-                {t("下载")}
-                <b>{bytes(traffic.at(-1)?.down ?? 0)}/s</b>
-              </span>
-              <span>
-                <i className="legend-dot blue" />
-                {t("上传")}
-                <b>{bytes(traffic.at(-1)?.up ?? 0)}/s</b>
-              </span>
+            <div className="traffic-title-actions">
+              <div className="chart-legend">
+                <span>
+                  <i className="legend-dot green" />
+                  {t("下载")}
+                  <b>{bytes(traffic.at(-1)?.down ?? 0)}/s</b>
+                </span>
+                <span>
+                  <i className="legend-dot blue" />
+                  {t("上传")}
+                  <b>{bytes(traffic.at(-1)?.up ?? 0)}/s</b>
+                </span>
+              </div>
+              {running && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setTrafficOpen(true)}
+                >
+                  {t("详情")}
+                </button>
+              )}
             </div>
           </div>
           <TrafficChart values={traffic} />
@@ -321,6 +355,13 @@ export function OverviewPage({
       {running && <NetworkPanel />}
       {running && <AdblockPanel settings={state.settings} perform={perform} />}
       {running && <RewritePanel compact perform={perform} />}
+      {running && trafficOpen && (
+        <TrafficDetailsModal
+          running={running}
+          perform={perform}
+          onClose={() => setTrafficOpen(false)}
+        />
+      )}
     </>
   );
 }

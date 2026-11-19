@@ -508,6 +508,50 @@ export interface Connections {
   uploadTotal: number;
   downloadTotal: number;
 }
+export interface HostTraffic {
+  host: string;
+  upload: number;
+  download: number;
+  activeConnections: number;
+  totalConnections: number;
+  chains: string[];
+  rule: string;
+  lastSeen: number;
+}
+export interface ConnectionTraffic {
+  id: string;
+  host: string;
+  port: number;
+  network: string;
+  chains: string[];
+  rule: string;
+  source: string;
+  upload: number;
+  download: number;
+  start: number;
+  duration: number;
+  active: boolean;
+}
+export interface TrafficDetails {
+  since: number;
+  uploadTotal: number;
+  downloadTotal: number;
+  activeConnections: number;
+  totalConnections: number;
+  /** Retained hosts with traffic or active connections (session total when hostsEvicted is false). */
+  totalHosts: number;
+  hostsEvicted?: boolean;
+  connectionHost?: string | null;
+  matchingActiveConnections?: number;
+  matchingClosedConnections?: number;
+  retainedClosedConnections?: number;
+  closedConnectionCap?: number;
+  hosts: HostTraffic[];
+  otherUpload: number;
+  otherDownload: number;
+  otherConnections: number;
+  connections: ConnectionTraffic[];
+}
 export const initial: Snapshot = {
   status: "stopped",
   error: null,

@@ -589,6 +589,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 defer { self.watchdog.end() }
                 switch message.command {
                 case "snapshot": break
+                case "traffic-details":
+                    completionHandler?(try core.trafficDetails(host: message.host))
+                    return
                 case "mode":
                     guard let mode = message.mode else { throw ClientError.message(L("缺少模式。")) }
                     try core.updateMode(mode)

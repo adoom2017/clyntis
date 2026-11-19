@@ -888,6 +888,7 @@ fn the_reported_network_selects_overrides_and_shows_in_the_snapshot() {
     let snapshot: serde_json::Value = serde_json::from_slice(&bytes[..length]).unwrap();
     assert_eq!(snapshot["network"]["networks"], serde_json::json!(["home"]));
     assert_eq!(snapshot["network"]["override"], "home");
+    assert!(snapshot.get("traffic").is_none());
     let invalid = b"{\"addresses\":[\"not an address\"]}";
     assert_eq!(
         unsafe { meta_set_network_v1(id, invalid.as_ptr(), invalid.len()) },
@@ -1015,5 +1016,66 @@ fn decryption_settings_change_live_and_the_request_log_is_readable() {
         unsafe { meta_request_detail_v1(id, 7, std::ptr::null_mut(), 0, &mut length) },
         ERROR
     );
+    assert_eq!(meta_destroy_v1(id), OK);
+}
+
+#[test]
+fn traffic_details_is_separate_from_snapshot_and_supports_host_filter() {
+    let id = create(b"rules: ['MATCH,DIRECT']\n", std::ptr::null());
+    let snap = snapshot(id);
+    assert!(snap.get("traffic").is_none());
+
+    let query = |host: &[u8]| -> serde_json::Value {
+        let mut length = 0;
+        assert_eq!(
+            unsafe {
+                meta_traffic_details_v1(
+                    id,
+                    if host.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        host.as_ptr()
+                    },
+                    host.len(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut length,
+                )
+            },
+            BUFFER_TOO_SMALL
+        );
+        let mut bytes = vec![0u8; length];
+        assert_eq!(
+            unsafe {
+                meta_traffic_details_v1(
+                    id,
+                    if host.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        host.as_ptr()
+                    },
+                    host.len(),
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut length,
+                )
+            },
+            OK
+        );
+        serde_json::from_slice(&bytes[..length]).unwrap()
+    };
+
+    let global = query(b"");
+    assert_eq!(global["uploadTotal"], 0);
+    assert_eq!(global["downloadTotal"], 0);
+    assert!(global["hosts"].is_array());
+    assert!(global["connections"].is_array());
+    assert!(global.get("connectionHost").is_none());
+
+    let filtered = query(b"Example.Test.");
+    assert_eq!(filtered["connectionHost"], "example.test");
+    assert_eq!(filtered["matchingActiveConnections"], 0);
+    assert_eq!(filtered["matchingClosedConnections"], 0);
+
     assert_eq!(meta_destroy_v1(id), OK);
 }

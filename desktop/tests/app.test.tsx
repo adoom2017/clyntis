@@ -878,4 +878,488 @@ describe("Editor", () => {
       vi.useRealTimers();
     }
   });
+  it("opens traffic details from Overview, drills down by host, and closes active connections", async () => {
+    let detailsCalls = 0;
+    const sampleDetails = {
+      since: 1700000000,
+      uploadTotal: 256,
+      downloadTotal: 1792,
+      activeConnections: 1,
+      totalConnections: 7,
+      totalHosts: 2,
+      hostsEvicted: false,
+      connectionHost: null,
+      matchingActiveConnections: 1,
+      matchingClosedConnections: 6,
+      retainedClosedConnections: 2,
+      hosts: [
+        {
+          host: "cdn.example.test",
+          upload: 128,
+          download: 1408,
+          activeConnections: 1,
+          totalConnections: 6,
+          chains: ["ProxyA"],
+          rule: "DomainSuffix(example.test)",
+          lastSeen: 1700000100,
+        },
+        {
+          host: "small.example.test",
+          upload: 28,
+          download: 184,
+          activeConnections: 0,
+          totalConnections: 1,
+          chains: ["DIRECT"],
+          rule: "Match",
+          lastSeen: 1700000050,
+        },
+      ],
+      otherUpload: 100,
+      otherDownload: 200,
+      otherConnections: 1,
+      connections: [
+        {
+          id: "conn-active",
+          host: "cdn.example.test",
+          port: 443,
+          network: "tcp",
+          chains: ["ProxyA"],
+          rule: "DomainSuffix(example.test)",
+          source: "127.0.0.1",
+          upload: 100,
+          download: 1024,
+          start: 1700000090,
+          duration: 5000,
+          active: true,
+        },
+        {
+          id: "conn-closed",
+          host: "cdn.example.test",
+          port: 443,
+          network: "tcp",
+          chains: ["ProxyA"],
+          rule: "DomainSuffix(example.test)",
+          source: "127.0.0.1",
+          upload: 28,
+          download: 384,
+          start: 1700000010,
+          duration: 1200,
+          active: false,
+        },
+        {
+          id: "conn-other",
+          host: "small.example.test",
+          port: 80,
+          network: "tcp",
+          chains: ["DIRECT"],
+          rule: "Match",
+          source: "127.0.0.1",
+          upload: 28,
+          download: 184,
+          start: 1700000005,
+          duration: 800,
+          active: false,
+        },
+      ],
+    };
+    invoke.mockImplementation(async (command, args) => {
+      if (command === "connections")
+        return { connections: [], uploadTotal: 256, downloadTotal: 1792 };
+      if (command === "traffic_details") {
+        detailsCalls += 1;
+        const host = (args as { host?: string | null } | undefined)?.host ?? null;
+        if (host) {
+          return {
+            ...sampleDetails,
+            connectionHost: host,
+            matchingActiveConnections: 1,
+            matchingClosedConnections: 5,
+            retainedClosedConnections: 1,
+            connections: sampleDetails.connections.filter(
+              (c) => c.host === host,
+            ),
+          };
+        }
+        return sampleDetails;
+      }
+      if (command === "close_connection") return null;
+      return { ...structuredClone(initial), status: "running" };
+    });
+
+    render(<App />);
+    const totalStat = await screen.findByRole("button", { name: /总流量/ });
+    await waitFor(() => expect(totalStat).toHaveTextContent("2.0 KB"));
+    fireEvent.click(totalStat);
+
+    const dialog = await screen.findByRole("dialog", { name: "流量详情" });
+    expect(detailsCalls).toBeGreaterThanOrEqual(1);
+    expect(within(dialog).getByText("cdn.example.test")).toBeInTheDocument();
+    expect(within(dialog).getByText("75.0%")).toBeInTheDocument();
+    expect(within(dialog).getByText("其他目标")).toBeInTheDocument();
+    expect(within(dialog).getByText("300 B")).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByText("cdn.example.test"));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("traffic_details", {
+        host: "cdn.example.test",
+      }),
+    );
+    expect(
+      within(dialog).getByText("目标：cdn.example.test"),
+    ).toBeInTheDocument();
+    const table = await within(dialog).findByRole("table");
+    expect(within(table).getByText("活跃")).toBeInTheDocument();
+    expect(within(table).getByText("已结束")).toBeInTheDocument();
+    expect(
+      within(table).queryByText("small.example.test"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).getByText("已结束连接仅保留高流量记录，显示 1 / 5 条"),
+    ).toBeInTheDocument();
+
+    const beforeClose = detailsCalls;
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "关闭 cdn.example.test 连接",
+      }),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("close_connection", {
+        id: "conn-active",
+      }),
+    );
+    await waitFor(() => expect(detailsCalls).toBeGreaterThan(beforeClose));
+  });
+  it("serializes traffic details polling and discards stale responses after closing a connection", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending: ((value: unknown) => void)[] = [];
+      invoke.mockImplementation((command) => {
+        if (command === "connections") {
+          return Promise.resolve({
+            connections: [],
+            uploadTotal: 100,
+            downloadTotal: 1000,
+          });
+        }
+        if (command === "traffic_details") {
+          return new Promise((resolve) => {
+            pending.push(resolve);
+          });
+        }
+        if (command === "close_connection") {
+          return Promise.resolve(null);
+        }
+        return Promise.resolve({ ...structuredClone(initial), status: "running" });
+      });
+
+      const activePayload = {
+        since: 1700000000,
+        uploadTotal: 100,
+        downloadTotal: 1000,
+        activeConnections: 1,
+        totalConnections: 1,
+        totalHosts: 1,
+        hostsEvicted: false,
+        connectionHost: null,
+        matchingActiveConnections: 1,
+        matchingClosedConnections: 0,
+        retainedClosedConnections: 0,
+        hosts: [
+          {
+            host: "cdn.example.test",
+            upload: 100,
+            download: 1000,
+            activeConnections: 1,
+            totalConnections: 1,
+            chains: ["ProxyA"],
+            rule: "Match",
+            lastSeen: 1700000010,
+          },
+        ],
+        otherUpload: 0,
+        otherDownload: 0,
+        otherConnections: 0,
+        connections: [
+          {
+            id: "conn-active",
+            host: "cdn.example.test",
+            port: 443,
+            network: "tcp",
+            chains: ["ProxyA"],
+            rule: "Match",
+            source: "127.0.0.1",
+            upload: 100,
+            download: 1000,
+            start: 1700000010,
+            duration: 1000,
+            active: true,
+          },
+        ],
+      };
+
+      const closedPayload = {
+        ...activePayload,
+        activeConnections: 0,
+        matchingActiveConnections: 0,
+        matchingClosedConnections: 1,
+        retainedClosedConnections: 1,
+        hosts: [{ ...activePayload.hosts[0], activeConnections: 0 }],
+        connections: [{ ...activePayload.connections[0], active: false }],
+      };
+
+      await act(async () => {
+        render(<App />);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      const totalStat = screen.getByRole("button", { name: /总流量/ });
+      await act(async () => {
+        fireEvent.click(totalStat);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(pending.length).toBe(1);
+      // Advancing timers while first poll is still pending must not overlap another poll.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
+      });
+      expect(pending.length).toBe(1);
+
+      await act(async () => {
+        pending[0](activePayload);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      const dialog = screen.getByRole("dialog", { name: "流量详情" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "按连接" }));
+      expect(
+        within(within(dialog).getByRole("table")).getByText("活跃"),
+      ).toBeInTheDocument();
+
+      // Let next serialized poll start and stay in-flight.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(pending.length).toBe(2);
+
+      // Closing triggers a newer refresh while poll #2 is still pending.
+      await act(async () => {
+        fireEvent.click(
+          within(dialog).getByRole("button", {
+            name: "关闭 cdn.example.test 连接",
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(pending.length).toBe(3);
+
+      // Post-close refresh finishes first with closed status.
+      await act(async () => {
+        pending[2](closedPayload);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const table = within(dialog).getByRole("table");
+      expect(within(table).getByText("已结束")).toBeInTheDocument();
+      expect(within(table).queryByText("活跃")).not.toBeInTheDocument();
+
+      // Earlier pre-close response arrives late: must be ignored.
+      await act(async () => {
+        pending[1](activePayload);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(within(table).getByText("已结束")).toBeInTheDocument();
+      expect(within(table).queryByText("活跃")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("keeps the newly selected host when switching hosts while closing a connection", async () => {
+    let resolveClose!: () => void;
+    const requestedHosts: (string | null)[] = [];
+    const base = {
+      since: 1700000000,
+      uploadTotal: 200,
+      downloadTotal: 2000,
+      activeConnections: 2,
+      totalConnections: 2,
+      totalHosts: 2,
+      hostsEvicted: false,
+      matchingActiveConnections: 1,
+      matchingClosedConnections: 0,
+      retainedClosedConnections: 0,
+      hosts: [
+        {
+          host: "alpha.test",
+          upload: 100,
+          download: 1000,
+          activeConnections: 1,
+          totalConnections: 1,
+          chains: ["ProxyA"],
+          rule: "Match",
+          lastSeen: 1700000100,
+        },
+        {
+          host: "beta.test",
+          upload: 100,
+          download: 1000,
+          activeConnections: 1,
+          totalConnections: 1,
+          chains: ["ProxyB"],
+          rule: "Match",
+          lastSeen: 1700000100,
+        },
+      ],
+      otherUpload: 0,
+      otherDownload: 0,
+      otherConnections: 0,
+    };
+    const alphaConn = {
+      id: "conn-a",
+      host: "alpha.test",
+      port: 443,
+      network: "tcp",
+      chains: ["ProxyA"],
+      rule: "Match",
+      source: "127.0.0.1",
+      upload: 100,
+      download: 1000,
+      start: 1700000100,
+      duration: 1000,
+      active: true,
+    };
+    const betaConn = {
+      id: "conn-b",
+      host: "beta.test",
+      port: 8443,
+      network: "tcp",
+      chains: ["ProxyB"],
+      rule: "Match",
+      source: "127.0.0.1",
+      upload: 100,
+      download: 1000,
+      start: 1700000100,
+      duration: 1000,
+      active: true,
+    };
+
+    invoke.mockImplementation(async (command, args) => {
+      if (command === "connections")
+        return { connections: [], uploadTotal: 200, downloadTotal: 2000 };
+      if (command === "traffic_details") {
+        const host =
+          (args as { host?: string | null } | undefined)?.host ?? null;
+        requestedHosts.push(host);
+        if (host === "alpha.test") {
+          return {
+            ...base,
+            connectionHost: "alpha.test",
+            connections: [alphaConn],
+          };
+        }
+        if (host === "beta.test") {
+          return {
+            ...base,
+            connectionHost: "beta.test",
+            connections: [betaConn],
+          };
+        }
+        return {
+          ...base,
+          connectionHost: null,
+          matchingActiveConnections: 2,
+          connections: [alphaConn, betaConn],
+        };
+      }
+      if (command === "close_connection") {
+        return new Promise<void>((resolve) => {
+          resolveClose = resolve;
+        });
+      }
+      return { ...structuredClone(initial), status: "running" };
+    });
+
+    render(<App />);
+    const totalStat = await screen.findByRole("button", { name: /总流量/ });
+    fireEvent.click(totalStat);
+
+    const dialog = await screen.findByRole("dialog", { name: "流量详情" });
+    fireEvent.click(await within(dialog).findByText("alpha.test"));
+    await within(dialog).findByRole("button", { name: "关闭 alpha.test 连接" });
+
+    // Start closing conn-a, but leave close_connection pending.
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "关闭 alpha.test 连接" }),
+    );
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("close_connection", { id: "conn-a" }),
+    );
+
+    // Switch back to hosts and drill down into beta.test while conn-a close is in flight.
+    fireEvent.click(within(dialog).getByRole("button", { name: "按目标" }));
+    fireEvent.click(await within(dialog).findByText("beta.test"));
+    expect(
+      within(dialog).getByText("目标：beta.test"),
+    ).toBeInTheDocument();
+    await within(dialog).findByRole("button", { name: "关闭 beta.test 连接" });
+
+    const beforeCloseDone = requestedHosts.length;
+    await act(async () => {
+      resolveClose();
+    });
+
+    await waitFor(() =>
+      expect(requestedHosts.length).toBeGreaterThan(beforeCloseDone),
+    );
+    // The post-close refresh must target the currently selected host (beta.test), not alpha.test.
+    expect(requestedHosts.slice(beforeCloseDone)).toEqual(["beta.test"]);
+    expect(
+      within(dialog).getByText("目标：beta.test"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "关闭 beta.test 连接" }),
+    ).toBeInTheDocument();
+  });
+  it("opens Connections from Overview and sorts rows by total traffic descending", async () => {
+    invoke.mockImplementation(async (command) => {
+      if (command === "connections") {
+        return {
+          uploadTotal: 150,
+          downloadTotal: 1124,
+          connections: [
+            {
+              id: "light",
+              metadata: { host: "light.test", port: 80 },
+              network: "tcp",
+              chains: ["DIRECT"],
+              upload: 50,
+              download: 100,
+              start: "200",
+            },
+            {
+              id: "heavy",
+              metadata: { host: "heavy.test", port: 443 },
+              network: "tcp",
+              chains: ["ProxyA"],
+              upload: 100,
+              download: 1024,
+              start: "100",
+            },
+          ],
+        };
+      }
+      return { ...structuredClone(initial), status: "running" };
+    });
+
+    render(<App />);
+    const connStat = await screen.findByRole("button", { name: /连接数/ });
+    fireEvent.click(connStat);
+
+    await screen.findByRole("columnheader", { name: "总计" });
+    const rows = screen.getAllByRole("row").slice(1);
+    expect(rows[0]).toHaveTextContent("heavy.test");
+    expect(rows[0]).toHaveTextContent("1.1 KB");
+    expect(rows[1]).toHaveTextContent("light.test");
+    expect(rows[1]).toHaveTextContent("150 B");
+  });
 });
