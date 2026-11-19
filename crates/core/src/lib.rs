@@ -1748,6 +1748,7 @@ impl Core {
         );
         status["decrypting"] = serde_json::json!(self.mitm.is_active());
         status["bypassed"] = serde_json::json!(self.mitm.bypassed_module_hosts());
+        status["skippedAlpn"] = serde_json::json!(self.mitm.skipped_alpn_module_hosts());
         status
     }
     /// Includes routing data, lists, modules and their dependent files.

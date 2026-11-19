@@ -17,6 +17,7 @@ struct RewriteStatus: Decodable, Equatable {
         let missing: [String]
         let updated: Double?
         let error: String?
+        let updateError: String?
     }
     struct Hit: Decodable, Equatable {
         let time: Double
@@ -186,6 +187,16 @@ struct RewriteView: View {
                 LabeledContent(L("模块主机名"), value: status.hostnames.count.formatted())
                 if !status.decrypting {
                     Text(L("HTTPS 解密未开启，模块不生效")).foregroundStyle(.orange)
+                }
+                ForEach(status.modules.filter { $0.updateError != nil }, id: \.name) { module in
+                    if let error = module.updateError {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(displayName(module.name))
+                            Text(L("更新失败，仍在使用缓存：{error}", ["error": error]))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             } header: {
                 Text(L("本次连接"))

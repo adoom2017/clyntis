@@ -6,9 +6,10 @@
 //! are limited, since the iOS tunnel has little memory.
 use crate::rewrite::Answer;
 use anyhow::Result;
-use clyntis_config::rewrite::Phase;
+use clyntis_config::rewrite::{Phase, ScriptArgument, ScriptValue};
 use std::{
     collections::HashMap,
+    io::Read,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -17,6 +18,7 @@ use std::{
 /// The default and the longest time a script may take.
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const SOURCE_LIMIT: usize = 4 << 20;
 /// What `$httpClient` responses and stored values may hold.
 const HTTP_BODY_LIMIT: usize = 8 << 20;
 const STORE_VALUE_LIMIT: usize = 512 << 10;
@@ -26,7 +28,7 @@ const STORE_LIMIT: usize = 4 << 20;
 pub(crate) struct Job {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
-    pub(crate) argument: String,
+    pub(crate) argument: ScriptArgument,
     pub(crate) timeout: Duration,
     pub(crate) binary: bool,
     pub(crate) phase: Phase,
@@ -58,7 +60,7 @@ pub(crate) struct Outcome {
 
 /// Scripts' shared state: the store and how many may run at once.
 pub(crate) struct Engine {
-    permits: tokio::sync::Semaphore,
+    permits: Arc<tokio::sync::Semaphore>,
     memory: usize,
     store: Arc<Mutex<Store>>,
 }
@@ -113,7 +115,7 @@ impl Store {
 impl Engine {
     pub(crate) fn new(directory: &std::path::Path, hosted: bool) -> Self {
         Self {
-            permits: tokio::sync::Semaphore::new(if hosted { 1 } else { 4 }),
+            permits: tokio::sync::Semaphore::new(if hosted { 1 } else { 4 }).into(),
             memory: if hosted { 16 << 20 } else { 128 << 20 },
             store: Arc::new(Mutex::new(Store {
                 path: directory.join("rewrite/store.json"),
@@ -127,14 +129,26 @@ impl Engine {
 pub(crate) async fn run(core: &Arc<crate::Core>, job: Job) -> Result<Outcome> {
     let timeout = job.timeout.min(MAX_TIMEOUT);
     let deadline = tokio::time::Instant::now() + timeout;
-    let _permit = tokio::time::timeout_at(deadline, core.scripts.permits.acquire())
+    let permit = tokio::time::timeout_at(deadline, core.scripts.permits.clone().acquire_owned())
         .await
         .map_err(|_| anyhow::anyhow!("script {}: waited too long for a free slot", job.name))??;
-    let source = tokio::fs::read_to_string(&job.path).await?;
     let core = core.clone();
     let handle = tokio::runtime::Handle::current();
     let deadline = deadline.into_std();
-    tokio::task::spawn_blocking(move || imp::run(core, handle, job, source, deadline)).await?
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut source = Vec::new();
+        std::fs::File::open(&job.path)?
+            .take(SOURCE_LIMIT as u64 + 1)
+            .read_to_end(&mut source)?;
+        anyhow::ensure!(
+            source.len() <= SOURCE_LIMIT,
+            "script source exceeds size limit"
+        );
+        let source = String::from_utf8(source)?;
+        imp::run(core, handle, job, source, deadline)
+    })
+    .await?
 }
 
 #[cfg(target_os = "android")]
@@ -471,7 +485,26 @@ mod imp {
             }
             globals.set("$response", object)?;
         }
-        globals.set("$argument", job.argument.as_str())?;
+        match &job.argument {
+            ScriptArgument::Text(text) => globals.set("$argument", text.as_str())?,
+            ScriptArgument::Object(entries) => {
+                let object = Object::new(ctx.clone())?;
+                for (key, value) in entries {
+                    match value {
+                        ScriptValue::Bool(b) => object.set(key.as_str(), *b)?,
+                        ScriptValue::Number(n) => {
+                            if let Ok(num) = n.parse::<f64>() {
+                                object.set(key.as_str(), num)?;
+                            } else {
+                                object.set(key.as_str(), n.as_str())?;
+                            }
+                        }
+                        ScriptValue::String(s) => object.set(key.as_str(), s.as_str())?,
+                    }
+                }
+                globals.set("$argument", object)?;
+            }
+        }
         let script = Object::new(ctx.clone())?;
         script.set("name", job.name.as_str())?;
         script.set(
@@ -605,6 +638,7 @@ mod imp {
                     .map(|v| header_list(&v))
                     .unwrap_or_default(),
                 body: body_field(&response).unwrap_or_default(),
+                file: None,
             });
         }
         outcome
@@ -717,7 +751,7 @@ mod tests {
         Job {
             name: "test".into(),
             path,
-            argument: "arg".into(),
+            argument: ScriptArgument::Text("arg".into()),
             timeout,
             binary,
             phase: Phase::Response,
@@ -731,6 +765,54 @@ mod tests {
                 body: Some(b"\x01\x02\x03".to_vec()),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn canceled_caller_keeps_worker_slot_until_script_exits() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        let config = clyntis_config::Config {
+            directory: dir.clone(),
+            internal_host_packet_io: true,
+            ..Default::default()
+        };
+        let core = crate::Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let script = dir.join("wait.js");
+        std::fs::write(
+            &script,
+            format!(
+                "$httpClient.get('http://{}/', () => $done({{}}));",
+                listener.local_addr().unwrap()
+            ),
+        )
+        .unwrap();
+        let caller = {
+            let core = core.clone();
+            tokio::spawn(async move { run(&core, job(script, DEFAULT_TIMEOUT, false)).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            while {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap() > 0 && line != "\r\n"
+            } {}
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert_eq!(core.scripts.permits.available_permits(), 0);
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _released = core.scripts.permits.acquire().await.unwrap();
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -748,6 +830,16 @@ mod tests {
             std::fs::write(&path, source).unwrap();
             path
         };
+
+        let path = directory.join("oversized.js");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(SOURCE_LIMIT as u64 + 1)
+            .unwrap();
+        let error = run(&core, job(path, DEFAULT_TIMEOUT, false))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "script source exceeds size limit");
 
         // Binary bodies, status, and the first `$done` wins.
         let path = script(
@@ -805,6 +897,36 @@ $done({body: "ignored"});"#,
             "const a = []; while (true) a.push('x'.repeat(1 << 20));",
         );
         assert!(run(&core, job(path, DEFAULT_TIMEOUT, false)).await.is_err());
+
+        // Typed Loon DSL object arguments parsed from module text (including
+        // `type=number` in `[Argument]`) are injected as a real JS object.
+        let module = clyntis_config::rewrite::parse_module(
+            r#"[Argument]
+price = input,9.99,type=number,tag=Price
+flag = switch,true,false,tag=Flag
+mode = select,"show","hide",tag=Mode
+[Script]
+response if ${url} ~= /^https:\/\/a\.test\/x$/ then script("https://cdn.test/obj.js", {${price}, ${flag}, ${mode}})
+"#,
+        );
+        let clyntis_config::rewrite::Action::Script(parsed_script) = &module.rules[0].action else {
+            panic!("expected script rule");
+        };
+        let path = script(
+            "obj_arg.js",
+            r#"
+            const ok = typeof $argument === "object"
+                && $argument.price === 9.99
+                && $argument.flag === true
+                && $argument.mode === "show";
+            $done({body: ok ? "typed-ok" : "wrong"});
+            "#,
+        );
+        let mut obj_job = job(path, DEFAULT_TIMEOUT, false);
+        obj_job.argument = parsed_script.argument.clone();
+        let outcome = run(&core, obj_job).await.unwrap();
+        assert_eq!(outcome.body.as_deref(), Some(&b"typed-ok"[..]));
+
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

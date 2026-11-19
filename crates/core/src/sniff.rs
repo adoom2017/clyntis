@@ -20,7 +20,7 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
         && !host.contains("..")
 }
-pub(crate) fn tls(data: &[u8]) -> Option<String> {
+fn tls_extension(data: &[u8], target: usize) -> Option<Vec<u8>> {
     let mut records = data;
     let mut hello = vec![];
     while !records.is_empty() {
@@ -59,23 +59,58 @@ pub(crate) fn tls(data: &[u8]) -> Option<String> {
     while !extensions.is_empty() {
         let kind = length(&mut extensions)?;
         let n = length(&mut extensions)?;
-        let mut value = take(&mut extensions, n)?;
-        if kind != 0 {
-            continue;
-        }
-        let n = length(&mut value)?;
-        let mut names = take(&mut value, n)?;
-        while !names.is_empty() {
-            let kind = take(&mut names, 1)?[0];
-            let n = length(&mut names)?;
-            let host = take(&mut names, n)?;
-            if kind == 0 {
-                let host = std::str::from_utf8(host).ok()?.to_ascii_lowercase();
-                return valid_host(&host).then_some(host);
-            }
+        let value = take(&mut extensions, n)?;
+        if kind == target {
+            return Some(value.to_vec());
         }
     }
     None
+}
+
+pub(crate) fn tls(data: &[u8]) -> Option<String> {
+    let raw = tls_extension(data, 0)?;
+    let mut value = raw.as_slice();
+    let n = length(&mut value)?;
+    let mut names = take(&mut value, n)?;
+    while !names.is_empty() {
+        let kind = take(&mut names, 1)?[0];
+        let n = length(&mut names)?;
+        let host = take(&mut names, n)?;
+        if kind == 0 {
+            let host = std::str::from_utf8(host).ok()?.to_ascii_lowercase();
+            return valid_host(&host).then_some(host);
+        }
+    }
+    None
+}
+
+/// False only when the ClientHello declares ALPN protocols and omits `http/1.1`
+/// (e.g. `h2`-only gRPC connections that cannot downgrade to HTTP/1.1).
+pub(crate) fn tls_supports_http1(data: &[u8]) -> bool {
+    let Some(raw) = tls_extension(data, 16) else {
+        return true;
+    };
+    let mut value = raw.as_slice();
+    let Some(list_len) = length(&mut value) else {
+        return true;
+    };
+    let Some(mut list) = take(&mut value, list_len) else {
+        return true;
+    };
+    let mut saw_protocol = false;
+    while !list.is_empty() {
+        let Some(plen) = take(&mut list, 1).map(|b| b[0] as usize) else {
+            return true;
+        };
+        let Some(proto) = take(&mut list, plen) else {
+            return true;
+        };
+        saw_protocol = true;
+        if proto == b"http/1.1" {
+            return true;
+        }
+    }
+    !saw_protocol
 }
 pub(crate) fn http(data: &[u8]) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 128];
@@ -214,7 +249,7 @@ fn domain(pattern: &str, host: &str) -> bool {
         .is_ok_and(|m| m.evaluate(&host.to_ascii_lowercase(), None, 0, "", false) == Some(true))
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn http_host_and_invalid_data() {
@@ -224,6 +259,71 @@ mod tests {
         );
         assert!(tls(&[22, 3, 3, 255, 255]).is_none());
         assert!(http(b"GET / HTTP/1.1\r\nHost: bad/name\r\n\r\n").is_none());
+    }
+
+    pub(crate) fn client_hello_with_alpn(host: &str, protos: &[&[u8]]) -> Vec<u8> {
+        let mut sni = Vec::new();
+        let name = host.as_bytes();
+        let list_len = (1 + 2 + name.len()) as u16;
+        sni.extend_from_slice(&list_len.to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name);
+
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&0u16.to_be_bytes());
+        ext.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&sni);
+
+        if !protos.is_empty() {
+            let mut proto_list = Vec::new();
+            for p in protos {
+                proto_list.push(p.len() as u8);
+                proto_list.extend_from_slice(p);
+            }
+            ext.extend_from_slice(&16u16.to_be_bytes());
+            ext.extend_from_slice(&((proto_list.len() + 2) as u16).to_be_bytes());
+            ext.extend_from_slice(&(proto_list.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&proto_list);
+        }
+
+        let mut hello_body = Vec::new();
+        hello_body.extend_from_slice(&[3, 3]); // TLS 1.2
+        hello_body.extend_from_slice(&[0u8; 32]); // random
+        hello_body.push(0); // session id len
+        hello_body.extend_from_slice(&2u16.to_be_bytes()); // cipher suites len
+        hello_body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        hello_body.push(1); // compression methods len
+        hello_body.push(0); // null compression
+        hello_body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hello_body.extend_from_slice(&ext);
+
+        let mut handshake = Vec::new();
+        handshake.push(1); // ClientHello
+        let len = hello_body.len();
+        handshake.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        handshake.extend_from_slice(&hello_body);
+
+        let mut record = Vec::new();
+        record.extend_from_slice(&[22, 3, 1]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    #[test]
+    fn alpn_detects_h2_only_client_hello() {
+        let h2_only = client_hello_with_alpn("grpc.example.test", &[b"h2"]);
+        assert_eq!(tls(&h2_only).as_deref(), Some("grpc.example.test"));
+        assert!(!tls_supports_http1(&h2_only));
+
+        let mixed = client_hello_with_alpn("app.example.test", &[b"h2", b"http/1.1"]);
+        assert_eq!(tls(&mixed).as_deref(), Some("app.example.test"));
+        assert!(tls_supports_http1(&mixed));
+
+        let no_alpn = client_hello_with_alpn("legacy.example.test", &[]);
+        assert_eq!(tls(&no_alpn).as_deref(), Some("legacy.example.test"));
+        assert!(tls_supports_http1(&no_alpn));
     }
 
     fn fake_ip_core() -> std::sync::Arc<crate::Core> {

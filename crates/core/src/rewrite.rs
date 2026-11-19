@@ -1,7 +1,10 @@
 //! Rewriting decrypted HTTP with modules (see `clyntis_config::rewrite`):
 //! compiled rules, the actions that need no script, and counters.
 use clyntis_config::{
-    rewrite::{Action, DomainKind, HeaderOp, Mock, MockBody, Module, Phase, Reject, TINY_GIF},
+    rewrite::{
+        Action, Condition, DomainKind, HeaderOp, MatchOp, Mock, MockBody, Module, Phase, Reject,
+        TINY_GIF,
+    },
     rule::{DomainSet, DomainSetBuilder},
 };
 use serde::Serialize;
@@ -42,6 +45,8 @@ pub struct ModuleInfo {
     pub updated: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "updateError", skip_serializing_if = "Option::is_none")]
+    pub update_error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Skipped {
@@ -55,13 +60,39 @@ pub(crate) struct Compiled {
     pub(crate) line: usize,
     pub(crate) phase: Phase,
     /// Retained after construction only for lookaround, set-build fallbacks
-    /// and redirect captures. Other patterns live only in the batched sets.
+    /// and redirect/url-replace captures. Other patterns live only in the
+    /// batched sets.
     pattern: Option<UrlPattern>,
+    conditions: Vec<CompiledCondition>,
+    pub(crate) pipe_continuation: bool,
     pub(crate) action: Action,
     /// Compiled regexes of body and header rewrites, in order.
     extra: Vec<fancy_regex::Regex>,
     /// The compiled filter of a jq rewrite.
     pub(crate) jq: Option<crate::jq::Filter>,
+}
+
+enum CompiledCondition {
+    Method { equals: bool, value: String },
+    Status { equals: bool, value: u16 },
+    RequestHeader { name: String, op: CompiledMatchOp },
+    ResponseHeader { name: String, op: CompiledMatchOp },
+}
+
+enum CompiledMatchOp {
+    Equals(String),
+    NotEquals(String),
+    Regex(fancy_regex::Regex),
+}
+
+impl CompiledMatchOp {
+    fn matches(&self, value: Option<&str>) -> bool {
+        match self {
+            Self::Equals(expected) => value.is_some_and(|v| v == expected),
+            Self::NotEquals(expected) => value != Some(expected.as_str()),
+            Self::Regex(regex) => value.is_some_and(|v| regex.is_match(v).unwrap_or(false)),
+        }
+    }
 }
 
 enum UrlPattern {
@@ -98,6 +129,29 @@ impl Compiled {
     /// `kind (module)`, for the request log.
     pub(crate) fn label(&self) -> String {
         format!("{} ({})", self.action.kind(), self.module)
+    }
+
+    pub(crate) fn matches_conditions(
+        &self,
+        method: &str,
+        request_headers: &[(String, String)],
+        response_status: Option<u16>,
+        response_headers: &[(String, String)],
+    ) -> bool {
+        self.conditions.iter().all(|cond| match cond {
+            CompiledCondition::Method { equals, value } => {
+                method.eq_ignore_ascii_case(value) == *equals
+            }
+            CompiledCondition::Status { equals, value } => {
+                response_status.is_some_and(|s| (s == *value) == *equals)
+            }
+            CompiledCondition::RequestHeader { name, op } => {
+                op.matches(find(request_headers, name))
+            }
+            CompiledCondition::ResponseHeader { name, op } => {
+                op.matches(find(response_headers, name))
+            }
+        })
     }
 }
 
@@ -251,7 +305,10 @@ fn flush_patterns(
     {
         Ok(set) => {
             for &i in indices.iter() {
-                if !matches!(rules[i].action, Action::Redirect { .. }) {
+                if !matches!(
+                    rules[i].action,
+                    Action::Redirect { .. } | Action::UrlReplace(_)
+                ) {
                     rules[i].pattern = None;
                 }
             }
@@ -312,21 +369,24 @@ impl Rewriter {
                 .collect();
             let mut count = 0;
             let mut scripts = 0;
+            let mut failed_line: Option<usize> = None;
             for rule in module.rules {
+                let line = rule.line;
+                let is_continuation = rule.pipe_continuation;
+                if is_continuation && failed_line == Some(line) {
+                    continue;
+                }
+                if !is_continuation {
+                    failed_line = None;
+                }
+                if !rule_has_file(&rule, |url| loaded.files.contains_key(url)) {
+                    if !is_continuation {
+                        failed_line = Some(line);
+                    }
+                    continue;
+                }
                 match compile(&loaded.name, rule) {
                     Ok((compiled, batchable)) => {
-                        // A rule whose file is missing cannot act.
-                        let file = match &compiled.action {
-                            Action::Script(script) => Some(&script.url),
-                            Action::Mock(Mock {
-                                body: MockBody::Remote(url),
-                                ..
-                            }) => Some(url),
-                            _ => None,
-                        };
-                        if file.is_some_and(|url| !loaded.files.contains_key(url)) {
-                            continue;
-                        }
                         if matches!(compiled.action, Action::Script(_)) {
                             scripts += 1;
                         }
@@ -342,7 +402,12 @@ impl Rewriter {
                             flush_patterns(&mut rules, &mut batch, &mut sets, &mut fancy);
                         }
                     }
-                    Err((line, text)) => skipped.push(Skipped { line, text }),
+                    Err((line, text)) => {
+                        if !is_continuation {
+                            failed_line = Some(line);
+                        }
+                        skipped.push(Skipped { line, text });
+                    }
                 }
             }
             if !module.reject.is_empty() {
@@ -356,7 +421,13 @@ impl Rewriter {
                 }
                 reject.push((loaded.name.clone(), module_reject.build()));
             }
-            hostnames.extend(module.hostnames.iter().cloned());
+            hostnames.extend(
+                module
+                    .hostnames
+                    .iter()
+                    .filter(|h| count > 0 || h.starts_with('-'))
+                    .cloned(),
+            );
             files.extend(loaded.files);
             modules.push(ModuleInfo {
                 name: loaded.name,
@@ -370,6 +441,7 @@ impl Rewriter {
                 missing: loaded.missing,
                 updated: loaded.updated,
                 error: None,
+                update_error: None,
             });
         }
         modules.extend(failed.into_iter().map(failed_module));
@@ -482,6 +554,7 @@ fn failed_module((name, updated, error): (String, Option<u64>, String)) -> Modul
         missing: vec![],
         updated,
         error: Some(error),
+        update_error: None,
     }
 }
 
@@ -500,7 +573,12 @@ fn compile(
         .dfa_size_limit(PATTERN_CACHE_LIMIT)
         .build()
     {
-        Ok(regex) if matches!(rule.action, Action::Redirect { .. }) => {
+        Ok(regex)
+            if matches!(
+                rule.action,
+                Action::Redirect { .. } | Action::UrlReplace(_)
+            ) =>
+        {
             (UrlPattern::Regular(regex), true)
         }
         Ok(_) => (UrlPattern::Source(rule.pattern.clone()), true),
@@ -515,6 +593,33 @@ fn compile(
             ),
         },
     };
+    let compile_op = |op: MatchOp| -> Result<CompiledMatchOp, (usize, String)> {
+        Ok(match op {
+            MatchOp::Equals(v) => CompiledMatchOp::Equals(v),
+            MatchOp::NotEquals(v) => CompiledMatchOp::NotEquals(v),
+            MatchOp::Regex(source) => {
+                CompiledMatchOp::Regex(regex(&source).map_err(|_| failed("bad condition regex"))?)
+            }
+        })
+    };
+    let conditions = rule
+        .conditions
+        .into_iter()
+        .map(|cond| {
+            Ok(match cond {
+                Condition::Method { equals, value } => CompiledCondition::Method { equals, value },
+                Condition::Status { equals, value } => CompiledCondition::Status { equals, value },
+                Condition::RequestHeader { name, op } => CompiledCondition::RequestHeader {
+                    name,
+                    op: compile_op(op)?,
+                },
+                Condition::ResponseHeader { name, op } => CompiledCondition::ResponseHeader {
+                    name,
+                    op: compile_op(op)?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let extra = match &rule.action {
         Action::BodyReplace(pairs) => pairs
             .iter()
@@ -539,12 +644,67 @@ fn compile(
             line: rule.line,
             phase: rule.phase,
             pattern: Some(pattern),
+            conditions,
+            pipe_continuation: rule.pipe_continuation,
             action: rule.action,
             extra,
             jq,
         },
         batchable,
     ))
+}
+
+fn rule_has_file(rule: &clyntis_config::rewrite::Rule, has_file: impl Fn(&str) -> bool) -> bool {
+    match &rule.action {
+        Action::Script(script) => has_file(&script.url),
+        Action::Mock(Mock {
+            body: MockBody::Remote(url),
+            ..
+        }) => has_file(url),
+        _ => true,
+    }
+}
+
+/// Counts how many rules in `module` compile cleanly (used before committing a
+/// downloaded module update so an incompatible upgrade does not replace a
+/// working cached module).
+pub(crate) fn compilable_rule_count(module: &Module) -> usize {
+    runnable_rule_count(module, |_| true)
+}
+
+/// Counts how many rules in `module` both compile cleanly and have their
+/// dependent script/mock files available. If the leading stage of a piped line
+/// fails to load, the entire pipe line is excluded.
+pub(crate) fn runnable_rule_count(module: &Module, has_file: impl Fn(&str) -> bool) -> usize {
+    let mut count = 0;
+    let mut failed_line: Option<usize> = None;
+    for rule in &module.rules {
+        if rule.pipe_continuation && failed_line == Some(rule.line) {
+            continue;
+        }
+        if !rule.pipe_continuation {
+            failed_line = None;
+        }
+        if rule_has_file(rule, &has_file) && compile("", (*rule).clone()).is_ok() {
+            count += 1;
+        } else if !rule.pipe_continuation {
+            failed_line = Some(rule.line);
+        }
+    }
+    count
+}
+
+/// Applies a `url.replace` rule to `url`.
+pub(crate) fn replace_url(rule: &Compiled, url: &str) -> Option<String> {
+    let Action::UrlReplace(target) = &rule.action else {
+        return None;
+    };
+    let pattern = rule.pattern.as_ref()?;
+    Some(
+        pattern
+            .replace(url, replacement(target).as_str())
+            .into_owned(),
+    )
 }
 
 /// A JavaScript replacement (`$1`, `$&`) in the `regex` crate's syntax.
@@ -586,6 +746,7 @@ pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
+    pub(crate) file: Option<PathBuf>,
 }
 impl Answer {
     fn new(status: u16, content_type: &str, body: Vec<u8>) -> Self {
@@ -597,10 +758,11 @@ impl Answer {
             status,
             headers,
             body,
+            file: None,
         }
     }
     /// The response on the wire, with its length.
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode_head(&self, length: u64) -> Vec<u8> {
         let mut out = format!("HTTP/1.1 {} {}\r\n", self.status, reason(self.status)).into_bytes();
         for (name, value) in &self.headers {
             if is_framing(name) {
@@ -608,13 +770,15 @@ impl Answer {
             }
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
-        out.extend_from_slice(&self.body);
+        if !(100..200).contains(&self.status) && !matches!(self.status, 204 | 304) {
+            out.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
         out
     }
 }
 
-fn is_framing(name: &str) -> bool {
+pub(crate) fn is_framing(name: &str) -> bool {
     name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
@@ -648,14 +812,11 @@ pub(crate) fn answer(rewriter: &Rewriter, rule: &Compiled, url: &str) -> Option<
             answer
         }
         Action::Mock(mock) => {
-            let body = match &mock.body {
-                MockBody::Inline(bytes) => bytes.clone(),
-                MockBody::Remote(url) => rewriter
-                    .file(url)
-                    .and_then(|path| std::fs::read(path).ok())
-                    .unwrap_or_default(),
-            };
-            let mut answer = Answer::new(mock.status, &mock.content_type, body);
+            let mut answer = Answer::new(mock.status, &mock.content_type, Vec::new());
+            match &mock.body {
+                MockBody::Inline(bytes) => answer.body = bytes.clone(),
+                MockBody::Remote(url) => answer.file = Some(rewriter.file(url)?.clone()),
+            }
             answer.headers.extend(mock.headers.iter().cloned());
             answer
         }
@@ -678,6 +839,10 @@ pub(crate) fn apply_header(rule: &Compiled, headers: &mut Vec<(String, String)>)
     };
     match op {
         HeaderOp::Add(name, value) if !is_framing(name) => {
+            headers.push((name.clone(), value.clone()));
+        }
+        HeaderOp::Set(name, value) if !is_framing(name) => {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
             headers.push((name.clone(), value.clone()));
         }
         HeaderOp::Delete(name) if !is_framing(name) => {
@@ -1075,7 +1240,7 @@ http-response-jq ^https://a\.test/feed 'del(.list[].ad, .banner)'
             find(&answer.headers, "location"),
             Some("https://new.test/p?qx")
         );
-        assert!(String::from_utf8(answer.encode()).unwrap().starts_with(
+        assert!(String::from_utf8(answer.encode_head(0)).unwrap().starts_with(
             "HTTP/1.1 302 Found\r\nLocation: https://new.test/p?qx\r\nContent-Length: 0\r\n\r\n"
         ));
 
@@ -1125,5 +1290,87 @@ http-response-jq ^https://a\.test/feed 'del(.list[].ad, .banner)'
         let mut text = b"not json".to_vec();
         let rewriter = rewriter("[Rewrite]\n^https://a\\.test/ response-body-json-del a\n");
         assert!(!apply_body(rewriter.rule(0), &mut text));
+    }
+
+    #[test]
+    fn empty_rule_module_keeps_only_excluded_hostnames() {
+        let rewriter = Rewriter::new(
+            vec![Loaded {
+                name: "empty".into(),
+                module: clyntis_config::rewrite::Module {
+                    hostnames: vec!["decrypt.test".into(), "-skip.test".into()],
+                    ..Default::default()
+                },
+                files: HashMap::new(),
+                missing: vec![],
+                updated: None,
+            }],
+            vec![],
+        );
+        assert_eq!(rewriter.hostnames, vec!["-skip.test".to_owned()]);
+    }
+
+    #[test]
+    fn header_set_conditions_and_url_replace_work() {
+        let text = r#"
+[Rewrite]
+request if ${url} ~= /^https:\/\/a\.test\/old\/(.*)/i as m && ${request.method} == "POST" then url.replace("https://a.test/new/${m.1}")
+request if ${url} ~= /^https:\/\/a\.test\/h$/ then header.set("X-Set", "1") | header.replace("User-Agent", /Bot\/\d+/, "App/2") | header.del("X-Drop")
+response if ${url} ~= /^https:\/\/a\.test\/r$/ && ${response.status} == 200 && ${response.header["Content-Type"]} ~= /^application\/json/i then response.header.set("X-Json", "yes")
+"#;
+        let module = clyntis_config::rewrite::parse_module(text);
+        assert!(module.skipped.is_empty());
+        assert_eq!(compilable_rule_count(&module), 5);
+        let rw = rewriter(text);
+
+        let url_rule = rw.rule(0);
+        assert!(url_rule.matches_conditions("POST", &[], None, &[]));
+        assert!(!url_rule.matches_conditions("GET", &[], None, &[]));
+        assert_eq!(
+            replace_url(url_rule, "https://a.test/old/item?k=1").as_deref(),
+            Some("https://a.test/new/item?k=1")
+        );
+
+        let mut headers = vec![
+            ("User-Agent".into(), "Bot/99".into()),
+            ("X-Drop".into(), "gone".into()),
+        ];
+        apply_header(rw.rule(1), &mut headers);
+        apply_header(rw.rule(2), &mut headers);
+        apply_header(rw.rule(3), &mut headers);
+        assert_eq!(find(&headers, "X-Set"), Some("1"));
+        assert_eq!(find(&headers, "User-Agent"), Some("App/2"));
+        assert_eq!(find(&headers, "X-Drop"), None);
+
+        let resp_rule = rw.rule(4);
+        let json_headers = vec![("Content-Type".into(), "application/json; charset=utf-8".into())];
+        assert!(resp_rule.matches_conditions("GET", &[], Some(200), &json_headers));
+        assert!(!resp_rule.matches_conditions("GET", &[], Some(404), &json_headers));
+        assert!(!resp_rule.matches_conditions("GET", &[], Some(200), &[]));
+
+        // If the leading stage of a piped line fails to compile, the entire pipe
+        // is non-runnable so its continuations are neither counted nor compiled.
+        let bad_pipe = r#"
+[Rewrite]
+request if ${url} ~= /^https:\/\/a\.test\/p$/ && ${request.header["X-H"]} ~= /(unclosed/ then header.set("X-A", "1") | header.del("Cookie")
+[MITM]
+hostname = a.test
+"#;
+        let module = clyntis_config::rewrite::parse_module(bad_pipe);
+        assert!(module.skipped.is_empty(), "{:?}", module.skipped);
+        assert_eq!(module.rules.len(), 2);
+        assert_eq!(compilable_rule_count(&module), 0);
+        let compiled = Rewriter::new(
+            vec![Loaded {
+                name: "badpipe".into(),
+                module,
+                files: HashMap::new(),
+                missing: vec![],
+                updated: None,
+            }],
+            vec![],
+        );
+        assert_eq!(compiled.rule_count(), 0);
+        assert!(compiled.hostnames.is_empty());
     }
 }

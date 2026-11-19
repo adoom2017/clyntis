@@ -562,6 +562,7 @@ fn build_connector(
 
 fn connector(
     config: &TlsConnectConfig,
+    check_name: bool,
 ) -> Result<(
     SslConnector,
     BrowserProfile,
@@ -591,7 +592,9 @@ fn connector(
             None,
         ));
     }
-    if selected == TlsFingerprint::Randomized {
+    // A connection using a custom name check must not seed the strict
+    // connector's session cache before the caller has checked the names.
+    if selected == TlsFingerprint::Randomized || !check_name {
         return Ok((
             build_connector(&profile, &alpn, config.verify_cert, false, None)?,
             profile,
@@ -638,7 +641,7 @@ fn configure_ssl_with(
     clock: &Arc<Clock>,
     check_name: bool,
 ) -> Result<(boring::ssl::Ssl, BrowserProfile)> {
-    let (connector, profile, alpn, session_key) = connector(config)?;
+    let (connector, profile, alpn, session_key) = connector(config, check_name)?;
     let mut configured = connector.configure()?;
     configured.set_verify_hostname(check_name && config.verify_cert && config.reality.is_none());
     let mut ssl = configured.into_ssl(&config.server_name)?;
@@ -1347,15 +1350,31 @@ mod tests {
     }
 
     #[test]
+    fn only_strict_name_checks_use_the_shared_session_cache() {
+        let config = TlsConnectConfig {
+            server_name: "session.test".into(),
+            alpn: vec!["http/1.1".into()],
+            verify_cert: true,
+            fingerprint: TlsFingerprint::Native,
+            reality: None,
+        };
+        assert!(connector(&config, false).unwrap().3.is_none());
+        assert!(connector(&config, true).unwrap().3.is_some());
+    }
+
+    #[test]
     fn verifying_contexts_share_one_root_store() {
         let store = |server_name: &str| {
-            let (connector, ..) = connector(&TlsConnectConfig {
-                server_name: server_name.into(),
-                alpn: vec!["http/1.1".into()],
-                verify_cert: true,
-                fingerprint: TlsFingerprint::Native,
-                reality: None,
-            })
+            let (connector, ..) = connector(
+                &TlsConnectConfig {
+                    server_name: server_name.into(),
+                    alpn: vec!["http/1.1".into()],
+                    verify_cert: true,
+                    fingerprint: TlsFingerprint::Native,
+                    reality: None,
+                },
+                true,
+            )
             .unwrap();
             foreign_types_shared::ForeignTypeRef::as_ptr(connector.context().cert_store())
         };

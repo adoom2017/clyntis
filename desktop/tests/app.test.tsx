@@ -647,6 +647,7 @@ describe("desktop workflows", () => {
           modules: [
             {
               name: "去广告 (测试版)",
+              updateError: "not a rewrite module",
               rules: 4,
               scripts: 0,
               hostnames: 1,
@@ -742,6 +743,10 @@ describe("desktop workflows", () => {
     expect(screen.getByText("已重写 · 拦截 JSON")).toHaveClass("reject");
     expect(screen.getByText("本地响应")).toBeInTheDocument();
     expect(screen.getByText("本地拦截")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "展开模块与记录" }));
+    expect(
+      screen.getByText("更新失败，仍在使用缓存：not a rewrite module"),
+    ).toBeInTheDocument();
   });
   it("formats idle and large transfer counters", () => {
     expect(bytes(0)).toBe("0 B");

@@ -123,7 +123,7 @@ format. For building and running, see the [README](README.md).
   body regex replacement, JSON deletion and replacement (Loon
   `response-body-json-*`), jq filters (Surge `http-response-jq` /
   `http-request-jq`, Loon `response-body-json-jq`; full jq via jaq, without
-  `env` and `input`, 5 s per body; a filter in a separate `jq-path` file is
+  `env` and `input`, 5 s and one million expression steps per body; a filter in a separate `jq-path` file is
   not supported), scripts
   (`http-request` / `http-response`, `requires-body`, `binary-body-mode`,
   `max-size`, `timeout`, `argument`), `[MITM] hostname` (added to the hosts
@@ -135,7 +135,10 @@ format. For building and running, see the [README](README.md).
   and `atob` / `btoa`; each run has a time and memory limit (one run at a
   time in the iOS tunnel), and Android builds have no script engine. Bodies
   over 8 MiB (2 MiB on iOS) pass through unchanged. Modules and scripts are
-  cached under the configuration directory (`rewrite/`); script storage is
+  cached under the configuration directory (`rewrite/`). Subscribed modules are limited to
+  2 MiB and scripts to 4 MiB. Remote mock responses stream from disk. After an
+  upgrade from name-only module caches, each subscription is fetched once to
+  associate its cache with its URL. Script storage is
   `rewrite/store.json`. `GET /rewrite` (the FFI snapshot's `rewrite`) shows
   each module's rules, scripts, skipped lines and download failures, and
   counts hits; a rewritten request's log entry names the rules in

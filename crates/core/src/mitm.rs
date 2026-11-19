@@ -269,6 +269,9 @@ pub(crate) struct Interceptor {
     /// Hosts whose clients refused the certificate (pinned or the CA not
     /// trusted): passed through from then on.
     bypass: Mutex<HashSet<String>>,
+    /// Hosts that had HTTP/2-only (non-HTTP/1.1 ALPN) connections passed
+    /// through without decryption or rewrite.
+    alpn_bypass: Mutex<HashSet<String>>,
     /// Tests talk to servers with their own certificates.
     verify_upstream: std::sync::atomic::AtomicBool,
     leaf_limit: usize,
@@ -281,6 +284,7 @@ impl Interceptor {
             authority: RwLock::default(),
             error: RwLock::default(),
             bypass: Mutex::default(),
+            alpn_bypass: Mutex::default(),
             verify_upstream: true.into(),
             leaf_limit: if hosted { HOSTED_LEAVES } else { LEAVES },
         };
@@ -353,8 +357,7 @@ impl Interceptor {
     pub(crate) fn set_module_hosts(&self, hosts: Vec<String>) {
         *self.module_hosts.write().unwrap() = hosts;
     }
-    /// Bypassed hosts that belong to loaded rewrite modules' `[MITM] hostname` rules.
-    pub(crate) fn bypassed_module_hosts(&self) -> Vec<String> {
+    fn filter_module_hosts(&self, set: &Mutex<HashSet<String>>) -> Vec<String> {
         let excluded: Vec<String> = self
             .settings
             .read()
@@ -369,8 +372,7 @@ impl Interceptor {
             return vec![];
         }
         patterns.extend(excluded);
-        let mut out: Vec<String> = self
-            .bypass
+        let mut out: Vec<String> = set
             .lock()
             .unwrap()
             .iter()
@@ -380,14 +382,31 @@ impl Interceptor {
         out.sort();
         out
     }
+    /// Bypassed hosts that belong to loaded rewrite modules' `[MITM] hostname` rules.
+    pub(crate) fn bypassed_module_hosts(&self) -> Vec<String> {
+        self.filter_module_hosts(&self.bypass)
+    }
+    /// Hosts from rewrite modules that had HTTP/2-only connections passed through.
+    pub(crate) fn skipped_alpn_module_hosts(&self) -> Vec<String> {
+        self.filter_module_hosts(&self.alpn_bypass)
+    }
     fn refused(&self, host: &str) {
         let mut bypass = self.bypass.lock().unwrap();
         if bypass.len() < BYPASS {
             bypass.insert(host.to_owned());
         }
     }
+    fn skipped_alpn(&self, host: &str) {
+        let mut skipped = self.alpn_bypass.lock().unwrap();
+        if skipped.len() < BYPASS && skipped.insert(host.to_owned()) {
+            tracing::warn!(
+                "[MITM] {host}: client ALPN does not offer http/1.1 (e.g. HTTP/2 or gRPC); passing connection through without decryption or rewrite"
+            );
+        }
+    }
     pub(crate) fn clear_bypass(&self) {
         self.bypass.lock().unwrap().clear();
+        self.alpn_bypass.lock().unwrap().clear();
     }
     pub(crate) fn status(&self) -> Value {
         let settings = self.settings.read().unwrap();
@@ -402,6 +421,8 @@ impl Interceptor {
         let ca = cert.map(|cert| describe(&cert));
         let mut bypassed: Vec<_> = self.bypass.lock().unwrap().iter().cloned().collect();
         bypassed.sort();
+        let mut skipped_alpn: Vec<_> = self.alpn_bypass.lock().unwrap().iter().cloned().collect();
+        skipped_alpn.sort();
         json!({
             "enable": settings.enable,
             "hostname": settings.hostname,
@@ -411,6 +432,7 @@ impl Interceptor {
             "ca": ca,
             "error": *self.error.read().unwrap(),
             "bypassed": bypassed,
+            "skippedAlpn": skipped_alpn,
         })
     }
 }
@@ -424,6 +446,7 @@ fn untrusted(error: &str) -> bool {
     error.contains("CERTIFICATE_VERIFY_FAILED")
         || error.contains("cert verification failed")
         || error.contains("do not cover")
+        || error.contains("NO_APPLICATION_PROTOCOL")
 }
 
 /// Bytes already read from a stream, served again before the rest of it.
@@ -552,7 +575,11 @@ impl Core {
             self.dial_logged(&target, None, &source).await?
         };
         let http = !tls && crate::sniff::http(&prefix).is_some();
-        if !self.mitm.intercepts(&route.host) || !(tls || http) {
+        let tls_http1 = tls && crate::sniff::tls_supports_http1(&prefix);
+        if self.mitm.intercepts(&route.host) && tls && !tls_http1 {
+            self.mitm.skipped_alpn(&route.host);
+        }
+        if !self.mitm.intercepts(&route.host) || !(tls_http1 || http) {
             outbound.write_all(&prefix).await?;
             return self.relay_io(stream, route, outbound, routed).await;
         }
@@ -1019,6 +1046,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keep_alive_uses_request_snapshots_and_preserves_http_boundaries() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("rule.js");
+        std::fs::write(
+            &script,
+            r#"
+            if ($request.url.endsWith("/stop")) $done({response: {status: 403, body:"stop"}});
+            else if ($request.url.endsWith("/generate")) $done({body:"new"});
+            else $done({headers: {"X-Rule":"yes"}});
+        "#,
+        )
+        .unwrap();
+        let core = core(test_settings(&["ads.test"]));
+        let install = |version: &str| {
+            let text = format!(
+                r#"[Script]
+up = type=http-request,pattern=/(local|upload)$,requires-body=1,script-path=https://s.test/r
+generate = type=http-request,pattern=/generate$,script-path=https://s.test/r
+generated = type=http-response,pattern=/generate$,script-path=https://s.test/r
+stop = type=http-request,pattern=/stop$,script-path=https://s.test/r
+[URL Rewrite]
+/local$ - reject-dict
+[Header Rewrite]
+http-response /upload$ header-add X-Version {version}
+"#
+            );
+            let module = clyntis_config::rewrite::parse_module(&text);
+            assert!(module.skipped.is_empty());
+            let loaded = crate::rewrite::Loaded {
+                name: version.into(),
+                module,
+                updated: None,
+                missing: vec![],
+                files: [(
+                    "https://s.test/r".into(),
+                    crate::rewrite::RewriteFile::pin(&script).unwrap(),
+                )]
+                .into(),
+            };
+            let mut resources = crate::resources::Resources::default();
+            resources.rewrite = Some(Arc::new(crate::rewrite::Rewriter::new(
+                vec![loaded],
+                vec![],
+            )));
+            *core.resources.write().unwrap() = Arc::new(resources);
+        };
+        install("first");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::new("ads.test", listener.local_addr().unwrap().port()).unwrap();
+        let (mut app, inbound) = tokio::io::duplex(4096);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            app.write_all(b"HEAD /local HTTP/1.1\r\nHost: ads.test\r\n\r\n").await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            let head = String::from_utf8(read_head(&mut app).await).unwrap();
+            assert!(head.starts_with("HTTP/1.1 200") && head.contains("Content-Length: 2"));
+            app.write_all(b"POST /local HTTP/1.1\r\nHost: ads.test\r\nContent-Length: 4\r\n\r\ndata").await.unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.starts_with("HTTP/1.1 200"));
+            assert_eq!(body, b"{}");
+            app.write_all(b"POST /upload HTTP/1.1\r\nHost: ads.test\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n").await.unwrap();
+            assert!(read_head(&mut app).await.starts_with(b"HTTP/1.1 100 Continue"));
+            app.write_all(b"data").await.unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.starts_with("POST /upload") && head.contains("Content-Length: 4"));
+            assert!(!head.to_ascii_lowercase().contains("expect:"));
+            let mut upload = [0; 4];
+            server.read_exact(&mut upload).await.unwrap();
+            assert_eq!(&upload, b"data");
+            install("second");
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            assert!(read_response(&mut app).await.0.contains("X-Version: first"));
+            app.write_all(b"POST /upload HTTP/1.1\r\nHost: ads.test\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            read_head(&mut server).await;
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            assert!(read_response(&mut app).await.0.contains("X-Version: second"));
+            app.write_all(b"POST /generate HTTP/1.1\r\nHost: ads.test\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\ndata").await.unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.contains("Content-Length: 3"));
+            assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+            let mut generated = [0; 3];
+            server.read_exact(&mut generated).await.unwrap();
+            assert_eq!(&generated, b"new");
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\n\r\ndata").await.unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(!head.to_ascii_lowercase().contains("content-encoding"));
+            assert_eq!(body, b"new");
+            let entry = core.requests.list(0, 20).0.into_iter()
+                .find(|entry| entry.http.as_ref().is_some_and(|http| http.url.ends_with("/generate")))
+                .unwrap();
+            let detail = core.requests.detail(entry.id).unwrap();
+            for key in ["requestHeaders", "responseHeaders"] {
+                let headers = detail[key].as_array().unwrap();
+                assert!(headers.contains(&json!(["Content-Length", "3"])));
+                assert!(!headers.iter().any(|h| h[0].as_str().unwrap().eq_ignore_ascii_case("content-encoding")));
+            }
+            assert_eq!(detail["requestBody"]["text"], "new");
+            assert_eq!(detail["responseBody"]["text"], "new");
+            app.write_all(b"POST /stop HTTP/1.1\r\nHost: ads.test\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n").await.unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.starts_with("HTTP/1.1 403") && head.contains("Connection: close"));
+            assert_eq!(body, b"stop");
+            assert_eq!(app.read(&mut [0]).await.unwrap(), 0);
+            drop(server);
+            drop(app);
+            relay.await.unwrap().unwrap();
+        }).await.unwrap();
+
+        // A client that closes before sending the full body can still read the answer.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::new("ads.test", listener.local_addr().unwrap().port()).unwrap();
+        let (mut app, inbound) = tokio::io::duplex(4096);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            app.write_all(b"POST /stop HTTP/1.1\r\nHost: ads.test\r\nContent-Length: 4\r\n\r\nx")
+                .await
+                .unwrap();
+            app.shutdown().await.unwrap();
+            let (_server, _) = listener.accept().await.unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.starts_with("HTTP/1.1 403") && head.contains("Connection: close"));
+            assert_eq!(body, b"stop");
+            assert_eq!(app.read(&mut [0]).await.unwrap(), 0);
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn rewrites_decrypted_http_with_modules_and_scripts() {
         let directory =
             std::env::temp_dir().join(format!("clyntis-rewrite-{}", uuid::Uuid::new_v4()));
@@ -1177,5 +1343,311 @@ hostname = ads.test
         let store = std::fs::read_to_string(directory.join("rewrite/store.json")).unwrap();
         assert_eq!(store, r#"{"k":"v1"}"#);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn h2_only_client_hello_passes_through_without_mitm_downgrade() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = tokio::io::AsyncReadExt::read(&mut tcp, &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(
+                crate::sniff::tls(&buf[..n]).as_deref(),
+                Some("grpc.ads.test")
+            );
+            assert!(!crate::sniff::tls_supports_http1(&buf[..n]));
+            tcp.write_all(b"RAW-PASSTHROUGH").await.unwrap();
+        });
+
+        let mut config =
+            clyntis_config::Config::parse(b"hosts: {grpc.ads.test: 127.0.0.1}\n").unwrap();
+        config.mitm = test_settings(&["*.ads.test"]);
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let target = Target::new("grpc.ads.test", port).unwrap();
+        assert!(core.inspects(&target));
+        let (mut app, inbound) = tokio::io::duplex(4096);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        let hello = crate::sniff::tests::client_hello_with_alpn("grpc.ads.test", &[b"h2"]);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            app.write_all(&hello).await.unwrap();
+            let mut reply = [0u8; 15];
+            tokio::io::AsyncReadExt::read_exact(&mut app, &mut reply)
+                .await
+                .unwrap();
+            assert_eq!(&reply, b"RAW-PASSTHROUGH");
+            drop(app);
+            server.await.unwrap();
+            let _ = relay.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(core.mitm_status()["skippedAlpn"], json!(["grpc.ads.test"]));
+    }
+
+    #[tokio::test]
+    async fn dsl_url_replace_conditions_pipes_and_reject_status_work_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config =
+            clyntis_config::Config::parse(b"hosts: {ads.test: 127.0.0.1}\n").unwrap();
+        config.mitm = test_settings(&["ads.test"]);
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let module = clyntis_config::rewrite::parse_module(&format!(
+            r#"
+[Rewrite]
+request if ${{url}} ~= /^http:\/\/ads\.test:{port}\/old\/(.*)$/ as m then url.replace("http://ads.test:{port}/new/${{m.1}}") | header.set("X-Added", "1") | header.del("X-Remove")
+request if ${{url}} ~= /^http:\/\/ads\.test:{port}\/pipe$/ && ${{request.header["X-Mode"]}} == "old" then header.set("X-Mode", "new") | header.del("Cookie")
+request if ${{url}} ~= /^http:\/\/ads\.test:{port}\/cross$/ then url.replace("http://other.test:{port}/x")
+request if ${{url}} ~= /^http:\/\/ads\.test:{port}\/blocked$/ then reject(451, "blocked")
+request if ${{url}} ~= /^http:\/\/ads\.test:{port}\/dict403$/ then reject_dict(403)
+response if ${{url}} ~= /^http:\/\/ads\.test:{port}\/new\/ok$/ && ${{response.status}} == 200 then response.header.set("X-Resp", "matched")
+response if ${{url}} ~= /^http:\/\/ads\.test:{port}\/lazy$/ then response.header.set("X-Mode", "clean")
+response if ${{url}} ~= /^http:\/\/ads\.test:{port}\/lazy$/ && ${{response.header["X-Mode"]}} == "clean" then response.json.delete("ad")
+[MITM]
+hostname = ads.test
+"#
+        ));
+        assert!(module.skipped.is_empty(), "{:?}", module.skipped);
+        let rewriter = crate::rewrite::Rewriter::new(
+            vec![crate::rewrite::Loaded {
+                name: "dsl".into(),
+                module,
+                updated: None,
+                missing: vec![],
+                files: Default::default(),
+            }],
+            vec![],
+        );
+        {
+            let mut resources = crate::resources::Resources::default();
+            resources.rewrite = Some(Arc::new(rewriter));
+            *core.resources.write().unwrap() = Arc::new(resources);
+        }
+        let target = Target::new("ads.test", port).unwrap();
+        let (mut app, inbound) = tokio::io::duplex(8192);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            app.write_all(
+                format!(
+                    "GET /old/ok HTTP/1.1\r\nHost: ads.test:{port}\r\nX-Remove: yes\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.starts_with("GET /new/ok HTTP/1.1\r\n"), "{head}");
+            assert!(head.contains("X-Added: 1\r\n"), "{head}");
+            assert!(!head.contains("X-Remove"), "{head}");
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.contains("X-Resp: matched\r\n"), "{head}");
+            assert_eq!(body, b"ok");
+
+            // Piped rule mutating its own condition header still runs subsequent stages.
+            app.write_all(
+                format!(
+                    "GET /pipe HTTP/1.1\r\nHost: ads.test:{port}\r\nX-Mode: old\r\nCookie: s=1\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.contains("X-Mode: new\r\n"), "{head}");
+            assert!(!head.contains("Cookie:"), "{head}");
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = read_response(&mut app).await;
+
+            // Earlier header rule activates a later body rule's condition, which
+            // must lazily read and rewrite the body.
+            app.write_all(
+                format!("GET /lazy HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.starts_with("GET /lazy HTTP/1.1\r\n"), "{head}");
+            let json = br#"{"ad":1,"ok":2}"#;
+            server
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        json.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            server.write_all(json).await.unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.contains("X-Mode: clean\r\n"), "{head}");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"ok": 2})
+            );
+
+            // Cross-origin url.replace is ignored and forwarded unchanged.
+            app.write_all(
+                format!("GET /cross HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.starts_with("GET /cross HTTP/1.1\r\n"), "{head}");
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = read_response(&mut app).await;
+
+            // reject(451, "blocked") and reject_dict(403) preserve status and body.
+            app.write_all(
+                format!("GET /blocked HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.starts_with("HTTP/1.1 451 "), "{head}");
+            assert_eq!(body, b"blocked");
+
+            app.write_all(
+                format!("GET /dict403 HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+            assert_eq!(body, b"{}");
+
+            drop(server);
+            drop(app);
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn script_without_body_then_json_delete_preserves_script_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = std::env::temp_dir().join(format!("meta-mitm-script-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("gen.js");
+        std::fs::write(
+            &script,
+            br#"$done({body: JSON.stringify({ad: 1, keep: "from-script"})});"#,
+        )
+        .unwrap();
+
+        let module = clyntis_config::rewrite::parse_module(&format!(
+            r#"
+[Script]
+gen = type=http-response,pattern=^http://ads\.test:{port}/script-json$,requires-body=0,script-path=https://s.test/gen.js
+[Rewrite]
+response if ${{url}} ~= /^http:\/\/ads\.test:{port}\/script-json$/ then response.json.delete("ad")
+[MITM]
+hostname = ads.test
+"#
+        ));
+        assert!(module.skipped.is_empty(), "{:?}", module.skipped);
+        let rewriter = crate::rewrite::Rewriter::new(
+            vec![crate::rewrite::Loaded {
+                name: "script-json".into(),
+                module,
+                updated: None,
+                missing: vec![],
+                files: [(
+                    "https://s.test/gen.js".to_owned(),
+                    crate::rewrite::RewriteFile::pin(&script).unwrap(),
+                )]
+                .into(),
+            }],
+            vec![],
+        );
+
+        let mut config =
+            clyntis_config::Config::parse(b"hosts: {ads.test: 127.0.0.1}\n").unwrap();
+        config.mitm = test_settings(&["ads.test"]);
+        config.directory = dir.clone();
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        {
+            let mut resources = crate::resources::Resources::default();
+            resources.rewrite = Some(Arc::new(rewriter));
+            *core.resources.write().unwrap() = Arc::new(resources);
+        }
+
+        let target = Target::new("ads.test", port).unwrap();
+        let (mut app, inbound) = tokio::io::duplex(8192);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            app.write_all(
+                format!("GET /script-json HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.starts_with("GET /script-json HTTP/1.1\r\n"), "{head}");
+            let upstream = br#"{"ad":9,"keep":"from-server"}"#;
+            server
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        upstream.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            server.write_all(upstream).await.unwrap();
+
+            let (_, body) = read_response(&mut app).await;
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"keep": "from-script"})
+            );
+
+            // Unread upstream wire body must have been drained cleanly for keep-alive.
+            app.write_all(format!("GET /ok HTTP/1.1\r\nHost: ads.test:{port}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let head = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(head.starts_with("GET /ok HTTP/1.1\r\n"), "{head}");
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            let (_, body) = read_response(&mut app).await;
+            assert_eq!(body, b"ok");
+
+            drop(server);
+            drop(app);
+            relay.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

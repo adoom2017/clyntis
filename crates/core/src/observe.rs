@@ -43,7 +43,9 @@ struct Pending {
     headers: Vec<(String, String)>,
     body: Arc<Mutex<Body>>,
     /// Answered by a rewrite rule instead of the server.
-    answer: Option<Answer>,
+    answer: Option<Box<Answer>>,
+    rewrites: Option<Rewrites>,
+    close_after_answer: bool,
     /// Rewrite rules for the response.
     response_rules: Vec<usize>,
     /// `(label, action)` of the rewrite rules that acted.
@@ -66,7 +68,13 @@ enum Framing {
     Close,
 }
 
-/// Rewrites for the connection: the module snapshot when it began.
+enum RequestEvent {
+    Continue,
+    Request(Pending),
+}
+
+/// The request and its response share one module snapshot.
+#[derive(Clone)]
 struct Rewrites {
     rewriter: Arc<Rewriter>,
     /// Bodies longer than this pass through unchanged.
@@ -85,32 +93,26 @@ where
     // Per direction; the iOS tunnel decrypting many connections cannot
     // afford large buffers.
     let capacity = if hosted { 8 << 10 } else { 32 << 10 };
-    let rewrites = context
-        .core
-        .rewriter()
-        .filter(|rewriter| rewriter.rule_count() > 0)
-        .map(|rewriter| Rewrites {
-            rewriter,
-            limit: if hosted { 2 << 20 } else { 8 << 20 },
-        });
+
     let result = tokio::try_join!(
         requests(
             BufReader::with_capacity(capacity, client_read),
             upstream_write,
             sender,
             context,
-            rewrites.as_ref(),
         ),
         responses(
             BufReader::with_capacity(capacity, upstream_read),
             client_write,
             &mut pending,
             context,
-            rewrites.as_ref(),
         ),
     );
     // Requests the server never answered still show up.
-    while let Ok(request) = pending.try_recv() {
+    while let Ok(event) = pending.try_recv() {
+        let RequestEvent::Request(request) = event else {
+            continue;
+        };
         let error = match &result {
             Err(error) => error.to_string(),
             Ok(_) => "no response".into(),
@@ -138,20 +140,113 @@ enum Verdict {
     Drop,
 }
 
-/// Applies `rules` (indices into the rewriter) in order.
-async fn apply_rules(
+struct BodySource<'a, R> {
+    reader: &'a mut R,
+    buffered: BufferedBody,
+    limit: usize,
+    bodiless: bool,
+    loaded: bool,
+    expects_continue: Option<&'a mpsc::UnboundedSender<RequestEvent>>,
+    sent_continue: bool,
+}
+
+impl<'a, R: AsyncBufRead + Unpin> BodySource<'a, R> {
+    async fn ensure_loaded(
+        &mut self,
+        message: &mut Message,
+        original_headers: &[(String, String)],
+    ) -> io::Result<()> {
+        // If an earlier `requires-body=0` rule already replaced the body, reuse that
+        // replacement body here and drain the unread wire body when forwarding.
+        if self.loaded || self.bodiless || message.body_changed {
+            return Ok(());
+        }
+        self.loaded = true;
+        if let Some(sender) = self.expects_continue {
+            sender
+                .send(RequestEvent::Continue)
+                .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            self.sent_continue = true;
+            message
+                .headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case("expect"));
+            message.head_changed = true;
+        }
+        let framing = self.buffered.remaining.take().unwrap_or(Framing::Length(0));
+        self.buffered = read_body(self.reader, framing, self.limit).await?;
+        if self.buffered.remaining.is_none() {
+            message.body = decoded(original_headers, &self.buffered.bytes, self.limit);
+        }
+        Ok(())
+    }
+}
+
+/// Applies `rules` (indices into the rewriter) in order, lazily buffering and
+/// decoding the body only when a matching rule needs it.
+async fn apply_rules<R: AsyncBufRead + Unpin>(
     context: &Context,
     rewrites: &Rewrites,
     rules: &[usize],
     phase: Phase,
     request: (&str, &str, &[(String, String)]),
+    original_headers: &[(String, String)],
     message: &mut Message,
+    body_source: &mut BodySource<'_, R>,
     applied: &mut Vec<(String, String)>,
-) -> Verdict {
+) -> io::Result<Verdict> {
     let (method, request_url, request_headers) = request;
+    let mut last_group: Option<(&str, usize, bool)> = None;
     for &index in rules {
         let rule = rewrites.rewriter.rule(index);
+        if rule.pipe_continuation {
+            if last_group != Some((rule.module.as_str(), rule.line, true)) {
+                continue;
+            }
+        } else {
+            let (req_headers, resp_status, resp_headers) = match phase {
+                Phase::Request => (message.headers.as_slice(), None, &[][..]),
+                Phase::Response => (
+                    request_headers,
+                    Some(message.status),
+                    message.headers.as_slice(),
+                ),
+            };
+            let matched = rule.matches_conditions(method, req_headers, resp_status, resp_headers);
+            last_group = Some((rule.module.as_str(), rule.line, matched));
+            if !matched {
+                continue;
+            }
+        }
+        if rule.action.needs_body() {
+            body_source.ensure_loaded(message, original_headers).await?;
+        }
         let acted = match &rule.action {
+            action if action.answers() && phase == Phase::Request => {
+                context.core.rewrite_stats.record(rule, request_url);
+                applied.push((rule.label(), action.kind()));
+                return Ok(rewrite::answer(&rewrites.rewriter, rule, request_url)
+                    .map_or(Verdict::Drop, Verdict::Answer));
+            }
+            Action::UrlReplace(_) if phase == Phase::Request => {
+                if let Some(new_url) = rewrite::replace_url(rule, &message.url) {
+                    if same_origin(&message.url, &new_url).is_some() {
+                        if new_url != message.url {
+                            message.url = new_url;
+                            message.head_changed = true;
+                        }
+                        true
+                    } else {
+                        tracing::warn!(
+                            from = %message.url,
+                            to = %new_url,
+                            "cross-origin url.replace is not supported; ignored"
+                        );
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
             Action::Header(_) => {
                 rewrite::apply_header(rule, &mut message.headers);
                 message.head_changed = true;
@@ -226,12 +321,12 @@ async fn apply_rules(
                         if outcome.abort {
                             context.core.rewrite_stats.record(rule, request_url);
                             applied.push((rule.label(), rule.action.kind()));
-                            return Verdict::Drop;
+                            return Ok(Verdict::Drop);
                         }
                         if let Some(answer) = outcome.response.filter(|_| phase == Phase::Request) {
                             context.core.rewrite_stats.record(rule, request_url);
                             applied.push((rule.label(), rule.action.kind()));
-                            return Verdict::Answer(answer);
+                            return Ok(Verdict::Answer(answer));
                         }
                         if let Some(url) = outcome.url.filter(|u| *u != message.url) {
                             message.url = url;
@@ -241,7 +336,15 @@ async fn apply_rules(
                             message.status = status;
                             message.head_changed = true;
                         }
-                        if let Some(headers) = outcome.headers {
+                        if let Some(mut headers) = outcome.headers {
+                            headers.retain(|(k, _)| !rewrite::is_framing(k));
+                            headers.extend(
+                                message
+                                    .headers
+                                    .iter()
+                                    .filter(|(k, _)| rewrite::is_framing(k))
+                                    .cloned(),
+                            );
                             message.headers = headers;
                             message.head_changed = true;
                         }
@@ -266,7 +369,51 @@ async fn apply_rules(
             applied.push((rule.label(), rule.action.kind()));
         }
     }
-    Verdict::Continue
+    Ok(Verdict::Continue)
+}
+
+struct BufferedBody {
+    bytes: Vec<u8>,
+    remaining: Option<Framing>,
+    // Header of the first chunk that did not fit; its payload is still unread.
+    next_chunk: Option<(Vec<u8>, u64)>,
+}
+
+impl BufferedBody {
+    fn unread(framing: Framing) -> Self {
+        Self {
+            bytes: Vec::new(),
+            remaining: Some(framing),
+            next_chunk: None,
+        }
+    }
+
+    async fn finish<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        mut tap: impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        tap(&self.bytes);
+        if matches!(self.remaining, Some(Framing::Chunked)) && !self.bytes.is_empty() {
+            writer
+                .write_all(format!("{:x}\r\n", self.bytes.len()).as_bytes())
+                .await?;
+            writer.write_all(&self.bytes).await?;
+            writer.write_all(b"\r\n").await?;
+        } else {
+            writer.write_all(&self.bytes).await?;
+        }
+        if let Some((line, size)) = &self.next_chunk {
+            writer.write_all(line).await?;
+            copy_exact(reader, writer, *size, &mut tap).await?;
+            writer.write_all(&read_line(reader).await?).await?;
+        }
+        if let Some(remaining) = self.remaining {
+            copy_body(reader, writer, remaining, tap).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Reads a whole body (chunk framing removed) unless it is over `limit`:
@@ -276,30 +423,32 @@ async fn read_body<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     framing: Framing,
     limit: usize,
-) -> io::Result<(Vec<u8>, bool)> {
-    let mut body = Vec::new();
+) -> io::Result<BufferedBody> {
+    let mut body = BufferedBody::unread(framing);
     match framing {
         Framing::Length(length) => {
             if length > limit as u64 {
-                return Ok((body, false));
+                return Ok(body);
             }
             copy_exact(reader, &mut tokio::io::sink(), length, &mut |b: &[u8]| {
-                body.extend_from_slice(b)
+                body.bytes.extend_from_slice(b)
             })
             .await?;
-            Ok((body, true))
+            body.remaining = None;
+            Ok(body)
         }
         Framing::Close => loop {
             let available = reader.fill_buf().await?;
             if available.is_empty() {
-                return Ok((body, true));
+                body.remaining = None;
+                return Ok(body);
             }
-            let n = available.len();
-            body.extend_from_slice(available);
+            let n = available.len().min(limit - body.bytes.len());
+            if n == 0 {
+                return Ok(body);
+            }
+            body.bytes.extend_from_slice(&available[..n]);
             reader.consume(n);
-            if body.len() > limit {
-                return Ok((body, false));
-            }
         },
         Framing::Chunked => loop {
             let line = read_line(reader).await?;
@@ -308,86 +457,55 @@ async fn read_body<R: AsyncBufRead + Unpin>(
                 loop {
                     let line = read_line(reader).await?;
                     if line == b"\r\n" || line == b"\n" {
-                        return Ok((body, true));
+                        body.remaining = None;
+                        return Ok(body);
                     }
                 }
             }
+            if size > (limit - body.bytes.len()) as u64 {
+                body.next_chunk = Some((line, size));
+                return Ok(body);
+            }
             copy_exact(reader, &mut tokio::io::sink(), size, &mut |b: &[u8]| {
-                body.extend_from_slice(b)
+                body.bytes.extend_from_slice(b)
             })
             .await?;
             read_line(reader).await?;
-            if body.len() > limit {
-                return Ok((body, false));
-            }
         },
     }
 }
 
-/// Writes the part of a body read by [`read_body`] that was over the limit,
-/// then relays the rest as it comes.
-async fn finish_body<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    framing: Framing,
-    read: &[u8],
-    tap: impl FnMut(&[u8]),
-) -> io::Result<()>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    match framing {
-        Framing::Chunked if !read.is_empty() => {
-            writer
-                .write_all(format!("{:x}\r\n", read.len()).as_bytes())
-                .await?;
-            writer.write_all(read).await?;
-            writer.write_all(b"\r\n").await?;
-        }
-        _ => writer.write_all(read).await?,
-    }
-    copy_body(reader, writer, framing, tap).await
-}
-
-/// The head to send for a rewritten message whose body is `body`, or whose
-/// original framing stays when `body` is `None`.
-fn encode_head(start: &str, headers: &[(String, String)], body: Option<(usize, bool)>) -> Vec<u8> {
+fn encode_head(start: &str, headers: &[(String, String)]) -> Vec<u8> {
     let mut out = format!("{start}\r\n").into_bytes();
     for (name, value) in headers {
-        if let Some((_, decoded)) = body
-            && (name.eq_ignore_ascii_case("content-length")
-                || name.eq_ignore_ascii_case("transfer-encoding")
-                || decoded && name.eq_ignore_ascii_case("content-encoding"))
-        {
-            continue;
-        }
         out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
-    }
-    if let Some((length, _)) = body {
-        out.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
     }
     out.extend_from_slice(b"\r\n");
     out
 }
 
-/// The whole body ready for the rules: decoded when it was compressed.
+/// Set the headers for the bytes sent and recorded, after buffering the body.
+fn set_body_headers(headers: &mut Vec<(String, String)>, length: usize, replaced: bool) {
+    headers.retain(|(name, _)| {
+        !(rewrite::is_framing(name) || replaced && name.eq_ignore_ascii_case("content-encoding"))
+    });
+    headers.push(("Content-Length".into(), length.to_string()));
+}
+
+/// The whole body ready for the rules, decoded when it was compressed.
 /// `None` when it is compressed in a way that cannot be undone.
-fn decoded(headers: &[(String, String)], raw: &[u8], limit: usize) -> Option<(Vec<u8>, bool)> {
+fn decoded(headers: &[(String, String)], raw: &[u8], limit: usize) -> Option<Vec<u8>> {
     match find(headers, "content-encoding").filter(|e| !e.eq_ignore_ascii_case("identity")) {
-        Some(encoding) if !raw.is_empty() => {
-            crate::requests::decode_limited(encoding, raw, limit).map(|plain| (plain, true))
-        }
-        _ => Some((raw.to_vec(), false)),
+        Some(encoding) if !raw.is_empty() => crate::requests::decode_limited(encoding, raw, limit),
+        _ => Some(raw.to_vec()),
     }
 }
 
 async fn requests<R, W>(
     mut reader: R,
     mut writer: W,
-    sender: mpsc::UnboundedSender<Pending>,
+    sender: mpsc::UnboundedSender<RequestEvent>,
     context: &Context,
-    rewrites: Option<&Rewrites>,
 ) -> io::Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -436,7 +554,21 @@ where
         let framing = framing(&headers).unwrap_or(Framing::Length(0));
         let body = Arc::new(Mutex::new(Body::default()));
         let cap = context.core.requests.body_cap();
+        let rewrites = context
+            .core
+            .rewriter()
+            .filter(|r| !upgrade && r.rule_count() > 0)
+            .map(|rewriter| Rewrites {
+                rewriter,
+                limit: if context.core.config.internal_host_packet_io {
+                    2 << 20
+                } else {
+                    8 << 20
+                },
+            });
         let mut pending = Pending {
+            rewrites: rewrites.clone(),
+            close_after_answer: false,
             started: now_ms(),
             method,
             url,
@@ -446,6 +578,7 @@ where
             response_rules: vec![],
             applied: vec![],
         };
+        let rewrites = rewrites.as_ref();
         let rules = match rewrites {
             Some(rewrites) if !upgrade => rewrites.rewriter.matching(Phase::Request, &pending.url),
             _ => vec![],
@@ -455,7 +588,7 @@ where
                 pending.response_rules = rewrites.rewriter.matching(Phase::Response, &pending.url);
             }
             let Some(channel) = &sender else { break };
-            let _ = channel.send(pending);
+            let _ = channel.send(RequestEvent::Request(pending));
             writer.write_all(&head).await?;
             copy_body(&mut reader, &mut writer, framing, |bytes| {
                 body.lock().unwrap().push(bytes, cap)
@@ -469,22 +602,9 @@ where
             }
             continue;
         };
-        // A rule that answers the request ends the request's rules.
-        let mut verdict = Verdict::Continue;
-        let mut rest = Vec::new();
-        for &index in &rules {
-            let rule = rewrites.rewriter.rule(index);
-            if rule.action.answers() {
-                context.core.rewrite_stats.record(rule, &pending.url);
-                pending.applied.push((rule.label(), rule.action.kind()));
-                verdict = match rewrite::answer(&rewrites.rewriter, rule, &pending.url) {
-                    Some(answer) => Verdict::Answer(answer),
-                    None => Verdict::Drop,
-                };
-                break;
-            }
-            rest.push(index);
-        }
+        let expects = find(&pending.headers, "expect")
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+            && !matches!(framing, Framing::Length(0));
         let mut message = Message {
             url: pending.url.clone(),
             status: 0,
@@ -493,32 +613,29 @@ where
             head_changed: false,
             body_changed: false,
         };
-        let needs_body = rest
-            .iter()
-            .any(|&i| rewrites.rewriter.rule(i).action.needs_body());
-        let (mut raw, mut complete) = (Vec::new(), true);
-        let mut decoded_body = false;
-        if matches!(verdict, Verdict::Continue) && needs_body {
-            (raw, complete) = read_body(&mut reader, framing, rewrites.limit).await?;
-            if complete
-                && let Some((plain, was_decoded)) = decoded(&message.headers, &raw, rewrites.limit)
-            {
-                message.body = Some(plain);
-                decoded_body = was_decoded;
-            }
-        }
-        if matches!(verdict, Verdict::Continue) {
-            verdict = apply_rules(
-                context,
-                rewrites,
-                &rest,
-                Phase::Request,
-                (&pending.method.clone(), &pending.url.clone(), &[]),
-                &mut message,
-                &mut pending.applied,
-            )
-            .await;
-        }
+        let mut body_source = BodySource {
+            reader: &mut reader,
+            buffered: BufferedBody::unread(framing),
+            limit: rewrites.limit,
+            bodiless: false,
+            loaded: false,
+            expects_continue: expects.then(|| sender.as_ref().unwrap()),
+            sent_continue: false,
+        };
+        let verdict = apply_rules(
+            context,
+            rewrites,
+            &rules,
+            Phase::Request,
+            (&pending.method, &pending.url, &[]),
+            &pending.headers,
+            &mut message,
+            &mut body_source,
+            &mut pending.applied,
+        )
+        .await?;
+        let buffered = body_source.buffered;
+        let sent_continue = body_source.sent_continue;
         match verdict {
             Verdict::Drop => {
                 record(
@@ -531,24 +648,34 @@ where
                 );
                 return Err(io::Error::other("closed by a rewrite rule"));
             }
-            Verdict::Answer(answer) => {
-                // The body is read and dropped; the server never sees it.
-                if !needs_body {
-                    copy_body(&mut reader, &mut tokio::io::sink(), framing, |bytes| {
-                        body.lock().unwrap().push(bytes, cap)
-                    })
-                    .await?;
-                } else {
-                    body.lock().unwrap().push(&raw, cap);
+            Verdict::Answer(mut answer) => {
+                let close = buffered.remaining.is_some()
+                    && ((expects && !sent_continue)
+                        || buffered
+                            .finish(&mut reader, &mut tokio::io::sink(), |b| {
+                                body.lock().unwrap().push(b, cap)
+                            })
+                            .await
+                            .is_err());
+                if close {
+                    answer
+                        .headers
+                        .retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
+                    answer.headers.push(("Connection".into(), "close".into()));
+                    pending.close_after_answer = true;
+                } else if buffered.remaining.is_none() {
+                    body.lock().unwrap().push(&buffered.bytes, cap);
                 }
-                pending.answer = Some(answer);
+                pending.answer = Some(Box::new(answer));
                 let Some(sender) = &sender else { break };
-                let _ = sender.send(pending);
+                let _ = sender.send(RequestEvent::Request(pending));
+                if close {
+                    break;
+                }
                 continue;
             }
             Verdict::Continue => {}
         }
-        pending.response_rules = rewrites.rewriter.matching(Phase::Response, &message.url);
         // A script may move the request to another path on the same host.
         let mut target = path;
         if message.url != pending.url {
@@ -562,47 +689,68 @@ where
                 }
             }
         }
-        pending.headers = message.headers.clone();
+        pending.response_rules = rewrites.rewriter.matching(Phase::Response, &pending.url);
         let start = format!("{} {target} HTTP/1.{minor}", pending.method);
         let Some(sender) = &sender else { break };
-        if complete && needs_body {
-            let (send, decoded_body) = if message.body_changed {
-                (message.body.take().unwrap_or_default(), decoded_body)
+        if message.body_changed || buffered.remaining.is_none() {
+            if message.body_changed && buffered.remaining.is_some() {
+                if expects && !sent_continue {
+                    sender
+                        .send(RequestEvent::Continue)
+                        .map_err(|_| io::ErrorKind::BrokenPipe)?;
+                    message
+                        .headers
+                        .retain(|(k, _)| !k.eq_ignore_ascii_case("expect"));
+                }
+                buffered
+                    .finish(&mut reader, &mut tokio::io::sink(), |_| {})
+                    .await?;
+            }
+            let send = if message.body_changed {
+                message.body.take().unwrap_or_default()
             } else {
-                (raw, false)
+                buffered.bytes
             };
+            if message.body_changed
+                || !send.is_empty()
+                || !matches!(framing, Framing::Length(0))
+                || message
+                    .headers
+                    .iter()
+                    .any(|(name, _)| rewrite::is_framing(name))
+            {
+                set_body_headers(&mut message.headers, send.len(), message.body_changed);
+            }
             body.lock().unwrap().push(&send, cap);
-            let framed = framing_header(&message.headers) || !send.is_empty();
-            let _ = sender.send(pending);
-            let head = encode_head(
-                &start,
-                &message.headers,
-                framed.then_some((send.len(), decoded_body)),
-            );
+            pending.headers = message.headers.clone();
+            let _ = sender.send(RequestEvent::Request(pending));
+            let head = encode_head(&start, &message.headers);
             writer.write_all(&head).await?;
             writer.write_all(&send).await?;
         } else {
-            let _ = sender.send(pending);
+            if expects && !sent_continue && find(&message.headers, "expect").is_none() {
+                sender
+                    .send(RequestEvent::Continue)
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+            }
+            pending.headers = message.headers.clone();
+            let _ = sender.send(RequestEvent::Request(pending));
             if message.head_changed {
                 writer
-                    .write_all(&encode_head(&start, &message.headers, None))
+                    .write_all(&encode_head(&start, &message.headers))
                     .await?;
             } else {
                 writer.write_all(&head).await?;
             }
-            body.lock().unwrap().push(&raw, cap);
-            finish_body(&mut reader, &mut writer, framing, &raw, |bytes| {
-                body.lock().unwrap().push(bytes, cap)
-            })
-            .await?;
+            buffered
+                .finish(&mut reader, &mut writer, |bytes| {
+                    body.lock().unwrap().push(bytes, cap)
+                })
+                .await?;
         }
         writer.flush().await?;
     }
     writer.shutdown().await
-}
-
-fn framing_header(headers: &[(String, String)]) -> bool {
-    find(headers, "content-length").is_some() || find(headers, "transfer-encoding").is_some()
 }
 
 /// The path of `to` when it has the same scheme and host as `from`.
@@ -617,9 +765,8 @@ fn same_origin(from: &str, to: &str) -> Option<String> {
 async fn responses<R, W>(
     mut reader: R,
     mut writer: W,
-    pending: &mut mpsc::UnboundedReceiver<Pending>,
+    pending: &mut mpsc::UnboundedReceiver<RequestEvent>,
     context: &Context,
-    rewrites: Option<&Rewrites>,
 ) -> io::Result<()>
 where
     R: AsyncBufRead + Unpin,
@@ -638,16 +785,48 @@ where
                 pending.recv().await
             }
         };
-        let Some(mut request) = next else {
+        let Some(event) = next else {
             // No more requests: whatever else the server sends goes through.
             tokio::io::copy_buf(&mut reader, &mut writer).await?;
             break;
         };
-        if let Some(answer) = request.answer.take() {
-            writer.write_all(&answer.encode()).await?;
+        let RequestEvent::Request(mut request) = event else {
+            writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
             writer.flush().await?;
+            continue;
+        };
+        let rewrites = request.rewrites.take();
+        if let Some(answer) = request.answer.take() {
+            let close = request.close_after_answer;
             let mut body = Body::default();
-            body.push(&answer.body, context.core.requests.body_cap());
+            let cap = context.core.requests.body_cap();
+            let file = match &answer.file {
+                Some(path) => Some(tokio::fs::File::open(path).await?),
+                None => None,
+            };
+            let length = match &file {
+                Some(file) => file.metadata().await?.len(),
+                None => answer.body.len() as u64,
+            };
+            writer.write_all(&answer.encode_head(length)).await?;
+            if request.method != "HEAD"
+                && !(100..200).contains(&answer.status)
+                && !matches!(answer.status, 204 | 304)
+            {
+                match file {
+                    Some(file) => {
+                        copy_exact(&mut BufReader::new(file), &mut writer, length, &mut |b| {
+                            body.push(b, cap)
+                        })
+                        .await?
+                    }
+                    None => {
+                        writer.write_all(&answer.body).await?;
+                        body.push(&answer.body, cap);
+                    }
+                }
+            }
+            writer.flush().await?;
             record(
                 context,
                 request,
@@ -656,6 +835,9 @@ where
                 None,
                 true,
             );
+            if close {
+                break;
+            }
             continue;
         }
         // The final response, after any informational ones.
@@ -728,103 +910,110 @@ where
         let cap = context.core.requests.body_cap();
         let mut body = Body::default();
         let rules = std::mem::take(&mut request.response_rules);
-        let (status, headers, copied) = match rewrites.filter(|_| !rules.is_empty() && !switched) {
-            None => {
-                writer.write_all(&head).await?;
-                let copied = copy_body(&mut reader, &mut writer, framing, |bytes| {
-                    body.push(bytes, cap)
-                })
-                .await;
-                (code, headers, copied)
-            }
-            Some(rewrites) => {
-                let needs_body = !bodiless
-                    && rules
-                        .iter()
-                        .any(|&i| rewrites.rewriter.rule(i).action.needs_body());
-                let (raw, complete) = if needs_body {
-                    read_body(&mut reader, framing, rewrites.limit).await?
-                } else {
-                    (Vec::new(), true)
-                };
-                let unpacked = (needs_body && complete)
-                    .then(|| decoded(&headers, &raw, rewrites.limit))
-                    .flatten();
-                let mut message = Message {
-                    url: request.url.clone(),
-                    status: code,
-                    headers: headers.clone(),
-                    body: unpacked.as_ref().map(|(b, _)| b.clone()),
-                    head_changed: false,
-                    body_changed: false,
-                };
-                let verdict = apply_rules(
-                    context,
-                    rewrites,
-                    &rules,
-                    Phase::Response,
-                    (&request.method, &request.url, &request.headers),
-                    &mut message,
-                    &mut request.applied,
-                )
-                .await;
-                if matches!(verdict, Verdict::Drop) {
-                    record(
-                        context,
-                        request,
-                        Some((code, headers)),
-                        Body::default(),
-                        Some("closed by a rewrite rule".into()),
-                        false,
-                    );
-                    return Err(io::Error::other("closed by a rewrite rule"));
-                }
-                let reason = if message.status == code && !reason.is_empty() {
-                    reason.clone()
-                } else {
-                    rewrite::reason(message.status).to_owned()
-                };
-                let start = format!("HTTP/1.{minor} {} {reason}", message.status);
-                if needs_body && complete {
-                    let (send, decoded_body) = if message.body_changed {
-                        (
-                            message.body.take().unwrap_or_default(),
-                            unpacked.as_ref().is_some_and(|(_, d)| *d),
-                        )
-                    } else {
-                        (raw, false)
-                    };
-                    writer
-                        .write_all(&encode_head(
-                            &start,
-                            &message.headers,
-                            Some((send.len(), decoded_body)),
-                        ))
-                        .await?;
-                    writer.write_all(&send).await?;
-                    body.push(&send, cap);
-                    let mut headers = message.headers;
-                    if decoded_body {
-                        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"));
-                    }
-                    (message.status, headers, Ok(()))
-                } else {
-                    if message.head_changed {
-                        writer
-                            .write_all(&encode_head(&start, &message.headers, None))
-                            .await?;
-                    } else {
-                        writer.write_all(&head).await?;
-                    }
-                    body.push(&raw, cap);
-                    let copied = finish_body(&mut reader, &mut writer, framing, &raw, |bytes| {
+        let (status, headers, copied) =
+            match rewrites.as_ref().filter(|_| !rules.is_empty() && !switched) {
+                None => {
+                    writer.write_all(&head).await?;
+                    let copied = copy_body(&mut reader, &mut writer, framing, |bytes| {
                         body.push(bytes, cap)
                     })
                     .await;
-                    (message.status, message.headers, copied)
+                    (code, headers, copied)
                 }
-            }
-        };
+                Some(rewrites) => {
+                    let mut message = Message {
+                        url: request.url.clone(),
+                        status: code,
+                        headers: headers.clone(),
+                        body: None,
+                        head_changed: false,
+                        body_changed: false,
+                    };
+                    let mut body_source = BodySource {
+                        reader: &mut reader,
+                        buffered: BufferedBody::unread(framing),
+                        limit: rewrites.limit,
+                        bodiless,
+                        loaded: false,
+                        expects_continue: None,
+                        sent_continue: false,
+                    };
+                    let verdict = apply_rules(
+                        context,
+                        rewrites,
+                        &rules,
+                        Phase::Response,
+                        (&request.method, &request.url, &request.headers),
+                        &headers,
+                        &mut message,
+                        &mut body_source,
+                        &mut request.applied,
+                    )
+                    .await?;
+                    let buffered = body_source.buffered;
+                    if matches!(verdict, Verdict::Drop) {
+                        record(
+                            context,
+                            request,
+                            Some((code, headers)),
+                            Body::default(),
+                            Some("closed by a rewrite rule".into()),
+                            false,
+                        );
+                        return Err(io::Error::other("closed by a rewrite rule"));
+                    }
+                    let reason = if message.status == code && !reason.is_empty() {
+                        reason.clone()
+                    } else {
+                        rewrite::reason(message.status).to_owned()
+                    };
+                    let start = format!("HTTP/1.{minor} {} {reason}", message.status);
+                    if request.method == "HEAD" || matches!(message.status, 204 | 304) {
+                        if message.status == 204 || !bodiless {
+                            message
+                                .headers
+                                .retain(|(name, _)| !rewrite::is_framing(name));
+                        }
+                        writer
+                            .write_all(&encode_head(&start, &message.headers))
+                            .await?;
+                        let copied = buffered
+                            .finish(&mut reader, &mut tokio::io::sink(), |_| {})
+                            .await;
+                        (message.status, message.headers, copied)
+                    } else if message.body_changed || buffered.remaining.is_none() || bodiless {
+                        if message.body_changed && buffered.remaining.is_some() {
+                            buffered
+                                .finish(&mut reader, &mut tokio::io::sink(), |_| {})
+                                .await?;
+                        }
+                        let send = if message.body_changed {
+                            message.body.take().unwrap_or_default()
+                        } else {
+                            buffered.bytes
+                        };
+                        set_body_headers(&mut message.headers, send.len(), message.body_changed);
+                        writer
+                            .write_all(&encode_head(&start, &message.headers))
+                            .await?;
+                        writer.write_all(&send).await?;
+                        body.push(&send, cap);
+                        (message.status, message.headers, Ok(()))
+                    } else {
+                        if message.head_changed {
+                            writer
+                                .write_all(&encode_head(&start, &message.headers))
+                                .await?;
+                        } else {
+                            writer.write_all(&head).await?;
+                        }
+                        let copied = buffered
+                            .finish(&mut reader, &mut writer, |bytes| body.push(bytes, cap))
+                            .await;
+                        (message.status, message.headers, copied)
+                    }
+                }
+            };
         record(
             context,
             request,
@@ -1078,6 +1267,23 @@ async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_chunk_passes_through_without_buffering_its_payload() {
+        let wire = b"2\r\nab\r\n5\r\ncdefg\r\n0\r\n\r\nNEXT";
+        let mut reader = &wire[..];
+        let body = read_body(&mut reader, Framing::Chunked, 4).await.unwrap();
+        assert_eq!(body.bytes, b"ab");
+        assert!(reader.starts_with(b"cdefg"));
+        let mut out = Vec::new();
+        let mut content = Vec::new();
+        body.finish(&mut reader, &mut out, |b| content.extend_from_slice(b))
+            .await
+            .unwrap();
+        assert_eq!(out, &wire[..wire.len() - 4]);
+        assert_eq!(content, b"abcdefg");
+        assert_eq!(reader, b"NEXT");
+    }
 
     #[test]
     fn recognizes_http_starts() {

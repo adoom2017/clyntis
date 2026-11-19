@@ -70,6 +70,7 @@ export interface RewriteStatus {
     missing: string[];
     updated?: number;
     error?: string;
+    updateError?: string;
   }[];
   recent: { time: number; url: string; action: string; module: string }[];
 }

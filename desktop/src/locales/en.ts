@@ -184,6 +184,8 @@ export const en: Record<string, string> = {
   "自 {since} 起，共拦截 {total} 次（DNS {dns}，连接 {connections}），涉及 {domains} 个域名。误拦时点「放行」加入白名单，立即生效。":
     "Since {since}: {total} blocks (DNS {dns}, connections {connections}) across {domains} domains. If something is blocked by mistake, choose Allow to add it to the allowlist; it applies at once.",
   "不可用：{error}": "Unavailable: {error}",
+  "更新失败，仍在使用缓存：{error}":
+    "Update failed, using cached rules: {error}",
   "{count} 条": "{count} entries",
   "更新于 {time}": "updated {time}",
   "{count} 次": "{count}×",

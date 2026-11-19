@@ -40,7 +40,11 @@ pub struct Source {
 impl Source {
     /// The cache file, inside the configuration directory.
     pub fn file_name(&self) -> String {
-        format!("rewrite/{}.module", safe_name(&self.name))
+        format!(
+            "rewrite/{}-{}.module",
+            safe_name(&self.name),
+            url_hash(&self.url)
+        )
     }
 }
 
@@ -62,10 +66,13 @@ fn safe_name(name: &str) -> String {
 
 /// A downloaded script or local response body: cached by its URL.
 pub fn cache_file(url: &str) -> String {
+    format!("rewrite/files/{}", url_hash(url))
+}
+
+fn url_hash(url: &str) -> String {
     use sha1::Digest;
     let digest = sha1::Sha1::digest(url.as_bytes());
-    let hex: String = digest.iter().take(10).map(|b| format!("{b:02x}")).collect();
-    format!("rewrite/files/{hex}")
+    digest.iter().take(10).map(|b| format!("{b:02x}")).collect()
 }
 
 impl Rewrite {
@@ -84,7 +91,7 @@ impl Rewrite {
                 !module.name.trim().is_empty()
                     && module.name.len() <= 64
                     && module.name != CUSTOM
-                    && names.insert(module.file_name()),
+                    && names.insert(safe_name(&module.name)),
                 "rewrite module names must be non-empty, unique and at most 64 bytes"
             );
             ensure!(
@@ -173,9 +180,29 @@ pub struct Rule {
     /// A regular expression the full URL must match.
     pub pattern: String,
     pub phase: Phase,
+    /// Additional conditions (method, status, headers) that must all hold.
+    pub conditions: Vec<Condition>,
+    /// True for subsequent stages of a piped `a | b` DSL rule: runs iff the
+    /// leading stage on the same `(module, line)` matched its conditions.
+    pub pipe_continuation: bool,
     pub action: Action,
     /// Its line in the module, for status and the request log.
     pub line: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Condition {
+    Method { equals: bool, value: String },
+    Status { equals: bool, value: u16 },
+    RequestHeader { name: String, op: MatchOp },
+    ResponseHeader { name: String, op: MatchOp },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MatchOp {
+    Equals(String),
+    NotEquals(String),
+    Regex(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +213,8 @@ pub enum Action {
         status: u16,
         location: String,
     },
+    /// Transparently rewrites the outbound request URL (same-origin path/query).
+    UrlReplace(String),
     Header(HeaderOp),
     /// Regex and replacement pairs, applied in order to the body as text.
     BodyReplace(Vec<(String, String)>),
@@ -204,6 +233,7 @@ impl Action {
         match self {
             Action::Reject(reject) => reject.name().into(),
             Action::Redirect { status, .. } => status.to_string(),
+            Action::UrlReplace(_) => "url".into(),
             Action::Header(_) => "header".into(),
             Action::BodyReplace(_) => "body".into(),
             Action::JsonDelete(_) | Action::JsonSet(_) => "json".into(),
@@ -250,7 +280,7 @@ impl Reject {
     fn parse(word: &str) -> Option<Self> {
         Some(match word.to_ascii_lowercase().as_str() {
             "reject" => Reject::NotFound,
-            "reject-200" | "reject-video" => Reject::Empty,
+            "reject-200" => Reject::Empty,
             "reject-img" | "reject-tinygif" => Reject::Image,
             "reject-dict" => Reject::Dict,
             "reject-array" => Reject::Array,
@@ -273,6 +303,8 @@ impl Reject {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderOp {
     Add(String, String),
+    /// Sets a header, replacing existing values or inserting if absent.
+    Set(String, String),
     Delete(String),
     /// Replaces the value of a header that is present.
     Replace(String, String),
@@ -302,6 +334,24 @@ pub const TINY_GIF: &[u8] = &[
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptArgument {
+    Text(String),
+    Object(Vec<(String, ScriptValue)>),
+}
+impl Default for ScriptArgument {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptValue {
+    Bool(bool),
+    Number(String),
+    String(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Script {
     pub name: String,
     /// http(s) URL of the script.
@@ -313,7 +363,7 @@ pub struct Script {
     pub max_size: Option<u64>,
     /// Seconds.
     pub timeout: Option<u64>,
-    pub argument: String,
+    pub argument: ScriptArgument,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -339,7 +389,8 @@ const RULES_LIMIT: usize = 10_000;
 /// Parses a module. Lines that are not understood are reported, never fatal:
 /// modules are written for other apps and use features this one lacks.
 pub fn parse_module(text: &str) -> Module {
-    let text = substitute_arguments(text);
+    let args = collect_arguments(text);
+    let text = substitute_arguments(text, &args);
     let mut module = Module::default();
     let mut section = Section::None;
     for (index, raw) in text.lines().enumerate() {
@@ -395,39 +446,52 @@ pub fn parse_module(text: &str) -> Module {
         } else {
             section
         };
-        let parsed = match section {
+        let parsed: Result<(), Option<String>> = match section {
             Section::Ignored | Section::Argument | Section::None => Ok(()),
             Section::Mitm => {
                 mitm_line(line, &mut module.hostnames);
                 Ok(())
             }
-            Section::Rule => rule_line(line, &mut module.reject),
-            Section::Script => script_line(line, number).map(|rule| module.rules.extend(rule)),
-            _ => rewrite_line(section, line, number).map(|rule| module.rules.push(rule)),
+            Section::Rule => rule_line(line, &mut module.reject).map_err(|()| None),
+            _ if is_dsl_rule(line) => match dsl_line(line, number, &args) {
+                Ok(rules) => {
+                    module.rules.extend(rules);
+                    Ok(())
+                }
+                Err(reason) => Err(Some(reason)),
+            },
+            Section::Script => script_line(line, number)
+                .map(|rule| module.rules.extend(rule))
+                .map_err(|()| None),
+            _ => rewrite_line(section, line, number)
+                .map(|rule| module.rules.push(rule))
+                .map_err(|()| None),
         };
-        if parsed.is_err() && module.skipped.len() < SKIPPED_KEPT {
-            module
-                .skipped
-                .push((number, line.chars().take(200).collect()));
+        if let Err(reason) = parsed
+            && module.skipped.len() < SKIPPED_KEPT
+        {
+            let text = match reason {
+                Some(reason) => format!("{reason}: {}", line.chars().take(160).collect::<String>()),
+                None => line.chars().take(200).collect(),
+            };
+            module.skipped.push((number, text));
         }
     }
     module
 }
 
-/// Fills `{{{name}}}` with the defaults of Surge `#!arguments=` and Loon
-/// `[Argument]`.
-fn substitute_arguments(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("{{{") {
-        return text.into();
-    }
-    let mut values: Vec<(String, String)> = Vec::new();
+fn collect_arguments(text: &str) -> Vec<(String, ScriptValue)> {
+    let mut values = Vec::new();
     let mut in_argument = false;
     for line in text.lines() {
         let line = line.trim();
         if let Some(arguments) = line.strip_prefix("#!arguments=") {
             for item in split_outside_quotes(arguments, ',') {
                 if let Some((key, value)) = item.split_once(':') {
-                    values.push((key.trim().into(), unquote(value.trim()).into()));
+                    values.push((
+                        key.trim().into(),
+                        ScriptValue::String(unquote(value.trim()).into()),
+                    ));
                 }
             }
         } else if line.starts_with('[') {
@@ -436,16 +500,109 @@ fn substitute_arguments(text: &str) -> std::borrow::Cow<'_, str> {
             // `name = switch,true,false,tag=…` / `name = input,"value",tag=…`:
             // the default is the first value.
             let fields = split_outside_quotes(rest, ',');
-            if let Some(value) = fields.get(1) {
-                values.push((key.trim().into(), unquote(value.trim()).into()));
+            if let (Some(kind), Some(value)) = (fields.first(), fields.get(1)) {
+                let raw = unquote(value.trim());
+                let kind = kind.trim().to_ascii_lowercase();
+                let declared_type = fields[2..]
+                    .iter()
+                    .filter_map(|f| f.split_once('='))
+                    .find(|(k, _)| k.trim().eq_ignore_ascii_case("type"))
+                    .map(|(_, v)| unquote(v.trim()).to_ascii_lowercase());
+                let typed = if kind == "switch"
+                    || matches!(declared_type.as_deref(), Some("bool" | "boolean"))
+                {
+                    ScriptValue::Bool(raw.eq_ignore_ascii_case("true"))
+                } else if (kind == "number"
+                    || matches!(
+                        declared_type.as_deref(),
+                        Some("number" | "int" | "integer" | "float" | "double")
+                    ))
+                    && raw.parse::<f64>().is_ok()
+                {
+                    ScriptValue::Number(raw.into())
+                } else {
+                    ScriptValue::String(raw.into())
+                };
+                values.push((key.trim().into(), typed));
             }
         }
     }
+    values
+}
+
+fn script_value_text(value: &ScriptValue) -> &str {
+    match value {
+        ScriptValue::Bool(true) => "true",
+        ScriptValue::Bool(false) => "false",
+        ScriptValue::Number(n) | ScriptValue::String(n) => n.as_str(),
+    }
+}
+
+/// Fills `{{{name}}}` everywhere and Loon 3.5+ `${name}` outside object
+/// literals `{...}` (which `dsl_line` resolves with full types).
+fn substitute_arguments<'a>(
+    text: &'a str,
+    values: &[(String, ScriptValue)],
+) -> std::borrow::Cow<'a, str> {
+    if values.is_empty() || (!text.contains("{{{") && !text.contains("${")) {
+        return text.into();
+    }
     let mut out = text.to_owned();
-    for (key, value) in values {
-        out = out.replace(&format!("{{{{{{{key}}}}}}}"), &value);
+    if out.contains("{{{") {
+        for (key, value) in values {
+            out = out.replace(&format!("{{{{{{{key}}}}}}}"), script_value_text(value));
+        }
+    }
+    if out.contains("${") {
+        let mut replaced = String::with_capacity(out.len());
+        let bytes = out.as_bytes();
+        let mut i = 0;
+        let mut brace_depth = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                if let Some(rel_end) = out[i + 2..].find('}') {
+                    let name = &out[i + 2..i + 2 + rel_end];
+                    if brace_depth == 0
+                        && let Some((_, value)) = values.iter().find(|(k, _)| k == name)
+                    {
+                        replaced.push_str(script_value_text(value));
+                    } else {
+                        replaced.push_str(&out[i..i + 3 + rel_end]);
+                    }
+                    i += 3 + rel_end;
+                    continue;
+                }
+            }
+            if bytes[i] == b'{' {
+                brace_depth += 1;
+            } else if bytes[i] == b'}' {
+                brace_depth = brace_depth.saturating_sub(1);
+            } else if bytes[i] == b'\n' {
+                brace_depth = 0;
+            }
+            let ch = out[i..].chars().next().unwrap();
+            replaced.push(ch);
+            i += ch.len_utf8();
+        }
+        out = replaced;
     }
     out.into()
+}
+
+fn push_mitm_host(item: &str, hosts: &mut Vec<String>) {
+    let host = item
+        .trim()
+        .trim_start_matches("%APPEND%")
+        .trim_start_matches("%INSERT%")
+        .trim();
+    if !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with('%')
+        && !host.chars().any(char::is_whitespace)
+        && !host.contains('=')
+    {
+        hosts.push(host.to_ascii_lowercase());
+    }
 }
 
 fn mitm_line(line: &str, hosts: &mut Vec<String>) {
@@ -455,15 +612,20 @@ fn mitm_line(line: &str, hosts: &mut Vec<String>) {
     if !key.trim().eq_ignore_ascii_case("hostname") {
         return;
     }
-    for host in value.split(',') {
-        let host = host
-            .trim()
-            .trim_start_matches("%APPEND%")
-            .trim_start_matches("%INSERT%")
-            .trim();
-        if !host.is_empty() && host.len() <= 253 && !host.starts_with('%') {
-            hosts.push(host.to_ascii_lowercase());
+    for item in value.split(',') {
+        if let Some((left, right)) = item.split_once('=') {
+            let left = left.trim();
+            let prefix_end = left.len().saturating_sub(8);
+            if left.len() > 8
+                && left.is_char_boundary(prefix_end)
+                && left[prefix_end..].eq_ignore_ascii_case("hostname")
+            {
+                push_mitm_host(&left[..prefix_end], hosts);
+                push_mitm_host(right, hosts);
+            }
+            continue;
         }
+        push_mitm_host(item, hosts);
     }
 }
 
@@ -616,6 +778,8 @@ fn rewrite_line(section: Section, line: &str, number: usize) -> Result<Rule, ()>
         Ok(Rule {
             pattern,
             phase,
+            conditions: Vec::new(),
+            pipe_continuation: false,
             action,
             line: number,
         })
@@ -800,7 +964,7 @@ fn keyword_action(
                     binary: false,
                     max_size: None,
                     timeout: None,
-                    argument: String::new(),
+                    argument: ScriptArgument::default(),
                 }),
             )
         }
@@ -863,50 +1027,76 @@ fn jq_filter(tokens: &[String]) -> Result<String, ()> {
     Ok(filter.to_owned())
 }
 
-fn mock(tokens: &[String]) -> Result<Mock, ()> {
-    let options = options(tokens);
-    let kind = option(&options, "data-type")
-        .unwrap_or("text")
-        .to_ascii_lowercase();
-    let status = option(&options, "status-code")
-        .map(|s| s.parse::<u16>().map_err(|_| ()))
-        .transpose()?
-        .unwrap_or(200);
+fn mock_content_type(kind: &str) -> Result<&'static str, ()> {
+    Ok(match kind {
+        "tiny-gif" | "gif" => "image/gif",
+        "base64" => "application/octet-stream",
+        "json" => "application/json",
+        "html" => "text/html; charset=utf-8",
+        "css" => "text/css",
+        "javascript" => "application/javascript",
+        "text" => "text/plain; charset=utf-8",
+        _ => return Err(()),
+    })
+}
+
+fn mock_from_parts(
+    kind: &str,
+    data: &str,
+    status: u16,
+    force_base64: bool,
+    content_type_override: Option<&str>,
+    headers: Vec<(String, String)>,
+) -> Result<Mock, ()> {
     if !(100..=599).contains(&status) {
         return Err(());
     }
-    let data = option(&options, "data").unwrap_or("");
+    let kind = kind.to_ascii_lowercase();
+    let default_type = mock_content_type(&kind)?;
     let (content_type, body) = match kind.as_str() {
         "tiny-gif" | "gif" if data.is_empty() || kind == "tiny-gif" => {
             ("image/gif", MockBody::Inline(TINY_GIF.to_vec()))
         }
-        "base64" | "gif" => {
+        _ if force_base64 || matches!(kind.as_str(), "base64" | "gif") => {
             use base64::Engine;
-            if data.starts_with("http://") || data.starts_with("https://") {
-                ("application/octet-stream", MockBody::Remote(data.into()))
+            let content_type = if kind == "gif" {
+                "application/octet-stream"
             } else {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|_| ())?;
-                ("application/octet-stream", MockBody::Inline(bytes))
-            }
-        }
-        "json" | "text" | "html" | "css" | "javascript" => {
-            let content_type = match kind.as_str() {
-                "json" => "application/json",
-                "html" => "text/html; charset=utf-8",
-                "css" => "text/css",
-                "javascript" => "application/javascript",
-                _ => "text/plain; charset=utf-8",
+                default_type
             };
             if data.starts_with("http://") || data.starts_with("https://") {
                 (content_type, MockBody::Remote(data.into()))
             } else {
-                (content_type, MockBody::Inline(data.as_bytes().to_vec()))
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| ())?;
+                (content_type, MockBody::Inline(bytes))
             }
         }
-        _ => return Err(()),
+        _ => {
+            if data.starts_with("http://") || data.starts_with("https://") {
+                (default_type, MockBody::Remote(data.into()))
+            } else {
+                (default_type, MockBody::Inline(data.as_bytes().to_vec()))
+            }
+        }
     };
+    Ok(Mock {
+        status,
+        content_type: content_type_override.unwrap_or(content_type).to_owned(),
+        body,
+        headers,
+    })
+}
+
+fn mock(tokens: &[String]) -> Result<Mock, ()> {
+    let options = options(tokens);
+    let kind = option(&options, "data-type").unwrap_or("text");
+    let status = option(&options, "status-code")
+        .map(|s| s.parse::<u16>().map_err(|_| ()))
+        .transpose()?
+        .unwrap_or(200);
+    let data = option(&options, "data").unwrap_or("");
     let mut headers = Vec::new();
     if let Some(list) = option(&options, "header") {
         for item in list.split('|') {
@@ -915,14 +1105,14 @@ fn mock(tokens: &[String]) -> Result<Mock, ()> {
             }
         }
     }
-    Ok(Mock {
+    mock_from_parts(
+        kind,
+        data,
         status,
-        content_type: option(&options, "content-type")
-            .unwrap_or(content_type)
-            .to_owned(),
-        body,
+        false,
+        option(&options, "content-type"),
         headers,
-    })
+    )
 }
 
 fn remote(url: String) -> Result<String, ()> {
@@ -942,6 +1132,44 @@ fn script_name(url: &str, number: usize) -> String {
             || format!("line {number}"),
             |n| n.trim_end_matches(".js").to_owned(),
         )
+}
+
+fn build_script(
+    phase: Phase,
+    pattern: String,
+    conditions: Vec<Condition>,
+    url: String,
+    options: &[(String, String)],
+    argument: Option<ScriptArgument>,
+    number: usize,
+) -> Result<Option<Rule>, ()> {
+    if option(options, "enable").is_some_and(|v| v.eq_ignore_ascii_case("false")) {
+        return Ok(None);
+    }
+    let url = remote(url)?;
+    let name = option(options, "tag")
+        .filter(|t| !t.is_empty())
+        .map_or_else(|| script_name(&url, number), str::to_owned);
+    let number_option =
+        |key| option(options, key).and_then(|v: &str| v.trim().parse::<u64>().ok());
+    Ok(Some(Rule {
+        pattern,
+        phase,
+        conditions,
+        pipe_continuation: false,
+        action: Action::Script(Script {
+            name,
+            url,
+            requires_body: truthy(option(options, "requires-body")),
+            binary: truthy(option(options, "binary-body-mode")),
+            max_size: number_option("max-size").filter(|s| *s > 0),
+            timeout: number_option("timeout").filter(|t| *t > 0),
+            argument: argument.unwrap_or_else(|| {
+                ScriptArgument::Text(option(options, "argument").unwrap_or("").to_owned())
+            }),
+        }),
+        line: number,
+    }))
 }
 
 /// Surge: `name = type=http-response,pattern=…,script-path=…,requires-body=1`.
@@ -982,30 +1210,1112 @@ fn script_line(line: &str, number: usize) -> Result<Option<Rule>, ()> {
             options.push(("tag".into(), name.trim().to_owned()));
             (phase, pattern, options)
         };
-    if option(&options, "enable").is_some_and(|v| v.eq_ignore_ascii_case("false")) {
-        return Ok(None);
-    }
     let url = option(&options, "script-path").ok_or(())?.to_owned();
-    let url = remote(url)?;
-    let name = option(&options, "tag")
-        .filter(|t| !t.is_empty())
-        .map_or_else(|| script_name(&url, number), str::to_owned);
-    let number_option =
-        |key| option(&options, key).and_then(|v: &str| v.trim().parse::<u64>().ok());
-    Ok(Some(Rule {
-        pattern,
-        phase,
-        action: Action::Script(Script {
-            name,
+    build_script(phase, pattern, Vec::new(), url, &options, None, number)
+}
+
+fn is_dsl_rule(line: &str) -> bool {
+    strip_dsl_phase(line).is_some()
+}
+
+fn strip_dsl_phase(line: &str) -> Option<(Phase, &str)> {
+    let rest = line.trim_start();
+    let (phase, after) = if rest.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("request")) {
+        (Phase::Request, &rest[7..])
+    } else if rest.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("response")) {
+        (Phase::Response, &rest[8..])
+    } else {
+        return None;
+    };
+    let after = after.strip_prefix(|c: char| c.is_ascii_whitespace())?.trim_start();
+    if !after.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("if")) {
+        return None;
+    }
+    let cond = after[2..].strip_prefix(|c: char| c.is_ascii_whitespace())?.trim_start();
+    Some((phase, cond))
+}
+
+fn skip_quoted(bytes: &[u8], i: usize) -> Option<usize> {
+    let quote = *bytes.get(i)?;
+    if !matches!(quote, b'"' | b'\'' | b'`') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if quote != b'`' && bytes[j] == b'\\' {
+            j += 2;
+            continue;
+        }
+        if bytes[j] == quote {
+            return Some(j + 1);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn skip_regex(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'/') || bytes.get(i + 1) == Some(&b'/') {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut in_class = false;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'[' => {
+                in_class = true;
+                j += 1;
+            }
+            b']' if in_class => {
+                in_class = false;
+                j += 1;
+            }
+            b'/' if !in_class => {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                return Some(j);
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn regex_allowed_before(bytes: &[u8], i: usize) -> bool {
+    let mut k = i;
+    while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    k == 0 || matches!(bytes[k - 1], b'(' | b',' | b'=' | b'~' | b'[' | b'|')
+}
+
+fn split_dsl_then(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(next) = skip_quoted(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i].is_ascii_whitespace() {
+            let ws_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if s.get(i..i + 4).is_some_and(|w| w.eq_ignore_ascii_case("then"))
+                && bytes.get(i + 4).is_some_and(u8::is_ascii_whitespace)
+            {
+                let after = s[i + 4..].trim_start();
+                return Some((&s[..ws_start], after));
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_quoted(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b if b == sep && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+fn escape_regex(literal: &str) -> String {
+    let mut out = String::with_capacity(literal.len());
+    for c in literal.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn parse_regex_literal(s: &str) -> Result<(String, &str), String> {
+    let s = s.trim_start();
+    let end = skip_regex(s.as_bytes(), 0).ok_or_else(|| "invalid regex literal".to_owned())?;
+    let mut slash = end;
+    while slash > 1 && s.as_bytes()[slash - 1].is_ascii_alphabetic() {
+        slash -= 1;
+    }
+    if slash <= 1 || s.as_bytes()[slash - 1] != b'/' {
+        return Err("invalid regex literal".to_owned());
+    }
+    let body = &s[1..slash - 1];
+    let flags = &s[slash..end];
+    if body.is_empty() {
+        return Err("empty regex literal".to_owned());
+    }
+    let (mut has_i, mut has_m, mut has_s) = (false, false, false);
+    for flag in flags.chars() {
+        match flag {
+            'i' => has_i = true,
+            'm' => has_m = true,
+            's' => has_s = true,
+            'g' => {}
+            other => return Err(format!("unsupported regex flag '{other}'")),
+        }
+    }
+    let mut inline = String::new();
+    if has_i {
+        inline.push('i');
+    }
+    if has_m {
+        inline.push('m');
+    }
+    if has_s {
+        inline.push('s');
+    }
+    let prefix = (!inline.is_empty()).then(|| format!("(?{inline})"));
+    let pattern = match prefix {
+        Some(prefix) if !body.starts_with(&prefix) => format!("{prefix}{body}"),
+        _ => body.to_owned(),
+    };
+    Ok((pattern, &s[end..]))
+}
+
+fn parse_string_literal(s: &str) -> Result<String, ()> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if skip_quoted(bytes, 0) != Some(s.len()) {
+        return Err(());
+    }
+    let quote = bytes[0];
+    let inner = &s[1..s.len() - 1];
+    if quote == b'`' || !inner.contains('\\') {
+        return Ok(inner.to_owned());
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+            && matches!(next, '\\' | '"' | '\'')
+        {
+            out.push(next);
+            chars.next();
+            continue;
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+fn parse_dsl_value(s: &str) -> Result<String, ()> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(());
+    }
+    if matches!(trimmed.as_bytes().first(), Some(b'"' | b'\'' | b'`')) {
+        parse_string_literal(trimmed)
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
+fn parse_dsl_string_list(s: &str) -> Result<Vec<String>, ()> {
+    let trimmed = s.trim();
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        let mut out = Vec::new();
+        for item in split_top_level(inner, b',') {
+            let item = item.trim();
+            if !item.is_empty() {
+                out.push(parse_string_literal(item)?);
+            }
+        }
+        if out.is_empty() {
+            return Err(());
+        }
+        Ok(out)
+    } else {
+        Ok(vec![parse_string_literal(trimmed)?])
+    }
+}
+
+fn split_top_level_op<'a>(s: &'a str, op: &[u8; 2]) -> Vec<&'a str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if let Some(next) = skip_quoted(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && bytes.get(i..i + 2) == Some(op.as_slice()) => {
+                out.push(&s[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+fn parse_header_condition_target(expr: &str) -> Option<(bool, String)> {
+    let (is_response, rest) = if let Some(rest) = expr
+        .strip_prefix("${request.headers")
+        .or_else(|| expr.strip_prefix("${request.header"))
+    {
+        (false, rest)
+    } else if let Some(rest) = expr
+        .strip_prefix("${response.headers")
+        .or_else(|| expr.strip_prefix("${response.header"))
+    {
+        (true, rest)
+    } else {
+        return None;
+    };
+    let rest = rest.strip_suffix('}')?;
+    let name = if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        parse_string_literal(inner).ok()?
+    } else if let Some(dot) = rest.strip_prefix('.') {
+        dot.trim().to_owned()
+    } else {
+        return None;
+    };
+    (!name.is_empty()).then_some((is_response, name))
+}
+
+fn parse_match_op(rest: &str) -> Result<MatchOp, String> {
+    let rest = rest.trim_start();
+    if let Some(rhs) = rest.strip_prefix("~=") {
+        let (pattern, tail) = parse_regex_literal(rhs)?;
+        if !tail.trim().is_empty() {
+            return Err("unexpected tokens after regex condition".to_owned());
+        }
+        Ok(MatchOp::Regex(pattern))
+    } else if let Some(rhs) = rest.strip_prefix("==") {
+        let value = parse_dsl_value(rhs).map_err(|()| "invalid == condition value".to_owned())?;
+        Ok(MatchOp::Equals(value))
+    } else if let Some(rhs) = rest.strip_prefix("!=") {
+        let value = parse_dsl_value(rhs).map_err(|()| "invalid != condition value".to_owned())?;
+        Ok(MatchOp::NotEquals(value))
+    } else {
+        Err(format!("unsupported condition operator: {rest}"))
+    }
+}
+
+fn parse_dsl_condition(cond: &str) -> Result<(String, Option<&str>, Vec<Condition>), String> {
+    let cond = cond.trim();
+    if split_top_level_op(cond, b"||").len() > 1 {
+        return Err("unsupported logical OR condition".to_owned());
+    }
+    let mut pattern: Option<String> = None;
+    let mut alias: Option<&str> = None;
+    let mut conditions = Vec::new();
+
+    for clause in split_top_level_op(cond, b"&&") {
+        let clause = clause.trim();
+        if clause.is_empty() {
+            return Err("empty condition clause".to_owned());
+        }
+        if let Some(rest) = clause.strip_prefix("${url}") {
+            let rest = rest.trim_start();
+            if pattern.is_some() {
+                return Err("duplicate ${url} condition".to_owned());
+            }
+            if let Some(rhs) = rest.strip_prefix("~=") {
+                let (pat, tail) = parse_regex_literal(rhs)?;
+                let tail = tail.trim();
+                let found_alias = if tail.is_empty() {
+                    None
+                } else {
+                    let after_as = tail
+                        .get(..2)
+                        .filter(|w| w.eq_ignore_ascii_case("as"))
+                        .and_then(|_| tail[2..].strip_prefix(|c: char| c.is_ascii_whitespace()))
+                        .ok_or_else(|| format!("invalid capture alias: {tail}"))?
+                        .trim();
+                    if after_as.is_empty() || after_as.contains(char::is_whitespace) {
+                        return Err(format!("invalid capture alias: {tail}"));
+                    }
+                    Some(after_as)
+                };
+                pattern = Some(pat);
+                alias = found_alias;
+            } else if let Some(rhs) = rest.strip_prefix("==") {
+                let exact = parse_string_literal(rhs)
+                    .map_err(|()| "invalid ${url} == literal".to_owned())?;
+                if exact.is_empty() {
+                    return Err("empty ${url} == literal".to_owned());
+                }
+                pattern = Some(format!("^{}$", escape_regex(&exact)));
+            } else {
+                return Err(format!("unsupported ${{url}} operator: {clause}"));
+            }
+            continue;
+        }
+        if let Some(rest) = clause.strip_prefix("${request.method}") {
+            let rest = rest.trim_start();
+            let (equals, rhs) = if let Some(rhs) = rest.strip_prefix("==") {
+                (true, rhs)
+            } else if let Some(rhs) = rest.strip_prefix("!=") {
+                (false, rhs)
+            } else {
+                return Err(format!("unsupported method condition: {clause}"));
+            };
+            let value = parse_dsl_value(rhs)
+                .map_err(|()| format!("invalid method condition: {clause}"))?;
+            conditions.push(Condition::Method { equals, value });
+            continue;
+        }
+        if let Some(rest) = clause
+            .strip_prefix("${response.status}")
+            .or_else(|| clause.strip_prefix("${response.statusCode}"))
+        {
+            let rest = rest.trim_start();
+            let (equals, rhs) = if let Some(rhs) = rest.strip_prefix("==") {
+                (true, rhs)
+            } else if let Some(rhs) = rest.strip_prefix("!=") {
+                (false, rhs)
+            } else {
+                return Err(format!("unsupported status condition: {clause}"));
+            };
+            let value = parse_dsl_value(rhs)
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .filter(|s| (100..=599).contains(s))
+                .ok_or_else(|| format!("invalid status condition: {clause}"))?;
+            conditions.push(Condition::Status { equals, value });
+            continue;
+        }
+        if let Some(close) = clause.find('}')
+            && let Some((is_response, name)) = parse_header_condition_target(&clause[..=close])
+        {
+            let op = parse_match_op(&clause[close + 1..])?;
+            conditions.push(if is_response {
+                Condition::ResponseHeader { name, op }
+            } else {
+                Condition::RequestHeader { name, op }
+            });
+            continue;
+        }
+        return Err(format!("unsupported condition: {clause}"));
+    }
+
+    let pattern = pattern.ok_or_else(|| "missing ${url} condition".to_owned())?;
+    Ok((pattern, alias, conditions))
+}
+
+fn parse_dsl_call(stage: &str) -> Result<(&str, Vec<&str>, &str), String> {
+    let stage = stage.trim();
+    let open = stage
+        .find('(')
+        .ok_or_else(|| format!("expected action call: {stage}"))?;
+    let func = stage[..open].trim();
+    if func.is_empty() {
+        return Err(format!("empty action name: {stage}"));
+    }
+    let bytes = stage.as_bytes();
+    let mut i = open + 1;
+    let mut depth = 1usize;
+    let mut close = None;
+    while i < bytes.len() {
+        if let Some(next) = skip_quoted(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close.ok_or_else(|| format!("unclosed action call: {stage}"))?;
+    let args_str = stage[open + 1..close].trim();
+    let args = if args_str.is_empty() {
+        Vec::new()
+    } else {
+        split_top_level(args_str, b',')
+            .into_iter()
+            .map(str::trim)
+            .collect()
+    };
+    Ok((func, args, stage[close + 1..].trim()))
+}
+
+fn apply_capture_alias(location: String, alias: Option<&str>) -> String {
+    let Some(alias) = alias else {
+        return location;
+    };
+    let mut out = location;
+    for n in 1..=9 {
+        out = out.replace(&format!("${{{alias}.{n}}}"), &format!("${n}"));
+    }
+    out
+}
+
+fn parse_dsl_typed_value(
+    raw: &str,
+    arg_defs: &[(String, ScriptValue)],
+) -> Result<ScriptValue, String> {
+    let trimmed = raw.trim();
+    if let Some(name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        return arg_defs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .ok_or_else(|| format!("unknown script argument '${{{name}}}'"));
+    }
+    if matches!(trimmed.as_bytes().first(), Some(b'"' | b'\'' | b'`')) {
+        return parse_string_literal(trimmed)
+            .map(ScriptValue::String)
+            .map_err(|()| format!("invalid script argument string: {trimmed}"));
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Ok(ScriptValue::Bool(true));
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Ok(ScriptValue::Bool(false));
+    }
+    if trimmed.parse::<f64>().is_ok() {
+        return Ok(ScriptValue::Number(trimmed.to_owned()));
+    }
+    Ok(ScriptValue::String(trimmed.to_owned()))
+}
+
+fn parse_dsl_script_argument(
+    raw: &str,
+    arg_defs: &[(String, ScriptValue)],
+) -> Result<ScriptArgument, String> {
+    let trimmed = raw.trim();
+    if let Some(inner) = trimmed.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        let mut entries = Vec::new();
+        for item in split_top_level(inner, b',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if let Some(name) = item.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+                let value = arg_defs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(|| format!("unknown script argument '${{{name}}}'"))?;
+                entries.push((name.to_owned(), value));
+            } else if let Some((k, v)) = item.split_once(':').or_else(|| item.split_once('=')) {
+                let key = unquote(k.trim()).to_owned();
+                if key.is_empty() {
+                    return Err(format!("empty script argument key: {item}"));
+                }
+                entries.push((key, parse_dsl_typed_value(v, arg_defs)?));
+            } else {
+                return Err(format!("invalid script argument entry: {item}"));
+            }
+        }
+        Ok(ScriptArgument::Object(entries))
+    } else {
+        parse_string_literal(trimmed)
+            .map(ScriptArgument::Text)
+            .map_err(|()| format!("invalid script argument: {trimmed}"))
+    }
+}
+
+fn dsl_pipe_headers(stages: &[&str]) -> Result<(Option<String>, Vec<(String, String)>), String> {
+    let mut content_type = None;
+    let mut headers = Vec::new();
+    for stage in stages {
+        let (func, args, after) = parse_dsl_call(stage)?;
+        if !after.is_empty() || args.len() != 2 {
+            return Err(format!("invalid piped header action: {stage}"));
+        }
+        if !matches!(
+            func.to_ascii_lowercase().as_str(),
+            "response.header.set"
+                | "response.header.add"
+                | "request.header.set"
+                | "request.header.add"
+                | "header.set"
+                | "header.add"
+        ) {
+            return Err(format!("unsupported piped action after mock: {func}"));
+        }
+        let name =
+            parse_string_literal(args[0]).map_err(|()| "invalid piped header name".to_owned())?;
+        let value =
+            parse_string_literal(args[1]).map_err(|()| "invalid piped header value".to_owned())?;
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(value);
+        } else {
+            headers.push((name, value));
+        }
+    }
+    Ok((content_type, headers))
+}
+
+fn parse_dsl_status(raw: &str) -> Result<u16, String> {
+    let status = parse_dsl_value(raw)
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|s| (100..=599).contains(s))
+        .ok_or_else(|| format!("invalid HTTP status code: {raw}"))?;
+    Ok(status)
+}
+
+fn parse_dsl_single_action(
+    default_phase: Phase,
+    pattern: &str,
+    alias: Option<&str>,
+    conditions: &[Condition],
+    stage: &str,
+    pipe_tail: &[&str],
+    number: usize,
+    arg_defs: &[(String, ScriptValue)],
+) -> Result<Option<Rule>, String> {
+    let (func, args, after) = parse_dsl_call(stage)?;
+    let func_lower = func.to_ascii_lowercase();
+
+    if func_lower == "script" {
+        if !pipe_tail.is_empty() || args.is_empty() || args.len() > 2 {
+            return Err("invalid script(...) arguments".to_owned());
+        }
+        let url =
+            parse_string_literal(args[0]).map_err(|()| "invalid script URL literal".to_owned())?;
+        let argument = args
+            .get(1)
+            .map(|raw| parse_dsl_script_argument(raw, arg_defs))
+            .transpose()?;
+        let options = if after.is_empty() {
+            Vec::new()
+        } else {
+            let rest = after
+                .get(..4)
+                .filter(|w| w.eq_ignore_ascii_case("with"))
+                .and_then(|_| after[4..].strip_prefix(|c: char| c.is_ascii_whitespace()))
+                .ok_or_else(|| format!("invalid script options: {after}"))?;
+            split_outside_quotes(rest, ',')
+                .into_iter()
+                .filter_map(|o| {
+                    o.split_once('=').map(|(k, v)| {
+                        (
+                            k.trim().to_ascii_lowercase().replace('_', "-"),
+                            unquote(v).to_owned(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        return build_script(
+            default_phase,
+            pattern.to_owned(),
+            conditions.to_vec(),
             url,
-            requires_body: truthy(option(&options, "requires-body")),
-            binary: truthy(option(&options, "binary-body-mode")),
-            max_size: number_option("max-size").filter(|s| *s > 0),
-            timeout: number_option("timeout").filter(|t| *t > 0),
-            argument: option(&options, "argument").unwrap_or("").to_owned(),
-        }),
-        line: number,
-    }))
+            &options,
+            argument,
+            number,
+        )
+        .map_err(|()| "invalid script URL".to_owned());
+    }
+
+    if !after.is_empty() {
+        return Err(format!("unexpected trailing tokens: {after}"));
+    }
+
+    let make = |phase, action| {
+        Ok(Some(Rule {
+            pattern: pattern.to_owned(),
+            phase,
+            conditions: conditions.to_vec(),
+            pipe_continuation: false,
+            action,
+            line: number,
+        }))
+    };
+
+    match func_lower.as_str() {
+        "reject" => {
+            if args.len() > 2 {
+                return Err("reject expects at most 2 arguments".to_owned());
+            }
+            let status = match args.first() {
+                Some(raw) => parse_dsl_status(raw)?,
+                None => 404,
+            };
+            let body = args
+                .get(1)
+                .map(|raw| parse_string_literal(raw))
+                .transpose()
+                .map_err(|()| "invalid reject body literal".to_owned())?;
+            match (status, body) {
+                (404, None) => make(Phase::Request, Action::Reject(Reject::NotFound)),
+                (200, None) => make(Phase::Request, Action::Reject(Reject::Empty)),
+                (status, body) => make(
+                    Phase::Request,
+                    Action::Mock(Mock {
+                        status,
+                        content_type: "text/plain; charset=utf-8".into(),
+                        body: MockBody::Inline(body.unwrap_or_default().into_bytes()),
+                        headers: Vec::new(),
+                    }),
+                ),
+            }
+        }
+        "reject_200" | "reject-200" => {
+            let status = args
+                .first()
+                .map(|s| parse_dsl_status(s))
+                .transpose()?
+                .unwrap_or(200);
+            if status == 200 {
+                make(Phase::Request, Action::Reject(Reject::Empty))
+            } else {
+                make(
+                    Phase::Request,
+                    Action::Mock(Mock {
+                        status,
+                        content_type: "text/plain; charset=utf-8".into(),
+                        body: MockBody::Inline(Vec::new()),
+                        headers: Vec::new(),
+                    }),
+                )
+            }
+        }
+        "reject_video" | "reject-video" => Err("unsupported action: reject_video".to_owned()),
+        "reject_img" | "reject-img" | "reject_tinygif" | "reject-tinygif" => {
+            let status = args
+                .first()
+                .map(|s| parse_dsl_status(s))
+                .transpose()?
+                .unwrap_or(200);
+            if status == 200 {
+                make(Phase::Request, Action::Reject(Reject::Image))
+            } else {
+                make(
+                    Phase::Request,
+                    Action::Mock(Mock {
+                        status,
+                        content_type: "image/gif".into(),
+                        body: MockBody::Inline(TINY_GIF.to_vec()),
+                        headers: Vec::new(),
+                    }),
+                )
+            }
+        }
+        "reject_dict" | "reject-dict" => {
+            let status = args
+                .first()
+                .map(|s| parse_dsl_status(s))
+                .transpose()?
+                .unwrap_or(200);
+            if status == 200 {
+                make(Phase::Request, Action::Reject(Reject::Dict))
+            } else {
+                make(
+                    Phase::Request,
+                    Action::Mock(Mock {
+                        status,
+                        content_type: "application/json".into(),
+                        body: MockBody::Inline(b"{}".to_vec()),
+                        headers: Vec::new(),
+                    }),
+                )
+            }
+        }
+        "reject_array" | "reject-array" => {
+            let status = args
+                .first()
+                .map(|s| parse_dsl_status(s))
+                .transpose()?
+                .unwrap_or(200);
+            if status == 200 {
+                make(Phase::Request, Action::Reject(Reject::Array))
+            } else {
+                make(
+                    Phase::Request,
+                    Action::Mock(Mock {
+                        status,
+                        content_type: "application/json".into(),
+                        body: MockBody::Inline(b"[]".to_vec()),
+                        headers: Vec::new(),
+                    }),
+                )
+            }
+        }
+        "reject_drop" | "reject-drop" | "reject_no_drop" | "reject-no-drop" => {
+            make(Phase::Request, Action::Reject(Reject::Drop))
+        }
+        "redirect" => {
+            if args.len() != 2 {
+                return Err("redirect expects 2 arguments".to_owned());
+            }
+            let status = parse_dsl_status(args[0])?;
+            if !matches!(status, 301 | 302 | 307 | 308) {
+                return Err(format!("unsupported redirect status {status}"));
+            }
+            let location = apply_capture_alias(
+                parse_string_literal(args[1])
+                    .map_err(|()| "invalid redirect location".to_owned())?,
+                alias,
+            );
+            make(Phase::Request, Action::Redirect { status, location })
+        }
+        "url.replace" => {
+            if args.len() != 1 {
+                return Err("url.replace expects 1 argument".to_owned());
+            }
+            let location = apply_capture_alias(
+                parse_string_literal(args[0])
+                    .map_err(|()| "invalid url.replace target".to_owned())?,
+                alias,
+            );
+            make(Phase::Request, Action::UrlReplace(location))
+        }
+        "response.body.mock" => {
+            if args.len() < 2 || args.len() > 4 {
+                return Err("response.body.mock expects 2..=4 arguments".to_owned());
+            }
+            let kind =
+                parse_string_literal(args[0]).map_err(|()| "invalid mock data type".to_owned())?;
+            let data =
+                parse_string_literal(args[1]).map_err(|()| "invalid mock body literal".to_owned())?;
+            let status = args
+                .get(2)
+                .map(|s| parse_dsl_status(s))
+                .transpose()?
+                .unwrap_or(200);
+            let is_base64 = args
+                .get(3)
+                .is_some_and(|s| parse_dsl_value(s).is_ok_and(|v| v.eq_ignore_ascii_case("true")));
+            let (content_type_override, headers) = dsl_pipe_headers(pipe_tail)?;
+            let mock = mock_from_parts(
+                &kind,
+                &data,
+                status,
+                is_base64,
+                content_type_override.as_deref(),
+                headers,
+            )
+            .map_err(|()| "invalid mock response definition".to_owned())?;
+            make(Phase::Request, Action::Mock(mock))
+        }
+        "response.body.mock_file" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err("response.body.mock_file expects 2..=3 arguments".to_owned());
+            }
+            let kind = parse_string_literal(args[0])
+                .map_err(|()| "invalid mock_file data type".to_owned())?
+                .to_ascii_lowercase();
+            let url = remote(
+                parse_string_literal(args[1]).map_err(|()| "invalid mock_file URL".to_owned())?,
+            )
+            .map_err(|()| "mock_file URL must be http(s)".to_owned())?;
+            let status = args
+                .get(2)
+                .map(|s| parse_dsl_status(s))
+                .transpose()?
+                .unwrap_or(200);
+            let default_type =
+                mock_content_type(&kind).map_err(|()| format!("unsupported mock type '{kind}'"))?;
+            let (content_type_override, headers) = dsl_pipe_headers(pipe_tail)?;
+            make(
+                Phase::Request,
+                Action::Mock(Mock {
+                    status,
+                    content_type: content_type_override
+                        .unwrap_or_else(|| default_type.to_owned()),
+                    body: MockBody::Remote(url),
+                    headers,
+                }),
+            )
+        }
+        "response.json.jq" | "request.json.jq" => {
+            if args.len() != 1 {
+                return Err("json.jq expects 1 argument".to_owned());
+            }
+            let phase = if func_lower.starts_with("request.") {
+                Phase::Request
+            } else {
+                Phase::Response
+            };
+            let filter =
+                parse_string_literal(args[0]).map_err(|()| "invalid jq literal".to_owned())?;
+            let filter = filter.trim();
+            if filter.is_empty() {
+                return Err("empty jq filter".to_owned());
+            }
+            make(phase, Action::Jq(filter.to_owned()))
+        }
+        "response.json.delete" | "request.json.delete" => {
+            if args.len() != 1 {
+                return Err("json.delete expects 1 argument".to_owned());
+            }
+            let phase = if func_lower.starts_with("request.") {
+                Phase::Request
+            } else {
+                Phase::Response
+            };
+            let paths = parse_dsl_string_list(args[0])
+                .map_err(|()| "invalid json.delete paths".to_owned())?
+                .into_iter()
+                .map(|p| json_path(&p))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|()| "invalid json path".to_owned())?;
+            make(phase, Action::JsonDelete(paths))
+        }
+        "response.json.replace"
+        | "response.json.add"
+        | "request.json.replace"
+        | "request.json.add" => {
+            if args.len() != 2 {
+                return Err("json.replace/add expects 2 arguments".to_owned());
+            }
+            let phase = if func_lower.starts_with("request.") {
+                Phase::Request
+            } else {
+                Phase::Response
+            };
+            let pairs = if args[0].trim().starts_with('[') {
+                let paths = parse_dsl_string_list(args[0])
+                    .map_err(|()| "invalid json path list".to_owned())?;
+                let inner_vals = args[1]
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|r| r.strip_suffix(']'))
+                    .ok_or_else(|| "expected JSON value array".to_owned())?;
+                let vals = split_top_level(inner_vals, b',')
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(parse_dsl_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|()| "invalid JSON value".to_owned())?;
+                if paths.len() != vals.len() {
+                    return Err("json path and value arrays differ in length".to_owned());
+                }
+                paths
+                    .into_iter()
+                    .zip(vals)
+                    .map(|(p, v)| Ok((json_path(&p)?, v)))
+                    .collect::<Result<Vec<_>, ()>>()
+                    .map_err(|()| "invalid json path".to_owned())?
+            } else {
+                vec![(
+                    json_path(
+                        &parse_string_literal(args[0])
+                            .map_err(|()| "invalid json path literal".to_owned())?,
+                    )
+                    .map_err(|()| "invalid json path".to_owned())?,
+                    parse_dsl_value(args[1]).map_err(|()| "invalid json value".to_owned())?,
+                )]
+            };
+            make(phase, Action::JsonSet(pairs))
+        }
+        "response.body.replace" | "request.body.replace" => {
+            if args.len() != 2 {
+                return Err("body.replace expects 2 arguments".to_owned());
+            }
+            let phase = if func_lower.starts_with("request.") {
+                Phase::Request
+            } else {
+                Phase::Response
+            };
+            let regex = if args[0].trim_start().starts_with('/') {
+                let (pattern, tail) = parse_regex_literal(args[0])?;
+                if !tail.trim().is_empty() {
+                    return Err("unexpected tokens after body.replace regex".to_owned());
+                }
+                pattern
+            } else {
+                parse_string_literal(args[0])
+                    .map_err(|()| "invalid body.replace target".to_owned())?
+            };
+            let replacement = parse_string_literal(args[1])
+                .map_err(|()| "invalid body.replace replacement".to_owned())?;
+            make(phase, Action::BodyReplace(vec![(regex, replacement)]))
+        }
+        op if op.starts_with("request.header.")
+            || op.starts_with("response.header.")
+            || op.starts_with("header.") =>
+        {
+            let (phase, action) = if let Some(action) = op.strip_prefix("request.header.") {
+                (Phase::Request, action)
+            } else if let Some(action) = op.strip_prefix("response.header.") {
+                (Phase::Response, action)
+            } else {
+                (default_phase, op.strip_prefix("header.").unwrap())
+            };
+            let header_op = match action {
+                "add" => {
+                    if args.len() != 2 {
+                        return Err("header.add expects 2 arguments".to_owned());
+                    }
+                    HeaderOp::Add(
+                        parse_string_literal(args[0])
+                            .map_err(|()| "invalid header name".to_owned())?,
+                        parse_string_literal(args[1])
+                            .map_err(|()| "invalid header value".to_owned())?,
+                    )
+                }
+                "set" => {
+                    if args.len() != 2 {
+                        return Err("header.set expects 2 arguments".to_owned());
+                    }
+                    HeaderOp::Set(
+                        parse_string_literal(args[0])
+                            .map_err(|()| "invalid header name".to_owned())?,
+                        parse_string_literal(args[1])
+                            .map_err(|()| "invalid header value".to_owned())?,
+                    )
+                }
+                "replace" if args.len() == 2 => HeaderOp::Replace(
+                    parse_string_literal(args[0]).map_err(|()| "invalid header name".to_owned())?,
+                    parse_string_literal(args[1])
+                        .map_err(|()| "invalid header value".to_owned())?,
+                ),
+                "replace" | "replace_regex" if args.len() == 3 => {
+                    let pattern = if args[1].trim_start().starts_with('/') {
+                        let (p, tail) = parse_regex_literal(args[1])?;
+                        if !tail.trim().is_empty() {
+                            return Err("unexpected tokens after header.replace regex".to_owned());
+                        }
+                        p
+                    } else {
+                        parse_string_literal(args[1])
+                            .map_err(|()| "invalid header.replace regex".to_owned())?
+                    };
+                    HeaderOp::ReplaceRegex(
+                        parse_string_literal(args[0])
+                            .map_err(|()| "invalid header name".to_owned())?,
+                        pattern,
+                        parse_string_literal(args[2])
+                            .map_err(|()| "invalid header replacement".to_owned())?,
+                    )
+                }
+                "del" | "delete" => {
+                    if args.len() != 1 {
+                        return Err("header.del expects 1 argument".to_owned());
+                    }
+                    HeaderOp::Delete(
+                        parse_string_literal(args[0])
+                            .map_err(|()| "invalid header name".to_owned())?,
+                    )
+                }
+                _ => return Err(format!("unsupported header action: {op}")),
+            };
+            make(phase, Action::Header(header_op))
+        }
+        other => Err(format!("unsupported action: {other}")),
+    }
+}
+
+fn dsl_line(
+    line: &str,
+    number: usize,
+    arg_defs: &[(String, ScriptValue)],
+) -> Result<Vec<Rule>, String> {
+    let (default_phase, rest) =
+        strip_dsl_phase(line).ok_or_else(|| "invalid DSL prefix".to_owned())?;
+    let (cond, action_str) =
+        split_dsl_then(rest).ok_or_else(|| "missing 'then' clause".to_owned())?;
+    let (pattern, alias, conditions) = parse_dsl_condition(cond)?;
+    let stages = split_top_level(action_str, b'|');
+    let first_stage = stages
+        .first()
+        .ok_or_else(|| "missing action after 'then'".to_owned())?;
+    let (first_func, _, _) = parse_dsl_call(first_stage)?;
+    let first_lower = first_func.to_ascii_lowercase();
+
+    if stages.len() > 1
+        && matches!(
+            first_lower.as_str(),
+            "response.body.mock" | "response.body.mock_file"
+        )
+    {
+        return parse_dsl_single_action(
+            default_phase,
+            &pattern,
+            alias,
+            &conditions,
+            first_stage,
+            &stages[1..],
+            number,
+            arg_defs,
+        )
+        .map(|rule| rule.into_iter().collect());
+    }
+
+    let mut rules = Vec::with_capacity(stages.len());
+    for (idx, stage) in stages.iter().enumerate() {
+        let stage_conditions = if idx == 0 { conditions.as_slice() } else { &[] };
+        if let Some(mut rule) = parse_dsl_single_action(
+            default_phase,
+            &pattern,
+            alias,
+            stage_conditions,
+            stage,
+            &[],
+            number,
+            arg_defs,
+        )? {
+            if idx > 0 {
+                if rules.first().is_some_and(|first: &Rule| first.phase != rule.phase) {
+                    return Err("mixed request/response phases in piped action".to_owned());
+                }
+                rule.pipe_continuation = true;
+            }
+            rules.push(rule);
+        }
+    }
+    Ok(rules)
 }
 
 #[cfg(test)]
@@ -1092,7 +2402,7 @@ hostname = %APPEND% api.test, *.img.test, -skip.test
         assert_eq!(module.rules[9].phase, Phase::Response);
         assert_eq!(script.name, "feed");
         assert!(script.requires_body && !script.binary);
-        assert_eq!(script.argument, "a=1,b=2");
+        assert_eq!(script.argument, ScriptArgument::Text("a=1,b=2".into()));
         assert_eq!(module.rules.len(), 10);
     }
 
@@ -1142,7 +2452,7 @@ hostname = a.test
         assert_eq!(script.name, "Feed");
         assert!(script.binary && script.requires_body);
         assert_eq!(script.timeout, Some(20));
-        assert_eq!(script.argument, "[lite]");
+        assert_eq!(script.argument, ScriptArgument::Text("[lite]".into()));
         assert_eq!(module.rules.len(), 8);
         assert_eq!(module.hostnames, ["a.test"]);
 
@@ -1196,5 +2506,174 @@ hostname = a.test
             cache_file("https://a.test/x.js").len(),
             "rewrite/files/".len() + 20
         );
+    }
+
+    #[test]
+    fn parses_loon_dsl_modules() {
+        let module = parse_module(
+            r#"#!name=LoonDSL
+[Argument]
+on_flag = switch,true,false,tag=On
+off_flag = switch,false,true,tag=Off
+mode = select,"show","hide",tag=Mode
+filter_flag = switch,true,tag=Filter
+[Rewrite]
+request if ${url} ~= /^https?:\/\/a\.test\/r404$/i then reject(404)
+request if ${url} ~= /^https?:\/\/a\.test\/r200$/i then reject(200)
+request if ${url} ~= /^https?:\/\/a\.test\/r451$/i then reject(451, "blocked")
+request if ${url} ~= /^https?:\/\/a\.test\/rdict$/i then reject_dict(200)
+request if ${url} ~= /^https?:\/\/a\.test\/rdict403$/i then reject_dict(403)
+request if ${url} ~= /^https?:\/\/a\.test\/rimg$/i then reject_img(200)
+request if ${url} ~= /^(http:\/\/a\.test\/topic\?ad=)false(&x=\d)$/i as urlMatch then redirect(302, "${urlMatch.1}true${urlMatch.2}")
+request if ${url} ~= /^https:\/\/a\.test\/(.*)&p=iphone/i as m then url.replace("https://a.test/${m.1}&p=ipad")
+response if ${url} == "https://grpc.a.test/Method" then response.body.mock("text", "AAAA", 200, true) | response.header.set("grpc-status", "0")
+response if ${url} ~= /^https?:\/\/a\.test\/mockfile/i then response.body.mock_file("json", "https://cdn.test/mock.json", 200)
+response if ${url} ~= /^https:\/\/a\.test\/jq\?/ && ${response.status} == 200 then response.json.jq(`.dns[]? |= (.ips = [] | .ttl = 86400)`)
+response if ${url} ~= /^https:\/\/a\.test\/del$/i then response.json.delete(["a.b", "c"])
+response if ${url} ~= /^https:\/\/a\.test\/jset$/i then response.json.replace(["x", "y"], [false, null])
+response if ${url} ~= /^https:\/\/a\.test\/brep$/i then response.body.replace(/^ad$/ms, "no")
+request if ${url} ~= /^https:\/\/a\.test\/hdr$/ && ${request.method} == "POST" && ${request.header["X-In"]} == "1" then header.set("X-Out", "2") | header.replace("User-Agent", /Bot\/\d+/, "App/1") | header.del("X-Drop")
+request if ${url} ~= /^https:\/\/a\.test\/vid$/ then reject_video()
+request if ${url} ~= /^https:\/\/a\.test\/badflag$/u then reject(404)
+request if ${url} ~= /^https:\/\/a\.test\/or$/ || ${request.method} == "GET" then reject(404)
+[Script]
+response if ${url} ~= /^https:\/\/a\.test\/s$/i then script("https://cdn.test/s.js", {${mode}, ${filter_flag}, level: 123}) with enable=${on_flag}, tag="S", timeout=10, requires_body=true, binary_body_mode=true
+request if ${url} ~= /^https:\/\/a\.test\/off$/i then script("https://cdn.test/off.js") with enable=${off_flag}, tag="Off"
+[MITM]
+hostname = a.test, first.test.comhostname = second.test.com, -skip.test.com
+"#,
+        );
+        assert_eq!(module.skipped.len(), 3);
+        assert!(module.skipped[0].1.contains("unsupported action: reject_video"));
+        assert!(module.skipped[1].1.contains("unsupported regex flag 'u'"));
+        assert!(module.skipped[2].1.contains("unsupported logical OR condition"));
+        assert_eq!(
+            module.hostnames,
+            ["a.test", "first.test.com", "second.test.com", "-skip.test.com"]
+        );
+        assert_eq!(module.rules.len(), 18);
+        let actions: Vec<_> = module.rules.iter().map(|r| &r.action).collect();
+        assert_eq!(module.rules[0].pattern, r"(?i)^https?:\/\/a\.test\/r404$");
+        assert_eq!(actions[0], &Action::Reject(Reject::NotFound));
+        assert_eq!(actions[1], &Action::Reject(Reject::Empty));
+        assert_eq!(
+            actions[2],
+            &Action::Mock(Mock {
+                status: 451,
+                content_type: "text/plain; charset=utf-8".into(),
+                body: MockBody::Inline(b"blocked".to_vec()),
+                headers: vec![],
+            })
+        );
+        assert_eq!(actions[3], &Action::Reject(Reject::Dict));
+        assert_eq!(
+            actions[4],
+            &Action::Mock(Mock {
+                status: 403,
+                content_type: "application/json".into(),
+                body: MockBody::Inline(b"{}".to_vec()),
+                headers: vec![],
+            })
+        );
+        assert_eq!(actions[5], &Action::Reject(Reject::Image));
+        assert_eq!(
+            actions[6],
+            &Action::Redirect {
+                status: 302,
+                location: "$1true$2".into(),
+            }
+        );
+        assert_eq!(
+            actions[7],
+            &Action::UrlReplace("https://a.test/$1&p=ipad".into())
+        );
+        assert_eq!(module.rules[8].pattern, r"^https://grpc\.a\.test/Method$");
+        let Action::Mock(grpc_mock) = actions[8] else {
+            panic!()
+        };
+        assert_eq!(grpc_mock.status, 200);
+        assert_eq!(grpc_mock.body, MockBody::Inline(vec![0, 0, 0]));
+        assert_eq!(
+            grpc_mock.headers,
+            vec![("grpc-status".into(), "0".into())]
+        );
+        let Action::Mock(file_mock) = actions[9] else {
+            panic!()
+        };
+        assert_eq!(
+            file_mock.body,
+            MockBody::Remote("https://cdn.test/mock.json".into())
+        );
+        assert_eq!(
+            module.rules[10].conditions,
+            vec![Condition::Status {
+                equals: true,
+                value: 200
+            }]
+        );
+        assert_eq!(
+            actions[10],
+            &Action::Jq(".dns[]? |= (.ips = [] | .ttl = 86400)".into())
+        );
+        assert_eq!(
+            actions[11],
+            &Action::JsonDelete(vec!["a.b".into(), "c".into()])
+        );
+        assert_eq!(
+            actions[12],
+            &Action::JsonSet(vec![
+                ("x".into(), "false".into()),
+                ("y".into(), "null".into()),
+            ])
+        );
+        assert_eq!(
+            actions[13],
+            &Action::BodyReplace(vec![("(?ms)^ad$".into(), "no".into())])
+        );
+        assert_eq!(
+            module.rules[14].conditions,
+            vec![
+                Condition::Method {
+                    equals: true,
+                    value: "POST".into()
+                },
+                Condition::RequestHeader {
+                    name: "X-In".into(),
+                    op: MatchOp::Equals("1".into())
+                }
+            ]
+        );
+        assert_eq!(
+            actions[14],
+            &Action::Header(HeaderOp::Set("X-Out".into(), "2".into()))
+        );
+        assert_eq!(
+            actions[15],
+            &Action::Header(HeaderOp::ReplaceRegex(
+                "User-Agent".into(),
+                r"Bot\/\d+".into(),
+                "App/1".into()
+            ))
+        );
+        assert_eq!(
+            actions[16],
+            &Action::Header(HeaderOp::Delete("X-Drop".into()))
+        );
+        assert_eq!(module.rules[17].phase, Phase::Response);
+        let Action::Script(script) = actions[17] else {
+            panic!()
+        };
+        assert_eq!(script.name, "S");
+        assert_eq!(script.url, "https://cdn.test/s.js");
+        assert_eq!(
+            script.argument,
+            ScriptArgument::Object(vec![
+                ("mode".into(), ScriptValue::String("show".into())),
+                ("filter_flag".into(), ScriptValue::Bool(true)),
+                ("level".into(), ScriptValue::Number("123".into())),
+            ])
+        );
+        assert_eq!(script.timeout, Some(10));
+        assert!(script.requires_body && script.binary);
     }
 }

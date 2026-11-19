@@ -81,7 +81,8 @@ function RewriteModulesList({
   return (
     <div className="module-cards">
       {modules.map((module) => {
-        const failed = !!module.error || module.missing.length > 0;
+        const failed =
+          !!(module.error || module.updateError) || module.missing.length > 0;
         return (
           <div className="module-card" key={module.name}>
             <div className="module-card-head">
@@ -119,6 +120,13 @@ function RewriteModulesList({
                     })}`
                   : ""}
               </div>
+            )}
+            {module.updateError && (
+              <p className="danger-text small">
+                {t("更新失败，仍在使用缓存：{error}", {
+                  error: module.updateError,
+                })}
+              </p>
             )}
             {module.missing.length > 0 && (
               <p className="danger-text small" style={{ marginTop: 4 }}>
@@ -273,7 +281,7 @@ export function RewritePanel({
     status.modules.reduce((sum, m) => sum + (m.reject ?? 0), 0);
   const bypassed = status.bypassed ?? [];
   const problems = status.modules.filter(
-    (m) => m.error || m.missing.length || m.skipped.length,
+    (m) => m.error || m.updateError || m.missing.length || m.skipped.length,
   ).length;
   const quickHits = status.recent.slice(0, 3);
 

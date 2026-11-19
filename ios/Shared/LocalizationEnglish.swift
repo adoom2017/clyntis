@@ -41,6 +41,7 @@ let englishText: [String: String] = [
     "点「放行」把域名加入白名单，立即生效。": "Choose Allow to add a domain to the allowlist; it applies at once.",
     "已放行": "Allowed",
     "不可用：{error}": "Unavailable: {error}",
+    "更新失败，仍在使用缓存：{error}": "Update failed, using cached rules: {error}",
     "{entries} 条": "{entries} entries",
     " · 更新于 {date}": " · updated {date}",
     "名称": "Name",
