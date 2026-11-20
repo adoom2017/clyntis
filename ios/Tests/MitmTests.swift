@@ -7,10 +7,11 @@ final class MitmTests: XCTestCase {
     func testSettingsApplyThroughTheCore() throws {
         let (cert, key) = try CoreSession.generateAuthority()
         var overrides = AppOverrides()
-        overrides.mitm = MitmSettings(enable: true, hostnames: ["*.ads.test"])
+        overrides.mitm = MitmSettings(enable: true, hostnames: ["*.ads.test"], quicFallback: true)
         overrides.mitm = overrides.mitm?.withAuthority(MitmAuthority(cert: cert, key: key))
         let yaml = try XCTUnwrap(String(data: overrides.applied(to: Data("mode: rule\n".utf8)), encoding: .utf8))
         XCTAssertTrue(yaml.contains("*.ads.test"), yaml)
+        XCTAssertTrue(yaml.contains("quic-fallback: true"), yaml)
         XCTAssertTrue(yaml.contains("BEGIN CERTIFICATE"))
         XCTAssertTrue(yaml.contains("PRIVATE KEY"))
         let saved = try JSONEncoder().encode(overrides.mitm?.withoutAuthority)
@@ -18,6 +19,7 @@ final class MitmTests: XCTestCase {
 
         let update = try JSONSerialization.jsonObject(with: XCTUnwrap(overrides.mitm).coreUpdate()) as? [String: [String: Any]]
         XCTAssertEqual(update?["mitm"]?["hostname"] as? [String], ["*.ads.test"])
+        XCTAssertEqual(update?["mitm"]?["quic-fallback"] as? Bool, true)
         XCTAssertEqual(update?["mitm"]?["ca-key"] as? String, key)
     }
 

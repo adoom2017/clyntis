@@ -836,6 +836,20 @@ function MitmPanel({
               }
             />
           </Setting>
+          <Setting
+            label={t("强制 QUIC 回退到 TCP")}
+            text={t(
+              "拒绝命中解密名单域名的 QUIC（UDP 443）连接，促使支持回退的浏览器或 App 改用 TCP 以便解密；不回退的 App 可能因此无法连接。默认关闭，立即生效。",
+            )}
+          >
+            <Toggle
+              checked={!!mitm.quicFallback}
+              label={t("强制 QUIC 回退到 TCP")}
+              onChange={(quicFallback) =>
+                void update({ ...mitm, quicFallback })
+              }
+            />
+          </Setting>
           {!!core?.bypassed.length && (
             <div className="mitm-bypassed">
               <div className="panel-title">

@@ -107,6 +107,8 @@ struct MitmSettings: Codable, Equatable {
     /// Also decrypt servers whose certificate names only loosely match;
     /// optional so settings saved before it still decode.
     var lenientUpstream: Bool?
+    /// Refuse QUIC (UDP 443) for decrypted hosts so apps fall back to TCP.
+    var quicFallback: Bool?
 
     var withoutAuthority: MitmSettings {
         var copy = self
@@ -129,6 +131,7 @@ struct MitmSettings: Codable, Equatable {
             "hostname": hostnames.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty },
         ]
         mitm["lenient-upstream"] = lenientUpstream ?? false
+        mitm["quic-fallback"] = quicFallback ?? false
         if let caCert { mitm["ca-cert"] = caCert }
         if let caKey { mitm["ca-key"] = caKey }
         return try JSONSerialization.data(withJSONObject: ["mitm": mitm])

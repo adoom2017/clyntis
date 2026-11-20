@@ -450,6 +450,8 @@ let englishText: [String: String] = [
     "用模块的写法，例如：": "In module syntax, for example:",
     "宽松校验服务器证书": "Lenient server certificate check",
     "部分 App 接受域名不完全匹配的证书，如用 *.example.com 访问 a.b.example.com。开启后这类服务器也会解密；证书本身不可信的仍直接转发。立即生效。": "Some apps accept certificates whose names do not strictly match, such as *.example.com for a.b.example.com. When on, those servers are decrypted too; certificates that are not trusted at all are still passed through. Applies at once.",
+    "强制 QUIC 回退到 TCP": "Force QUIC fallback to TCP",
+    "拒绝命中解密名单域名的 QUIC（UDP 443）连接，促使支持回退的浏览器或 App 改用 TCP 以便解密；不回退的 App 可能因此无法连接。默认关闭，立即生效。": "Refuse QUIC (UDP 443) connections to decrypted hosts so apps that fall back switch to TCP for inspection; apps without TCP fallback may fail to connect. Off by default; applies at once.",
     "总流量": "Total traffic",
     "流量详情": "Traffic details",
     "连接后显示流量详情": "Connect to see traffic details",

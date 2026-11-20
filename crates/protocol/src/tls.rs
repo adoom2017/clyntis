@@ -5,12 +5,14 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use boring::{
+    error::{ErrLib, ErrorStack},
     ssl::{
-        CertificateCompressionAlgorithm, CertificateCompressor, SslConnector, SslMethod,
-        SslOptions, SslSession, SslSessionCacheMode, SslVerifyMode, SslVersion,
+        CertificateCompressionAlgorithm, CertificateCompressor, ErrorCode, SslAcceptor,
+        SslConnector, SslMethod, SslOptions, SslSession, SslSessionCacheMode, SslVerifyMode,
+        SslVersion,
     },
     x509::{
-        X509,
+        X509, X509VerifyError,
         store::{X509Store, X509StoreBuilder},
     },
 };
@@ -825,6 +827,330 @@ pub(crate) fn quic_ssl(
     Ok((ssl, profile))
 }
 
+/// Zero-cost wrapper implementing `Debug` so `tokio_boring::HandshakeError`
+/// exposes `std::error::Error::source()`.
+pub struct DebugStream<S>(pub S);
+
+impl<S> DebugStream<S> {
+    pub fn into_inner(self) -> S {
+        self.0
+    }
+}
+
+impl<S> std::fmt::Debug for DebugStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Stream")
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for DebugStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for DebugStream<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+}
+
+/// Structured category for an upstream TLS client handshake failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsHandshakeErrorKind {
+    CertificateInvalid,
+    ProtocolIncompatible,
+    NetworkIo,
+    Setup,
+}
+
+/// Classified upstream TLS handshake failure carrying I/O and BoringSSL metadata.
+#[derive(Debug)]
+pub struct TlsHandshakeError {
+    pub kind: TlsHandshakeErrorKind,
+    pub message: String,
+    pub io_kind: Option<std::io::ErrorKind>,
+    pub ssl_reasons: Vec<i32>,
+}
+
+impl std::fmt::Display for TlsHandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TlsHandshakeError {}
+
+/// Structured category for a downstream TLS server accept failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientTlsErrorKind {
+    CertificateRefused,
+    ProtocolIncompatible,
+    IoOrDisconnect,
+}
+
+/// Classified downstream TLS accept failure carrying I/O and BoringSSL metadata.
+#[derive(Debug)]
+pub struct ClientTlsError {
+    pub kind: ClientTlsErrorKind,
+    pub message: String,
+    pub io_kind: Option<std::io::ErrorKind>,
+    pub ssl_reasons: Vec<i32>,
+}
+
+impl std::fmt::Display for ClientTlsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClientTlsError {}
+
+fn extract_ssl_reasons(stack: &ErrorStack) -> Vec<i32> {
+    let ssl_lib = ErrLib(boring_sys::ERR_LIB_SSL.0 as _);
+    stack
+        .errors()
+        .iter()
+        .filter_map(|err| err.library_reason(ssl_lib))
+        .collect()
+}
+
+fn classify_upstream_handshake_error<S>(
+    error: &tokio_boring::HandshakeError<DebugStream<S>>,
+) -> TlsHandshakeError {
+    let message = format!("TLS handshake failed: {error}");
+    let cert_verify_failed = error.ssl().is_some_and(
+        |ssl| matches!(ssl.verify_result(), Err(v) if v != X509VerifyError::INVALID_CALL),
+    );
+    let source = std::error::Error::source(error);
+    if let Some(_stack) = source.and_then(|s| s.downcast_ref::<ErrorStack>()) {
+        return TlsHandshakeError {
+            kind: TlsHandshakeErrorKind::Setup,
+            message,
+            io_kind: None,
+            ssl_reasons: Vec::new(),
+        };
+    }
+    if let Some(ssl_err) = source.and_then(|s| s.downcast_ref::<boring::ssl::Error>()) {
+        if let Some(io) = ssl_err.io_error() {
+            return TlsHandshakeError {
+                kind: if cert_verify_failed {
+                    TlsHandshakeErrorKind::CertificateInvalid
+                } else {
+                    TlsHandshakeErrorKind::NetworkIo
+                },
+                message,
+                io_kind: Some(io.kind()),
+                ssl_reasons: Vec::new(),
+            };
+        }
+        let ssl_reasons = ssl_err
+            .ssl_error()
+            .map(extract_ssl_reasons)
+            .unwrap_or_default();
+        if cert_verify_failed {
+            return TlsHandshakeError {
+                kind: TlsHandshakeErrorKind::CertificateInvalid,
+                message,
+                io_kind: None,
+                ssl_reasons,
+            };
+        }
+        if matches!(ssl_err.code(), ErrorCode::SYSCALL | ErrorCode::ZERO_RETURN) {
+            return TlsHandshakeError {
+                kind: TlsHandshakeErrorKind::NetworkIo,
+                message,
+                io_kind: None,
+                ssl_reasons,
+            };
+        }
+        if let Some(stack) = ssl_err.ssl_error() {
+            let is_cert = ssl_reasons.iter().any(|&r| {
+                matches!(
+                    r,
+                    boring_sys::SSL_R_CERTIFICATE_VERIFY_FAILED
+                        | boring_sys::SSL_R_PEER_DID_NOT_RETURN_A_CERTIFICATE
+                        | boring_sys::SSL_R_CANNOT_PARSE_LEAF_CERT
+                        | boring_sys::SSL_R_UNSUPPORTED_CERTIFICATE
+                        | boring_sys::SSL_R_CERT_DECOMPRESSION_FAILED
+                        | boring_sys::SSL_R_NO_CERTIFICATES_RETURNED
+                        | boring_sys::SSL_R_TLS_PEER_DID_NOT_RESPOND_WITH_CERTIFICATE_LIST
+                )
+            });
+            let is_close = ssl_reasons.iter().any(|&r| {
+                matches!(
+                    r,
+                    boring_sys::SSL_R_SSLV3_ALERT_CLOSE_NOTIFY
+                        | boring_sys::SSL_R_TLSV1_ALERT_USER_CANCELLED
+                )
+            });
+            let kind = if is_cert {
+                TlsHandshakeErrorKind::CertificateInvalid
+            } else if is_close || stack.errors().is_empty() {
+                TlsHandshakeErrorKind::NetworkIo
+            } else {
+                TlsHandshakeErrorKind::ProtocolIncompatible
+            };
+            return TlsHandshakeError {
+                kind,
+                message,
+                io_kind: None,
+                ssl_reasons,
+            };
+        }
+    }
+    TlsHandshakeError {
+        kind: if cert_verify_failed {
+            TlsHandshakeErrorKind::CertificateInvalid
+        } else {
+            TlsHandshakeErrorKind::NetworkIo
+        },
+        message,
+        io_kind: None,
+        ssl_reasons: Vec::new(),
+    }
+}
+
+fn classify_client_handshake_error<S>(
+    error: &tokio_boring::HandshakeError<DebugStream<S>>,
+) -> ClientTlsError {
+    let message = error.to_string();
+    let source = std::error::Error::source(error);
+    if source
+        .and_then(|s| s.downcast_ref::<ErrorStack>())
+        .is_some()
+    {
+        return ClientTlsError {
+            kind: ClientTlsErrorKind::IoOrDisconnect,
+            message,
+            io_kind: None,
+            ssl_reasons: Vec::new(),
+        };
+    }
+    if let Some(ssl_err) = source.and_then(|s| s.downcast_ref::<boring::ssl::Error>()) {
+        if let Some(io) = ssl_err.io_error() {
+            return ClientTlsError {
+                kind: ClientTlsErrorKind::IoOrDisconnect,
+                message,
+                io_kind: Some(io.kind()),
+                ssl_reasons: Vec::new(),
+            };
+        }
+        if matches!(ssl_err.code(), ErrorCode::SYSCALL | ErrorCode::ZERO_RETURN) {
+            return ClientTlsError {
+                kind: ClientTlsErrorKind::IoOrDisconnect,
+                message,
+                io_kind: None,
+                ssl_reasons: Vec::new(),
+            };
+        }
+        if let Some(stack) = ssl_err.ssl_error() {
+            let ssl_reasons = extract_ssl_reasons(stack);
+            let cert_refused = ssl_reasons.iter().any(|&r| {
+                matches!(
+                    r,
+                    boring_sys::SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+                        | boring_sys::SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE
+                        | boring_sys::SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED
+                        | boring_sys::SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED
+                        | boring_sys::SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+                        | boring_sys::SSL_R_TLSV1_ALERT_UNKNOWN_CA
+                        | boring_sys::SSL_R_TLSV1_ALERT_ACCESS_DENIED
+                        | boring_sys::SSL_R_TLSV1_ALERT_BAD_CERTIFICATE_STATUS_RESPONSE
+                        | boring_sys::SSL_R_TLSV1_ALERT_BAD_CERTIFICATE_HASH_VALUE
+                )
+            });
+            let is_close = ssl_reasons.iter().any(|&r| {
+                matches!(
+                    r,
+                    boring_sys::SSL_R_SSLV3_ALERT_CLOSE_NOTIFY
+                        | boring_sys::SSL_R_TLSV1_ALERT_USER_CANCELLED
+                )
+            });
+            let proto_incompatible = ssl_reasons.iter().any(|&r| {
+                matches!(
+                    r,
+                    boring_sys::SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE
+                        | boring_sys::SSL_R_TLSV1_ALERT_PROTOCOL_VERSION
+                        | boring_sys::SSL_R_TLSV1_ALERT_INSUFFICIENT_SECURITY
+                        | boring_sys::SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL
+                        | boring_sys::SSL_R_NO_APPLICATION_PROTOCOL
+                        | boring_sys::SSL_R_NO_SHARED_CIPHER
+                        | boring_sys::SSL_R_UNSUPPORTED_PROTOCOL
+                )
+            });
+            let kind = if cert_refused {
+                ClientTlsErrorKind::CertificateRefused
+            } else if is_close || !proto_incompatible {
+                ClientTlsErrorKind::IoOrDisconnect
+            } else {
+                ClientTlsErrorKind::ProtocolIncompatible
+            };
+            return ClientTlsError {
+                kind,
+                message,
+                io_kind: None,
+                ssl_reasons,
+            };
+        }
+    }
+    ClientTlsError {
+        kind: ClientTlsErrorKind::IoOrDisconnect,
+        message,
+        io_kind: None,
+        ssl_reasons: Vec::new(),
+    }
+}
+
+/// Accepts a downstream TLS client handshake and returns a structured error
+/// classification distinguishing certificate rejection alerts, protocol
+/// incompatibilities, and ordinary I/O disconnects.
+pub async fn accept_classified<S>(
+    acceptor: &SslAcceptor,
+    stream: S,
+) -> std::result::Result<tokio_boring::SslStream<DebugStream<S>>, ClientTlsError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tokio_boring::accept(acceptor, DebugStream(stream))
+        .await
+        .map_err(|error| classify_client_handshake_error(&error))
+}
+
 #[derive(Clone, Default)]
 pub struct SecureConnector {
     clock: Arc<Clock>,
@@ -847,10 +1173,10 @@ impl SecureConnector {
             browser_version = selected.browser_version,
             "using BoringSSL TLS profile"
         );
-        let tls = tokio_boring::SslStreamBuilder::new(ssl, stream)
+        let tls = tokio_boring::SslStreamBuilder::new(ssl, DebugStream(stream))
             .connect()
             .await
-            .map_err(|error| anyhow::anyhow!("TLS handshake failed: {error}"))?;
+            .map_err(|error| anyhow::Error::new(classify_upstream_handshake_error(&error)))?;
         Ok(Box::new(tls))
     }
 
@@ -870,20 +1196,26 @@ impl SecureConnector {
         // The chain is still verified against the roots; only the name check
         // is left to `names_ok`.
         let (ssl, _) = configure_ssl_with(config, &self.clock, false)?;
-        let tls = tokio_boring::SslStreamBuilder::new(ssl, stream)
+        let tls = tokio_boring::SslStreamBuilder::new(ssl, DebugStream(stream))
             .connect()
             .await
-            .map_err(|error| anyhow::anyhow!("TLS handshake failed: {error}"))?;
+            .map_err(|error| anyhow::Error::new(classify_upstream_handshake_error(&error)))?;
         let names = tls
             .ssl()
             .peer_certificate()
             .map(|cert| certificate_names(&cert))
             .unwrap_or_default();
-        ensure!(
-            names_ok(&names),
-            "TLS handshake failed: certificate names {names:?} do not cover {}",
-            config.server_name
-        );
+        if !names_ok(&names) {
+            return Err(anyhow::Error::new(TlsHandshakeError {
+                kind: TlsHandshakeErrorKind::CertificateInvalid,
+                message: format!(
+                    "TLS handshake failed: certificate names {names:?} do not cover {}",
+                    config.server_name
+                ),
+                io_kind: None,
+                ssl_reasons: Vec::new(),
+            }));
+        }
         Ok(Box::new(tls))
     }
 
@@ -1442,6 +1774,132 @@ mod tests {
             drop(stream);
             task.await??;
         }
+        Ok(())
+    }
+
+    fn test_acceptor(
+        host: &str,
+        configure: impl FnOnce(&mut boring::ssl::SslAcceptorBuilder) -> Result<()>,
+    ) -> Result<SslAcceptor> {
+        let cert = rcgen::generate_simple_self_signed(vec![host.into()])?;
+        let certificate = X509::from_der(cert.cert.der().as_ref())?;
+        let key = PKey::private_key_from_pkcs8(&cert.signing_key.serialize_der())?;
+        let mut server = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+        server.set_certificate(&certificate)?;
+        server.set_private_key(&key)?;
+        configure(&mut server)?;
+        Ok(server.build())
+    }
+
+    #[tokio::test]
+    async fn upstream_handshake_errors_are_structured() -> Result<()> {
+        let connector = SecureConnector::default();
+        let config = TlsConnectConfig {
+            server_name: "ads.test".into(),
+            alpn: vec!["http/1.1".into()],
+            verify_cert: true,
+            fingerprint: TlsFingerprint::Native,
+            reality: None,
+        };
+
+        // 1. Untrusted self-signed server -> CertificateInvalid.
+        let server = test_acceptor("ads.test", |_| Ok(()))?;
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move { tokio_boring::accept(&server, peer).await });
+        let err = connector
+            .connect(Box::new(client), &config)
+            .await
+            .err()
+            .unwrap();
+        let classified = err.downcast_ref::<TlsHandshakeError>().unwrap();
+        assert_eq!(
+            classified.kind,
+            TlsHandshakeErrorKind::CertificateInvalid,
+            "{classified:?}"
+        );
+        let _ = task.await;
+
+        // 2. Server rejecting offered ALPN with ALERT_FATAL -> ProtocolIncompatible.
+        let alpn_server = test_acceptor("ads.test", |builder| {
+            builder.set_alpn_select_callback(|_, _| Err(boring::ssl::AlpnError::ALERT_FATAL));
+            Ok(())
+        })?;
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(async move { tokio_boring::accept(&alpn_server, peer).await });
+        let mut no_verify = config.clone();
+        no_verify.verify_cert = false;
+        let err = connector
+            .connect(Box::new(client), &no_verify)
+            .await
+            .err()
+            .unwrap();
+        let classified = err.downcast_ref::<TlsHandshakeError>().unwrap();
+        assert_eq!(
+            classified.kind,
+            TlsHandshakeErrorKind::ProtocolIncompatible,
+            "{classified:?}"
+        );
+        let _ = task.await;
+
+        // 3. Peer dropping connection immediately during handshake -> NetworkIo.
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        drop(peer);
+        let err = connector
+            .connect(Box::new(client), &config)
+            .await
+            .err()
+            .unwrap();
+        let classified = err.downcast_ref::<TlsHandshakeError>().unwrap();
+        assert_eq!(
+            classified.kind,
+            TlsHandshakeErrorKind::NetworkIo,
+            "{classified:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_accept_distinguishes_cert_refusal_from_io_disconnect() -> Result<()> {
+        let acceptor = test_acceptor("ads.test", |_| Ok(()))?;
+
+        // 1. Pinned client rejecting untrusted CA -> CertificateRefused.
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        let accept = tokio::spawn({
+            let acceptor = acceptor.clone();
+            async move { accept_classified(&acceptor, peer).await }
+        });
+        let mut client_cfg = SslConnector::builder(SslMethod::tls())?;
+        client_cfg.set_verify(SslVerifyMode::PEER);
+        let ssl = client_cfg.build().configure()?;
+        assert!(
+            tokio_boring::connect(ssl, "ads.test", client)
+                .await
+                .is_err()
+        );
+        let err = accept.await?.err().unwrap();
+        assert_eq!(
+            err.kind,
+            ClientTlsErrorKind::CertificateRefused,
+            "reasons={:?} msg={}",
+            err.ssl_reasons,
+            err.message
+        );
+
+        // 2. Client closing stream mid-handshake without cert alert -> IoOrDisconnect.
+        let (mut client, peer) = tokio::io::duplex(64 * 1024);
+        let accept = tokio::spawn(async move { accept_classified(&acceptor, peer).await });
+        tokio::io::AsyncWriteExt::write_all(&mut client, &[22, 3, 1, 0, 5]).await?;
+        drop(client);
+        let err = accept.await?.err().unwrap();
+        assert_eq!(
+            err.kind,
+            ClientTlsErrorKind::IoOrDisconnect,
+            "reasons={:?} msg={}",
+            err.ssl_reasons,
+            err.message
+        );
+
         Ok(())
     }
 }

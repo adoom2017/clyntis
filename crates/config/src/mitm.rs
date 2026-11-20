@@ -21,6 +21,10 @@ pub struct Mitm {
     /// for `a.b.example.com`, which some apps accept. Off: those servers are
     /// passed through.
     pub lenient_upstream: bool,
+    /// Refuse QUIC (UDP 443) for decrypted hosts so apps that fall back to TCP
+    /// can be inspected. Off (default): QUIC passes through directly so apps
+    /// without TCP fallback continue working.
+    pub quic_fallback: bool,
 }
 
 /// Whether a certificate for `names` covers `host` under the lenient rule:

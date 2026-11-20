@@ -77,18 +77,27 @@ format. For building and running, see the [README](README.md).
   `*` matches any characters (dots too) and `?` one; a leading `-` excludes.
   The server is verified against the bundled web PKI roots (not the system
   store, so servers with private CAs fail) before the client is shown a
-  certificate for it; only HTTP/1.1 is offered to the client. A client that refuses the certificate (certificate pinning, or the
-  CA not trusted) fails once, and its host is then passed through untouched
-  until the list is cleared (`DELETE /mitm/bypass`; `GET /mitm` shows it).
-  A server whose certificate does not verify (some apps accept certificates
-  that miss the host name, such as `*.example.com` for `a.b.example.com`) is
-  not decrypted either: the connection is passed through for the app to judge,
-  and the host joins the same list.
+  certificate for it; only HTTP/1.1 is offered to the client. When a client
+  explicitly refuses the certificate with a TLS alert (certificate pinning, or
+  the CA not trusted), that connection fails once and its host is recorded in
+  a timed bypass cache scoped to `directory/.mitm-bypass.json` and the active
+  CA (for 7 days, or until `DELETE /mitm/bypass` / changing CA), so restarts do
+  not repeat first-handshake failures. Plain client disconnects and transient
+  upstream timeouts/I/O failures do not write long-term bypass entries; while
+  nothing has been sent to the client yet, eligible upstream handshake failures
+  (including timeouts and early EOFs) perform a time-bounded raw TLS passthrough
+  fallback. Only certificate/protocol incompatibilities join the bypass list
+  (`GET /mitm` shows it). Incomplete or non-HTTP/1.1 ClientHellos are passed
+  through without decryption.
   `mitm.lenient-upstream: true` decrypts those servers too when their
   certificate chain verifies and a name loosely covers the host: equal to
   it, or a wildcard `*.domain` with the host anywhere below `domain`. A chain
   that does not verify is still passed through.
-  UDP 443 to a decrypted host is refused so browsers use TCP instead of QUIC.
+  `mitm.quic-fallback: false` (the default) lets UDP 443 pass through so apps
+  without TCP fallback keep working; set `mitm.quic-fallback: true` to refuse
+  UDP 443 to decrypted hosts (unless already rejected by routing, bypassed, or
+  identified as HTTP/2-only) so browsers fall back to TCP. Existing `REJECT`
+  decisions from rules, adblock, or rewrite modules keep their original rule.
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the
   key private and turn decryption off when not analyzing.

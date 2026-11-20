@@ -570,6 +570,19 @@ struct MitmView: View {
             } footer: {
                 Text(L("部分 App 接受域名不完全匹配的证书，如用 *.example.com 访问 a.b.example.com。开启后这类服务器也会解密；证书本身不可信的仍直接转发。立即生效。"))
             }
+            Section {
+                Toggle(L("强制 QUIC 回退到 TCP"), isOn: Binding(get: { settings.quicFallback ?? false }, set: { on in
+                    Task {
+                        await run {
+                            var next = settings
+                            next.quicFallback = on
+                            try await model.saveMitm(next)
+                        }
+                    }
+                }))
+            } footer: {
+                Text(L("拒绝命中解密名单域名的 QUIC（UDP 443）连接，促使支持回退的浏览器或 App 改用 TCP 以便解密；不回退的 App 可能因此无法连接。默认关闭，立即生效。"))
+            }
             if let bypassed = model.mitm?.bypassed, !bypassed.isEmpty {
                 Section {
                     ForEach(bypassed, id: \.self) { Text($0).font(.footnote.monospaced()) }

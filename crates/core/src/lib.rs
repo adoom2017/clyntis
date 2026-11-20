@@ -393,7 +393,11 @@ impl Core {
         xudp_key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         xudp_key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         let requests = Arc::new(requests::Requests::new(config.internal_host_packet_io));
-        let mitm = mitm::Interceptor::new(&config.mitm, config.internal_host_packet_io);
+        let mitm = mitm::Interceptor::new(
+            &config.mitm,
+            &config.directory,
+            config.internal_host_packet_io,
+        );
         let scripts = script::Engine::new(&config.directory, config.internal_host_packet_io);
         let traffic = Mutex::new(traffic::Ledger::new(config.internal_host_packet_io));
         Ok(Arc::new(Self {
@@ -1513,9 +1517,12 @@ impl Core {
             result=tokio::time::timeout(Duration::from_secs(20),async {
                 let source=source.map(|source|source.split_once(':').map(|(_,value)|value).unwrap_or(source));
                 let mut decision=self.route_decision(&target,"udp").await?;
-                // QUIC to a decrypted host would bypass decryption: refusing
-                // it makes browsers fall back to TCP at once.
-                if target.port==443 && self.mitm.intercepts(&target.host) {
+                // QUIC fallback for MITM is an explicit policy; preserve prior
+                // REJECT decisions (adblock, module reject, user rules).
+                if decision.node != "REJECT"
+                    && target.port == 443
+                    && self.mitm.blocks_quic(&target.host)
+                {
                     decision=RouteDecision{node:"REJECT".into(),group:"REJECT".into(),rule:"MITM(QUIC)".into()};
                 }
                 if decision.node=="REJECT" {

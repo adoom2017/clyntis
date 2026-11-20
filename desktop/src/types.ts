@@ -80,6 +80,8 @@ export interface MitmSettings {
   hostnames: string[];
   /** Also decrypt servers whose certificate names only loosely match. */
   lenientUpstream?: boolean;
+  /** Refuse QUIC (UDP 443) for decrypted hosts so apps fall back to TCP. */
+  quicFallback?: boolean;
 }
 export interface HttpSummary {
   method: string;
@@ -141,6 +143,8 @@ export interface MitmInfo {
   core: {
     enable: boolean;
     hostname: string[];
+    lenientUpstream?: boolean;
+    quicFallback?: boolean;
     active: boolean;
     error: string | null;
     bypassed: string[];

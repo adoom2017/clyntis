@@ -1,6 +1,29 @@
 use clyntis_protocol::Target;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+const MAX_CLIENT_HELLO: usize = 32768;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientHelloAlpn {
+    Absent,
+    SupportsHttp1,
+    NonHttp1Only,
+    Malformed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientHello {
+    pub(crate) sni: Option<String>,
+    pub(crate) alpn: ClientHelloAlpn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClientHelloStatus {
+    Incomplete,
+    Invalid,
+    Complete(ClientHello),
+}
+
 fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     if input.len() < n {
         return None;
@@ -20,56 +43,7 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
         && !host.contains("..")
 }
-fn tls_extension(data: &[u8], target: usize) -> Option<Vec<u8>> {
-    let mut records = data;
-    let mut hello = vec![];
-    while !records.is_empty() {
-        let header = take(&mut records, 5)?;
-        if header[0] != 22 {
-            return None;
-        }
-        let n = u16::from_be_bytes([header[3], header[4]]) as usize;
-        hello.extend_from_slice(take(&mut records, n)?);
-        if hello.len() > 32768 {
-            return None;
-        }
-        if hello.len() >= 4 {
-            let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
-            if hello.len() >= size + 4 {
-                break;
-            }
-        }
-    }
-    let mut input = hello.as_slice();
-    if take(&mut input, 1)?[0] != 1 {
-        return None;
-    }
-    let n = take(&mut input, 3)?;
-    let size = ((n[0] as usize) << 16) | ((n[1] as usize) << 8) | n[2] as usize;
-    input = take(&mut input, size)?;
-    take(&mut input, 34)?;
-    let n = take(&mut input, 1)?[0] as usize;
-    take(&mut input, n)?;
-    let n = length(&mut input)?;
-    take(&mut input, n)?;
-    let n = take(&mut input, 1)?[0] as usize;
-    take(&mut input, n)?;
-    let n = length(&mut input)?;
-    let mut extensions = take(&mut input, n)?;
-    while !extensions.is_empty() {
-        let kind = length(&mut extensions)?;
-        let n = length(&mut extensions)?;
-        let value = take(&mut extensions, n)?;
-        if kind == target {
-            return Some(value.to_vec());
-        }
-    }
-    None
-}
-
-pub(crate) fn tls(data: &[u8]) -> Option<String> {
-    let raw = tls_extension(data, 0)?;
-    let mut value = raw.as_slice();
+fn parse_sni(mut value: &[u8]) -> Option<String> {
     let n = length(&mut value)?;
     let mut names = take(&mut value, n)?;
     while !names.is_empty() {
@@ -83,34 +57,215 @@ pub(crate) fn tls(data: &[u8]) -> Option<String> {
     }
     None
 }
-
-/// False only when the ClientHello declares ALPN protocols and omits `http/1.1`
-/// (e.g. `h2`-only gRPC connections that cannot downgrade to HTTP/1.1).
-pub(crate) fn tls_supports_http1(data: &[u8]) -> bool {
-    let Some(raw) = tls_extension(data, 16) else {
-        return true;
-    };
-    let mut value = raw.as_slice();
+fn parse_alpn(mut value: &[u8]) -> ClientHelloAlpn {
     let Some(list_len) = length(&mut value) else {
-        return true;
+        return ClientHelloAlpn::Malformed;
     };
     let Some(mut list) = take(&mut value, list_len) else {
-        return true;
+        return ClientHelloAlpn::Malformed;
     };
-    let mut saw_protocol = false;
+    if !value.is_empty() || list.is_empty() {
+        return ClientHelloAlpn::Malformed;
+    }
+    let mut supports_http1 = false;
     while !list.is_empty() {
         let Some(plen) = take(&mut list, 1).map(|b| b[0] as usize) else {
-            return true;
+            return ClientHelloAlpn::Malformed;
         };
+        if plen == 0 {
+            return ClientHelloAlpn::Malformed;
+        }
         let Some(proto) = take(&mut list, plen) else {
-            return true;
+            return ClientHelloAlpn::Malformed;
         };
-        saw_protocol = true;
         if proto == b"http/1.1" {
-            return true;
+            supports_http1 = true;
         }
     }
-    !saw_protocol
+    if supports_http1 {
+        ClientHelloAlpn::SupportsHttp1
+    } else {
+        ClientHelloAlpn::NonHttp1Only
+    }
+}
+
+pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
+    if data.is_empty() {
+        return ClientHelloStatus::Incomplete;
+    }
+    if data[0] != 22 {
+        return ClientHelloStatus::Invalid;
+    }
+    let mut records = data;
+    let mut hello = Vec::new();
+    while !records.is_empty() {
+        if records.len() < 5 {
+            return ClientHelloStatus::Incomplete;
+        }
+        let header = &records[..5];
+        if header[0] != 22 {
+            return ClientHelloStatus::Invalid;
+        }
+        let n = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if n == 0 || hello.len().saturating_add(n) > MAX_CLIENT_HELLO {
+            return ClientHelloStatus::Invalid;
+        }
+        if records.len() < 5 + n {
+            return ClientHelloStatus::Incomplete;
+        }
+        hello.extend_from_slice(&records[5..5 + n]);
+        records = &records[5 + n..];
+        if hello.len() >= 4 {
+            if hello[0] != 1 {
+                return ClientHelloStatus::Invalid;
+            }
+            let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
+            if size + 4 > MAX_CLIENT_HELLO {
+                return ClientHelloStatus::Invalid;
+            }
+            if hello.len() >= size + 4 {
+                break;
+            }
+        }
+    }
+    if hello.len() < 4 {
+        return ClientHelloStatus::Incomplete;
+    }
+    if hello[0] != 1 {
+        return ClientHelloStatus::Invalid;
+    }
+    let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
+    if size + 4 > MAX_CLIENT_HELLO {
+        return ClientHelloStatus::Invalid;
+    }
+    if hello.len() < size + 4 {
+        return ClientHelloStatus::Incomplete;
+    }
+    let Some(mut input) = hello.get(4..4 + size) else {
+        return ClientHelloStatus::Invalid;
+    };
+    if take(&mut input, 34).is_none() {
+        return ClientHelloStatus::Invalid;
+    }
+    let Some(session_len) = take(&mut input, 1).map(|b| b[0] as usize) else {
+        return ClientHelloStatus::Invalid;
+    };
+    if take(&mut input, session_len).is_none() {
+        return ClientHelloStatus::Invalid;
+    }
+    let Some(cipher_len) = length(&mut input) else {
+        return ClientHelloStatus::Invalid;
+    };
+    if take(&mut input, cipher_len).is_none() {
+        return ClientHelloStatus::Invalid;
+    }
+    let Some(comp_len) = take(&mut input, 1).map(|b| b[0] as usize) else {
+        return ClientHelloStatus::Invalid;
+    };
+    if take(&mut input, comp_len).is_none() {
+        return ClientHelloStatus::Invalid;
+    }
+    if input.is_empty() {
+        return ClientHelloStatus::Complete(ClientHello {
+            sni: None,
+            alpn: ClientHelloAlpn::Absent,
+        });
+    }
+    let Some(ext_len) = length(&mut input) else {
+        return ClientHelloStatus::Invalid;
+    };
+    let Some(mut extensions) = take(&mut input, ext_len) else {
+        return ClientHelloStatus::Invalid;
+    };
+    if !input.is_empty() {
+        return ClientHelloStatus::Invalid;
+    }
+    let mut sni = None;
+    let mut alpn = ClientHelloAlpn::Absent;
+    while !extensions.is_empty() {
+        let Some(kind) = length(&mut extensions) else {
+            return ClientHelloStatus::Invalid;
+        };
+        let Some(n) = length(&mut extensions) else {
+            return ClientHelloStatus::Invalid;
+        };
+        let Some(value) = take(&mut extensions, n) else {
+            return ClientHelloStatus::Invalid;
+        };
+        match kind {
+            0 if sni.is_none() => sni = parse_sni(value),
+            16 => alpn = parse_alpn(value),
+            _ => {}
+        }
+    }
+    ClientHelloStatus::Complete(ClientHello { sni, alpn })
+}
+
+pub(crate) fn tls(data: &[u8]) -> Option<String> {
+    match parse_client_hello(data) {
+        ClientHelloStatus::Complete(hello) => hello.sni,
+        ClientHelloStatus::Incomplete | ClientHelloStatus::Invalid => None,
+    }
+}
+
+/// True only when a complete ClientHello was read and either has no ALPN
+/// extension or explicitly offers `http/1.1`. Incomplete, invalid, malformed-ALPN,
+/// and `h2`-only handshakes return `false` so MITM passes them through.
+#[cfg(test)]
+pub(crate) fn tls_supports_http1(data: &[u8]) -> bool {
+    matches!(
+        parse_client_hello(data),
+        ClientHelloStatus::Complete(ClientHello {
+            alpn: ClientHelloAlpn::Absent | ClientHelloAlpn::SupportsHttp1,
+            ..
+        })
+    )
+}
+
+/// Appends initial client bytes into `prefix` until a complete TLS ClientHello,
+/// HTTP request head, non-TLS/non-HTTP first byte, EOF, cap, or `timeout`.
+pub(crate) async fn read_first_bytes<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    prefix: &mut Vec<u8>,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let done = |buf: &[u8]| -> bool {
+        if buf.is_empty() {
+            return false;
+        }
+        if buf.len() >= MAX_CLIENT_HELLO {
+            return true;
+        }
+        if buf[0] == 22 {
+            return !matches!(parse_client_hello(buf), ClientHelloStatus::Incomplete);
+        }
+        if buf[0].is_ascii_uppercase() {
+            return buf.windows(4).any(|w| w == b"\r\n\r\n");
+        }
+        true
+    };
+    if done(prefix) {
+        return Ok(());
+    }
+    match tokio::time::timeout(timeout, async {
+        loop {
+            let mut buffer = [0u8; 4096];
+            let n = stream.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            prefix.extend_from_slice(&buffer[..n]);
+            if done(prefix) {
+                break;
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(()),
+    }
 }
 pub(crate) fn http(data: &[u8]) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 128];
@@ -204,7 +359,10 @@ impl crate::Core {
                         return Ok::<_, std::io::Error>(());
                     }
                 }
-                if prefix.len() >= 32768 {
+                if prefix.len() >= MAX_CLIENT_HELLO
+                    || (prefix.first() == Some(&22)
+                        && !matches!(parse_client_hello(&prefix), ClientHelloStatus::Incomplete))
+                {
                     break;
                 }
             }
@@ -324,6 +482,98 @@ pub(crate) mod tests {
         let no_alpn = client_hello_with_alpn("legacy.example.test", &[]);
         assert_eq!(tls(&no_alpn).as_deref(), Some("legacy.example.test"));
         assert!(tls_supports_http1(&no_alpn));
+        assert_eq!(
+            parse_client_hello(&no_alpn),
+            ClientHelloStatus::Complete(ClientHello {
+                sni: Some("legacy.example.test".into()),
+                alpn: ClientHelloAlpn::Absent,
+            })
+        );
+
+        // Complete ClientHello with zero extensions also has Absent ALPN.
+        let mut bare_body = vec![3, 3];
+        bare_body.extend_from_slice(&[0u8; 32]);
+        bare_body.push(0);
+        bare_body.extend_from_slice(&2u16.to_be_bytes());
+        bare_body.extend_from_slice(&[0x13, 0x01]);
+        bare_body.push(1);
+        bare_body.push(0);
+        let mut bare = vec![22, 3, 1];
+        bare.extend_from_slice(&((bare_body.len() + 4) as u16).to_be_bytes());
+        bare.push(1);
+        bare.extend_from_slice(&[0, 0, bare_body.len() as u8]);
+        bare.extend_from_slice(&bare_body);
+        assert_eq!(
+            parse_client_hello(&bare),
+            ClientHelloStatus::Complete(ClientHello {
+                sni: None,
+                alpn: ClientHelloAlpn::Absent,
+            })
+        );
+        assert!(tls_supports_http1(&bare));
+    }
+
+    #[test]
+    fn incomplete_or_fragmented_client_hello_is_distinguished() {
+        let h2_only = client_hello_with_alpn("grpc.example.test", &[b"h2"]);
+
+        // Partial TLS record header and partial single record must not claim HTTP/1.1.
+        assert_eq!(
+            parse_client_hello(&h2_only[..3]),
+            ClientHelloStatus::Incomplete
+        );
+        assert!(!tls_supports_http1(&h2_only[..3]));
+        assert_eq!(
+            parse_client_hello(&h2_only[..15]),
+            ClientHelloStatus::Incomplete
+        );
+        assert!(!tls_supports_http1(&h2_only[..15]));
+
+        // Multi-record ClientHello: first fragment alone is Incomplete.
+        let handshake = &h2_only[5..];
+        let split = handshake.len() / 2;
+        let mut frag1 = vec![22, 3, 1];
+        frag1.extend_from_slice(&(split as u16).to_be_bytes());
+        frag1.extend_from_slice(&handshake[..split]);
+        assert_eq!(parse_client_hello(&frag1), ClientHelloStatus::Incomplete);
+        assert!(!tls_supports_http1(&frag1));
+
+        // Adding the second fragment yields Complete NonHttp1Only.
+        let mut two_records = frag1;
+        two_records.extend_from_slice(&[22, 3, 1]);
+        two_records.extend_from_slice(&((handshake.len() - split) as u16).to_be_bytes());
+        two_records.extend_from_slice(&handshake[split..]);
+        assert_eq!(
+            parse_client_hello(&two_records),
+            ClientHelloStatus::Complete(ClientHello {
+                sni: Some("grpc.example.test".into()),
+                alpn: ClientHelloAlpn::NonHttp1Only,
+            })
+        );
+        assert!(!tls_supports_http1(&two_records));
+    }
+
+    #[tokio::test]
+    async fn read_first_bytes_completes_partial_prefix_across_chunks() {
+        let hello = client_hello_with_alpn("split.example.test", &[b"h2"]);
+        let cut = hello.len() / 2;
+        let mut prefix = hello[..cut].to_vec();
+        let (mut writer, mut reader) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut writer, &hello[cut..])
+                .await
+                .unwrap();
+        });
+        read_first_bytes(&mut reader, &mut prefix, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_client_hello(&prefix),
+            ClientHelloStatus::Complete(ClientHello {
+                sni: Some("split.example.test".into()),
+                alpn: ClientHelloAlpn::NonHttp1Only,
+            })
+        );
     }
 
     fn fake_ip_core() -> std::sync::Arc<crate::Core> {

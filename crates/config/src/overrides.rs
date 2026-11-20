@@ -38,6 +38,8 @@ pub struct MitmSettings {
     pub ca_key: String,
     /// See `Mitm::lenient_upstream`.
     pub lenient_upstream: bool,
+    /// See `Mitm::quic_fallback`.
+    pub quic_fallback: bool,
 }
 
 impl MitmSettings {
@@ -53,6 +55,7 @@ impl MitmSettings {
             ca_cert: self.ca_cert.clone(),
             ca_key: self.ca_key.clone(),
             lenient_upstream: self.lenient_upstream,
+            quic_fallback: self.quic_fallback,
         }
     }
 }
@@ -113,6 +116,10 @@ impl Overrides {
             value.insert(
                 Value::from("lenient-upstream"),
                 Value::from(mitm.lenient_upstream),
+            );
+            value.insert(
+                Value::from("quic-fallback"),
+                Value::from(mitm.quic_fallback),
             );
             // `Mitm` never serializes its key, so it is written here.
             value.insert(Value::from("ca-key"), Value::from(mitm.ca_key));
@@ -197,6 +204,7 @@ mod tests {
                 ca_cert: "CERT".into(),
                 ca_key: "KEY".into(),
                 lenient_upstream: true,
+                quic_fallback: true,
             }),
             rewrite: Some(crate::rewrite::Settings {
                 enabled: true,
@@ -216,6 +224,7 @@ mod tests {
         assert!(config.mitm.enable);
         assert_eq!(config.mitm.hostname, ["*.ads.test"]);
         assert!(config.mitm.lenient_upstream);
+        assert!(config.mitm.quic_fallback);
         assert_eq!(
             (config.mitm.ca_cert.as_str(), config.mitm.ca_key.as_str()),
             ("CERT", "KEY")
