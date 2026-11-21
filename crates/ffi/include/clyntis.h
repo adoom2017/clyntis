@@ -111,7 +111,7 @@ int32_t meta_prefetch_resources_v1(const uint8_t *config, size_t length,
     const uint8_t *directory, size_t directory_length);
 /* Whether the routing files a configuration references exist in directory
  * and are current: *state is 0 current, 1 expired (usable; refresh later),
- * 2 missing (fetched after connecting). Cheap; parses no geo data. */
+ * 2 missing or unusable (fetched after connecting). Cheap; parses no geo data. */
 int32_t meta_resources_state_v1(const uint8_t *config, size_t length,
     const uint8_t *directory, size_t directory_length, uint32_t *state);
 int32_t meta_create_v1(const uint8_t *config, size_t length, const meta_hooks_v1 *hooks, meta_handle *out);
@@ -143,10 +143,14 @@ int32_t meta_set_network_v1(meta_handle handle, const uint8_t *network, size_t l
 int32_t meta_set_tun_fd_v1(meta_handle handle, int32_t fd);
 #endif
 int32_t meta_error_v1(uint8_t *buffer, size_t capacity, size_t *length);
+/* Releases any pending result when the calling thread abandons a buffer retry. */
+void meta_discard_pending_output_v1(void);
 int32_t meta_snapshot_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
 /* Cheap periodic check: {"stopped":bool,"connections":n,"upload":n,"download":n}.
  * Use it instead of meta_snapshot_v1 when the configuration is not needed. */
 int32_t meta_status_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
+/* Writes the configured IPv6 flag (0 or 1). */
+int32_t meta_config_ipv6_v1(meta_handle handle, uint32_t *enabled);
 /* Traffic breakdown by destination host and connection, as UTF-8 JSON.
  * Pass host (length 0 for global breakdown, or a host name to filter
  * connections for drill-down). Response size is capped separately from

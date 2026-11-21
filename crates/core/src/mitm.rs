@@ -11,7 +11,7 @@ use boring::{
     hash::MessageDigest,
     nid::Nid,
     pkey::{PKey, Private},
-    ssl::{AlpnError, SslAcceptor, SslMethod},
+    ssl::{AlpnError, SslAcceptor, SslMethod, SslMode},
     x509::{
         X509, X509Builder, X509NameBuilder,
         extension::{
@@ -229,6 +229,7 @@ impl Authority {
         }
         let leaf = self.leaf(host)?;
         let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())?;
+        builder.set_mode(SslMode::RELEASE_BUFFERS);
         builder.set_certificate(&leaf)?;
         builder.set_private_key(&self.leaf_key)?;
         // Only HTTP/1.1 is read; a client that insists on h2 fails and the
@@ -788,7 +789,9 @@ impl Interceptor {
     /// Drops cached per-host TLS acceptors under memory pressure.
     pub(crate) fn relieve_memory(&self) {
         if let Some(authority) = self.authority.read().unwrap().as_ref() {
-            authority.leaves.lock().unwrap().clear();
+            let mut leaves = authority.leaves.lock().unwrap();
+            leaves.clear();
+            leaves.shrink_to_fit();
         }
     }
     pub(crate) fn status(&self) -> Value {

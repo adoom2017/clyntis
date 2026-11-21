@@ -28,6 +28,10 @@ use tokio::{
 /// A request head this long without its end is not HTTP worth reading.
 const HEAD_LIMIT: usize = 64 << 10;
 const LINE_LIMIT: usize = 8 << 10;
+const PENDING_LIMIT: usize = 64;
+const HOSTED_PENDING_LIMIT: usize = 16;
+const HOSTED_REWRITE_BODY_LIMIT: usize = 512 << 10;
+const DESKTOP_REWRITE_BODY_LIMIT: usize = 8 << 20;
 
 pub(crate) struct Context {
     pub(crate) core: Arc<Core>,
@@ -140,8 +144,12 @@ where
 {
     let (client_read, client_write) = tokio::io::split(client);
     let (upstream_read, upstream_write) = tokio::io::split(upstream);
-    let (sender, mut pending) = mpsc::unbounded_channel();
     let hosted = context.core.config.internal_host_packet_io;
+    let (sender, mut pending) = mpsc::channel(if hosted {
+        HOSTED_PENDING_LIMIT
+    } else {
+        PENDING_LIMIT
+    });
     // Per direction; the iOS tunnel decrypting many connections cannot
     // afford large buffers.
     let capacity = if hosted { 8 << 10 } else { 32 << 10 };
@@ -186,7 +194,7 @@ struct Message {
     headers: Vec<(String, String)>,
     /// The whole body, decoded; `None` when the rules do not need it or it
     /// could not be read whole.
-    body: Option<Vec<u8>>,
+    body: Option<Arc<Vec<u8>>>,
     head_changed: bool,
     body_changed: bool,
 }
@@ -203,7 +211,7 @@ struct BodySource<'a, R> {
     limit: usize,
     bodiless: bool,
     loaded: bool,
-    expects_continue: Option<&'a mpsc::UnboundedSender<RequestEvent>>,
+    expects_continue: Option<&'a mpsc::Sender<RequestEvent>>,
     sent_continue: bool,
     permit: Option<Arc<OwnedSemaphorePermit>>,
 }
@@ -223,6 +231,7 @@ impl<'a, R: AsyncBufRead + Unpin> BodySource<'a, R> {
         if let Some(sender) = self.expects_continue {
             sender
                 .send(RequestEvent::Continue)
+                .await
                 .map_err(|_| io::ErrorKind::BrokenPipe)?;
             self.sent_continue = true;
             message
@@ -233,7 +242,15 @@ impl<'a, R: AsyncBufRead + Unpin> BodySource<'a, R> {
         let framing = self.buffered.remaining.take().unwrap_or(Framing::Length(0));
         self.buffered = read_body(self.reader, framing, self.limit).await?;
         if self.buffered.remaining.is_none() {
-            message.body = decoded(original_headers, &self.buffered.bytes, self.limit);
+            let body = match find(original_headers, "content-encoding")
+                .filter(|e| !e.eq_ignore_ascii_case("identity"))
+            {
+                Some(encoding) if !self.buffered.bytes.is_empty() => {
+                    crate::requests::decode_limited(encoding, &self.buffered.bytes, self.limit)
+                }
+                _ => Some(std::mem::take(&mut self.buffered.bytes)),
+            };
+            message.body = body.map(Arc::new);
         }
         Ok(())
     }
@@ -428,13 +445,12 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                     }
                     _ => None,
                 };
-                match output {
-                    Some(body) if message.body.as_ref() != Some(&body) => {
-                        message.body = Some(body);
-                        message.body_changed = true;
-                        true
-                    }
-                    _ => false,
+                if let Some(body) = output {
+                    message.body = Some(Arc::new(body));
+                    message.body_changed = true;
+                    true
+                } else {
+                    false
                 }
             }
             Action::BodyReplace(_) | Action::JsonDelete(_) | Action::JsonSet(_) => {
@@ -442,7 +458,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                     rewrite::apply_body_with(
                         &rewrites.rewriter,
                         index,
-                        body,
+                        Arc::make_mut(body),
                         allow_compile,
                         group_runtimes.as_ref(),
                     )
@@ -454,7 +470,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                 if script.requires_body
                     && (message.body.is_none()
                         || script.max_size.is_some_and(|max| {
-                            message.body.as_ref().map_or(0, Vec::len) as u64 > max
+                            message.body.as_deref().map_or(0, Vec::len) as u64 > max
                         }))
                 {
                     continue;
@@ -464,7 +480,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                 };
                 let mut body = script
                     .requires_body
-                    .then(|| message.body.clone().unwrap_or_default());
+                    .then(|| message.body.as_deref().cloned().unwrap_or_default());
                 let job = script::Job {
                     name: script.name.clone(),
                     path: path.clone(),
@@ -540,9 +556,9 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                                 message.head_changed = true;
                             }
                             if let Some(body) = outcome.body
-                                && message.body.as_ref() != Some(&body)
+                                && message.body.as_deref() != Some(&body)
                             {
-                                message.body = Some(body);
+                                message.body = Some(Arc::new(body));
                                 message.body_changed = true;
                             }
                             true
@@ -556,6 +572,9 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
             }
             _ => false,
         };
+        if message.body_changed && body_source.buffered.remaining.is_none() {
+            body_source.buffered.bytes = Vec::new();
+        }
         if acted {
             context.core.rewrite_stats.record(rule, request_url);
             applied.push((rule.label(), rule.action.kind()));
@@ -689,19 +708,10 @@ fn set_body_headers(headers: &mut Vec<(String, String)>, length: usize, replaced
     headers.push(("Content-Length".into(), length.to_string()));
 }
 
-/// The whole body ready for the rules, decoded when it was compressed.
-/// `None` when it is compressed in a way that cannot be undone.
-fn decoded(headers: &[(String, String)], raw: &[u8], limit: usize) -> Option<Vec<u8>> {
-    match find(headers, "content-encoding").filter(|e| !e.eq_ignore_ascii_case("identity")) {
-        Some(encoding) if !raw.is_empty() => crate::requests::decode_limited(encoding, raw, limit),
-        _ => Some(raw.to_vec()),
-    }
-}
-
 async fn requests<R, W>(
     mut reader: R,
     mut writer: W,
-    sender: mpsc::UnboundedSender<RequestEvent>,
+    sender: mpsc::Sender<RequestEvent>,
     context: &Context,
     in_flight: &InFlightTracker,
     raw_passthrough: &AtomicBool,
@@ -772,9 +782,9 @@ where
             .map(|rewriter| Rewrites {
                 rewriter,
                 limit: if context.core.config.internal_host_packet_io {
-                    2 << 20
+                    HOSTED_REWRITE_BODY_LIMIT
                 } else {
-                    8 << 20
+                    DESKTOP_REWRITE_BODY_LIMIT
                 },
             });
         let mut pending = Pending {
@@ -810,7 +820,7 @@ where
             }
             let Some(channel) = &sender else { break };
             pending.in_flight = Some(in_flight.enter());
-            if channel.send(RequestEvent::Request(pending)).is_err() {
+            if channel.send(RequestEvent::Request(pending)).await.is_err() {
                 break;
             }
             writer.write_all(&head).await?;
@@ -896,7 +906,12 @@ where
                             .is_err()
                     }
                 } else {
-                    capture(context, &mut body.lock().unwrap(), &buffered.bytes, cap);
+                    let wire_bytes = if buffered.bytes.is_empty() {
+                        message.body.as_deref().map_or(&[][..], Vec::as_slice)
+                    } else {
+                        &buffered.bytes
+                    };
+                    capture(context, &mut body.lock().unwrap(), wire_bytes, cap);
                     drop(buffered);
                     drop(permit);
                     false
@@ -912,7 +927,7 @@ where
                 pending.answer_budget = answer_budget;
                 let Some(sender) = &sender else { break };
                 pending.in_flight = Some(in_flight.enter());
-                if sender.send(RequestEvent::Request(pending)).is_err() {
+                if sender.send(RequestEvent::Request(pending)).await.is_err() {
                     break;
                 }
                 if close {
@@ -943,11 +958,12 @@ where
         let start = format!("{} {target} HTTP/1.{minor}", pending.method);
         let Some(sender) = &sender else { break };
         if message.body_changed || buffered.remaining.is_none() {
-            let send = if message.body_changed {
-                if buffered.remaining.is_some() {
+            let send = if message.body_changed || buffered.bytes.is_empty() {
+                if message.body_changed && buffered.remaining.is_some() {
                     if expects && !sent_continue {
                         sender
                             .send(RequestEvent::Continue)
+                            .await
                             .map_err(|_| io::ErrorKind::BrokenPipe)?;
                         message
                             .headers
@@ -959,7 +975,7 @@ where
                 }
                 message.body.take().unwrap_or_default()
             } else {
-                buffered.bytes
+                Arc::new(buffered.bytes)
             };
             message.body = None;
             if message.body_changed
@@ -975,7 +991,7 @@ where
             capture(context, &mut body.lock().unwrap(), &send, cap);
             pending.headers = message.headers.clone();
             pending.in_flight = Some(in_flight.enter());
-            if sender.send(RequestEvent::Request(pending)).is_err() {
+            if sender.send(RequestEvent::Request(pending)).await.is_err() {
                 break;
             }
             let head = encode_head(&start, &message.headers);
@@ -987,11 +1003,12 @@ where
             if expects && !sent_continue && find(&message.headers, "expect").is_none() {
                 sender
                     .send(RequestEvent::Continue)
+                    .await
                     .map_err(|_| io::ErrorKind::BrokenPipe)?;
             }
             pending.headers = message.headers.clone();
             pending.in_flight = Some(in_flight.enter());
-            if sender.send(RequestEvent::Request(pending)).is_err() {
+            if sender.send(RequestEvent::Request(pending)).await.is_err() {
                 break;
             }
             if message.head_changed {
@@ -1024,7 +1041,7 @@ fn same_origin(from: &str, to: &str) -> Option<String> {
 async fn responses<R, W>(
     mut reader: R,
     mut writer: W,
-    pending: &mut mpsc::UnboundedReceiver<RequestEvent>,
+    pending: &mut mpsc::Receiver<RequestEvent>,
     context: &Context,
     raw_passthrough: &AtomicBool,
 ) -> io::Result<()>
@@ -1258,15 +1275,15 @@ where
                             .await;
                         (message.status, message.headers, copied)
                     } else if message.body_changed || buffered.remaining.is_none() || bodiless {
-                        let send = if message.body_changed {
-                            if buffered.remaining.is_some() {
+                        let send = if message.body_changed || buffered.bytes.is_empty() {
+                            if message.body_changed && buffered.remaining.is_some() {
                                 buffered
                                     .finish(&mut reader, &mut tokio::io::sink(), None, |_| {})
                                     .await?;
                             }
                             message.body.take().unwrap_or_default()
                         } else {
-                            buffered.bytes
+                            Arc::new(buffered.bytes)
                         };
                         message.body = None;
                         set_body_headers(&mut message.headers, send.len(), message.body_changed);
@@ -2561,5 +2578,52 @@ request if ${url} ~= /^http:\/\/ads\.test\/pipe$/ then url.replace("http://ads.t
             .find_map(|e| e.http)
             .unwrap();
         assert_eq!(http.rewrite_actions, vec!["url", "header"]);
+    }
+
+    #[tokio::test]
+    async fn hosted_pipelined_requests_exceeding_pending_limit_complete_in_order() {
+        let dir = TestDir::new("clyntis-observe-pipeline-bound");
+        let core = hosted_core(dir.path(), "", vec![]);
+        let (context, _tracker) = make_context(&core);
+        let (mut app, client) = tokio::io::duplex(256 << 10);
+        let (mut server, upstream) = tokio::io::duplex(256 << 10);
+        let relay_task = tokio::spawn({
+            let context = context.clone();
+            async move { relay(client, upstream, &context).await }
+        });
+
+        let total = HOSTED_PENDING_LIMIT + 8;
+        let server_task = tokio::spawn(async move {
+            for i in 0..total {
+                let req = String::from_utf8(read_http_head(&mut server).await).unwrap();
+                assert!(
+                    req.starts_with(&format!("GET /p/{i} HTTP/1.1")),
+                    "unexpected request {i}: {req}"
+                );
+                let body = format!("resp-{i}");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                server.write_all(head.as_bytes()).await.unwrap();
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut batch = String::new();
+            for i in 0..total {
+                batch.push_str(&format!("GET /p/{i} HTTP/1.1\r\nHost: ads.test\r\n\r\n"));
+            }
+            app.write_all(batch.as_bytes()).await.unwrap();
+            for i in 0..total {
+                let (_, body) = read_http_response(&mut app).await;
+                assert_eq!(body, format!("resp-{i}").as_bytes());
+            }
+            drop(app);
+            server_task.await.unwrap();
+            relay_task.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

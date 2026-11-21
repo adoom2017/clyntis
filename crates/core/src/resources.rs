@@ -986,7 +986,8 @@ async fn rewrite(
         }
     }
     // Scripts and response files, each once, several at a time.
-    let urls = rewrite_file_urls(parsed.iter().map(|(_, module, _)| module));
+    let script_limit = crate::script::source_limit(config.internal_host_packet_io);
+    let urls = rewrite_file_urls(parsed.iter().map(|(_, module, _)| module), script_limit);
     enum DownloadFile {
         Ready(Arc<crate::rewrite::RewriteFile>),
         Deferred(PathBuf, Staged),
@@ -1046,7 +1047,8 @@ async fn rewrite(
         pending_commits.iter().map(|p| p.parsed_index).collect();
     for (idx, (_, module, _)) in parsed.iter().enumerate() {
         if !deferred_indices.contains(&idx) {
-            publish_urls.extend(rewrite_file_urls(std::iter::once(module)).into_keys());
+            publish_urls
+                .extend(rewrite_file_urls(std::iter::once(module), script_limit).into_keys());
         }
     }
     let mut kept_cached_urls = std::collections::BTreeMap::new();
@@ -1061,7 +1063,7 @@ async fn rewrite(
         if dropped_to_zero && let Ok(cached) = read_module(&pending.path) {
             let mut cached_pins = HashMap::new();
             let mut cached_urls = Vec::new();
-            for (url, limit) in rewrite_file_urls(std::iter::once(&cached)) {
+            for (url, limit) in rewrite_file_urls(std::iter::once(&cached), script_limit) {
                 cached_urls.push((url.clone(), limit));
                 if files.contains_key(&url) {
                     continue;
@@ -1095,8 +1097,10 @@ async fn rewrite(
             }
         }
         if !kept_cached {
-            let candidate_urls =
-                rewrite_file_urls(std::iter::once(&parsed[pending.parsed_index].1));
+            let candidate_urls = rewrite_file_urls(
+                std::iter::once(&parsed[pending.parsed_index].1),
+                script_limit,
+            );
             publish_urls.extend(candidate_urls.into_keys());
             if let Err(error) = pending.staged.commit() {
                 tracing::warn!(module = %name, %error, "failed to commit updated module");
@@ -1224,13 +1228,14 @@ fn read_module(path: &Path) -> Result<clyntis_config::rewrite::Module> {
 
 fn rewrite_file_urls<'a>(
     modules: impl IntoIterator<Item = &'a clyntis_config::rewrite::Module>,
+    script_limit: usize,
 ) -> std::collections::BTreeMap<String, usize> {
     use clyntis_config::rewrite::{Action, Mock, MockBody};
     let mut urls = std::collections::BTreeMap::new();
     for module in modules {
         for rule in &module.rules {
             let (url, limit) = match &rule.action {
-                Action::Script(script) => (&script.url, crate::script::SOURCE_LIMIT),
+                Action::Script(script) => (&script.url, script_limit),
                 Action::Mock(Mock {
                     body: MockBody::Remote(url),
                     ..
@@ -1290,7 +1295,7 @@ pub enum Freshness {
     Current,
     /// Present but past an update interval: usable until replaced.
     Expired,
-    /// Some file does not exist; start from cache and download it after connecting.
+    /// Some file is missing or unusable; fetch it after connecting.
     Missing,
 }
 
@@ -1299,9 +1304,12 @@ pub enum Freshness {
 pub fn freshness(config: &Config) -> Result<Freshness> {
     let mut refs = references(config)?;
     let mut state = Freshness::Current;
-    let mut check = |path: &Path, interval: Option<u64>| {
+    let mut check = |path: &Path, interval: Option<u64>, limit: Option<usize>| {
         let found = match std::fs::metadata(path) {
             Err(_) => Freshness::Missing,
+            Ok(meta) if limit.is_some_and(|limit| exceeds_limit(&meta, limit)) => {
+                Freshness::Missing
+            }
             Ok(meta) if expired(Some(&meta), interval) => Freshness::Expired,
             Ok(_) => Freshness::Current,
         };
@@ -1313,7 +1321,7 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
             p.payload.clone()
         } else {
             let path = asset_path(&config.directory, &p.path)?;
-            if check(&path, (p.kind == "http").then_some(p.interval)) == Freshness::Missing {
+            if check(&path, (p.kind == "http").then_some(p.interval), None) == Freshness::Missing {
                 continue;
             }
             parse_payload(&read_limited(&path)?, &p.format)?
@@ -1325,6 +1333,7 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
             check(
                 &config.directory.join(list.file_name()),
                 Some(config.adblock.interval),
+                None,
             );
         }
     }
@@ -1337,19 +1346,21 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
         }
         for module in &config.rewrite.modules {
             let path = config.directory.join(module.file_name());
-            if check(&path, Some(config.rewrite.interval)) == Freshness::Missing {
+            if check(&path, Some(config.rewrite.interval), None) == Freshness::Missing {
                 continue;
             }
             if let Ok(module) = read_module(&path) {
                 modules.push(module);
             }
         }
-        for (url, _) in rewrite_file_urls(&modules) {
+        let script_limit = crate::script::source_limit(config.internal_host_packet_io);
+        for (url, limit) in rewrite_file_urls(&modules, script_limit) {
             check(
                 &config
                     .directory
                     .join(clyntis_config::rewrite::cache_file(&url)),
                 Some(config.rewrite.interval),
+                Some(limit),
             );
         }
     }
@@ -1360,10 +1371,10 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
         } else {
             "Country.mmdb"
         };
-        check(&config.directory.join(file), interval);
+        check(&config.directory.join(file), interval, None);
     }
     if refs.iter().any(|r| r.0 == "geosite") {
-        check(&config.directory.join("geosite.dat"), interval);
+        check(&config.directory.join("geosite.dat"), interval, None);
     }
     Ok(state)
 }
@@ -1405,6 +1416,10 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     }
     result
 }
+fn exceeds_limit(meta: &std::fs::Metadata, limit: usize) -> bool {
+    meta.len() > limit as u64
+}
+
 async fn asset(
     path: &Path,
     url: &str,
@@ -1414,20 +1429,16 @@ async fn asset(
     pending: &mut Staged,
 ) -> Result<PathBuf> {
     let meta = std::fs::metadata(path).ok();
-    let expired = refresh && expired(meta.as_ref(), interval);
-    if let Some(meta) = &meta
-        && !expired
-    {
-        ensure!(
-            meta.len() <= fetch.limit as u64,
-            "resource exceeds size limit"
-        );
+    let oversized = meta
+        .as_ref()
+        .is_some_and(|meta| exceeds_limit(meta, fetch.limit));
+    let remote = interval.is_some() && !url.is_empty();
+    let refresh_cache = refresh && (expired(meta.as_ref(), interval) || (oversized && remote));
+    if meta.is_some() && !refresh_cache {
+        ensure!(!oversized, "resource exceeds size limit");
         return Ok(path.into());
     }
-    ensure!(
-        interval.is_some() && !url.is_empty(),
-        "local routing resource is missing"
-    );
+    ensure!(remote, "local routing resource is missing");
     ensure!(
         fetch.download,
         "routing resource is not cached; download deferred until connected"
@@ -1482,7 +1493,7 @@ async fn asset(
             Ok(temp)
         }
         // An expired file is still usable: stay on it rather than fail.
-        Err(error) if meta.is_some_and(|m| m.len() <= fetch.limit as u64) => {
+        Err(error) if meta.is_some() && !oversized => {
             pending.discard(&temp);
             tracing::warn!(error = %format!("{error:#}"), "keeping the current routing resource");
             Ok(path.into())
@@ -3664,6 +3675,59 @@ rules:
         );
         dns_server.abort();
         let _ = dns_server.await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_refresh_replaces_a_recent_oversized_script_cache() {
+        use axum::{Router, routing::get};
+        let dir = std::env::temp_dir().join(format!("meta-fresh-script-{}", uuid::Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let script_url = format!("http://{}/ad.js", listener.local_addr().unwrap());
+        let script = "$done({});";
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/ad.js", get(move || async move { script })),
+            )
+            .await
+            .unwrap()
+        });
+        let config = Config {
+            directory: dir.clone(),
+            internal_host_packet_io: true,
+            rewrite: clyntis_config::rewrite::Rewrite {
+                enable: true,
+                interval: 3600,
+                custom: format!(
+                    "[Script]\nad = type=http-response,pattern=^https://a\\.test/,script-path={script_url}\n"
+                ),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        let path = dir.join(clyntis_config::rewrite::cache_file(&script_url));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(crate::script::source_limit(true) as u64 + 1)
+            .unwrap();
+        assert_eq!(freshness(&config).unwrap(), Freshness::Missing);
+        let cached =
+            load_rewrites(&config, &Resources::default(), false, LoadMode::Available).await;
+        assert!(cached.rewrite.as_ref().unwrap().file(&script_url).is_none());
+        let refreshed = load_rewrites(&config, &cached, true, LoadMode::Available).await;
+        assert!(
+            refreshed
+                .rewrite
+                .as_ref()
+                .unwrap()
+                .file(&script_url)
+                .is_some()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
+        assert_eq!(freshness(&config).unwrap(), Freshness::Current);
+        server.abort();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

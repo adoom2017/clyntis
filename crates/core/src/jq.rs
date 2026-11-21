@@ -94,10 +94,11 @@ impl Filter {
 
     /// The body with the filter applied: its first output, as JSON. `None`
     /// when the body is not JSON, the filter fails, outputs nothing or runs
-    /// too long.
+    /// too long. The relay keeps its own reference so it can forward the
+    /// unchanged body if the worker times out or exits unexpectedly.
     pub(crate) async fn apply(
         &self,
-        body: Vec<u8>,
+        body: Arc<Vec<u8>>,
         body_slot: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Option<Vec<u8>> {
         let filter = self.0.clone();
@@ -110,7 +111,7 @@ impl Filter {
             let _permit = permit;
             // Cancellation of the relay does not stop a running blocking worker.
             let _body_slot = body_slot;
-            run(&filter, &body, deadline.into_std(), STEP_LIMIT)
+            run(&filter, &body, deadline.into_std(), STEP_LIMIT).filter(|output| output != &*body)
         });
         tokio::time::timeout_at(deadline, task).await.ok()?.ok()?
     }
@@ -172,7 +173,10 @@ mod tests {
         ];
         for (code, input, expected) in cases {
             let filter = Filter::compile(code).unwrap();
-            let output = filter.apply(input.as_bytes().to_vec(), None).await.unwrap();
+            let output = filter
+                .apply(Arc::new(input.as_bytes().to_vec()), None)
+                .await
+                .unwrap();
             let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
             let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
             assert_eq!(output, expected, "{code}");
@@ -182,8 +186,18 @@ mod tests {
             assert!(Filter::compile(code).is_err(), "{code}");
         }
         let filter = Filter::compile("del(.a)").unwrap();
-        assert!(filter.apply(b"not json".to_vec(), None).await.is_none());
+        assert!(
+            filter
+                .apply(Arc::new(b"not json".to_vec()), None)
+                .await
+                .is_none()
+        );
         let failing = Filter::compile("error(\"x\")").unwrap();
-        assert!(failing.apply(b"{}".to_vec(), None).await.is_none());
+        assert!(
+            failing
+                .apply(Arc::new(b"{}".to_vec()), None)
+                .await
+                .is_none()
+        );
     }
 }

@@ -8,8 +8,8 @@ use boring::{
     error::{ErrLib, ErrorStack},
     ssl::{
         CertificateCompressionAlgorithm, CertificateCompressor, ErrorCode, SslAcceptor,
-        SslConnector, SslMethod, SslOptions, SslSession, SslSessionCacheMode, SslVerifyMode,
-        SslVersion,
+        SslConnector, SslMethod, SslMode, SslOptions, SslSession, SslSessionCacheMode,
+        SslVerifyMode, SslVersion,
     },
     x509::{
         X509, X509VerifyError,
@@ -454,13 +454,22 @@ struct ContextKey {
     profile: TlsFingerprint,
     alpn: Vec<String>,
     verify: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SessionKey {
+    context: ContextKey,
     server_name: String,
 }
 static CONTEXTS: OnceLock<Mutex<HashMap<ContextKey, SslConnector>>> = OnceLock::new();
 /// The webpki roots, parsed once and shared by every verifying context: a
-/// context with its own copy holds about 1.2 MiB, and contexts are cached per
-/// server name, which cost the iOS tunnel tens of MiB of its ~50 MiB limit.
+/// context with its own copy holds about 1.2 MiB, and contexts are cached by
+/// profile/ALPN/verification mode rather than per server name.
 static ROOTS: OnceLock<X509Store> = OnceLock::new();
+
+fn session_server_name_index() -> boring::ex_data::Index<boring::ssl::Ssl, String> {
+    static INDEX: OnceLock<boring::ex_data::Index<boring::ssl::Ssl, String>> = OnceLock::new();
+    *INDEX.get_or_init(|| boring::ssl::Ssl::new_ex_index().expect("Ssl ex_data index"))
+}
 
 fn roots() -> Result<&'static X509Store> {
     if let Some(store) = ROOTS.get() {
@@ -474,9 +483,9 @@ fn roots() -> Result<&'static X509Store> {
     }
     Ok(ROOTS.get_or_init(|| builder.build()))
 }
-static SESSIONS: OnceLock<Mutex<VecDeque<(ContextKey, SslSession)>>> = OnceLock::new();
+static SESSIONS: OnceLock<Mutex<VecDeque<(SessionKey, SslSession)>>> = OnceLock::new();
 
-fn store_session(key: ContextKey, session: SslSession) {
+fn store_session(key: SessionKey, session: SslSession) {
     let mut sessions = SESSIONS.get_or_init(Default::default).lock().unwrap();
     sessions.retain(|(stored, _)| stored != &key);
     sessions.push_back((key, session));
@@ -485,7 +494,7 @@ fn store_session(key: ContextKey, session: SslSession) {
     }
 }
 
-fn take_session(key: &ContextKey) -> Option<SslSession> {
+fn take_session(key: &SessionKey) -> Option<SslSession> {
     let mut sessions = SESSIONS.get_or_init(Default::default).lock().unwrap();
     let index = sessions.iter().rposition(|(stored, _)| stored == key)?;
     sessions.remove(index).map(|(_, session)| session)
@@ -495,10 +504,14 @@ fn take_session(key: &ContextKey) -> Option<SslSession> {
 /// root certificate store intact.
 pub fn clear_caches() {
     if let Some(contexts) = CONTEXTS.get() {
-        contexts.lock().unwrap().clear();
+        let mut contexts = contexts.lock().unwrap();
+        contexts.clear();
+        contexts.shrink_to_fit();
     }
     if let Some(sessions) = SESSIONS.get() {
-        sessions.lock().unwrap().clear();
+        let mut sessions = sessions.lock().unwrap();
+        sessions.clear();
+        sessions.shrink_to_fit();
     }
 }
 
@@ -520,9 +533,10 @@ fn build_connector(
     alpn: &[String],
     verify: bool,
     reality: bool,
-    session_key: Option<ContextKey>,
+    context_key: Option<ContextKey>,
 ) -> Result<SslConnector> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_mode(SslMode::RELEASE_BUFFERS);
     builder.set_min_proto_version(Some(if reality {
         SslVersion::TLS1_3
     } else {
@@ -545,8 +559,19 @@ fn build_connector(
         SslSessionCacheMode::CLIENT
     });
     builder.set_session_cache_size(256);
-    if let Some(key) = session_key {
-        builder.set_new_session_callback(move |_, session| store_session(key.clone(), session));
+    if let Some(context) = context_key {
+        let index = session_server_name_index();
+        builder.set_new_session_callback(move |ssl, session| {
+            if let Some(server_name) = ssl.ex_data(index).cloned() {
+                store_session(
+                    SessionKey {
+                        context: context.clone(),
+                        server_name,
+                    },
+                    session,
+                );
+            }
+        });
     }
     if !profile.tls.session_ticket {
         builder.set_options(SslOptions::NO_TICKET);
@@ -580,7 +605,7 @@ fn connector(
     SslConnector,
     BrowserProfile,
     Vec<String>,
-    Option<ContextKey>,
+    Option<SessionKey>,
 )> {
     let selected = config.fingerprint.resolve();
     let profile = if selected == TlsFingerprint::Randomized {
@@ -615,30 +640,33 @@ fn connector(
             None,
         ));
     }
-    let key = ContextKey {
+    let context_key = ContextKey {
         profile: selected,
         alpn: alpn.clone(),
         verify: config.verify_cert,
+    };
+    let session_key = SessionKey {
+        context: context_key.clone(),
         server_name: config.server_name.clone(),
     };
     let cache = CONTEXTS.get_or_init(Default::default);
-    if let Some(found) = cache.lock().unwrap().get(&key).cloned() {
-        return Ok((found, profile, alpn, Some(key)));
+    if let Some(found) = cache.lock().unwrap().get(&context_key).cloned() {
+        return Ok((found, profile, alpn, Some(session_key)));
     }
     let built = build_connector(
         &profile,
         &alpn,
         config.verify_cert,
         false,
-        Some(key.clone()),
+        Some(context_key.clone()),
     )?;
     let result = built.clone();
     let mut cache = cache.lock().unwrap();
     if cache.len() >= 64 {
         cache.clear();
     }
-    cache.insert(key.clone(), built);
-    Ok((result, profile, alpn, Some(key)))
+    cache.insert(context_key, built);
+    Ok((result, profile, alpn, Some(session_key)))
 }
 
 fn configure_ssl(
@@ -658,12 +686,13 @@ fn configure_ssl_with(
     let mut configured = connector.configure()?;
     configured.set_verify_hostname(check_name && config.verify_cert && config.reality.is_none());
     let mut ssl = configured.into_ssl(&config.server_name)?;
-    if let Some(key) = session_key.as_ref()
-        && let Some(session) = take_session(key)
-    {
-        // SAFETY: the cached session came from the same server/profile/ALPN and
-        // verification context. BoringSSL takes its own reference on success.
-        unsafe { ssl.set_session(&session)? };
+    if let Some(key) = session_key.as_ref() {
+        ssl.set_ex_data(session_server_name_index(), key.server_name.clone());
+        if let Some(session) = take_session(key) {
+            // SAFETY: the cached session came from the same server/profile/ALPN and
+            // verification context. BoringSSL takes its own reference on success.
+            unsafe { ssl.set_session(&session)? };
+        }
     }
     if config.reality.is_some() {
         // REALITY deliberately uses an ephemeral certificate whose Ed25519
@@ -1721,7 +1750,7 @@ mod tests {
 
     #[test]
     fn verifying_contexts_share_one_root_store() {
-        let store = |server_name: &str| {
+        let context_ptrs = |server_name: &str| {
             let (connector, ..) = connector(
                 &TlsConnectConfig {
                     server_name: server_name.into(),
@@ -1733,13 +1762,16 @@ mod tests {
                 true,
             )
             .unwrap();
-            foreign_types_shared::ForeignTypeRef::as_ptr(connector.context().cert_store())
+            (
+                foreign_types_shared::ForeignTypeRef::as_ptr(connector.context()),
+                foreign_types_shared::ForeignTypeRef::as_ptr(connector.context().cert_store()),
+            )
         };
-        // Contexts are cached per server name; each copy of the roots held
-        // about 1.2 MiB (Tailscale probes every DERP region by name).
-        let first = store("derp1.example.com");
-        assert_eq!(first, store("derp2.example.com"));
-        assert_eq!(first, roots().unwrap().as_ptr());
+        let (first_ctx, first_store) = context_ptrs("derp1.example.com");
+        let (second_ctx, second_store) = context_ptrs("derp2.example.com");
+        assert_eq!(first_ctx, second_ctx);
+        assert_eq!(first_store, second_store);
+        assert_eq!(first_store, roots().unwrap().as_ptr());
     }
 
     #[tokio::test]
@@ -1959,10 +1991,24 @@ mod tests {
         let (conn, _, _, key) = connector(&config, true).unwrap();
         let root_ptr = foreign_types_shared::ForeignTypeRef::as_ptr(conn.context().cert_store());
         let key = key.unwrap();
-        assert!(CONTEXTS.get().unwrap().lock().unwrap().contains_key(&key));
+        assert!(
+            CONTEXTS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(&key.context)
+        );
 
         clear_caches();
-        assert!(!CONTEXTS.get().unwrap().lock().unwrap().contains_key(&key));
+        assert!(
+            !CONTEXTS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(&key.context)
+        );
         assert!(take_session(&key).is_none());
 
         let (conn2, ..) = connector(&config, true).unwrap();

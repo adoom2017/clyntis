@@ -1898,6 +1898,7 @@ impl Core {
         }
         self.mitm.relieve_memory();
         self.requests.relieve_memory();
+        self.scripts.relieve_memory();
         if include_network {
             self.resolver.clear_cache();
             clyntis_protocol::tls::clear_caches();

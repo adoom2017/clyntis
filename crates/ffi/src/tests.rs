@@ -1079,3 +1079,66 @@ fn traffic_details_is_separate_from_snapshot_and_supports_host_filter() {
 
     assert_eq!(meta_destroy_v1(id), OK);
 }
+
+#[test]
+fn buffer_too_small_retry_reuses_cached_output_once_and_clears_after() {
+    let mut length = 0;
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        unsafe { meta_mitm_generate_ca_v1(tiny.as_mut_ptr(), tiny.len(), &mut length) },
+        BUFFER_TOO_SMALL
+    );
+    assert!(length > tiny.len());
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_some()));
+
+    // Immediate retry with sufficient capacity consumes the exact cached output
+    // without generating a second random CA, and clears the thread-local cache.
+    let mut out = vec![0u8; length];
+    assert_eq!(
+        unsafe { meta_mitm_generate_ca_v1(out.as_mut_ptr(), out.len(), &mut length) },
+        OK
+    );
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_none()));
+    let ca: serde_json::Value = serde_json::from_slice(&out[..length]).unwrap();
+    assert!(ca["cert"].as_str().is_some_and(|s| !s.is_empty()));
+
+    assert_eq!(
+        unsafe { meta_mitm_generate_ca_v1(tiny.as_mut_ptr(), tiny.len(), &mut length) },
+        BUFFER_TOO_SMALL
+    );
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_some()));
+    meta_discard_pending_output_v1();
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_none()));
+
+    // An unconsumed pending buffer is also cleared if another FFI call intervenes.
+    assert_eq!(
+        unsafe { meta_mitm_generate_ca_v1(tiny.as_mut_ptr(), tiny.len(), &mut length) },
+        BUFFER_TOO_SMALL
+    );
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_some()));
+    let rule = b"DOMAIN,example.com,DIRECT";
+    assert_eq!(
+        unsafe { meta_custom_rule_validate_v1(rule.as_ptr(), rule.len()) },
+        OK
+    );
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_none()));
+}
+
+#[test]
+fn output_above_the_retry_cache_limit_still_reports_its_length() {
+    let mut length = 0;
+    let mut tiny = [0u8; 8];
+    let status = boundary(|| unsafe {
+        cached_output(
+            (3, 1, 0, 0),
+            SNAPSHOT_CACHE_LIMIT,
+            tiny.as_mut_ptr(),
+            tiny.len(),
+            &mut length,
+            || Ok(vec![0; SNAPSHOT_CACHE_LIMIT + 1]),
+        )
+    });
+    assert_eq!(status, BUFFER_TOO_SMALL);
+    assert_eq!(length, SNAPSHOT_CACHE_LIMIT + 1);
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_none()));
+}

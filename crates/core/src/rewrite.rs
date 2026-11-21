@@ -1353,7 +1353,9 @@ impl Rewriter {
         let mut cache = self.compiled.cache.lock().unwrap();
         cache.global = None;
         cache.hosts.clear();
+        cache.hosts.shrink_to_fit();
         cache.rule_extras.clear();
+        cache.rule_extras.shrink_to_fit();
     }
 
     /// The rules of `phase` that match `url`, in module order.
@@ -2296,7 +2298,7 @@ http-response-jq ^https://a\.test/feed 'del(.list[].ad, .banner)'
             br#"{"list":[{"ad":true,"id":1}],"banner":{"x":1},"keep":"\"ad\":true"}"#.to_vec();
         for rule_idx in &body_rules {
             match rewriter.jq(*rule_idx) {
-                Some(filter) => body = filter.apply(body, None).await.unwrap(),
+                Some(filter) => body = filter.apply(Arc::new(body), None).await.unwrap(),
                 None => assert!(apply_body(&rewriter, *rule_idx, &mut body)),
             }
         }
@@ -2543,7 +2545,7 @@ hostname = a.test
         let jq_out = rewriter
             .jq(3)
             .unwrap()
-            .apply(br#"{"drop":false}"#.to_vec(), None)
+            .apply(Arc::new(br#"{"drop":false}"#.to_vec()), None)
             .await
             .unwrap();
         assert_eq!(jq_out, br#"{"drop":true}"#);
@@ -2726,7 +2728,7 @@ response if ${url} ~= /^https:\/\/.*\/jq$/ then response.json.jq(`.drop |= not`)
 
         let filter = rewriter.jq_with(8, false, None).expect("cached jq filter");
         let jq_out = filter
-            .apply(br#"{"drop":false}"#.to_vec(), None)
+            .apply(Arc::new(br#"{"drop":false}"#.to_vec()), None)
             .await
             .unwrap();
         assert_eq!(jq_out, br#"{"drop":true}"#);
@@ -2970,7 +2972,7 @@ response if ${url} ~= /^https:\/\/a\.test\/simple$/ then response.header.delete(
         let filter = rewriter
             .jq_with(6, false, Some(&pinned_resp))
             .expect("pinned jq filter");
-        let jq_out = filter.apply(resp_body, None).await.unwrap();
+        let jq_out = filter.apply(Arc::new(resp_body), None).await.unwrap();
         assert_eq!(jq_out, br#"{"drop":true,"tag":"ok"}"#);
 
         match answer_with(

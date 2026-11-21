@@ -106,17 +106,20 @@ format. For building and running, see the [README](README.md).
   pressure use the usual route without inspection, while already-open
   connections reuse already-compiled rewrite rules and skip uncached rules
   without recompiling them. Image, audio, and video bodies are forwarded as
-  usual but omitted from the iOS request log. Only body-buffering rewrites and
-  scripts (`requires-body=1`) share the single hosted body-rewrite slot
-  (released as soon as a buffered body is sent or an oversized body starts
-  streaming); when it is busy, those actions are skipped without delaying
-  other requests, while `requires-body=0` scripts still run through the script
-  queue unless paused under memory pressure. Local rewrite and script response
-  bodies share the 2 MiB hosted body budget and release it once sent; if the
-  budget cannot hold a local response, the original request is forwarded
-  instead. iOS HAR export caps serialized output at 2 MiB. It omits bodies
-  that do not fit and, if metadata alone exceeds the limit, prioritizes recent
-  entries and notes that records were omitted.
+  usual but omitted from the iOS request log, and kept headers/URLs in the iOS
+  request log are bounded to 2 MiB total (with decompressed detail bodies
+  capped at 512 KiB). Only body-buffering rewrites and scripts
+  (`requires-body=1`) share the single hosted body-rewrite slot (up to 512 KiB
+  per body, released as soon as a buffered body is sent or an oversized body
+  starts streaming); when it is busy, those actions are skipped without
+  delaying other requests, while `requires-body=0` scripts still run through
+  the script queue (4 MiB JS heap, 1 MiB source and `$httpClient` response
+  limits on iOS) unless paused under memory pressure. Local rewrite and script
+  response bodies share the 2 MiB hosted body budget and release it once sent;
+  if the budget cannot hold a local response, the original request is forwarded
+  instead. iOS HAR and CSV exports cap serialized output at 2 MiB. HAR export
+  omits bodies that do not fit and, if metadata alone exceeds the limit,
+  prioritizes recent entries and notes that records were omitted.
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the
   key private and turn decryption off when not analyzing.

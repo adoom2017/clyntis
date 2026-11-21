@@ -21,7 +21,17 @@ pub const ERROR: i32 = 1;
 pub const WOULD_BLOCK: i32 = 2;
 pub const BUFFER_TOO_SMALL: i32 = 3;
 const LIMIT: usize = 16 * 1024 * 1024;
-thread_local! { static ERROR_TEXT: RefCell<String> = const { RefCell::new(String::new()) }; }
+const SNAPSHOT_CACHE_LIMIT: usize = 1024 * 1024;
+const REQUEST_CACHE_LIMIT: usize = 4 * 1024 * 1024;
+struct PendingOutput {
+    key: (u8, u64, u64, u64),
+    bytes: Vec<u8>,
+}
+thread_local! {
+    static ERROR_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
+    static PENDING_OUTPUT: RefCell<Option<PendingOutput>> = const { RefCell::new(None) };
+    static CURRENT_PENDING: RefCell<Option<PendingOutput>> = const { RefCell::new(None) };
+}
 static HANDLES: OnceLock<Mutex<std::collections::HashMap<u64, Arc<Handle>>>> = OnceLock::new();
 static NEXT: AtomicU64 = AtomicU64::new(1);
 fn handles() -> &'static Mutex<std::collections::HashMap<u64, Arc<Handle>>> {
@@ -36,13 +46,26 @@ fn handle(id: u64) -> Result<Arc<Handle>> {
         .context("invalid or destroyed core handle")
 }
 fn boundary(operation: impl FnOnce() -> Result<i32>) -> i32 {
+    struct PendingGuard;
+    impl Drop for PendingGuard {
+        fn drop(&mut self) {
+            CURRENT_PENDING.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    PENDING_OUTPUT.with(|pending| {
+        let taken = pending.borrow_mut().take();
+        CURRENT_PENDING.with(|current| *current.borrow_mut() = taken);
+    });
+    let _guard = PendingGuard;
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
+            PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = None);
             ERROR_TEXT.with(|text| *text.borrow_mut() = format!("{error:#}"));
             ERROR
         }
         Err(_) => {
+            PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = None);
             ERROR_TEXT.with(|text| *text.borrow_mut() = "panic contained at C ABI boundary".into());
             ERROR
         }
@@ -85,6 +108,51 @@ unsafe fn output(
         }
     }
     Ok(OK)
+}
+unsafe fn cached_output(
+    key: (u8, u64, u64, u64),
+    cache_limit: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+    produce: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<i32> {
+    ensure!(!length.is_null(), "output length is required");
+    let cached = CURRENT_PENDING.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|p| p.key == key && capacity >= p.bytes.len())
+        {
+            slot.take().map(|p| p.bytes)
+        } else {
+            *slot = None;
+            None
+        }
+    });
+    let bytes = match cached {
+        Some(bytes) => bytes,
+        None => produce()?,
+    };
+    if capacity < bytes.len() {
+        let len = bytes.len();
+        if len <= cache_limit {
+            PENDING_OUTPUT.with(|slot| {
+                *slot.borrow_mut() = Some(PendingOutput { key, bytes });
+            });
+        }
+        unsafe {
+            *length = len;
+        }
+        return Ok(BUFFER_TOO_SMALL);
+    }
+    unsafe { output(&bytes, buffer, capacity, length) }
+}
+fn bytes_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn meta_abi_version_v1() -> u32 {
@@ -241,11 +309,18 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
     length: *mut usize,
 ) -> i32 {
     boundary(|| {
-        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
-        let rules: Vec<String> = serde_json::from_slice(unsafe { input(rules, rules_len)? })?;
-        let applied = clyntis_config::custom::apply(yaml, &rules)?;
-        let value = serde_json::json!({"yaml": applied.yaml, "skipped": applied.skipped});
-        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+        let yaml_bytes = unsafe { input(config, len)? };
+        let rules_bytes = unsafe { input(rules, rules_len)? };
+        let key = (1, bytes_hash(yaml_bytes), bytes_hash(rules_bytes), 0);
+        unsafe {
+            cached_output(key, LIMIT, buffer, capacity, length, || {
+                let yaml = std::str::from_utf8(yaml_bytes)?;
+                let rules: Vec<String> = serde_json::from_slice(rules_bytes)?;
+                let applied = clyntis_config::custom::apply(yaml, &rules)?;
+                let value = serde_json::json!({"yaml": applied.yaml, "skipped": applied.skipped});
+                Ok(serde_json::to_vec(&value)?)
+            })
+        }
     })
 }
 
@@ -266,11 +341,17 @@ pub unsafe extern "C" fn meta_overrides_apply_v1(
     length: *mut usize,
 ) -> i32 {
     boundary(|| {
-        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
-        let overrides: clyntis_config::overrides::Overrides =
-            serde_json::from_slice(unsafe { input(overrides, overrides_len)? })?;
-        let yaml = overrides.apply(yaml)?;
-        unsafe { output(yaml.as_bytes(), buffer, capacity, length) }
+        let yaml_bytes = unsafe { input(config, len)? };
+        let overrides_bytes = unsafe { input(overrides, overrides_len)? };
+        let key = (2, bytes_hash(yaml_bytes), bytes_hash(overrides_bytes), 0);
+        unsafe {
+            cached_output(key, LIMIT, buffer, capacity, length, || {
+                let yaml = std::str::from_utf8(yaml_bytes)?;
+                let overrides: clyntis_config::overrides::Overrides =
+                    serde_json::from_slice(overrides_bytes)?;
+                Ok(overrides.apply(yaml)?.into_bytes())
+            })
+        }
     })
 }
 
@@ -399,6 +480,7 @@ pub unsafe extern "C" fn meta_prefetch_resources_v1(
         );
         config.directory = path;
         config.tun.enable = false;
+        config.internal_host_packet_io = cfg!(target_os = "ios");
         let core =
             clyntis_core::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks))?;
         // Current files were validated when they were downloaded, and the
@@ -417,8 +499,8 @@ pub unsafe extern "C" fn meta_prefetch_resources_v1(
 
 /// Report whether the routing files `config` references exist in `directory`
 /// and are within their update intervals: `state` receives 0 (current),
-/// 1 (present but expired: usable, refresh when convenient) or 2 (missing:
-/// fetched after connecting). Cheap; parses no geo data.
+/// 1 (present but expired: usable, refresh when convenient) or 2 (missing or
+/// unusable: fetched after connecting). Cheap; parses no geo data.
 ///
 /// # Safety
 /// `data` and `directory` must be readable for their lengths; `state` writable.
@@ -437,6 +519,7 @@ pub unsafe extern "C" fn meta_resources_state_v1(
             input(directory, directory_len)?
         })?);
         config.tun.enable = false;
+        config.internal_host_packet_io = cfg!(target_os = "ios");
         let core =
             clyntis_core::Core::new(config, std::sync::Arc::new(clyntis_platform::DefaultHooks))?;
         let value = match core.resource_freshness()? {
@@ -596,6 +679,13 @@ pub unsafe extern "C" fn meta_error_v1(
             .with(|text| unsafe { output(text.borrow().as_bytes(), buffer, capacity, length) })
     })
 }
+
+/// Discards an unconsumed caller-buffer result on the calling thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn meta_discard_pending_output_v1() {
+    PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = None);
+}
+
 const TRAFFIC_DETAILS_JSON_CAP: usize = 512 * 1024;
 
 /// # Safety
@@ -607,10 +697,47 @@ pub unsafe extern "C" fn meta_snapshot_v1(
     capacity: usize,
     length: *mut usize,
 ) -> i32 {
+    #[derive(serde::Serialize)]
+    struct Snapshot {
+        config: serde_json::Value,
+        selections: std::collections::HashMap<String, String>,
+        connections: Vec<clyntis_core::Connection>,
+        proxies: serde_json::Map<String, serde_json::Value>,
+        adblock: serde_json::Value,
+        rewrite: serde_json::Value,
+        network: serde_json::Value,
+        mitm: serde_json::Value,
+        upload: u64,
+        download: u64,
+        stopped: bool,
+    }
     boundary(|| {
         let handle = handle(id)?;
-        let value = serde_json::json!({"config":handle.core.configuration(), "selections":handle.core.selections(), "connections":handle.core.connections(), "proxies":handle.core.proxy_status(), "adblock":handle.core.adblock_status(), "rewrite":handle.core.rewrite_status(), "network":handle.core.network_status(), "mitm":handle.core.mitm_status(), "upload":handle.core.upload.load(Ordering::Relaxed), "download":handle.core.download.load(Ordering::Relaxed), "stopped":handle.core.stop.is_cancelled()});
-        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+        unsafe {
+            cached_output(
+                (3, id, 0, 0),
+                SNAPSHOT_CACHE_LIMIT,
+                buffer,
+                capacity,
+                length,
+                || {
+                    let snapshot = Snapshot {
+                        config: handle.core.configuration(),
+                        selections: handle.core.selections(),
+                        connections: handle.core.connections(),
+                        proxies: handle.core.proxy_status(),
+                        adblock: handle.core.adblock_status(),
+                        rewrite: handle.core.rewrite_status(),
+                        network: handle.core.network_status(),
+                        mitm: handle.core.mitm_status(),
+                        upload: handle.core.upload.load(Ordering::Relaxed),
+                        download: handle.core.download.load(Ordering::Relaxed),
+                        stopped: handle.core.stop.is_cancelled(),
+                    };
+                    Ok(serde_json::to_vec(&snapshot)?)
+                },
+            )
+        }
     })
 }
 /// Traffic breakdown by destination host and connection, as UTF-8 JSON.
@@ -630,13 +757,26 @@ pub unsafe extern "C" fn meta_traffic_details_v1(
     length: *mut usize,
 ) -> i32 {
     boundary(|| {
-        let host = std::str::from_utf8(unsafe { input_with_limit(host, host_len, 4096)? })?;
+        let host_bytes = unsafe { input_with_limit(host, host_len, 4096)? };
+        let host = std::str::from_utf8(host_bytes)?;
         let host = (!host.trim().is_empty()).then_some(host);
-        let bytes = handle(id)?
-            .core
-            .traffic_details(host)
-            .to_capped_json_vec(TRAFFIC_DETAILS_JSON_CAP)?;
-        unsafe { output(&bytes, buffer, capacity, length) }
+        let handle = handle(id)?;
+        let key = (4, id, bytes_hash(host_bytes), 0);
+        unsafe {
+            cached_output(
+                key,
+                TRAFFIC_DETAILS_JSON_CAP,
+                buffer,
+                capacity,
+                length,
+                || {
+                    Ok(handle
+                        .core
+                        .traffic_details(host)
+                        .to_capped_json_vec(TRAFFIC_DETAILS_JSON_CAP)?)
+                },
+            )
+        }
     })
 }
 /// The few figures a host checks periodically, as JSON: `stopped`,
@@ -664,6 +804,21 @@ pub unsafe extern "C" fn meta_status_v1(
         unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
     })
 }
+
+/// Reads whether the core configuration enables IPv6.
+///
+/// # Safety
+/// `enabled` must be writable for one `u32`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_config_ipv6_v1(id: u64, enabled: *mut u32) -> i32 {
+    boundary(|| {
+        ensure!(!enabled.is_null(), "IPv6 flag output is required");
+        let handle = handle(id)?;
+        unsafe { enabled.write(u32::from(handle.core.config.ipv6)) };
+        Ok(OK)
+    })
+}
+
 /// # Safety
 /// Data must be readable for len bytes and contain UTF-8 JSON.
 #[unsafe(no_mangle)]
@@ -715,13 +870,23 @@ pub unsafe extern "C" fn meta_requests_v1(
     capacity: usize,
     length: *mut usize,
 ) -> i32 {
+    #[derive(serde::Serialize)]
+    struct RequestsPage {
+        requests: Vec<clyntis_core::requests::Request>,
+        next: u64,
+    }
     boundary(|| {
-        let (requests, next) = handle(id)?
-            .core
-            .requests
-            .list(after, limit.clamp(1, 5000) as usize);
-        let value = serde_json::json!({"requests": requests, "next": next});
-        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+        let handle = handle(id)?;
+        let key = (5, id, after, u64::from(limit));
+        unsafe {
+            cached_output(key, REQUEST_CACHE_LIMIT, buffer, capacity, length, || {
+                let (requests, next) = handle
+                    .core
+                    .requests
+                    .list(after, limit.clamp(1, 5000) as usize);
+                Ok(serde_json::to_vec(&RequestsPage { requests, next })?)
+            })
+        }
     })
 }
 /// One request log entry with headers and bodies, as JSON.
@@ -737,12 +902,17 @@ pub unsafe extern "C" fn meta_request_detail_v1(
     length: *mut usize,
 ) -> i32 {
     boundary(|| {
-        let value = handle(id)?
-            .core
-            .requests
-            .detail(request)
-            .context("request not found")?;
-        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+        let handle = handle(id)?;
+        let key = (6, id, request, 0);
+        unsafe {
+            cached_output(key, REQUEST_CACHE_LIMIT, buffer, capacity, length, || {
+                handle
+                    .core
+                    .requests
+                    .detail_json(request)
+                    .context("request not found")
+            })
+        }
     })
 }
 /// The request log as a file: `format` 0 writes HAR (HTTP requests with
@@ -759,13 +929,19 @@ pub unsafe extern "C" fn meta_requests_export_v1(
     length: *mut usize,
 ) -> i32 {
     boundary(|| {
-        let requests = &handle(id)?.core.requests;
-        let bytes = match format {
-            0 => requests.export_har_json()?,
-            1 => requests.export_csv().into_bytes(),
-            _ => anyhow::bail!("unknown export format"),
-        };
-        unsafe { output(&bytes, buffer, capacity, length) }
+        let handle = handle(id)?;
+        let key = (7, id, u64::from(format), 0);
+        unsafe {
+            cached_output(key, LIMIT, buffer, capacity, length, || {
+                let requests = &handle.core.requests;
+                let bytes = match format {
+                    0 => requests.export_har_json()?,
+                    1 => requests.export_csv().into_bytes(),
+                    _ => anyhow::bail!("unknown export format"),
+                };
+                Ok(bytes)
+            })
+        }
     })
 }
 #[unsafe(no_mangle)]
@@ -793,10 +969,19 @@ pub unsafe extern "C" fn meta_mitm_generate_ca_v1(
     capacity: usize,
     length: *mut usize,
 ) -> i32 {
-    boundary(|| {
-        let (cert, key) = clyntis_core::generate_authority()?;
-        let value = serde_json::json!({"cert": cert, "key": key});
-        unsafe { output(&serde_json::to_vec(&value)?, buffer, capacity, length) }
+    boundary(|| unsafe {
+        cached_output(
+            (8, 0, 0, 0),
+            SNAPSHOT_CACHE_LIMIT,
+            buffer,
+            capacity,
+            length,
+            || {
+                let (cert, key) = clyntis_core::generate_authority()?;
+                let value = serde_json::json!({"cert": cert, "key": key});
+                Ok(serde_json::to_vec(&value)?)
+            },
+        )
     })
 }
 /// Checks a CA (`json`: `{"cert": PEM, "key": PEM}`) and writes JSON with

@@ -47,7 +47,7 @@ final class CoreSession {
         case current = 0
         /// Present but past an update interval: usable, refresh when convenient.
         case expired = 1
-        /// Missing files are fetched asynchronously after connecting.
+        /// Missing or unusable files are fetched asynchronously after connecting.
         case missing = 2
     }
 
@@ -173,8 +173,9 @@ final class CoreSession {
     /// Top-level `ipv6` of the running configuration; the tunnel routes IPv6
     /// only when it is enabled.
     func enablesIPv6() throws -> Bool {
-        let state = try JSONSerialization.jsonObject(with: snapshot()) as? [String: Any]
-        return (state?["config"] as? [String: Any])?["ipv6"] as? Bool ?? false
+        var enabled: UInt32 = 0
+        try Self.check(meta_config_ipv6_v1(handle, &enabled))
+        return enabled != 0
     }
 
     func snapshot() throws -> Data {
@@ -332,10 +333,12 @@ final class CoreSession {
             }
             if result == META_OK { return data.prefix(length) }
             guard result == META_BUFFER_TOO_SMALL, length > 0, length <= limit else {
+                meta_discard_pending_output_v1()
                 throw ClientError.message(L("无法读取内核结果。"))
             }
             data = Data(count: length)
         }
+        meta_discard_pending_output_v1()
         throw ClientError.message(L("内核结果变化过快，请重试。"))
     }
 }

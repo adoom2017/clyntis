@@ -27,24 +27,33 @@ pub(crate) struct Limits {
     pub(crate) body_bytes: usize,
     /// One body; the rest of a longer body is counted but not kept.
     pub(crate) body_cap: usize,
+    /// All kept headers and URLs together (0 disables).
+    pub(crate) header_bytes: usize,
+    /// Decoded body cap for the detail view.
+    pub(crate) decoded_cap: u64,
 }
 const DESKTOP: Limits = Limits {
     entries: 5000,
     body_bytes: 64 << 20,
     body_cap: 2 << 20,
+    header_bytes: 0,
+    decoded_cap: DECODED_CAP,
 };
 /// The iOS tunnel lives within about 50 MiB.
 const HOSTED: Limits = Limits {
     entries: 500,
     body_bytes: 1 << 20,
     body_cap: 128 << 10,
+    header_bytes: 2 << 20,
+    decoded_cap: HOSTED_DECODED_CAP,
 };
 // Leave space for in-flight exchanges even when the log fills its share.
 pub(crate) const HOSTED_CAPTURE_BYTES: usize = 2 << 20;
-/// Whole-export byte limit for hosted/iOS HAR export.
+/// Whole-export byte limit for hosted/iOS HAR and CSV exports.
 pub(crate) const HOSTED_HAR_BYTES: usize = 2 << 20;
 /// A decoded body shown to the apps stops here.
 const DECODED_CAP: u64 = 4 << 20;
+pub(crate) const HOSTED_DECODED_CAP: u64 = 512 << 10;
 const TRUNCATED_BODY_COMMENT: &str = "truncated: only the beginning was kept";
 const OMITTED_BODY_COMMENT: &str = "omitted: export size limit reached";
 const HAR_LOG_PREFIX_START: &str =
@@ -185,6 +194,17 @@ impl Entry {
             d.request_body.bytes.capacity() + d.response_body.bytes.capacity()
         })
     }
+    fn header_bytes(&self) -> usize {
+        let url_bytes = self.summary.http.as_ref().map_or(0, |h| h.url.capacity());
+        let headers = self.detail.as_ref().map_or(0, |d| {
+            d.request_headers
+                .iter()
+                .chain(&d.response_headers)
+                .map(|(k, v)| k.capacity() + v.capacity())
+                .sum::<usize>()
+        });
+        url_bytes + headers
+    }
 }
 
 #[derive(Default)]
@@ -192,6 +212,7 @@ struct Log {
     entries: VecDeque<Arc<Entry>>,
     next: u64,
     body_bytes: usize,
+    header_bytes: usize,
 }
 
 pub struct Requests {
@@ -285,23 +306,29 @@ impl Requests {
         log.body_bytes = 0;
     }
     fn push(&self, mut summary: Request, mut detail: Option<HttpDetail>) {
-        if self.capture_budget.is_none()
-            && let Some(detail) = &mut detail
-        {
-            detail.request_body.bytes.shrink_to_fit();
-            detail.response_body.bytes.shrink_to_fit();
+        if let Some(detail) = &mut detail {
+            detail.request_headers.shrink_to_fit();
+            detail.response_headers.shrink_to_fit();
+            if self.capture_budget.is_none() {
+                detail.request_body.bytes.shrink_to_fit();
+                detail.response_body.bytes.shrink_to_fit();
+            }
         }
         let mut log = self.log.lock().unwrap();
         log.next += 1;
         summary.id = log.next;
         let entry = Arc::new(Entry { summary, detail });
         log.body_bytes += entry.body_bytes();
+        log.header_bytes += entry.header_bytes();
         log.entries.push_back(entry);
         while log.entries.len() > self.limits.entries
-            || (log.body_bytes > self.limits.body_bytes && log.entries.len() > 1)
+            || ((log.body_bytes > self.limits.body_bytes
+                || (self.limits.header_bytes > 0 && log.header_bytes > self.limits.header_bytes))
+                && log.entries.len() > 1)
         {
             if let Some(old) = log.entries.pop_front() {
                 log.body_bytes -= old.body_bytes();
+                log.header_bytes -= old.header_bytes();
             }
         }
     }
@@ -411,6 +438,12 @@ impl Requests {
     }
     /// One entry with its headers and bodies (decompressed when possible).
     pub fn detail(&self, id: u64) -> Option<Value> {
+        let bytes = self.detail_json(id)?;
+        serde_json::from_slice(&bytes).ok()
+    }
+    /// Serialized JSON for one entry with its headers and bodies, avoiding an
+    /// intermediate `serde_json::Value` tree.
+    pub fn detail_json(&self, id: u64) -> Option<Vec<u8>> {
         let entry = {
             let log = self.log.lock().unwrap();
             let index = log
@@ -419,17 +452,32 @@ impl Requests {
                 .ok()?;
             log.entries[index].clone()
         };
-        let mut value = serde_json::to_value(&entry.summary).ok()?;
-        if let Some(detail) = &entry.detail {
-            let headers = |list: &[(String, String)]| {
-                list.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>()
-            };
-            value["requestHeaders"] = json!(headers(&detail.request_headers));
-            value["responseHeaders"] = json!(headers(&detail.response_headers));
-            value["requestBody"] = render(&detail.request_body, &detail.request_headers);
-            value["responseBody"] = render(&detail.response_body, &detail.response_headers);
-        }
-        Some(value)
+        let cap = self.limits.decoded_cap;
+        let view = match &entry.detail {
+            Some(detail) => DetailView {
+                summary: &entry.summary,
+                request_headers: Some(HeaderTuples(&detail.request_headers)),
+                response_headers: Some(HeaderTuples(&detail.response_headers)),
+                request_body: Some(render_body_with_cap(
+                    &detail.request_body,
+                    &detail.request_headers,
+                    cap,
+                )),
+                response_body: Some(render_body_with_cap(
+                    &detail.response_body,
+                    &detail.response_headers,
+                    cap,
+                )),
+            },
+            None => DetailView {
+                summary: &entry.summary,
+                request_headers: None,
+                response_headers: None,
+                request_body: None,
+                response_body: None,
+            },
+        };
+        serde_json::to_vec(&view).ok()
     }
     fn snapshot(&self) -> Vec<Arc<Entry>> {
         self.log.lock().unwrap().entries.iter().cloned().collect()
@@ -544,62 +592,110 @@ impl Requests {
             .map_err(serde_json::Error::io)?;
         Ok(out.bytes)
     }
-    /// Every entry, one line each, as CSV with a header line.
+    /// Every entry, one line each, as CSV with a header line. Hosted logs cap
+    /// the whole export at [`HOSTED_HAR_BYTES`], keeping the newest entries.
     pub fn export_csv(&self) -> String {
-        let mut out = String::from(
-            "id,time,kind,network,source,host,port,method,url,status,content_type,rule,chain,upload,download,duration_ms,reason\n",
-        );
-        for entry in self.snapshot() {
-            let r = &entry.summary;
-            let http = r.http.as_ref();
-            let fields = [
-                r.id.to_string(),
-                iso_time(r.time),
-                r.status.clone(),
-                r.network.clone(),
-                r.source.clone(),
-                r.host.clone(),
-                r.port.to_string(),
-                http.map(|h| h.method.clone()).unwrap_or_default(),
-                http.map(|h| h.url.clone()).unwrap_or_default(),
-                http.and_then(|h| h.status)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-                http.and_then(|h| h.content_type.clone())
-                    .unwrap_or_default(),
-                r.rule.clone(),
-                r.chain.clone(),
-                r.upload.to_string(),
-                r.download.to_string(),
-                r.duration.to_string(),
-                http.and_then(|h| h.error.clone())
-                    .or_else(|| r.reason.clone())
-                    .unwrap_or_default(),
-            ];
-            let line: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
-            out.push_str(&line.join(","));
-            out.push('\n');
+        self.export_csv_with_limit(self.capture_budget.is_some().then_some(HOSTED_HAR_BYTES))
+    }
+    pub(crate) fn export_csv_with_limit(&self, limit: Option<usize>) -> String {
+        const HEADER: &str = "id,time,kind,network,source,host,port,method,url,status,content_type,rule,chain,upload,download,duration_ms,reason\n";
+        let snapshot = self.snapshot();
+        let Some(max) = limit else {
+            let mut out = String::from(HEADER);
+            for entry in &snapshot {
+                write_csv_row(&entry.summary, &mut out);
+            }
+            return out;
+        };
+        if max < HEADER.len() {
+            return String::new();
+        }
+        let mut rows: Vec<String> = Vec::with_capacity(snapshot.len());
+        let mut total = HEADER.len();
+        for entry in snapshot.iter().rev() {
+            let mut row = String::new();
+            write_csv_row(&entry.summary, &mut row);
+            if total + row.len() > max {
+                break;
+            }
+            total += row.len();
+            rows.push(row);
+        }
+        let mut out = String::with_capacity(total);
+        out.push_str(HEADER);
+        for row in rows.iter().rev() {
+            out.push_str(row);
         }
         out
     }
     pub fn clear(&self) {
         let mut log = self.log.lock().unwrap();
         log.entries.clear();
+        log.entries.shrink_to_fit();
         log.body_bytes = 0;
+        log.header_bytes = 0;
     }
 }
 
-fn csv_field(value: &str) -> String {
+fn write_csv_row(r: &Request, out: &mut String) {
+    use std::fmt::Write;
+    let http = r.http.as_ref();
+    let _ = write!(out, "{},{},", r.id, iso_time(r.time));
+    push_csv_field(out, &r.status);
+    out.push(',');
+    push_csv_field(out, &r.network);
+    out.push(',');
+    push_csv_field(out, &r.source);
+    out.push(',');
+    push_csv_field(out, &r.host);
+    let _ = write!(out, ",{},", r.port);
+    push_csv_field(out, http.map_or("", |h| h.method.as_str()));
+    out.push(',');
+    push_csv_field(out, http.map_or("", |h| h.url.as_str()));
+    out.push(',');
+    if let Some(status) = http.and_then(|h| h.status) {
+        let _ = write!(out, "{status}");
+    }
+    out.push(',');
+    push_csv_field(
+        out,
+        http.and_then(|h| h.content_type.as_deref()).unwrap_or(""),
+    );
+    out.push(',');
+    push_csv_field(out, &r.rule);
+    out.push(',');
+    push_csv_field(out, &r.chain);
+    let _ = write!(out, ",{},{},{},", r.upload, r.download, r.duration);
+    let reason = http
+        .and_then(|h| h.error.as_deref())
+        .or(r.reason.as_deref())
+        .unwrap_or("");
+    push_csv_field(out, reason);
+    out.push('\n');
+}
+
+fn push_csv_field(out: &mut String, value: &str) {
     // A leading =, +, - or @ would run as a formula in a spreadsheet.
-    let value = if value.starts_with(['=', '+', '-', '@']) {
-        format!("'{value}")
+    let prefix_quote = value.starts_with(['=', '+', '-', '@']);
+    let needs_quotes = value.contains([',', '"', '\n', '\r']);
+    if needs_quotes {
+        out.push('"');
+        if prefix_quote {
+            out.push('\'');
+        }
+        for ch in value.chars() {
+            if ch == '"' {
+                out.push_str("\"\"");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('"');
     } else {
-        value.to_owned()
-    };
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value
+        if prefix_quote {
+            out.push('\'');
+        }
+        out.push_str(value);
     }
 }
 
@@ -1142,22 +1238,81 @@ fn render_bytes<'a>(bytes: Cow<'a, [u8]>, headers: &[(String, String)]) -> Rende
     }
 }
 
+struct HeaderTuples<'a>(&'a [(String, String)]);
+
+impl Serialize for HeaderTuples<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for (name, value) in self.0 {
+            seq.serialize_element(&(name.as_str(), value.as_str()))?;
+        }
+        seq.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderedBody<'a> {
+    size: u64,
+    truncated: bool,
+    decoded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base64: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DetailView<'a> {
+    #[serde(flatten)]
+    summary: &'a Request,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_headers: Option<HeaderTuples<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_headers: Option<HeaderTuples<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body: Option<RenderedBody<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_body: Option<RenderedBody<'a>>,
+}
+
+fn render_body_with_cap<'a>(
+    body: &'a Body,
+    headers: &'a [(String, String)],
+    decoded_cap: u64,
+) -> RenderedBody<'a> {
+    let mut decode_truncated = false;
+    let (bytes, decoded) = if !body.bytes.is_empty()
+        && let Some(encoding) = header(headers, "content-encoding")
+        && let Some(mut plain) = decode_with(encoding, &body.bytes, decoded_cap + 1)
+    {
+        if plain.len() as u64 > decoded_cap {
+            plain.truncate(decoded_cap as usize);
+            decode_truncated = true;
+        }
+        (Cow::Owned(plain), true)
+    } else {
+        (Cow::Borrowed(body.bytes.as_slice()), false)
+    };
+    let (text, base64) = match render_bytes(bytes, headers) {
+        RenderedText::Text(text) => (Some(text), None),
+        RenderedText::Base64(data) => (None, Some(data)),
+    };
+    RenderedBody {
+        size: body.size,
+        truncated: body.truncated() || decode_truncated,
+        decoded,
+        text,
+        base64,
+    }
+}
+
 /// A body for the apps: decompressed per Content-Encoding, then as text when
 /// it reads as text, else base64.
 fn render(body: &Body, headers: &[(String, String)]) -> Value {
-    let (DecodedBody::Bytes(bytes), decoded) = decode_body(body, headers, None) else {
-        unreachable!("unbounded decode cannot exceed limit");
-    };
-    let mut value = json!({
-        "size": body.size,
-        "truncated": body.truncated(),
-        "decoded": decoded,
-    });
-    match render_bytes(bytes, headers) {
-        RenderedText::Text(text) => value["text"] = json!(text),
-        RenderedText::Base64(data) => value["base64"] = json!(data),
-    }
-    value
+    serde_json::to_value(render_body_with_cap(body, headers, DECODED_CAP))
+        .expect("RenderedBody must serialize")
 }
 
 /// The whole decoded body, or `None` when a coding is unknown, the data is
@@ -1231,6 +1386,8 @@ mod tests {
                 entries: 3,
                 body_bytes: 10,
                 body_cap: 8,
+                header_bytes: 0,
+                decoded_cap: DECODED_CAP,
             },
             capture_budget: None,
         };
@@ -1898,5 +2055,71 @@ mod tests {
         let streamed: Value =
             serde_json::from_slice(&requests.export_har_with_limit(None).unwrap()).unwrap();
         assert_eq!(streamed, har);
+    }
+
+    #[test]
+    fn hosted_header_budget_decoded_cap_and_csv_limit_bound_memory() {
+        let requests = Requests::new(true);
+
+        // 1. Hosted detail view caps decompressed bodies at HOSTED_DECODED_CAP (512 KiB)
+        // and marks the body truncated rather than expanding up to 4 MiB.
+        let huge_plain = vec![b'z'; (HOSTED_DECODED_CAP as usize) + 128 * 1024];
+        let compressed = gzip_compress(&huge_plain);
+        assert!(compressed.len() < HOSTED.body_cap);
+        push_http_exchange(
+            &requests,
+            "bomb.test",
+            "GET",
+            "https://bomb.test/gzip",
+            200,
+            vec![("Host", "bomb.test")],
+            b"",
+            vec![("Content-Type", "text/plain"), ("Content-Encoding", "gzip")],
+            &compressed,
+        );
+        let id = requests.list(0, 10).0[0].id;
+        let detail = requests.detail(id).unwrap();
+        let resp_body = &detail["responseBody"];
+        assert_eq!(resp_body["decoded"], true);
+        assert_eq!(resp_body["truncated"], true);
+        assert_eq!(
+            resp_body["text"].as_str().unwrap().len(),
+            HOSTED_DECODED_CAP as usize
+        );
+
+        // 2. Hosted header budget (2 MiB) evicts older entries with large headers
+        // even when entry count (< 500) and body bytes (0) are small.
+        requests.clear();
+        let large_header_val = "h".repeat(32 * 1024);
+        for i in 0..80 {
+            push_http_exchange(
+                &requests,
+                &format!("hdr{i}.test"),
+                "GET",
+                &format!("https://hdr{i}.test/path"),
+                200,
+                vec![("Host", "hdr.test"), ("X-Huge-Req", &large_header_val)],
+                b"",
+                vec![("X-Huge-Resp", &large_header_val)],
+                b"",
+            );
+        }
+        let log_guard = requests.log.lock().unwrap();
+        assert!(
+            log_guard.header_bytes <= HOSTED.header_bytes,
+            "header_bytes {} exceeded {}",
+            log_guard.header_bytes,
+            HOSTED.header_bytes
+        );
+        assert!(log_guard.entries.len() < 80);
+        drop(log_guard);
+
+        // 3. Hosted CSV export enforces HOSTED_HAR_BYTES and keeps newest entries in order.
+        let small_csv = requests.export_csv_with_limit(Some(512));
+        assert!(small_csv.len() <= 512, "csv len {}", small_csv.len());
+        let lines: Vec<&str> = small_csv.lines().collect();
+        assert!(lines[0].starts_with("id,time,kind,"));
+        assert!(lines.len() >= 2);
+        assert!(lines.last().unwrap().contains("hdr79.test"));
     }
 }

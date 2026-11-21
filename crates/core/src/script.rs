@@ -19,10 +19,20 @@ use std::{
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const SOURCE_LIMIT: usize = 4 << 20;
+pub(crate) const HOSTED_SOURCE_LIMIT: usize = 1 << 20;
 /// What `$httpClient` responses and stored values may hold.
 const HTTP_BODY_LIMIT: usize = 8 << 20;
+const HOSTED_HTTP_BODY_LIMIT: usize = 1 << 20;
 const STORE_VALUE_LIMIT: usize = 512 << 10;
 const STORE_LIMIT: usize = 4 << 20;
+
+pub(crate) const fn source_limit(hosted: bool) -> usize {
+    if hosted {
+        HOSTED_SOURCE_LIMIT
+    } else {
+        SOURCE_LIMIT
+    }
+}
 
 /// One script run.
 pub(crate) struct Job {
@@ -62,6 +72,9 @@ pub(crate) struct Outcome {
 pub(crate) struct Engine {
     permits: Arc<tokio::sync::Semaphore>,
     memory: usize,
+    stack_size: usize,
+    source_limit: usize,
+    http_body_limit: usize,
     store: Arc<Mutex<Store>>,
 }
 
@@ -116,12 +129,25 @@ impl Engine {
     pub(crate) fn new(directory: &std::path::Path, hosted: bool) -> Self {
         Self {
             permits: tokio::sync::Semaphore::new(if hosted { 1 } else { 4 }).into(),
-            memory: if hosted { 16 << 20 } else { 128 << 20 },
+            memory: if hosted { 4 << 20 } else { 128 << 20 },
+            stack_size: if hosted { 512 << 10 } else { 1 << 20 },
+            source_limit: source_limit(hosted),
+            http_body_limit: if hosted {
+                HOSTED_HTTP_BODY_LIMIT
+            } else {
+                HTTP_BODY_LIMIT
+            },
             store: Arc::new(Mutex::new(Store {
                 path: directory.join("rewrite/store.json"),
                 values: None,
             })),
         }
+    }
+
+    /// Drops the in-memory `$persistentStore` mirror under memory pressure;
+    /// entries are already persisted on disk and reload on the next access.
+    pub(crate) fn relieve_memory(&self) {
+        self.store.lock().unwrap().values = None;
     }
 }
 
@@ -139,17 +165,15 @@ pub(crate) async fn run(
     let core = core.clone();
     let handle = tokio::runtime::Handle::current();
     let deadline = deadline.into_std();
+    let limit = core.scripts.source_limit;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _body_slot = body_slot;
         let mut source = Vec::new();
         std::fs::File::open(&job.path)?
-            .take(SOURCE_LIMIT as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut source)?;
-        anyhow::ensure!(
-            source.len() <= SOURCE_LIMIT,
-            "script source exceeds size limit"
-        );
+        anyhow::ensure!(source.len() <= limit, "script source exceeds size limit");
         let source = String::from_utf8(source)?;
         imp::run(core, handle, job, source, deadline)
     })
@@ -203,13 +227,13 @@ mod imp {
     pub(super) fn run_capture(
         core: Arc<crate::Core>,
         handle: tokio::runtime::Handle,
-        job: Job,
+        mut job: Job,
         source: String,
         deadline: Instant,
     ) -> Result<(Result<Outcome>, Vec<String>)> {
         let runtime = Runtime::new()?;
         runtime.set_memory_limit(core.scripts.memory);
-        runtime.set_max_stack_size(1 << 20);
+        runtime.set_max_stack_size(core.scripts.stack_size);
         runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
         let context = Context::full(&runtime)?;
         let state = Rc::new(RefCell::new(State {
@@ -219,8 +243,8 @@ mod imp {
         let name = job.name.clone();
         let result = (|| -> Result<()> {
             context.with(|ctx| -> Result<()> {
-                install(&ctx, &core, &job, &state)?;
-                exec(&ctx, &source, &name)
+                install(&ctx, &core, &mut job, &state)?;
+                exec_bytes(&ctx, source.into_bytes(), &name)
             })?;
             // The event loop: promise jobs, then `$httpClient` calls and
             // timers in order, until `$done` or nothing is left.
@@ -280,11 +304,12 @@ mod imp {
                                     let body: Value = if call_info.binary {
                                         TypedArray::<u8>::new(ctx.clone(), body)?.into_value()
                                     } else {
-                                        rquickjs::String::from_str(
-                                            ctx.clone(),
-                                            &String::from_utf8_lossy(&body),
-                                        )?
-                                        .into_value()
+                                        let text = match String::from_utf8(body) {
+                                            Ok(s) => s,
+                                            Err(e) => String::from_utf8_lossy(&e.into_bytes())
+                                                .into_owned(),
+                                        };
+                                        rquickjs::String::from_str(ctx.clone(), &text)?.into_value()
                                     };
                                     call(
                                         &ctx,
@@ -368,13 +393,12 @@ mod imp {
         Ok(())
     }
 
-    fn exec(ctx: &Ctx<'_>, source: &str, name: &str) -> Result<()> {
+    fn exec_bytes(ctx: &Ctx<'_>, source: Vec<u8>, name: &str) -> Result<()> {
         // Sloppy mode, as Surge and Loon run scripts: many assign to
         // undeclared variables.
         let mut options = rquickjs::context::EvalOptions::default();
         options.strict = false;
-        let result: rquickjs::Result<Value> =
-            ctx.eval_with_options(source.as_bytes().to_vec(), options);
+        let result: rquickjs::Result<Value> = ctx.eval_with_options(source, options);
         if result.is_err() {
             anyhow::bail!("{name}: {}", describe(&ctx.catch()));
         }
@@ -404,7 +428,7 @@ mod imp {
     fn install<'js>(
         ctx: &Ctx<'js>,
         core: &Arc<crate::Core>,
-        job: &Job,
+        job: &mut Job,
         state: &Rc<RefCell<State>>,
     ) -> Result<()> {
         let globals = ctx.globals();
@@ -484,22 +508,24 @@ mod imp {
             })?,
         )?;
         globals.set("__native", native)?;
-        exec(ctx, PRELUDE, "prelude")?;
+        exec_bytes(ctx, PRELUDE.as_bytes().to_vec(), "prelude")?;
 
         let request = Object::new(ctx.clone())?;
         request.set("url", job.url.as_str())?;
         request.set("method", job.method.as_str())?;
         request.set("headers", headers_object(ctx, &job.request_headers)?)?;
-        if let Some(body) = &job.request_body {
+        job.request_headers = Vec::new();
+        if let Some(body) = job.request_body.take() {
             set_body(ctx, &request, body, job.binary)?;
         }
         globals.set("$request", request)?;
-        if let Some(response) = &job.response {
+        if let Some(mut response) = job.response.take() {
             let object = Object::new(ctx.clone())?;
             object.set("status", response.status)?;
             object.set("statusCode", response.status)?;
             object.set("headers", headers_object(ctx, &response.headers)?)?;
-            if let Some(body) = &response.body {
+            response.headers = Vec::new();
+            if let Some(body) = response.body.take() {
                 set_body(ctx, &object, body, job.binary)?;
             }
             globals.set("$response", object)?;
@@ -541,15 +567,19 @@ mod imp {
     fn set_body<'js>(
         ctx: &Ctx<'js>,
         object: &Object<'js>,
-        body: &[u8],
+        body: Vec<u8>,
         binary: bool,
     ) -> Result<()> {
         if binary {
-            let bytes = TypedArray::<u8>::new(ctx.clone(), body.to_vec())?;
+            let bytes = TypedArray::<u8>::new(ctx.clone(), body)?;
             object.set("bodyBytes", bytes.arraybuffer()?)?;
             object.set("body", bytes)?;
         } else {
-            object.set("body", String::from_utf8_lossy(body).as_ref())?;
+            let text = match String::from_utf8(body) {
+                Ok(s) => s,
+                Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+            };
+            object.set("body", text.as_str())?;
         }
         Ok(())
     }
@@ -735,29 +765,26 @@ mod imp {
             })
             .collect::<Vec<_>>();
         let encoding = crate::rewrite::find(&headers, "content-encoding").map(str::to_owned);
+        let limit = core.scripts.http_body_limit;
         let mut body = Vec::new();
         let mut incoming = response.into_body();
         while let Some(frame) = incoming.frame().await {
             if let Ok(data) = frame?.into_data() {
-                anyhow::ensure!(
-                    body.len() + data.len() <= HTTP_BODY_LIMIT,
-                    "response too large"
-                );
+                anyhow::ensure!(body.len() + data.len() <= limit, "response too large");
                 body.extend_from_slice(&data);
             }
         }
-        let (headers, body) = match encoding
-            .and_then(|e| crate::requests::decode_limited(&e, &body, HTTP_BODY_LIMIT))
-        {
-            Some(plain) => (
-                headers
-                    .into_iter()
-                    .filter(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"))
-                    .collect(),
-                plain,
-            ),
-            None => (headers, body),
-        };
+        let (headers, body) =
+            match encoding.and_then(|e| crate::requests::decode_limited(&e, &body, limit)) {
+                Some(plain) => (
+                    headers
+                        .into_iter()
+                        .filter(|(k, _)| !k.eq_ignore_ascii_case("content-encoding"))
+                        .collect(),
+                    plain,
+                ),
+                None => (headers, body),
+            };
         Ok((status, headers, body))
     }
 }
@@ -963,6 +990,75 @@ response if ${url} ~= /^https:\/\/a\.test\/x$/ then script("https://cdn.test/obj
             logs,
             [r#"[Uint8Array(64)] {"buf":"[ArrayBuffer(16)]","view":"[Uint8Array(3)]"}"#]
         );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn hosted_script_limits_and_store_memory_relief() {
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-script-hosted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = clyntis_config::Config {
+            directory: directory.clone(),
+            internal_host_packet_io: true,
+            ..Default::default()
+        };
+        let core = crate::Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        assert_eq!(core.scripts.memory, 4 << 20);
+        assert_eq!(core.scripts.stack_size, 512 << 10);
+        assert_eq!(core.scripts.source_limit, HOSTED_SOURCE_LIMIT);
+        assert_eq!(core.scripts.http_body_limit, HOSTED_HTTP_BODY_LIMIT);
+
+        let oversized = directory.join("hosted_oversized.js");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(HOSTED_SOURCE_LIMIT as u64 + 1)
+            .unwrap();
+        let err = run(&core, job(oversized, DEFAULT_TIMEOUT, false))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "script source exceeds size limit");
+
+        // Allocating > 4 MiB in QuickJS fails on hosted even though desktop allows 128 MiB.
+        let mem_6m = directory.join("mem_6m.js");
+        std::fs::write(
+            &mem_6m,
+            "const a = []; for (let i = 0; i < 6; i++) a.push(new Uint8Array(1 << 20)); $done({});",
+        )
+        .unwrap();
+        assert!(
+            run(&core, job(mem_6m, DEFAULT_TIMEOUT, false))
+                .await
+                .is_err()
+        );
+
+        // $persistentStore writes to disk, drops its in-memory mirror on relieve_memory(),
+        // and reloads transparently on the next read.
+        let store_write = directory.join("store_write.js");
+        std::fs::write(
+            &store_write,
+            r#"$persistentStore.write("persisted-value", "k1"); $done({});"#,
+        )
+        .unwrap();
+        run(&core, job(store_write, DEFAULT_TIMEOUT, false))
+            .await
+            .unwrap();
+        assert!(core.scripts.store.lock().unwrap().values.is_some());
+
+        core.relieve_memory();
+        assert!(core.scripts.store.lock().unwrap().values.is_none());
+
+        let store_read = directory.join("store_read.js");
+        std::fs::write(
+            &store_read,
+            r#"$done({body: $persistentStore.read("k1") || "missing"});"#,
+        )
+        .unwrap();
+        let outcome = run(&core, job(store_read, DEFAULT_TIMEOUT, false))
+            .await
+            .unwrap();
+        assert_eq!(outcome.body.as_deref(), Some(&b"persisted-value"[..]));
 
         let _ = std::fs::remove_dir_all(&directory);
     }
