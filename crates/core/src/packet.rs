@@ -126,7 +126,7 @@ impl Budget {
 /// `trace_above` the load is logged when the footprint moved by a MiB (at
 /// most every second) or every 30 s, to find what grew without flooding the
 /// host's log; above
-/// `shed_above` new flows are refused (clients retry); above `close_above`
+/// `shed_above` new flows are restricted; above `close_above`
 /// every connection is closed, so apps reconnect instead of the VPN failing.
 struct Guard {
     budget: Budget,
@@ -137,6 +137,10 @@ struct Guard {
     /// When closing everything was last reported: repeats that closed and
     /// released nothing are logged at most once a minute.
     closed_logged: Option<Instant>,
+    relieved: Option<Instant>,
+    inspection_paused: bool,
+    inspection_recovering: Option<Instant>,
+    reconnect_slots: u8,
     shedding: bool,
     counts: GuardCounts,
 }
@@ -144,9 +148,16 @@ struct Guard {
 /// `shed_above`, so a footprint hovering at the line does not flip new flows
 /// on and off.
 const RECOVER_MARGIN: u64 = 2 * MIB;
+const INSPECTION_PAUSE_ABOVE: u64 = 35 * MIB;
+const INSPECTION_RECOVERY: Duration = Duration::from_secs(3);
+/// While shedding, give app traffic a way back if there is at least 1 MiB
+/// of headroom. Refill only on a fresh footprint sample.
+const RECONNECTS_PER_SAMPLE: u8 = 2;
 /// After closing everything, new flows wait at least this long: apps that
 /// reconnect at once would rebuild the load just released.
 const CLOSE_COOLDOWN: Duration = Duration::from_secs(3);
+/// How often cache + allocator pressure relief runs while shedding stays active.
+const RELIEF_EVERY: Duration = Duration::from_secs(2);
 /// How often the guard acted since the TUN started, for its log lines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GuardCounts {
@@ -179,6 +190,10 @@ impl Guard {
             logged_footprint: 0,
             closed: None,
             closed_logged: None,
+            relieved: None,
+            inspection_paused: false,
+            inspection_recovering: None,
+            reconnect_slots: 0,
             shedding: false,
             counts: GuardCounts::default(),
         }
@@ -219,6 +234,14 @@ impl Guard {
     fn due(&self) -> bool {
         self.next_due().is_some_and(|at| Instant::now() >= at)
     }
+    fn refuses_new_flow(&self) -> bool {
+        self.shedding && self.reconnect_slots == 0
+    }
+    fn admitted_flow(&mut self) {
+        if self.shedding {
+            self.reconnect_slots = self.reconnect_slots.saturating_sub(1);
+        }
+    }
     /// When memory should next be sampled; never with tracing disabled.
     fn next_due(&self) -> Option<Instant> {
         (self.budget.trace_above > 0).then(|| self.sampled + GUARD_EVERY)
@@ -231,38 +254,91 @@ impl Guard {
         usage: Option<memory::Usage>,
         load: impl FnOnce() -> Load,
     ) -> bool {
-        self.sampled = Instant::now();
+        self.check_at(core, usage, Instant::now(), load)
+    }
+
+    fn check_at(
+        &mut self,
+        core: &Core,
+        usage: Option<memory::Usage>,
+        now: Instant,
+        load: impl FnOnce() -> Load,
+    ) -> bool {
+        self.sampled = now;
+        self.reconnect_slots = 0;
         let Some(usage) = usage else {
             return false;
         };
         let mib = |bytes: u64| format!("{:.1}", bytes as f64 / MIB as f64);
-        let since = |at: Option<Instant>, period: u64| {
-            at.is_none_or(|at| at.elapsed() >= Duration::from_secs(period))
+        let elapsed_since = |at: Option<Instant>, period: u64| {
+            at.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(period))
         };
-        let decision = self.decide(usage.footprint, Instant::now());
+        let decision = self.decide(usage.footprint, now);
+        if self.shedding
+            && usage.footprint < self.budget.close_above.saturating_sub(MIB)
+            && self
+                .closed
+                .is_none_or(|at| now.saturating_duration_since(at) >= CLOSE_COOLDOWN)
+        {
+            self.reconnect_slots = RECONNECTS_PER_SAMPLE;
+        }
+        let inspection_paused = self.inspection_paused;
+        if self.shedding || usage.footprint >= INSPECTION_PAUSE_ABOVE {
+            self.inspection_paused = true;
+            self.inspection_recovering = None;
+        } else if inspection_paused {
+            if usage.footprint < INSPECTION_PAUSE_ABOVE - RECOVER_MARGIN {
+                let since = *self.inspection_recovering.get_or_insert(now);
+                if now.saturating_duration_since(since) >= INSPECTION_RECOVERY {
+                    self.inspection_paused = false;
+                    self.inspection_recovering = None;
+                }
+            } else {
+                self.inspection_recovering = None;
+            }
+        }
+        let mut relieved_now = false;
+        if self.inspection_paused != inspection_paused {
+            core.mitm.set_memory_limited(self.inspection_paused);
+            if self.inspection_paused {
+                tracing::warn!(
+                    footprint_mib = mib(usage.footprint),
+                    "memory rising; paused new HTTPS inspection"
+                );
+            } else {
+                tracing::info!("memory stable; resumed HTTPS inspection");
+            }
+        }
         match decision.shedding {
             Some(true) => {
-                let released = memory::relieve();
+                let released = core.relieve_memory();
+                self.relieved = Some(now);
+                relieved_now = true;
                 tracing::warn!(
                     footprint_mib = mib(usage.footprint),
                     released_kib = released / 1024,
                     times = self.counts.refusing,
-                    "memory high; refusing new connections"
+                    "memory high; limiting new connections"
                 );
             }
-            Some(false) => tracing::warn!(
-                footprint_mib = mib(usage.footprint),
-                times_refusing = self.counts.refusing,
-                times_closed = self.counts.closed,
-                "memory recovered; accepting new connections"
-            ),
+            Some(false) => {
+                self.relieved = None;
+                tracing::warn!(
+                    footprint_mib = mib(usage.footprint),
+                    times_refusing = self.counts.refusing,
+                    times_closed = self.counts.closed,
+                    "memory recovered; accepting new connections"
+                );
+            }
             None => {}
         }
         if decision.close {
             let closed = core.close_connections();
-            let released = memory::relieve();
-            if closed > 0 || released >= MIB || since(self.closed_logged, 60) {
-                self.closed_logged = Some(Instant::now());
+            let released = core.relieve_memory();
+            self.relieved = Some(now);
+            relieved_now = true;
+            if closed > 0 || released >= MIB || elapsed_since(self.closed_logged, 60) {
+                self.closed_logged = Some(now);
                 tracing::warn!(
                     footprint_mib = mib(usage.footprint),
                     closed,
@@ -272,18 +348,44 @@ impl Guard {
                 );
             }
         }
+        // Relieve pressure before denying new flows, and retry as tasks drop buffers.
+        if self.inspection_paused
+            && !relieved_now
+            && self
+                .relieved
+                .is_none_or(|at| now.saturating_duration_since(at) >= RELIEF_EVERY)
+        {
+            let released = if self.shedding {
+                core.relieve_memory()
+            } else {
+                core.relieve_inspection_memory()
+            };
+            self.relieved = Some(now);
+            if released >= MIB {
+                tracing::info!(
+                    footprint_mib = mib(usage.footprint),
+                    released_kib = released / 1024,
+                    "memory relief reclaimed free pages"
+                );
+            }
+        }
+        if !self.inspection_paused && !self.shedding {
+            self.relieved = None;
+        }
         let moved = usage.footprint.abs_diff(self.logged_footprint) >= MIB;
         if usage.footprint >= self.budget.trace_above
-            && since(self.logged, 1)
-            && (moved || since(self.logged, 30))
+            && elapsed_since(self.logged, 1)
+            && (moved || elapsed_since(self.logged, 30))
         {
-            self.logged = Some(Instant::now());
+            self.logged = Some(now);
             self.logged_footprint = usage.footprint;
             let load = load();
             tracing::warn!(
                 footprint_mib = mib(usage.footprint),
                 heap_used_mib = mib(usage.heap_used),
                 heap_reserved_mib = mib(usage.heap_reserved),
+                https_inspections = core.mitm.active_inspections(),
+                captured_body_kib = core.requests.captured_bytes() / 1024,
                 connections = core.connection_count(),
                 tcp_flows = load.tcp_flows,
                 udp_flows = load.udp_flows,
@@ -870,10 +972,11 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 if let Some((flow, syn)) = sniff(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }
                     let admit_tcp = flow.tcp && syn && !tcp_flows.contains_key(&flow);
-                    if admit_tcp && (guard.shedding || tcp_flows.len() >= budget.max_tcp) {
+                    if admit_tcp && (guard.refuses_new_flow() || tcp_flows.len() >= budget.max_tcp) {
                         tcp_refused += 1;
                     }
-                    if admit_tcp && !guard.shedding && tcp_flows.len() < budget.max_tcp {
+                    if admit_tcp && !guard.refuses_new_flow() && tcp_flows.len() < budget.max_tcp {
+                        guard.admitted_flow();
                         let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]), tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]));
                         socket.set_timeout(Some(NetDuration::from_secs(300)));
                         socket.set_keep_alive(Some(NetDuration::from_secs(30)));
@@ -900,7 +1003,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                             let _ = socket.bind(flow.target);
                             socket
                         };
-                        if let Err(refusal) = udp.admit_port(flow.target, dns, guard.shedding, Instant::now(), &mut sockets, socket) {
+                        if let Err(refusal) = udp.admit_port(flow.target, dns, guard.refuses_new_flow(), Instant::now(), &mut sockets, socket) {
                             // Refused here rather than by smoltcp, which would
                             // answer every retransmission with an ICMP error.
                             drops.refused(refusal);
@@ -1106,9 +1209,12 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 continue;
             }
             let dns = !udp.flows.contains_key(&flow) && hijack_dns(&core, flow.target, false);
-            match udp.admit_session(&flow, dns, guard.shedding) {
+            match udp.admit_session(&flow, dns, guard.refuses_new_flow()) {
                 Ok(false) => {}
                 Ok(true) => {
+                    if !dns {
+                        guard.admitted_flow();
+                    }
                     let (input, receiver) = mpsc::channel(budget.udp_queue);
                     let core = core.clone();
                     let replies = replies.clone();
@@ -1307,6 +1413,208 @@ mod guard_tests {
         );
         // Still critical after five seconds: close again.
         assert!(guard.decide(budget.close_above, at(6000)).close);
+    }
+
+    #[test]
+    fn shedding_triggers_and_retries_cache_and_heap_relief() {
+        let dir = std::env::temp_dir().join(format!("clyntis-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = clyntis_config::Config {
+            directory: dir.clone(),
+            internal_host_packet_io: true,
+            ..Default::default()
+        };
+        let core = crate::Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let target = clyntis_protocol::Target::new("ads.test", 443).unwrap();
+        let tracker =
+            crate::traffic::Tracker::new(core.clone(), target, "DIRECT".into(), "tcp").unwrap();
+        let seed_body = || {
+            let mut body = crate::requests::Body::default();
+            body.push(b"payload-bytes", 1024);
+            core.requests.exchange(
+                &tracker.state,
+                1,
+                crate::requests::HttpSummary::default(),
+                crate::requests::HttpDetail {
+                    response_body: body,
+                    ..Default::default()
+                },
+            );
+        };
+        let empty_load = || Load {
+            tcp_flows: 0,
+            udp_flows: 0,
+            udp_ports: 0,
+            queued_packets: 0,
+            tasks: 0,
+        };
+        let budget = Budget::HOSTED;
+        let mut guard = Guard::new(budget);
+        let t0 = Instant::now();
+        let usage = |footprint| {
+            Some(memory::Usage {
+                footprint,
+                heap_used: footprint,
+                heap_reserved: footprint,
+            })
+        };
+
+        // Pause inspection and reclaim memory while ordinary flows still run.
+        seed_body();
+        core.resolver.seed_test_cache_entry();
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+        assert!(!guard.check_at(&core, usage(INSPECTION_PAUSE_ABOVE), t0, empty_load));
+        assert!(core.mitm.memory_limited());
+        assert!(!guard.shedding);
+        assert!(!tracker.cancel().is_cancelled());
+        let id1 = core.requests.list(0, 10).0[0].id;
+        assert_eq!(
+            core.requests.detail(id1).unwrap()["responseBody"]["text"],
+            ""
+        );
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+
+        // Before RELIEF_EVERY, ongoing shedding skips redundant cache wipes.
+        seed_body();
+        assert!(!guard.check_at(
+            &core,
+            usage(INSPECTION_PAUSE_ABOVE),
+            t0 + Duration::from_secs(1),
+            empty_load
+        ));
+        let id2 = core.requests.list(id1, 10).0[0].id;
+        assert_eq!(
+            core.requests.detail(id2).unwrap()["responseBody"]["text"],
+            "payload-bytes"
+        );
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+
+        // At RELIEF_EVERY, lightweight relief runs again without wiping DNS cache.
+        assert!(!guard.check_at(
+            &core,
+            usage(INSPECTION_PAUSE_ABOVE),
+            t0 + RELIEF_EVERY,
+            empty_load
+        ));
+        assert_eq!(
+            core.requests.detail(id2).unwrap()["responseBody"]["text"],
+            ""
+        );
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+
+        // A single low reading does not resume inspection.
+        let recovered = INSPECTION_PAUSE_ABOVE - RECOVER_MARGIN - 1;
+        assert!(!guard.check_at(
+            &core,
+            usage(recovered),
+            t0 + Duration::from_secs(3),
+            empty_load
+        ));
+        assert!(core.mitm.memory_limited());
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+        assert!(!guard.check_at(
+            &core,
+            usage(recovered),
+            t0 + Duration::from_secs(3) + INSPECTION_RECOVERY,
+            empty_load
+        ));
+        assert!(!core.mitm.memory_limited());
+        assert!(!guard.shedding);
+        assert!(guard.relieved.is_none());
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+
+        // Rising from inspection pause to budget.shed_above runs full relief
+        // immediately (clearing DNS cache), and periodic relief keeps doing so
+        // while shedding stays active.
+        let t_pause = t0 + Duration::from_secs(7);
+        assert!(!guard.check_at(&core, usage(INSPECTION_PAUSE_ABOVE), t_pause, empty_load));
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+
+        let t_shed = t_pause + GUARD_EVERY;
+        seed_body();
+        assert!(!guard.check_at(&core, usage(budget.shed_above), t_shed, empty_load));
+        assert!(guard.shedding);
+        assert!(core.mitm.memory_limited());
+        let id3 = core.requests.list(id2, 10).0[0].id;
+        assert_eq!(
+            core.requests.detail(id3).unwrap()["responseBody"]["text"],
+            ""
+        );
+        assert_eq!(core.resolver.cache_entry_count(), 0);
+
+        core.resolver.seed_test_cache_entry();
+        assert!(!guard.check_at(
+            &core,
+            usage(budget.shed_above),
+            t_shed + Duration::from_secs(1),
+            empty_load
+        ));
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+        assert!(!guard.check_at(
+            &core,
+            usage(budget.shed_above),
+            t_shed + RELIEF_EVERY,
+            empty_load
+        ));
+        assert_eq!(core.resolver.cache_entry_count(), 0);
+
+        // Recovering out of shedding while inspection stays paused uses
+        // lightweight relief and preserves DNS cache until inspection resumes.
+        core.resolver.seed_test_cache_entry();
+        let t_recover = t_shed + Duration::from_secs(3);
+        assert!(!guard.check_at(&core, usage(recovered), t_recover, empty_load));
+        assert!(!guard.shedding);
+        assert!(core.mitm.memory_limited());
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+        assert!(!guard.check_at(
+            &core,
+            usage(recovered),
+            t_recover + INSPECTION_RECOVERY,
+            empty_load
+        ));
+        assert!(!core.mitm.memory_limited());
+        assert!(guard.relieved.is_none());
+        assert_eq!(core.resolver.cache_entry_count(), 1);
+
+        // Like on the device, a footprint above the regular recovery
+        // threshold can persist even after all sessions have drained.
+        let t1 = t0 + Duration::from_secs(20);
+        assert!(guard.check_at(&core, usage(budget.close_above), t1, empty_load));
+        assert_eq!(core.resolver.cache_entry_count(), 0);
+        assert!(guard.refuses_new_flow());
+        let plateau = budget.close_above - 2 * MIB;
+        assert!(!guard.check_at(
+            &core,
+            usage(plateau),
+            t1 + CLOSE_COOLDOWN - GUARD_EVERY,
+            empty_load,
+        ));
+        assert!(guard.refuses_new_flow());
+        assert!(!guard.check_at(&core, usage(plateau), t1 + CLOSE_COOLDOWN, empty_load));
+        assert!(core.mitm.memory_limited());
+        for _ in 0..RECONNECTS_PER_SAMPLE {
+            assert!(!guard.refuses_new_flow());
+            guard.admitted_flow();
+        }
+        guard.admitted_flow();
+        assert!(guard.refuses_new_flow());
+        assert!(!guard.check_at(
+            &core,
+            usage(plateau),
+            t1 + CLOSE_COOLDOWN + GUARD_EVERY,
+            empty_load,
+        ));
+        assert!(!guard.refuses_new_flow());
+        assert!(!guard.check_at(
+            &core,
+            usage(budget.close_above - MIB),
+            t1 + CLOSE_COOLDOWN + 2 * GUARD_EVERY,
+            empty_load,
+        ));
+        assert!(guard.refuses_new_flow());
+
+        drop(tracker);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

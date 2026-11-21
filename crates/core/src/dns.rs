@@ -469,6 +469,30 @@ impl Resolver {
         *self.cache.lock().unwrap() = Cache::default();
         self.reachable.lock().unwrap().clear();
     }
+    #[cfg(test)]
+    pub(crate) fn seed_test_cache_entry(&self) {
+        let now = Instant::now();
+        let key = b"test.example".to_vec();
+        let response = b"cached-dns-response".to_vec();
+        let size = key.len() + response.len() + CACHE_OVERHEAD;
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(prev) = cache.entries.insert(
+            key,
+            CacheEntry {
+                response,
+                inserted: now,
+                expires: now + Duration::from_secs(60),
+                size,
+            },
+        ) {
+            cache.size = cache.size.saturating_sub(prev.size);
+        }
+        cache.size += size;
+    }
+    #[cfg(test)]
+    pub(crate) fn cache_entry_count(&self) -> usize {
+        self.cache.lock().unwrap().entries.len()
+    }
     pub async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         let mut host = host.trim_end_matches('.').to_ascii_lowercase();
         // hosts entries come first: a device's LAN address configured for one

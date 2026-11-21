@@ -761,7 +761,7 @@ pub unsafe extern "C" fn meta_requests_export_v1(
     boundary(|| {
         let requests = &handle(id)?.core.requests;
         let bytes = match format {
-            0 => serde_json::to_vec_pretty(&requests.export_har())?,
+            0 => requests.export_har_json()?,
             1 => requests.export_csv().into_bytes(),
             _ => anyhow::bail!("unknown export format"),
         };

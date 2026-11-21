@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 type Compiled = jaq_core::Filter<Budgeted>;
 struct Budgeted;
@@ -60,6 +60,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKED: &[&str] = &["env", "input", "inputs", "range"];
 
 /// A compiled filter, shared by the connections that use it.
+#[derive(Clone)]
 pub(crate) struct Filter(Arc<Compiled>);
 
 impl Filter {
@@ -94,7 +95,11 @@ impl Filter {
     /// The body with the filter applied: its first output, as JSON. `None`
     /// when the body is not JSON, the filter fails, outputs nothing or runs
     /// too long.
-    pub(crate) async fn apply(&self, body: Vec<u8>) -> Option<Vec<u8>> {
+    pub(crate) async fn apply(
+        &self,
+        body: Vec<u8>,
+        body_slot: Option<Arc<OwnedSemaphorePermit>>,
+    ) -> Option<Vec<u8>> {
         let filter = self.0.clone();
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         let permit = tokio::time::timeout_at(deadline, WORKERS.acquire())
@@ -103,6 +108,8 @@ impl Filter {
             .ok()?;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Cancellation of the relay does not stop a running blocking worker.
+            let _body_slot = body_slot;
             run(&filter, &body, deadline.into_std(), STEP_LIMIT)
         });
         tokio::time::timeout_at(deadline, task).await.ok()?.ok()?
@@ -165,7 +172,7 @@ mod tests {
         ];
         for (code, input, expected) in cases {
             let filter = Filter::compile(code).unwrap();
-            let output = filter.apply(input.as_bytes().to_vec()).await.unwrap();
+            let output = filter.apply(input.as_bytes().to_vec(), None).await.unwrap();
             let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
             let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
             assert_eq!(output, expected, "{code}");
@@ -175,8 +182,8 @@ mod tests {
             assert!(Filter::compile(code).is_err(), "{code}");
         }
         let filter = Filter::compile("del(.a)").unwrap();
-        assert!(filter.apply(b"not json".to_vec()).await.is_none());
+        assert!(filter.apply(b"not json".to_vec(), None).await.is_none());
         let failing = Filter::compile("error(\"x\")").unwrap();
-        assert!(failing.apply(b"{}".to_vec()).await.is_none());
+        assert!(failing.apply(b"{}".to_vec(), None).await.is_none());
     }
 }

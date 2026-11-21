@@ -38,11 +38,21 @@
     removeAllValues: () => false,
   };
 
+  function binaryTag(v) {
+    if (v instanceof ArrayBuffer) return `[ArrayBuffer(${v.byteLength})]`;
+    if (ArrayBuffer.isView(v)) {
+      const name = (v.constructor && v.constructor.name) || 'TypedArray';
+      return `[${name}(${v.byteLength})]`;
+    }
+    return undefined;
+  }
   function text(v) {
     if (typeof v === 'string') return v;
     if (v instanceof Error) return v.stack ? `${v.message}\n${v.stack}` : String(v);
+    const tag = binaryTag(v);
+    if (tag !== undefined) return tag;
     try {
-      return JSON.stringify(v);
+      return JSON.stringify(v, (_, value) => binaryTag(value) ?? value);
     } catch (_) {
       return String(v);
     }

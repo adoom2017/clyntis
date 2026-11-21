@@ -433,6 +433,7 @@ impl Desktop {
         let (cert, key) = clyntis_core::generate_authority()?;
         let op = self.operation.lock().await;
         self.store.save_mitm_authority(&cert, &key)?;
+        self.clear_saved_mitm_bypass();
         let settings = self.store.settings()?;
         if settings.overrides.mitm.is_some()
             && let Some(engine) = op.engine.as_ref()
@@ -446,6 +447,16 @@ impl Desktop {
                 .await?;
         }
         Ok(())
+    }
+    fn clear_saved_mitm_bypass(&self) {
+        let _ = std::fs::remove_file(self.store.root.join(".mitm-bypass.json"));
+        if let Ok(profiles) = self.store.list() {
+            for profile in profiles {
+                let _ = std::fs::remove_file(
+                    self.store.runtime_dir(profile.id).join(".mitm-bypass.json"),
+                );
+            }
+        }
     }
     /// Saved rules plus, for the selected profile, its targets and the rules
     /// it cannot use.
@@ -1126,7 +1137,14 @@ pub async fn trust_mitm_ca(state: State<'_, Desktop>) -> Reply<()> {
     if !path.exists() {
         return Err(tr!("请先生成证书", "Create the certificate first"));
     }
-    platform::trust_ca(&path).await.map_err(error)
+    platform::trust_ca(&path).await.map_err(error)?;
+    state.clear_saved_mitm_bypass();
+    if let Ok(controller) = controller(&state).await {
+        let _ = controller
+            .request(reqwest::Method::DELETE, &["mitm", "bypass"], None)
+            .await;
+    }
+    Ok(())
 }
 /// Saves the CA certificate (not its key), for other devices or browsers.
 #[tauri::command]
@@ -1140,11 +1158,25 @@ pub fn export_mitm_ca(state: State<'_, Desktop>, path: String) -> Reply<()> {
 }
 #[tauri::command]
 pub async fn clear_mitm_bypass(state: State<'_, Desktop>) -> Reply<()> {
+    state.clear_saved_mitm_bypass();
     controller(&state)
         .await?
         .request(reqwest::Method::DELETE, &["mitm", "bypass"], None)
         .await
         .map_err(error)?;
+    Ok(())
+}
+#[tauri::command]
+pub fn clear_logs(state: State<'_, Desktop>) -> Reply<()> {
+    use clyntis_desktop_service::diagnostics::clear_log_files;
+    state.logs.lock().unwrap().clear();
+    let mut directories = vec![state.store.root.clone()];
+    if let Ok(profiles) = state.store.list() {
+        directories.extend(profiles.iter().map(|p| state.store.runtime_dir(p.id)));
+    }
+    for directory in directories {
+        clear_log_files(&directory);
+    }
     Ok(())
 }
 /// The core's own log (every rotated `clyntis-runner` file of each profile
@@ -1161,7 +1193,9 @@ pub fn export_logs(state: State<'_, Desktop>, path: String) -> Reply<()> {
     }
     for directory in directories {
         for file in log_files(&directory) {
-            if let Ok(bytes) = std::fs::read(&file) {
+            if let Ok(bytes) = std::fs::read(&file)
+                && !bytes.is_empty()
+            {
                 output.extend_from_slice(format!("==> {} <==\n", file.display()).as_bytes());
                 output.extend_from_slice(&bytes);
                 if !bytes.ends_with(b"\n") {

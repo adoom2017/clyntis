@@ -42,15 +42,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Per-host certificates kept; the cache starts over when full. Each holds
 /// a TLS context: the iOS tunnel, within about 50 MiB, keeps few.
 const LEAVES: usize = 512;
 const HOSTED_LEAVES: usize = 32;
+const HOSTED_INSPECTIONS: usize = 32;
 /// Maximum hosts kept in the bypass cache.
 const BYPASS: usize = 2048;
-/// How long persisted bypass entries (cert refusal / upstream incompatibility) live.
-const BYPASS_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+/// How long persisted client-certificate-refusal bypass entries live.
+const BYPASS_TTL_SECS: i64 = 24 * 60 * 60;
 /// How long non-persisted session bypass entries live.
 const SESSION_BYPASS_TTL_SECS: i64 = 60 * 60;
 /// Maximum size accepted when loading the persisted bypass cache.
@@ -63,6 +65,8 @@ const FIRST_BYTES: Duration = Duration::from_secs(2);
 const UPSTREAM_HANDSHAKE: Duration = Duration::from_secs(10);
 /// How long passthrough fallback redialing may take.
 const PASSTHROUGH_DIAL: Duration = Duration::from_secs(10);
+/// How long an idle hosted HTTP/1.1 keep-alive connection stays open between requests.
+const HOSTED_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 
 /// The name, fingerprints and expiry of a CA certificate (PEM).
 pub fn describe_authority(cert: &str) -> Option<Value> {
@@ -350,13 +354,24 @@ pub(crate) struct Interceptor {
     persist_lock: Mutex<()>,
     /// Tests talk to servers with their own certificates.
     verify_upstream: AtomicBool,
+    hosted: bool,
     leaf_limit: usize,
+    inspection_limit: usize,
+    inspection_slots: Arc<Semaphore>,
+    rewrite_slot: Arc<Semaphore>,
+    memory_limited: AtomicBool,
     upstream_handshake_ms: AtomicU64,
     passthrough_dial_ms: AtomicU64,
     first_bytes_ms: AtomicU64,
+    pub(crate) hosted_keepalive_idle_ms: AtomicU64,
 }
 impl Interceptor {
     pub(crate) fn new(mitm: &Mitm, directory: &Path, hosted: bool) -> Self {
+        let inspection_limit = if hosted {
+            HOSTED_INSPECTIONS
+        } else {
+            Semaphore::MAX_PERMITS
+        };
         let interceptor = Self {
             settings: RwLock::default(),
             module_hosts: RwLock::default(),
@@ -368,21 +383,23 @@ impl Interceptor {
             storage_path: Some(directory.join(BYPASS_FILE_NAME)),
             persist_lock: Mutex::default(),
             verify_upstream: true.into(),
+            hosted,
             leaf_limit: if hosted { HOSTED_LEAVES } else { LEAVES },
+            inspection_limit,
+            inspection_slots: Arc::new(Semaphore::new(inspection_limit)),
+            rewrite_slot: Arc::new(Semaphore::new(1)),
+            memory_limited: false.into(),
             upstream_handshake_ms: AtomicU64::new(UPSTREAM_HANDSHAKE.as_millis() as u64),
             passthrough_dial_ms: AtomicU64::new(PASSTHROUGH_DIAL.as_millis() as u64),
             first_bytes_ms: AtomicU64::new(FIRST_BYTES.as_millis() as u64),
+            hosted_keepalive_idle_ms: AtomicU64::new(HOSTED_KEEPALIVE_IDLE.as_millis() as u64),
         };
         if let Err(error) = interceptor.set(mitm.clone()) {
             tracing::warn!("HTTPS decryption is off: {error:#}");
         }
         interceptor
     }
-    fn load_persisted(
-        &self,
-        ca_fingerprint: &str,
-        lenient_upstream: bool,
-    ) -> HashMap<String, BypassEntry> {
+    fn load_persisted(&self, ca_fingerprint: &str) -> HashMap<String, BypassEntry> {
         let Some(path) = &self.storage_path else {
             return HashMap::new();
         };
@@ -423,12 +440,9 @@ impl Interceptor {
             if entry.expires_at <= now {
                 continue;
             }
-            if entry.reason == BypassReason::UpstreamCertificate
-                && entry.lenient_upstream != lenient_upstream
-            {
-                continue;
-            }
-            if entry.reason == BypassReason::ClientProtocolIncompatible {
+            // Only downstream client certificate refusal requires persistence across
+            // restarts; upstream failures fall back seamlessly via raw TLS passthrough.
+            if entry.reason != BypassReason::ClientCertificateRefused {
                 continue;
             }
             let host = normalize_host(&entry.host);
@@ -510,8 +524,10 @@ impl Interceptor {
         let same_loaded_ca = prev_authority
             .as_ref()
             .is_some_and(|a| a.ca_cert == mitm.ca_cert && a.ca_key == mitm.ca_key);
-        let mut persist_needed = false;
         let result = if !mitm.enable {
+            if let Some(authority) = &prev_authority {
+                authority.leaves.lock().unwrap().clear();
+            }
             if !same_loaded_ca {
                 *self.authority.write().unwrap() = None;
             }
@@ -528,7 +544,7 @@ impl Interceptor {
                         self.alpn_bypass.lock().unwrap().clear();
                         self.remove_persisted();
                     } else if prev_fp.is_none() {
-                        let loaded = self.load_persisted(&new_fp, mitm.lenient_upstream);
+                        let loaded = self.load_persisted(&new_fp);
                         if !loaded.is_empty() {
                             let mut bypass = self.bypass.lock().unwrap();
                             for (host, entry) in loaded {
@@ -551,19 +567,12 @@ impl Interceptor {
         };
         if mitm.lenient_upstream && !prev_lenient {
             let mut bypass = self.bypass.lock().unwrap();
-            let before = bypass.len();
             bypass.retain(|_, entry| {
                 !(entry.reason == BypassReason::UpstreamCertificate && !entry.lenient_upstream)
             });
-            if bypass.len() != before {
-                persist_needed = true;
-            }
         }
         *self.error.write().unwrap() = result.as_ref().err().map(|e| format!("{e:#}"));
         *self.settings.write().unwrap() = mitm;
-        if persist_needed {
-            self.save_persisted();
-        }
         result
     }
     fn active(&self) -> Option<Arc<Authority>> {
@@ -585,6 +594,10 @@ impl Interceptor {
     fn first_bytes_timeout(&self) -> Duration {
         Duration::from_millis(self.first_bytes_ms.load(Ordering::Relaxed))
     }
+    pub(crate) fn hosted_keepalive_idle(&self) -> Option<Duration> {
+        self.hosted
+            .then(|| Duration::from_millis(self.hosted_keepalive_idle_ms.load(Ordering::Relaxed)))
+    }
     /// Whether decryption is on and working.
     pub(crate) fn is_active(&self) -> bool {
         self.active().is_some()
@@ -605,9 +618,38 @@ impl Interceptor {
     pub(crate) fn intercepts(&self, host: &str) -> bool {
         self.active().is_some() && self.listed(host) && !self.is_bypassed(host)
     }
+    pub(crate) fn memory_limited(&self) -> bool {
+        self.memory_limited.load(Ordering::Relaxed)
+    }
+    pub(crate) fn set_memory_limited(&self, limited: bool) {
+        self.memory_limited.store(limited, Ordering::Relaxed);
+    }
+    pub(crate) fn active_inspections(&self) -> usize {
+        self.inspection_limit - self.inspection_slots.available_permits()
+    }
+    fn can_inspect(&self) -> bool {
+        !self.memory_limited() && self.inspection_slots.available_permits() != 0
+    }
+    pub(crate) fn try_inspect(&self) -> Option<OwnedSemaphorePermit> {
+        if self.memory_limited() {
+            return None;
+        }
+        let slot = self.inspection_slots.clone().try_acquire_owned().ok()?;
+        (!self.memory_limited()).then_some(slot)
+    }
+    pub(crate) fn try_rewrite(&self) -> Option<Arc<OwnedSemaphorePermit>> {
+        if self.memory_limited() {
+            return None;
+        }
+        self.rewrite_slot
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .map(Arc::new)
+    }
     /// Whether UDP 443 (QUIC) to `host` should be rejected to induce TCP fallback.
     pub(crate) fn blocks_quic(&self, host: &str) -> bool {
-        if !self.settings.read().unwrap().quic_fallback {
+        if !self.can_inspect() || !self.settings.read().unwrap().quic_fallback {
             return false;
         }
         if !self.intercepts(host) {
@@ -724,7 +766,7 @@ impl Interceptor {
         );
     }
     fn record_upstream_bypass(&self, host: &str, reason: BypassReason) {
-        self.record_bypass(host, reason, BYPASS_TTL_SECS, true);
+        self.record_bypass(host, reason, SESSION_BYPASS_TTL_SECS, false);
     }
     fn skipped_alpn(&self, host: &str) {
         let key = normalize_host(host);
@@ -742,6 +784,12 @@ impl Interceptor {
         self.bypass.lock().unwrap().clear();
         self.alpn_bypass.lock().unwrap().clear();
         self.remove_persisted();
+    }
+    /// Drops cached per-host TLS acceptors under memory pressure.
+    pub(crate) fn relieve_memory(&self) {
+        if let Some(authority) = self.authority.read().unwrap().as_ref() {
+            authority.leaves.lock().unwrap().clear();
+        }
     }
     pub(crate) fn status(&self) -> Value {
         let settings = self.settings.read().unwrap();
@@ -825,7 +873,7 @@ impl Core {
     /// is on, and the target names a host to decrypt or is an address whose
     /// host only the client's first bytes tell.
     pub(crate) fn inspects(&self, target: &Target) -> bool {
-        if self.mitm.active().is_none() {
+        if !self.mitm.can_inspect() || self.mitm.active().is_none() {
             return false;
         }
         let target = self.restore_target(target);
@@ -839,7 +887,12 @@ impl Core {
         self.mitm.status()
     }
     pub fn set_mitm(&self, mitm: Mitm) -> Result<()> {
-        self.mitm.set(mitm)
+        let disabling = !mitm.enable;
+        let result = self.mitm.set(mitm);
+        if disabling && let Some(rewriter) = self.rewriter() {
+            rewriter.relieve_memory();
+        }
+        result
     }
     pub fn clear_mitm_bypass(&self) {
         self.mitm.clear_bypass();
@@ -857,7 +910,8 @@ impl Core {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let restored = self.restore_target(&target);
-        let (mut route, destination, mut prefix) = if self.wants_sniff(&restored) {
+        let wants_sniff = self.wants_sniff(&restored);
+        let (mut route, destination, mut prefix) = if wants_sniff {
             self.sniff_target(&mut stream, &target).await?
         } else {
             (restored.clone(), restored.clone(), vec![])
@@ -866,11 +920,13 @@ impl Core {
             .await?;
         let tls = prefix.first() == Some(&22);
         let hello_status = tls.then(|| crate::sniff::parse_client_hello(&prefix));
-        if route.ip().is_some()
-            && let Some(host) = crate::sniff::tls(&prefix).or_else(|| crate::sniff::http(&prefix))
-        {
-            route.host = host;
+        let sniffed_host = route
+            .ip()
+            .and_then(|_| crate::sniff::tls(&prefix).or_else(|| crate::sniff::http(&prefix)));
+        if wants_sniff && let Some(host) = sniffed_host.as_ref() {
+            route.host = host.clone();
         }
+        let inspect_host = sniffed_host.as_deref().unwrap_or(&route.host).to_owned();
         let (mut outbound, routed) = if route != restored {
             self.dial_sniffed(&route, &destination, &target, &source)
                 .await?
@@ -883,45 +939,53 @@ impl Core {
                 crate::sniff::ClientHelloAlpn::Absent
                 | crate::sniff::ClientHelloAlpn::SupportsHttp1 => true,
                 crate::sniff::ClientHelloAlpn::NonHttp1Only => {
-                    if self.mitm.intercepts(&route.host) {
-                        self.mitm.skipped_alpn(&route.host);
+                    if self.mitm.intercepts(&inspect_host) {
+                        self.mitm.skipped_alpn(&inspect_host);
                     }
                     false
                 }
                 crate::sniff::ClientHelloAlpn::Malformed => {
-                    if self.mitm.intercepts(&route.host) {
+                    if self.mitm.intercepts(&inspect_host) {
                         tracing::warn!(
                             "[MITM] {}: malformed ALPN extension in ClientHello; passing connection through without decryption",
-                            route.host
+                            inspect_host
                         );
                     }
                     false
                 }
             },
             Some(crate::sniff::ClientHelloStatus::Incomplete) => {
-                if self.mitm.intercepts(&route.host) {
+                if self.mitm.intercepts(&inspect_host) {
                     tracing::warn!(
                         "[MITM] {}: incomplete TLS ClientHello before timeout; passing connection through without decryption",
-                        route.host
+                        inspect_host
                     );
                 }
                 false
             }
             Some(crate::sniff::ClientHelloStatus::Invalid) | None => false,
         };
-        if !self.mitm.intercepts(&route.host) || !(tls_http1 || http) {
+        if !self.mitm.intercepts(&inspect_host) || !(tls_http1 || http) {
             outbound.write_all(&prefix).await?;
             return self.relay_io(stream, route, outbound, routed).await;
         }
+        let Some(slot) = self.mitm.try_inspect() else {
+            outbound.write_all(&prefix).await?;
+            return self.relay_io(stream, route, outbound, routed).await;
+        };
         let client = Prefixed {
             prefix,
             offset: 0,
             inner: stream,
         };
-        let Some(client) = self
-            .observe(client, route.clone(), outbound, routed, tls)
-            .await?
-        else {
+        let observe_target = Target {
+            host: inspect_host,
+            port: route.port,
+        };
+        let outcome = self
+            .observe(client, observe_target, outbound, routed, tls, slot)
+            .await;
+        let Some(client) = outcome? else {
             return Ok(());
         };
         // Upstream handshake fell back before anything was sent to the client:
@@ -950,17 +1014,19 @@ impl Core {
     /// Decrypts and relays a connection. Returns the client untouched when an
     /// eligible upstream TLS handshake fails before anything is sent to the
     /// client, for the caller to pass it through as raw TLS instead.
-    async fn observe<S>(
+    pub(crate) async fn observe<S>(
         self: &Arc<Self>,
         client: S,
         route: Target,
         outbound: BoxStream,
         routed: Routed,
         tls: bool,
+        slot: OwnedSemaphorePermit,
     ) -> Result<Option<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        let _slot = slot;
         let host = route.host.clone();
         let default_port = if tls { 443 } else { 80 };
         let authority = if route.port == default_port {
@@ -1809,6 +1875,149 @@ hostname = ads.test
     }
 
     #[tokio::test]
+    async fn hosted_inspection_limits_pass_through_the_original_handshake() {
+        let dir = TestDir::new("clyntis-mitm-budget");
+        let mut config = clyntis_config::Config::parse(b"hosts: {ads.test: 127.0.0.1}\n").unwrap();
+        config.directory = dir.path().to_path_buf();
+        config.internal_host_packet_io = true;
+        config.mitm = test_settings(&["ads.test"]);
+        config.mitm.quic_fallback = true;
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::new("ads.test", listener.local_addr().unwrap().port()).unwrap();
+        assert!(core.inspects(&target));
+        assert!(core.mitm.blocks_quic(&target.host));
+        let mut permits: Vec<_> = (0..HOSTED_INSPECTIONS)
+            .map(|_| core.mitm.try_inspect().unwrap())
+            .collect();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for paused in [false, true] {
+                if paused {
+                    // The next connection will exercise the pressure gate instead.
+                    permits.clear();
+                    core.mitm.set_memory_limited(true);
+                }
+                assert!(!core.inspects(&target));
+                assert!(!core.mitm.blocks_quic(&target.host));
+                let hello =
+                    crate::sniff::tests::client_hello_with_alpn(&target.host, &[b"http/1.1"]);
+                let (mut app, inbound) = tokio::io::duplex(4096);
+                let relay = {
+                    let (core, target) = (core.clone(), target.clone());
+                    // A connection that entered the inspector just before the gate closed.
+                    tokio::spawn(
+                        async move { core.inspect_tcp(inbound, target, "app".into()).await },
+                    )
+                };
+                app.write_all(&hello).await.unwrap();
+                let (mut server, _) = listener.accept().await.unwrap();
+                let mut received = vec![0; hello.len()];
+                server.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, hello);
+                server.write_all(b"original server").await.unwrap();
+                let mut reply = [0; 15];
+                app.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"original server");
+                app.shutdown().await.unwrap();
+                server.shutdown().await.unwrap();
+                relay.await.unwrap().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!core.inspects(&target));
+        core.mitm.set_memory_limited(false);
+        assert!(core.inspects(&target));
+        assert!(core.mitm.blocks_quic(&target.host));
+        assert!(!core.mitm.is_bypassed(&target.host));
+    }
+
+    #[tokio::test]
+    async fn hosted_relay_keeps_shipping_bodies_when_rewrite_and_capture_are_limited() {
+        let dir = TestDir::new("clyntis-mitm-body-budget");
+        let mut config = clyntis_config::Config::parse(b"hosts: {ads.test: 127.0.0.1}\n").unwrap();
+        config.directory = dir.path().to_path_buf();
+        config.internal_host_packet_io = true;
+        config.mitm = test_settings(&["ads.test"]);
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        let module = clyntis_config::rewrite::parse_module(
+            r#"[Body Rewrite]
+http-response-jq ^http://ads\.test.*/feed 'del(.ad)'
+[Header Rewrite]
+http-response ^http://ads\.test.*/feed header-add X-Handled 1
+"#,
+        );
+        assert!(module.skipped.is_empty(), "{:?}", module.skipped);
+        let rewriter = crate::rewrite::Rewriter::new(
+            vec![crate::rewrite::Loaded {
+                name: "ads".into(),
+                module,
+                files: Default::default(),
+                missing: vec![],
+                updated: None,
+            }],
+            vec![],
+        );
+        let mut resources = crate::resources::Resources::default();
+        resources.rewrite = Some(Arc::new(rewriter));
+        *core.resources.write().unwrap() = Arc::new(resources);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::new("ads.test", listener.local_addr().unwrap().port()).unwrap();
+        let (mut app, inbound) = tokio::io::duplex(4096);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let busy = core.mitm.try_rewrite().unwrap();
+            app.write_all(b"GET /feed HTTP/1.1\r\nHost: ads.test\r\n\r\n").await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+            read_head(&mut server).await;
+            let original = br#"{"ad":1,"keep":2}"#;
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n").await.unwrap();
+            server.write_all(original).await.unwrap();
+            let (head, body) = read_response(&mut app).await;
+            assert!(head.contains("X-Handled: 1\r\n"));
+            assert_eq!(body, original);
+            drop(busy);
+
+            app.write_all(b"GET /picture HTTP/1.1\r\nHost: ads.test\r\n\r\n").await.unwrap();
+            read_head(&mut server).await;
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/webp\r\nContent-Length: 5\r\n\r\nimage").await.unwrap();
+            assert_eq!(read_response(&mut app).await.1, b"image");
+
+            // The same stream is usable after both downgrades.
+            app.write_all(b"GET /feed HTTP/1.1\r\nHost: ads.test\r\n\r\n").await.unwrap();
+            read_head(&mut server).await;
+            server.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n").await.unwrap();
+            server.write_all(original).await.unwrap();
+            assert_eq!(read_response(&mut app).await.1, br#"{"keep":2}"#);
+
+            app.shutdown().await.unwrap();
+            server.shutdown().await.unwrap();
+            relay.await.unwrap().unwrap();
+        }).await.unwrap();
+        let picture = core
+            .requests
+            .list(0, 20)
+            .0
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .http
+                    .as_ref()
+                    .is_some_and(|http| http.url.ends_with("/picture"))
+            })
+            .unwrap();
+        let detail = core.requests.detail(picture.id).unwrap();
+        assert_eq!(detail["responseBody"]["size"], 5);
+        assert_eq!(detail["responseBody"]["truncated"], true);
+        assert_eq!(detail["responseBody"]["text"], "");
+    }
+
+    #[tokio::test]
     async fn h2_only_client_hello_passes_through_without_mitm_downgrade() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2562,7 +2771,7 @@ hostname = ads.test
         relay.await.unwrap().unwrap();
         assert!(!core.mitm.intercepts("ads.test"));
         assert_eq!(core.mitm_status()["bypassed"], json!(["ads.test"]));
-        assert!(core.dir.path().join(BYPASS_FILE_NAME).exists());
+        assert!(!core.dir.path().join(BYPASS_FILE_NAME).exists());
     }
 
     #[tokio::test]
@@ -2699,5 +2908,199 @@ hostname = ads.test
         relay.await.unwrap().unwrap();
         assert_eq!(core.mitm_status()["skippedAlpn"], json!([]));
         assert_eq!(core.mitm_status()["bypassed"], json!([]));
+    }
+
+    #[test]
+    fn relieve_memory_and_disabling_mitm_clear_leaf_acceptors() {
+        let dir = TestDir::new("clyntis-mitm-relieve");
+        let settings = test_settings(&["*.ads.test"]);
+        let interceptor = Interceptor::new(&settings, dir.path(), false);
+        let authority = interceptor.active().unwrap();
+        authority.acceptor("a.ads.test", LEAVES).unwrap();
+        assert_eq!(authority.leaves.lock().unwrap().len(), 1);
+
+        interceptor.relieve_memory();
+        assert!(authority.leaves.lock().unwrap().is_empty());
+
+        authority.acceptor("b.ads.test", LEAVES).unwrap();
+        assert_eq!(authority.leaves.lock().unwrap().len(), 1);
+        interceptor
+            .set(Mitm {
+                enable: false,
+                ..settings
+            })
+            .unwrap();
+        assert!(authority.leaves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bare_ip_without_sniffer_keeps_ip_routing_for_non_mitm_hosts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_hello =
+            crate::sniff::tests::client_hello_with_alpn("blocked-domain.test", &[b"http/1.1"]);
+        let expected_copy = expected_hello.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut got = vec![0u8; expected_copy.len()];
+            tcp.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected_copy);
+            tcp.write_all(b"RAW-IP-OK").await.unwrap();
+        });
+
+        let dir = TestDir::new("clyntis-mitm-ip-route");
+        let mut config = clyntis_config::Config::parse(
+            b"rules:\n- DOMAIN,blocked-domain.test,REJECT\n- MATCH,DIRECT\n",
+        )
+        .unwrap();
+        config.directory = dir.path().to_path_buf();
+        config.mitm = test_settings(&["mitm-only.test"]);
+        assert!(!config.sniffer.enable);
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+
+        let target = Target::new("127.0.0.1", port).unwrap();
+        let (mut app, inbound) = tokio::io::duplex(4096);
+        let relay = {
+            let core = core.clone();
+            tokio::spawn(async move { core.inspect_tcp(inbound, target, "app".into()).await })
+        };
+        app.write_all(&expected_hello).await.unwrap();
+        let mut reply = [0u8; 9];
+        app.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"RAW-IP-OK");
+        drop(app);
+        server_task.await.unwrap();
+        relay.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn hosted_inspection_cap_is_32_and_keepalive_idle_defaults_to_60s() {
+        let dir = TestDir::new("clyntis-mitm-hosted-cap");
+        let settings = test_settings(&["*.ads.test"]);
+        let hosted = Interceptor::new(&settings, dir.path(), true);
+        assert_eq!(HOSTED_INSPECTIONS, 32);
+        assert_eq!(
+            hosted.hosted_keepalive_idle(),
+            Some(Duration::from_secs(60))
+        );
+        let mut permits: Vec<_> = (0..32).map(|_| hosted.try_inspect().unwrap()).collect();
+        assert_eq!(hosted.active_inspections(), 32);
+        assert!(hosted.try_inspect().is_none());
+        permits.pop();
+        assert_eq!(hosted.active_inspections(), 31);
+        assert!(hosted.try_inspect().is_some());
+        drop(permits);
+        assert_eq!(hosted.active_inspections(), 0);
+
+        let desktop = Interceptor::new(&settings, dir.path(), false);
+        assert_eq!(desktop.hosted_keepalive_idle(), None);
+    }
+
+    #[tokio::test]
+    async fn hosted_observe_releases_slot_on_websocket_upgrade_and_idle_keepalive() {
+        let dir = TestDir::new("clyntis-mitm-observe-slot");
+        let mut config = clyntis_config::Config::default();
+        config.directory = dir.path().to_path_buf();
+        config.internal_host_packet_io = true;
+        config.mitm = test_settings(&["ads.test"]);
+        let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+        core.mitm
+            .hosted_keepalive_idle_ms
+            .store(60, Ordering::Relaxed);
+
+        // 1. WebSocket upgrade keeps inspection_slot held until the upgraded connection closes.
+        let slot = core.mitm.try_inspect().unwrap();
+        assert_eq!(core.mitm.active_inspections(), 1);
+        let (mut app, client) = tokio::io::duplex(4096);
+        let (mut server, upstream) = tokio::io::duplex(4096);
+        let observe_task = {
+            let core = core.clone();
+            tokio::spawn(async move {
+                core.observe(
+                    client,
+                    Target::new("ads.test", 80).unwrap(),
+                    Box::new(upstream),
+                    Routed::from("DIRECT"),
+                    false,
+                    slot,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            app.write_all(
+                b"GET /ws HTTP/1.1\r\nHost: ads.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let req = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(req.starts_with("GET /ws HTTP/1.1"));
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let resp = String::from_utf8(read_head(&mut app).await).unwrap();
+            assert!(resp.starts_with("HTTP/1.1 101 "));
+            app.write_all(b"\x81\x04ping").await.unwrap();
+            let mut got = [0u8; 6];
+            server.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"\x81\x04ping");
+            assert_eq!(core.mitm.active_inspections(), 1);
+            server.write_all(b"\x81\x04pong").await.unwrap();
+            app.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"\x81\x04pong");
+            assert_eq!(core.mitm.active_inspections(), 1);
+            drop(app);
+            drop(server);
+            observe_task.await.unwrap().unwrap();
+            assert_eq!(core.mitm.active_inspections(), 0);
+        })
+        .await
+        .unwrap();
+
+        // 2. Idle keep-alive closes after hosted_keepalive_idle_ms without cutting a slow response.
+        let slot = core.mitm.try_inspect().unwrap();
+        assert_eq!(core.mitm.active_inspections(), 1);
+        let (mut app, client) = tokio::io::duplex(4096);
+        let (mut server, upstream) = tokio::io::duplex(4096);
+        let observe_task = {
+            let core = core.clone();
+            tokio::spawn(async move {
+                core.observe(
+                    client,
+                    Target::new("ads.test", 80).unwrap(),
+                    Box::new(upstream),
+                    Routed::from("DIRECT"),
+                    false,
+                    slot,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            app.write_all(b"GET /slow HTTP/1.1\r\nHost: ads.test\r\n\r\n")
+                .await
+                .unwrap();
+            let req = String::from_utf8(read_head(&mut server).await).unwrap();
+            assert!(req.starts_with("GET /slow HTTP/1.1"));
+            // Wait well past hosted_keepalive_idle_ms (60 ms) while response is in flight.
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            assert_eq!(core.mitm.active_inspections(), 1);
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow")
+                .await
+                .unwrap();
+            let (_, body) = read_response(&mut app).await;
+            assert_eq!(body, b"slow");
+            // Keep both sides open without closing; idle timeout must close the relay and free the slot.
+            let mut eof = [0u8; 1];
+            assert_eq!(app.read(&mut eof).await.unwrap(), 0);
+            observe_task.await.unwrap().unwrap();
+            assert_eq!(core.mitm.active_inspections(), 0);
+        })
+        .await
+        .unwrap();
     }
 }

@@ -491,6 +491,17 @@ fn take_session(key: &ContextKey) -> Option<SslSession> {
     sessions.remove(index).map(|(_, session)| session)
 }
 
+/// Drops cached TLS contexts and resumed sessions while keeping the shared
+/// root certificate store intact.
+pub fn clear_caches() {
+    if let Some(contexts) = CONTEXTS.get() {
+        contexts.lock().unwrap().clear();
+    }
+    if let Some(sessions) = SESSIONS.get() {
+        sessions.lock().unwrap().clear();
+    }
+}
+
 fn alpn_wire(alpn: &[String]) -> Result<Vec<u8>> {
     let mut wire = Vec::new();
     for item in alpn {
@@ -968,11 +979,7 @@ fn classify_upstream_handshake_error<S>(
     if let Some(ssl_err) = source.and_then(|s| s.downcast_ref::<boring::ssl::Error>()) {
         if let Some(io) = ssl_err.io_error() {
             return TlsHandshakeError {
-                kind: if cert_verify_failed {
-                    TlsHandshakeErrorKind::CertificateInvalid
-                } else {
-                    TlsHandshakeErrorKind::NetworkIo
-                },
+                kind: TlsHandshakeErrorKind::NetworkIo,
                 message,
                 io_kind: Some(io.kind()),
                 ssl_reasons: Vec::new(),
@@ -982,14 +989,6 @@ fn classify_upstream_handshake_error<S>(
             .ssl_error()
             .map(extract_ssl_reasons)
             .unwrap_or_default();
-        if cert_verify_failed {
-            return TlsHandshakeError {
-                kind: TlsHandshakeErrorKind::CertificateInvalid,
-                message,
-                io_kind: None,
-                ssl_reasons,
-            };
-        }
         if matches!(ssl_err.code(), ErrorCode::SYSCALL | ErrorCode::ZERO_RETURN) {
             return TlsHandshakeError {
                 kind: TlsHandshakeErrorKind::NetworkIo,
@@ -1018,15 +1017,41 @@ fn classify_upstream_handshake_error<S>(
                         | boring_sys::SSL_R_TLSV1_ALERT_USER_CANCELLED
                 )
             });
+            let proto_incompatible = ssl_reasons.iter().any(|&r| {
+                matches!(
+                    r,
+                    boring_sys::SSL_R_NO_APPLICATION_PROTOCOL
+                        | boring_sys::SSL_R_TLSV1_ALERT_NO_APPLICATION_PROTOCOL
+                        | boring_sys::SSL_R_TLSV1_ALERT_PROTOCOL_VERSION
+                        | boring_sys::SSL_R_UNSUPPORTED_PROTOCOL
+                        | boring_sys::SSL_R_NO_SHARED_CIPHER
+                        | boring_sys::SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE
+                        | boring_sys::SSL_R_TLSV1_ALERT_INSUFFICIENT_SECURITY
+                        | boring_sys::SSL_R_TLSV1_ALERT_CERTIFICATE_REQUIRED
+                        | boring_sys::SSL_R_ECH_REJECTED
+                )
+            });
             let kind = if is_cert {
                 TlsHandshakeErrorKind::CertificateInvalid
             } else if is_close || stack.errors().is_empty() {
                 TlsHandshakeErrorKind::NetworkIo
-            } else {
+            } else if proto_incompatible {
                 TlsHandshakeErrorKind::ProtocolIncompatible
+            } else if cert_verify_failed {
+                TlsHandshakeErrorKind::CertificateInvalid
+            } else {
+                TlsHandshakeErrorKind::NetworkIo
             };
             return TlsHandshakeError {
                 kind,
+                message,
+                io_kind: None,
+                ssl_reasons,
+            };
+        }
+        if cert_verify_failed {
+            return TlsHandshakeError {
+                kind: TlsHandshakeErrorKind::CertificateInvalid,
                 message,
                 io_kind: None,
                 ssl_reasons,
@@ -1856,6 +1881,25 @@ mod tests {
             "{classified:?}"
         );
 
+        // 4. Upstream proxy returning plain HTTP error bytes instead of TLS -> NetworkIo.
+        let (client, mut peer) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ =
+                tokio::io::AsyncWriteExt::write_all(&mut peer, b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await;
+        });
+        let err = connector
+            .connect(Box::new(client), &no_verify)
+            .await
+            .err()
+            .unwrap();
+        let classified = err.downcast_ref::<TlsHandshakeError>().unwrap();
+        assert_eq!(
+            classified.kind,
+            TlsHandshakeErrorKind::NetworkIo,
+            "{classified:?}"
+        );
+
         Ok(())
     }
 
@@ -1901,5 +1945,28 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn clear_caches_drops_contexts_and_sessions_and_keeps_roots() {
+        let config = TlsConnectConfig {
+            server_name: "clear-cache.test".into(),
+            alpn: vec!["http/1.1".into()],
+            verify_cert: true,
+            fingerprint: TlsFingerprint::Native,
+            reality: None,
+        };
+        let (conn, _, _, key) = connector(&config, true).unwrap();
+        let root_ptr = foreign_types_shared::ForeignTypeRef::as_ptr(conn.context().cert_store());
+        let key = key.unwrap();
+        assert!(CONTEXTS.get().unwrap().lock().unwrap().contains_key(&key));
+
+        clear_caches();
+        assert!(!CONTEXTS.get().unwrap().lock().unwrap().contains_key(&key));
+        assert!(take_session(&key).is_none());
+
+        let (conn2, ..) = connector(&config, true).unwrap();
+        let root_ptr2 = foreign_types_shared::ForeignTypeRef::as_ptr(conn2.context().cert_store());
+        assert_eq!(root_ptr, root_ptr2);
     }
 }

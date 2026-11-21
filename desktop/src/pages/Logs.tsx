@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { Download, Pause, Play, Search } from "lucide-react";
+import { Download, Pause, Play, Search, Trash2 } from "lucide-react";
 import { locale, t } from "../i18n";
 import { type Log } from "../types";
 import { type Perform } from "../components/common";
@@ -25,7 +25,15 @@ function LogPayload({ text }: { text: string }) {
     </span>
   );
 }
-export function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
+export function LogPage({
+  logs,
+  perform,
+  onClear,
+}: {
+  logs: Log[];
+  perform: Perform;
+  onClear?: () => void;
+}) {
   const [level, setLevel] = useState("all");
   const [paused, setPaused] = useState(false);
   const [frozen, setFrozen] = useState<Log[]>([]);
@@ -87,6 +95,20 @@ export function LogPage({ logs, perform }: { logs: Log[]; perform: Perform }) {
           >
             <Download size={15} />
             {t("导出")}
+          </button>
+          <button
+            className="button secondary"
+            disabled={!logs.length && !frozen.length}
+            onClick={() =>
+              void perform(async () => {
+                await invoke("clear_logs");
+                setFrozen([]);
+                onClear?.();
+              })
+            }
+          >
+            <Trash2 size={15} />
+            {t("清空")}
           </button>
         </div>
       </div>

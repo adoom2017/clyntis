@@ -98,6 +98,25 @@ format. For building and running, see the [README](README.md).
   UDP 443 to decrypted hosts (unless already rejected by routing, bypassed, or
   identified as HTTP/2-only) so browsers fall back to TCP. Existing `REJECT`
   decisions from rules, adblock, or rewrite modules keep their original rule.
+  The iOS tunnel inspects up to 32 connections at a time, holding each slot
+  until the connection closes (including upgraded WebSocket, `CONNECT`, and
+  non-HTTP connections), while idle HTTP/1.1 keep-alive connections close
+  after 60 seconds with no response in flight to free their slot. Extra
+  connections and connections opened while inspection is paused for memory
+  pressure use the usual route without inspection, while already-open
+  connections reuse already-compiled rewrite rules and skip uncached rules
+  without recompiling them. Image, audio, and video bodies are forwarded as
+  usual but omitted from the iOS request log. Only body-buffering rewrites and
+  scripts (`requires-body=1`) share the single hosted body-rewrite slot
+  (released as soon as a buffered body is sent or an oversized body starts
+  streaming); when it is busy, those actions are skipped without delaying
+  other requests, while `requires-body=0` scripts still run through the script
+  queue unless paused under memory pressure. Local rewrite and script response
+  bodies share the 2 MiB hosted body budget and release it once sent; if the
+  budget cannot hold a local response, the original request is forwarded
+  instead. iOS HAR export caps serialized output at 2 MiB. It omits bodies
+  that do not fit and, if metadata alone exceeds the limit, prioritizes recent
+  entries and notes that records were omitted.
   `PATCH /configs` with `mitm` applies new settings without a restart. The
   CA can intercept any site the device visits while it is trusted: keep the
   key private and turn decryption off when not analyzing.

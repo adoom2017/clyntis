@@ -118,6 +118,7 @@ fn main() {
             app::trust_mitm_ca,
             app::export_mitm_ca,
             app::clear_mitm_bypass,
+            app::clear_logs,
             app::export_logs,
             app::install_service,
             app::uninstall_service,

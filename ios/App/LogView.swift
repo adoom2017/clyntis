@@ -26,7 +26,6 @@ struct LogView: View {
     @State private var entries: [LogEntry] = []
     @State private var level = Level.all
     @State private var query = ""
-    @State private var confirmClear = false
 
     private var visible: [LogEntry] {
         entries.reversed().filter { entry in
@@ -75,14 +74,11 @@ struct LogView: View {
                             Image(systemName: "square.and.arrow.up")
                         }
                     }
-                    Button(L("清空"), systemImage: "trash") { confirmClear = true }
-                        .disabled(entries.isEmpty)
-                }
-            }
-            .confirmationDialog(L("清空所有日志？"), isPresented: $confirmClear, titleVisibility: .visible) {
-                Button(L("清空"), role: .destructive) {
-                    LogFile.shared.clear()
-                    entries = []
+                    Button(L("清空"), systemImage: "trash") {
+                        LogFile.shared.clear()
+                        entries = []
+                    }
+                    .disabled(entries.isEmpty)
                 }
             }
             .refreshable { await reload() }

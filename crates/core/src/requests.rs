@@ -5,14 +5,19 @@
 use crate::{RouteDecision, traffic};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clyntis_protocol::Target;
-use serde::Serialize;
+use serde::{
+    Serialize,
+    ser::{SerializeSeq, Serializer},
+};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::VecDeque,
-    io::Read,
+    io::{Read, Write},
     sync::{Arc, Mutex, atomic::Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Limits on what the log keeps.
 #[derive(Clone, Copy, Debug)]
@@ -31,11 +36,23 @@ const DESKTOP: Limits = Limits {
 /// The iOS tunnel lives within about 50 MiB.
 const HOSTED: Limits = Limits {
     entries: 500,
-    body_bytes: 2 << 20,
+    body_bytes: 1 << 20,
     body_cap: 128 << 10,
 };
+// Leave space for in-flight exchanges even when the log fills its share.
+pub(crate) const HOSTED_CAPTURE_BYTES: usize = 2 << 20;
+/// Whole-export byte limit for hosted/iOS HAR export.
+pub(crate) const HOSTED_HAR_BYTES: usize = 2 << 20;
 /// A decoded body shown to the apps stops here.
 const DECODED_CAP: u64 = 4 << 20;
+const TRUNCATED_BODY_COMMENT: &str = "truncated: only the beginning was kept";
+const OMITTED_BODY_COMMENT: &str = "omitted: export size limit reached";
+const HAR_LOG_PREFIX_START: &str =
+    r#"{"log":{"version":"1.2","creator":{"name":"Clyntis","version":"#;
+const HAR_LOG_PREFIX_END: &str = r#"},"pages":[],"entries":["#;
+const HAR_LOG_SUFFIX: &str = "]}}";
+const HAR_TRUNCATED_SUFFIX: &str =
+    r#"],"comment":"Some entries were omitted to fit the export size limit."}}"#;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +109,7 @@ pub struct HttpSummary {
 }
 
 /// Headers and the kept part of the bodies, as sent (still compressed).
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct HttpDetail {
     pub(crate) request_headers: Vec<(String, String)>,
     pub(crate) response_headers: Vec<(String, String)>,
@@ -100,18 +117,58 @@ pub(crate) struct HttpDetail {
     pub(crate) response_body: Body,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Body {
     pub(crate) bytes: Vec<u8>,
     /// Bytes seen, kept or not.
     pub(crate) size: u64,
+    reservation: Option<OwnedSemaphorePermit>,
 }
 impl Body {
+    #[cfg(test)]
     pub(crate) fn push(&mut self, bytes: &[u8], cap: usize) {
+        self.capture(bytes, cap, None);
+    }
+    fn capture(&mut self, bytes: &[u8], cap: usize, budget: Option<&Arc<Semaphore>>) {
+        let seen = self.size;
         self.size += bytes.len() as u64;
-        let room = cap.saturating_sub(self.bytes.len());
-        self.bytes
-            .extend_from_slice(&bytes[..bytes.len().min(room)]);
+        // Once bytes were omitted, keep only the contiguous prefix.
+        if seen != self.bytes.len() as u64 {
+            return;
+        }
+        let end = self.bytes.len() + bytes.len().min(cap.saturating_sub(self.bytes.len()));
+        if let Some(budget) = budget {
+            let capacity = self.bytes.capacity();
+            if end > capacity {
+                let growth = end
+                    .max(capacity.saturating_mul(2))
+                    .min(cap)
+                    .saturating_sub(capacity)
+                    .min(budget.available_permits());
+                if growth != 0
+                    && let Ok(permit) = budget.clone().try_acquire_many_owned(growth as u32)
+                {
+                    self.bytes
+                        .reserve_exact(capacity + growth - self.bytes.len());
+                    match &mut self.reservation {
+                        Some(held) => held.merge(permit),
+                        None => self.reservation = Some(permit),
+                    }
+                }
+            }
+            let end = end.min(self.bytes.capacity());
+            self.bytes
+                .extend_from_slice(&bytes[..end - self.bytes.len()]);
+        } else {
+            self.bytes
+                .extend_from_slice(&bytes[..end - self.bytes.len()]);
+        }
+    }
+    fn without_bytes(&self) -> Self {
+        Self {
+            size: self.size,
+            ..Self::default()
+        }
     }
     fn truncated(&self) -> bool {
         (self.bytes.len() as u64) < self.size
@@ -140,6 +197,7 @@ struct Log {
 pub struct Requests {
     log: Mutex<Log>,
     limits: Limits,
+    capture_budget: Option<Arc<Semaphore>>,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -153,13 +211,83 @@ impl Requests {
         Self {
             log: Mutex::default(),
             limits: if hosted { HOSTED } else { DESKTOP },
+            capture_budget: hosted.then(|| Arc::new(Semaphore::new(HOSTED_CAPTURE_BYTES))),
         }
     }
-    pub(crate) fn body_cap(&self) -> usize {
+    pub(crate) fn body_cap(&self, content_type: Option<&str>) -> usize {
+        if self.capture_budget.is_some()
+            && let Some(mime) = content_type
+            && let Some((kind, _)) = mime.split_once('/')
+            && ["image", "video", "audio"]
+                .iter()
+                .any(|k| kind.eq_ignore_ascii_case(k))
+        {
+            return 0;
+        }
         self.limits.body_cap
     }
+    pub(crate) fn capture(&self, body: &mut Body, bytes: &[u8], cap: usize) {
+        body.capture(bytes, cap, self.capture_budget.as_ref());
+    }
+    pub(crate) fn captured_bytes(&self) -> usize {
+        self.capture_budget.as_ref().map_or(0, |budget| {
+            HOSTED_CAPTURE_BYTES.saturating_sub(budget.available_permits())
+        })
+    }
+    /// Reserves `bytes` from the hosted body-memory budget shared with
+    /// captured request/response log bodies. Returns `Ok(None)` when
+    /// unbudgeted (desktop) or `bytes == 0`, `Ok(Some(permit))` on success,
+    /// or `Err(())` when the hosted budget cannot cover `bytes`.
+    pub(crate) fn reserve_body_budget(
+        &self,
+        bytes: usize,
+    ) -> Result<Option<OwnedSemaphorePermit>, ()> {
+        let Some(budget) = &self.capture_budget else {
+            return Ok(None);
+        };
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let permits = u32::try_from(bytes).map_err(|_| ())?;
+        budget
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map(Some)
+            .map_err(|_| ())
+    }
+    /// Drops stored HTTP body payloads under memory pressure while retaining
+    /// summaries and headers.
+    pub(crate) fn relieve_memory(&self) {
+        let mut log = self.log.lock().unwrap();
+        for slot in &mut log.entries {
+            let has_bodies = slot.detail.as_ref().is_some_and(|d| {
+                d.request_body.bytes.capacity() > 0 || d.response_body.bytes.capacity() > 0
+            });
+            if has_bodies {
+                if let Some(entry) = Arc::get_mut(slot) {
+                    let detail = entry.detail.as_mut().unwrap();
+                    detail.request_body = detail.request_body.without_bytes();
+                    detail.response_body = detail.response_body.without_bytes();
+                } else {
+                    let detail = slot.detail.as_ref().unwrap();
+                    *slot = Arc::new(Entry {
+                        summary: slot.summary.clone(),
+                        detail: Some(HttpDetail {
+                            request_headers: detail.request_headers.clone(),
+                            response_headers: detail.response_headers.clone(),
+                            request_body: detail.request_body.without_bytes(),
+                            response_body: detail.response_body.without_bytes(),
+                        }),
+                    });
+                }
+            }
+        }
+        log.body_bytes = 0;
+    }
     fn push(&self, mut summary: Request, mut detail: Option<HttpDetail>) {
-        if let Some(detail) = &mut detail {
+        if self.capture_budget.is_none()
+            && let Some(detail) = &mut detail
+        {
             detail.request_body.bytes.shrink_to_fit();
             detail.response_body.bytes.shrink_to_fit();
         }
@@ -311,6 +439,12 @@ impl Requests {
     /// decompressed; connections without HTTP are left out (see
     /// [`Requests::export_csv`]).
     pub fn export_har(&self) -> Value {
+        if self.capture_budget.is_some() {
+            return self
+                .export_har_with_limit(Some(HOSTED_HAR_BYTES))
+                .and_then(|bytes| serde_json::from_slice(&bytes))
+                .expect("serialized HAR must be valid JSON");
+        }
         let entries: Vec<Value> = self
             .snapshot()
             .iter()
@@ -326,6 +460,89 @@ impl Requests {
             "pages": [],
             "entries": entries,
         }})
+    }
+    /// Serialized HAR 1.2 JSON bytes. Hosted logs stream compact JSON capped at
+    /// [`HOSTED_HAR_BYTES`]; desktop logs keep pretty-printed unbounded JSON.
+    pub fn export_har_json(&self) -> serde_json::Result<Vec<u8>> {
+        if self.capture_budget.is_some() {
+            self.export_har_with_limit(Some(HOSTED_HAR_BYTES))
+        } else {
+            serde_json::to_vec_pretty(&self.export_har())
+        }
+    }
+    /// Streams compact HAR 1.2 JSON directly into a single buffer, optionally
+    /// enforcing a whole-export byte limit. Keep complete entries, newest first
+    /// when choosing which fit, and use the remaining space for bodies.
+    pub(crate) fn export_har_with_limit(
+        &self,
+        limit: Option<usize>,
+    ) -> serde_json::Result<Vec<u8>> {
+        let snapshot = self.snapshot();
+        let mut entries: Vec<_> = snapshot
+            .iter()
+            .filter_map(|entry| {
+                let http = entry.summary.http.as_ref()?;
+                let detail = entry.detail.as_ref()?;
+                Some((&entry.summary, http, detail))
+            })
+            .collect();
+
+        let mut suffix = HAR_LOG_SUFFIX;
+        let (base_bytes, mut remaining_body_bytes) = if let Some(max) = limit {
+            let mut counter = ByteCounter(0);
+            write_har_prefix(&mut counter)?;
+            let prefix_bytes = counter.0;
+            let mut sizes = Vec::with_capacity(entries.len());
+            for (summary, http, detail) in &entries {
+                let entry = HarEntry::without_bodies(summary, http, detail);
+                sizes.push(json_byte_len(&entry)?);
+            }
+            let mut base = prefix_bytes
+                + HAR_LOG_SUFFIX.len()
+                + sizes.iter().sum::<usize>()
+                + entries.len().saturating_sub(1);
+            if base > max {
+                suffix = HAR_TRUNCATED_SUFFIX;
+                base = prefix_bytes + suffix.len();
+                if base > max {
+                    return Err(serde_json::Error::io(har_size_error()));
+                }
+                entries.reverse();
+                let mut retained_any = false;
+                let mut sizes = sizes.into_iter().rev();
+                entries.retain(|_| {
+                    let size = sizes.next().unwrap() + usize::from(retained_any);
+                    if size > max - base {
+                        return false;
+                    }
+                    base += size;
+                    retained_any = true;
+                    true
+                });
+                entries.reverse();
+            }
+            (base, Some(max - base))
+        } else {
+            (0, None)
+        };
+
+        let mut out = HarBuffer {
+            bytes: Vec::with_capacity(base_bytes),
+            limit,
+        };
+        write_har_prefix(&mut out)?;
+        for (index, (summary, http, detail)) in entries.iter().enumerate() {
+            if index > 0 {
+                out.write_all(b",").map_err(serde_json::Error::io)?;
+            }
+            let post_data = har_post_data_for_export(detail, &mut remaining_body_bytes)?;
+            let content = har_content_for_export(detail, &mut remaining_body_bytes)?;
+            let entry = HarEntry::new(summary, http, detail, post_data, content);
+            serde_json::to_writer(&mut out, &entry)?;
+        }
+        out.write_all(suffix.as_bytes())
+            .map_err(serde_json::Error::io)?;
+        Ok(out.bytes)
     }
     /// Every entry, one line each, as CSV with a header line.
     pub fn export_csv(&self) -> String {
@@ -408,6 +625,361 @@ fn iso_time(ms: u64) -> String {
     )
 }
 
+struct ByteCounter(usize);
+
+fn har_size_error() -> std::io::Error {
+    std::io::Error::other("HAR exceeds export size limit")
+}
+
+struct HarBuffer {
+    bytes: Vec<u8>,
+    limit: Option<usize>,
+}
+
+impl Write for HarBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(limit) = self.limit {
+            if buf.len() > limit - self.bytes.len() {
+                return Err(har_size_error());
+            }
+            let end = self.bytes.len() + buf.len();
+            if end > self.bytes.capacity() {
+                let capacity = end.max(self.bytes.capacity().saturating_mul(2)).min(limit);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
+        }
+        self.bytes.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_byte_len<T: Serialize>(value: &T) -> serde_json::Result<usize> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+fn write_har_prefix(mut w: impl Write) -> serde_json::Result<()> {
+    w.write_all(HAR_LOG_PREFIX_START.as_bytes())
+        .map_err(serde_json::Error::io)?;
+    serde_json::to_writer(&mut w, env!("CARGO_PKG_VERSION"))?;
+    w.write_all(HAR_LOG_PREFIX_END.as_bytes())
+        .map_err(serde_json::Error::io)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct HarPair<'a> {
+    name: &'a str,
+    value: &'a str,
+}
+
+struct HarHeaders<'a>(&'a [(String, String)]);
+
+impl Serialize for HarHeaders<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for (name, value) in self.0 {
+            seq.serialize_element(&HarPair { name, value })?;
+        }
+        seq.end()
+    }
+}
+
+struct HarQueryString<'a>(&'a str);
+
+impl Serialize for HarQueryString<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(None)?;
+        if let Some((_, query)) = self.0.split_once('?') {
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                seq.serialize_element(&HarPair { name, value })?;
+            }
+        }
+        seq.end()
+    }
+}
+
+struct HarRuleComment<'a>(&'a str, &'a str);
+
+impl Serialize for HarRuleComment<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{} -> {}", self.0, self.1))
+    }
+}
+
+#[derive(Serialize)]
+struct HarEmpty {}
+
+#[derive(Serialize)]
+struct HarTimings {
+    send: u64,
+    wait: u64,
+    receive: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarPostData<'a> {
+    mime_type: &'a str,
+    text: Cow<'a, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarContent<'a> {
+    size: u64,
+    mime_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarRequest<'a> {
+    method: &'a str,
+    url: &'a str,
+    http_version: &'static str,
+    cookies: [(); 0],
+    headers: HarHeaders<'a>,
+    query_string: HarQueryString<'a>,
+    headers_size: i32,
+    body_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    post_data: Option<HarPostData<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarResponse<'a> {
+    status: u16,
+    status_text: &'a str,
+    http_version: &'static str,
+    cookies: [(); 0],
+    headers: HarHeaders<'a>,
+    content: HarContent<'a>,
+    #[serde(rename = "redirectURL")]
+    redirect_url: &'static str,
+    headers_size: i32,
+    body_size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarEntry<'a> {
+    started_date_time: String,
+    time: u64,
+    request: HarRequest<'a>,
+    response: HarResponse<'a>,
+    cache: HarEmpty,
+    timings: HarTimings,
+    connection: &'a str,
+    comment: HarRuleComment<'a>,
+}
+
+impl<'a> HarEntry<'a> {
+    fn without_bodies(r: &'a Request, http: &'a HttpSummary, detail: &'a HttpDetail) -> Self {
+        Self::new(
+            r,
+            http,
+            detail,
+            har_post_data_placeholder(detail),
+            har_content_placeholder(detail),
+        )
+    }
+
+    fn new(
+        r: &'a Request,
+        http: &'a HttpSummary,
+        detail: &'a HttpDetail,
+        post_data: Option<HarPostData<'a>>,
+        content: HarContent<'a>,
+    ) -> Self {
+        Self {
+            started_date_time: iso_time(r.time),
+            time: r.duration,
+            request: HarRequest {
+                method: &http.method,
+                url: &http.url,
+                http_version: "HTTP/1.1",
+                cookies: [],
+                headers: HarHeaders(&detail.request_headers),
+                query_string: HarQueryString(&http.url),
+                headers_size: -1,
+                body_size: http.request_size,
+                post_data,
+            },
+            response: HarResponse {
+                status: http.status.unwrap_or(0),
+                status_text: http.error.as_deref().unwrap_or(""),
+                http_version: "HTTP/1.1",
+                cookies: [],
+                headers: HarHeaders(&detail.response_headers),
+                content,
+                redirect_url: "",
+                headers_size: -1,
+                body_size: http.response_size,
+            },
+            cache: HarEmpty {},
+            timings: HarTimings {
+                send: 0,
+                wait: r.duration,
+                receive: 0,
+            },
+            connection: &r.connection,
+            comment: HarRuleComment(&r.rule, &r.chain),
+        }
+    }
+}
+
+fn har_post_data_placeholder(detail: &HttpDetail) -> Option<HarPostData<'_>> {
+    if detail.request_body.size == 0 {
+        return None;
+    }
+    let mime_type = header(&detail.request_headers, "content-type").unwrap_or_default();
+    let comment = (!detail.request_body.bytes.is_empty()).then_some(OMITTED_BODY_COMMENT);
+    Some(HarPostData {
+        mime_type,
+        text: Cow::Borrowed(""),
+        comment,
+    })
+}
+
+fn har_content_placeholder(detail: &HttpDetail) -> HarContent<'_> {
+    let body = &detail.response_body;
+    let mime_type = header(&detail.response_headers, "content-type").unwrap_or_default();
+    if body.bytes.is_empty() {
+        HarContent {
+            size: body.size,
+            mime_type,
+            text: Some(Cow::Borrowed("")),
+            encoding: None,
+            comment: body.truncated().then_some(TRUNCATED_BODY_COMMENT),
+        }
+    } else {
+        HarContent {
+            size: body.size,
+            mime_type,
+            text: None,
+            encoding: None,
+            comment: Some(OMITTED_BODY_COMMENT),
+        }
+    }
+}
+
+fn fit_body_for_har<'a, T: Serialize>(
+    body: &'a Body,
+    headers: &'a [(String, String)],
+    remaining_body_bytes: &mut Option<usize>,
+    placeholder: T,
+    build_candidate: impl FnOnce(RenderedText<'a>) -> T,
+) -> serde_json::Result<T> {
+    if *remaining_body_bytes == Some(0) {
+        return Ok(placeholder);
+    }
+    let rem_opt = *remaining_body_bytes;
+    let (decoded, _) = decode_body(body, headers, rem_opt);
+    let DecodedBody::Bytes(bytes) = decoded else {
+        return Ok(placeholder);
+    };
+    // Serialized text/base64 is always >= raw byte length, and the omitted
+    // comment placeholder only saves <= 47 bytes, so larger bodies cannot fit.
+    if let Some(rem) = rem_opt
+        && bytes.len() > rem.saturating_add(64)
+    {
+        return Ok(placeholder);
+    }
+    let candidate = build_candidate(render_bytes(bytes, headers));
+    if let Some(rem) = remaining_body_bytes.as_mut() {
+        let extra = json_byte_len(&candidate)?.saturating_sub(json_byte_len(&placeholder)?);
+        if extra > *rem {
+            return Ok(placeholder);
+        }
+        *rem -= extra;
+    }
+    Ok(candidate)
+}
+
+fn har_post_data_for_export<'a>(
+    detail: &'a HttpDetail,
+    remaining_body_bytes: &mut Option<usize>,
+) -> serde_json::Result<Option<HarPostData<'a>>> {
+    let Some(placeholder) = har_post_data_placeholder(detail) else {
+        return Ok(None);
+    };
+    if detail.request_body.bytes.is_empty() {
+        return Ok(Some(placeholder));
+    }
+    let mime_type = placeholder.mime_type;
+    fit_body_for_har(
+        &detail.request_body,
+        &detail.request_headers,
+        remaining_body_bytes,
+        placeholder,
+        |rendered| HarPostData {
+            mime_type,
+            text: match rendered {
+                RenderedText::Text(text) => text,
+                RenderedText::Base64(data) => Cow::Owned(data),
+            },
+            comment: None,
+        },
+    )
+    .map(Some)
+}
+
+fn har_content_for_export<'a>(
+    detail: &'a HttpDetail,
+    remaining_body_bytes: &mut Option<usize>,
+) -> serde_json::Result<HarContent<'a>> {
+    let placeholder = har_content_placeholder(detail);
+    if detail.response_body.bytes.is_empty() {
+        return Ok(placeholder);
+    }
+    let body = &detail.response_body;
+    let mime_type = placeholder.mime_type;
+    fit_body_for_har(
+        body,
+        &detail.response_headers,
+        remaining_body_bytes,
+        placeholder,
+        |rendered| {
+            let (text, encoding) = match rendered {
+                RenderedText::Text(text) => (Some(text), None),
+                RenderedText::Base64(data) => (Some(Cow::Owned(data)), Some("base64")),
+            };
+            HarContent {
+                size: body.size,
+                mime_type,
+                text,
+                encoding,
+                comment: body.truncated().then_some(TRUNCATED_BODY_COMMENT),
+            }
+        },
+    )
+}
+
 fn har_headers(headers: &[(String, String)]) -> Value {
     json!(
         headers
@@ -431,7 +1003,7 @@ fn har_content(body: &Body, headers: &[(String, String)]) -> Value {
         content["encoding"] = json!("base64");
     }
     if body.truncated() {
-        content["comment"] = json!("truncated: only the beginning was kept");
+        content["comment"] = json!(TRUNCATED_BODY_COMMENT);
     }
     content
 }
@@ -497,19 +1069,42 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.trim())
 }
 
-/// A body for the apps: decompressed per Content-Encoding, then as text when
-/// it reads as text, else base64.
-fn render(body: &Body, headers: &[(String, String)]) -> Value {
-    let mut bytes = std::borrow::Cow::Borrowed(body.bytes.as_slice());
-    let mut decoded = false;
-    if let Some(encoding) = header(headers, "content-encoding")
-        && let Some(plain) = decode(encoding, &body.bytes)
+enum DecodedBody<'a> {
+    Bytes(Cow<'a, [u8]>),
+    ExceededLimit,
+}
+
+enum RenderedText<'a> {
+    Text(Cow<'a, str>),
+    Base64(String),
+}
+
+fn decode_body<'a>(
+    body: &'a Body,
+    headers: &[(String, String)],
+    limit: Option<usize>,
+) -> (DecodedBody<'a>, bool) {
+    if !body.bytes.is_empty()
+        && let Some(encoding) = header(headers, "content-encoding")
     {
-        bytes = plain.into();
-        decoded = true;
+        let cap = limit
+            .map(|rem| rem.min(DECODED_CAP as usize) as u64 + 1)
+            .unwrap_or(DECODED_CAP);
+        if let Some(plain) = decode_with(encoding, &body.bytes, cap) {
+            if limit.is_some_and(|rem| plain.len() > rem) {
+                return (DecodedBody::ExceededLimit, true);
+            }
+            return (DecodedBody::Bytes(Cow::Owned(plain)), true);
+        }
     }
-    let content_type = header(headers, "content-type").unwrap_or_default();
-    let textual = content_type.starts_with("text/")
+    (
+        DecodedBody::Bytes(Cow::Borrowed(body.bytes.as_slice())),
+        false,
+    )
+}
+
+fn is_textual_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
         || [
             "json",
             "xml",
@@ -518,28 +1113,51 @@ fn render(body: &Body, headers: &[(String, String)]) -> Value {
             "graphql",
         ]
         .iter()
-        .any(|t| content_type.contains(t));
+        .any(|t| content_type.contains(t))
+}
+
+fn render_bytes<'a>(bytes: Cow<'a, [u8]>, headers: &[(String, String)]) -> RenderedText<'a> {
+    let textual = is_textual_content_type(header(headers, "content-type").unwrap_or_default());
+    match bytes {
+        Cow::Borrowed(slice) => match std::str::from_utf8(slice) {
+            Ok(text) => RenderedText::Text(Cow::Borrowed(text)),
+            // A truncated body may end inside a character.
+            Err(error) if error.valid_up_to() + 4 > slice.len() || textual => {
+                RenderedText::Text(Cow::Owned(String::from_utf8_lossy(slice).into_owned()))
+            }
+            Err(_) => RenderedText::Base64(STANDARD.encode(slice)),
+        },
+        Cow::Owned(vec) => match String::from_utf8(vec) {
+            Ok(text) => RenderedText::Text(Cow::Owned(text)),
+            Err(error) => {
+                let valid_up_to = error.utf8_error().valid_up_to();
+                let vec = error.into_bytes();
+                if valid_up_to + 4 > vec.len() || textual {
+                    RenderedText::Text(Cow::Owned(String::from_utf8_lossy(&vec).into_owned()))
+                } else {
+                    RenderedText::Base64(STANDARD.encode(&vec))
+                }
+            }
+        },
+    }
+}
+
+/// A body for the apps: decompressed per Content-Encoding, then as text when
+/// it reads as text, else base64.
+fn render(body: &Body, headers: &[(String, String)]) -> Value {
+    let (DecodedBody::Bytes(bytes), decoded) = decode_body(body, headers, None) else {
+        unreachable!("unbounded decode cannot exceed limit");
+    };
     let mut value = json!({
         "size": body.size,
         "truncated": body.truncated(),
         "decoded": decoded,
     });
-    match std::str::from_utf8(&bytes) {
-        Ok(text) => value["text"] = json!(text),
-        // A truncated body may end inside a character.
-        Err(error) if error.valid_up_to() + 4 > bytes.len() || textual => {
-            value["text"] = json!(String::from_utf8_lossy(&bytes))
-        }
-        Err(_) => value["base64"] = json!(STANDARD.encode(&bytes)),
+    match render_bytes(bytes, headers) {
+        RenderedText::Text(text) => value["text"] = json!(text),
+        RenderedText::Base64(data) => value["base64"] = json!(data),
     }
     value
-}
-
-/// Undoes Content-Encoding (the last coding listed was applied last); `None`
-/// when a coding is unknown or nothing came out. A truncated body decodes
-/// as far as it goes.
-fn decode(encoding: &str, bytes: &[u8]) -> Option<Vec<u8>> {
-    decode_with(encoding, bytes, DECODED_CAP)
 }
 
 /// The whole decoded body, or `None` when a coding is unknown, the data is
@@ -550,33 +1168,33 @@ pub(crate) fn decode_limited(encoding: &str, bytes: &[u8], limit: usize) -> Opti
 }
 
 fn decode_with(encoding: &str, bytes: &[u8], cap: u64) -> Option<Vec<u8>> {
-    let mut data = bytes.to_vec();
+    let mut data = Cow::Borrowed(bytes);
     let mut changed = false;
     for coding in encoding.rsplit(',').map(|c| c.trim().to_ascii_lowercase()) {
         let mut out = Vec::new();
         let reader: Box<dyn Read + '_> = match coding.as_str() {
             "" | "identity" => continue,
-            "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(data.as_slice())),
+            "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(data.as_ref())),
             "deflate" => {
                 // Usually zlib-wrapped, sometimes raw.
                 if data.first().is_some_and(|b| b & 0x0f == 8) {
-                    Box::new(flate2::read::ZlibDecoder::new(data.as_slice()))
+                    Box::new(flate2::read::ZlibDecoder::new(data.as_ref()))
                 } else {
-                    Box::new(flate2::read::DeflateDecoder::new(data.as_slice()))
+                    Box::new(flate2::read::DeflateDecoder::new(data.as_ref()))
                 }
             }
-            "br" => Box::new(brotli::Decompressor::new(data.as_slice(), 4096)),
-            "zstd" => Box::new(zstd::stream::read::Decoder::new(data.as_slice()).ok()?),
+            "br" => Box::new(brotli::Decompressor::new(data.as_ref(), 4096)),
+            "zstd" => Box::new(zstd::stream::read::Decoder::new(data.as_ref()).ok()?),
             _ => return None,
         };
         let _ = reader.take(cap).read_to_end(&mut out);
         if out.is_empty() && !data.is_empty() {
             return None;
         }
-        data = out;
+        data = Cow::Owned(out);
         changed = true;
     }
-    changed.then_some(data)
+    changed.then(|| data.into_owned())
 }
 
 #[cfg(test)]
@@ -614,6 +1232,7 @@ mod tests {
                 body_bytes: 10,
                 body_cap: 8,
             },
+            capture_budget: None,
         };
         for n in 0..5 {
             requests.push(summary(&format!("{n}.test")), None);
@@ -630,12 +1249,17 @@ mod tests {
         let mut body = Body::default();
         body.push(b"0123456789abcdef", 8);
         assert_eq!((body.bytes.len(), body.size), (8, 16));
-        let detail = HttpDetail {
-            response_body: body,
-            ..Default::default()
-        };
-        requests.push(summary("a.test"), Some(detail.clone()));
-        requests.push(summary("b.test"), Some(detail));
+        for host in ["a.test", "b.test"] {
+            let mut response_body = Body::default();
+            response_body.push(b"0123456789abcdef", 8);
+            requests.push(
+                summary(host),
+                Some(HttpDetail {
+                    response_body,
+                    ..Default::default()
+                }),
+            );
+        }
         let (all, _) = requests.list(0, 100);
         assert_eq!(all.len(), 1);
         let shown = requests.detail(all[0].id).unwrap();
@@ -660,6 +1284,7 @@ mod tests {
         let body = Body {
             size: 0,
             bytes: gzip.finish().unwrap(),
+            ..Default::default()
         };
         let headers = vec![
             ("Content-Encoding".to_owned(), "gzip".to_owned()),
@@ -671,6 +1296,7 @@ mod tests {
         let binary = Body {
             size: 4,
             bytes: vec![0xff, 0xfe, 0x00, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80],
+            ..Default::default()
         };
         assert_eq!(
             render(&binary, &[])["base64"],
@@ -716,5 +1342,561 @@ mod tests {
         assert_eq!(entry["request"]["headers"][0]["value"], "ads.test");
         assert_eq!(entry["response"]["status"], 204);
         assert_eq!(entry["startedDateTime"], "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn capture_budget_counts_in_flight_bodies_and_retained_snapshots() {
+        let mut requests = Requests::new(true);
+        requests.capture_budget = Some(Arc::new(Semaphore::new(12)));
+        let mut in_flight = Body::default();
+        requests.capture(&mut in_flight, b"12345678", 8);
+        let mut response = Body::default();
+        requests.capture(&mut response, b"abcdef", 8);
+        assert_eq!(response.bytes, b"abcd");
+        assert_eq!(response.size, 6);
+        requests.push(
+            summary("a.test"),
+            Some(HttpDetail {
+                response_body: response,
+                ..Default::default()
+            }),
+        );
+        let snapshot = requests.snapshot();
+        requests.relieve_memory();
+        let mut next = Body::default();
+        requests.capture(&mut next, b"next", 8);
+        assert!(next.bytes.is_empty(), "export still owns the old body");
+        drop(snapshot);
+        drop(in_flight);
+        requests.capture(&mut next, b"more", 8);
+        assert!(
+            next.bytes.is_empty(),
+            "never splice a body after omitted bytes"
+        );
+        assert_eq!(next.size, 8);
+        let mut fresh = Body::default();
+        requests.capture(&mut fresh, b"fresh", 8);
+        assert_eq!(fresh.bytes, b"fresh");
+    }
+
+    #[test]
+    fn relieve_memory_drops_bodies_but_keeps_summaries_and_headers() {
+        let requests = Requests::new(true);
+        let mut req_body = Body::default();
+        req_body.push(b"hello-req", 1024);
+        let mut resp_body = Body::default();
+        resp_body.push(b"hello-resp", 1024);
+        let mut req = summary("ads.test");
+        req.status = "http".into();
+        requests.push(
+            req,
+            Some(HttpDetail {
+                request_headers: vec![("Host".into(), "ads.test".into())],
+                response_headers: vec![("Content-Type".into(), "text/plain".into())],
+                request_body: req_body,
+                response_body: resp_body,
+            }),
+        );
+        assert!(requests.log.lock().unwrap().body_bytes > 0);
+        requests.relieve_memory();
+        assert_eq!(requests.log.lock().unwrap().body_bytes, 0);
+        let (all, _) = requests.list(0, 10);
+        assert_eq!(all.len(), 1);
+        let detail = requests.detail(all[0].id).unwrap();
+        assert_eq!(detail["requestHeaders"][0][1], "ads.test");
+        assert_eq!(detail["responseHeaders"][0][1], "text/plain");
+        assert_eq!(detail["requestBody"]["text"], "");
+        assert_eq!(detail["requestBody"]["truncated"], true);
+        assert_eq!(detail["requestBody"]["size"], 9);
+        assert_eq!(detail["responseBody"]["size"], 10);
+    }
+
+    #[test]
+    fn reserve_body_budget_shares_hosted_budget_and_restores_on_drop() {
+        let desktop = Requests::new(false);
+        assert_eq!(desktop.captured_bytes(), 0);
+        assert!(desktop.reserve_body_budget(0).unwrap().is_none());
+        assert!(desktop.reserve_body_budget(1024).unwrap().is_none());
+        assert!(desktop.reserve_body_budget(usize::MAX).unwrap().is_none());
+        assert_eq!(desktop.captured_bytes(), 0);
+
+        let hosted = Requests::new(true);
+        assert_eq!(hosted.captured_bytes(), 0);
+        assert!(hosted.reserve_body_budget(0).unwrap().is_none());
+        assert_eq!(hosted.captured_bytes(), 0);
+
+        let mut captured = Body::default();
+        let captured_chunk = vec![b'a'; 1024];
+        hosted.capture(&mut captured, &captured_chunk, captured_chunk.len());
+        assert_eq!(captured.bytes.len(), 1024);
+        assert_eq!(hosted.captured_bytes(), 1024);
+
+        let remaining = HOSTED_CAPTURE_BYTES - 1024;
+        assert!(hosted.reserve_body_budget(remaining + 1).is_err());
+        assert!(hosted.reserve_body_budget(usize::MAX).is_err());
+        assert_eq!(hosted.captured_bytes(), 1024);
+
+        let reserved = hosted
+            .reserve_body_budget(remaining)
+            .expect("exact remaining budget should succeed")
+            .expect("nonzero hosted reservation should hold a permit");
+        assert_eq!(hosted.captured_bytes(), HOSTED_CAPTURE_BYTES);
+        assert!(hosted.reserve_body_budget(1).is_err());
+        assert!(hosted.reserve_body_budget(0).unwrap().is_none());
+
+        let mut starved = Body::default();
+        hosted.capture(&mut starved, b"blocked", 64);
+        assert!(starved.bytes.is_empty());
+        assert_eq!(starved.size, 7);
+
+        drop(reserved);
+        assert_eq!(hosted.captured_bytes(), 1024);
+
+        drop(captured);
+        assert_eq!(hosted.captured_bytes(), 0);
+
+        let full = hosted
+            .reserve_body_budget(HOSTED_CAPTURE_BYTES)
+            .expect("full budget should be restored after drop")
+            .expect("full hosted reservation should hold a permit");
+        assert_eq!(hosted.captured_bytes(), HOSTED_CAPTURE_BYTES);
+        drop(full);
+        assert_eq!(hosted.captured_bytes(), 0);
+    }
+
+    fn push_http_exchange(
+        requests: &Requests,
+        host: &str,
+        method: &str,
+        url: &str,
+        status: u16,
+        request_headers: Vec<(&str, &str)>,
+        request_payload: &[u8],
+        response_headers: Vec<(&str, &str)>,
+        response_payload: &[u8],
+    ) {
+        let mut request_body = Body::default();
+        if !request_payload.is_empty() {
+            let cap = requests.body_cap(None);
+            requests.capture(&mut request_body, request_payload, cap);
+        }
+        let resp_ct = response_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| *v);
+        let mut response_body = Body::default();
+        if !response_payload.is_empty() {
+            let cap = requests.body_cap(resp_ct);
+            requests.capture(&mut response_body, response_payload, cap);
+        }
+        let mut req = summary(host);
+        req.status = "http".into();
+        req.connection = format!("conn-{host}");
+        req.duration = 42;
+        req.http = Some(HttpSummary {
+            method: method.into(),
+            url: url.into(),
+            decrypted: true,
+            status: Some(status),
+            content_type: resp_ct.map(str::to_owned),
+            request_size: request_body.size,
+            response_size: response_body.size,
+            ..Default::default()
+        });
+        requests.push(
+            req,
+            Some(HttpDetail {
+                request_headers: request_headers
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
+                response_headers: response_headers
+                    .into_iter()
+                    .map(|(k, v)| (k.into(), v.into()))
+                    .collect(),
+                request_body,
+                response_body,
+            }),
+        );
+    }
+
+    fn gzip_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn hosted_har_export_enforces_limit_and_preserves_metadata() {
+        let requests = Requests::new(true);
+        push_http_exchange(
+            &requests,
+            "first.test",
+            "POST",
+            "https://first.test/submit?k=1&flag",
+            201,
+            vec![("Host", "first.test"), ("Content-Type", "text/plain")],
+            b"small-req",
+            vec![("Content-Type", "text/plain"), ("X-Resp", "first")],
+            b"small-resp",
+        );
+        let large_req = vec![b'q'; 600];
+        let large_resp = vec![b'r'; 2000];
+        push_http_exchange(
+            &requests,
+            "second.test",
+            "PUT",
+            "https://second.test/upload?token=abc",
+            200,
+            vec![("Host", "second.test"), ("Content-Type", "text/plain")],
+            &large_req,
+            vec![("Content-Type", "application/json"), ("X-Resp", "second")],
+            &large_resp,
+        );
+        // Binary body where 4/3x base64 expansion pushes serialized size over small remaining budgets.
+        let binary_resp: Vec<u8> = (0..180).map(|i| ((i * 37) as u8) | 0x80).collect();
+        push_http_exchange(
+            &requests,
+            "third.test",
+            "GET",
+            "https://third.test/bin",
+            200,
+            vec![("Host", "third.test")],
+            b"",
+            vec![("Content-Type", "application/octet-stream")],
+            &binary_resp,
+        );
+        // Control bytes whose raw length is < remaining budget (120), but \u0000 JSON escaping
+        // expands 6x and exceeds the budget.
+        push_http_exchange(
+            &requests,
+            "fourth.test",
+            "GET",
+            "https://fourth.test/esc",
+            200,
+            vec![("Host", "fourth.test")],
+            b"",
+            vec![("Content-Type", "text/plain")],
+            &[0u8; 40],
+        );
+
+        let snapshot = requests.snapshot();
+        let mut counter = ByteCounter(0);
+        write_har_prefix(&mut counter).unwrap();
+        for entry in &snapshot {
+            counter.0 += json_byte_len(&HarEntry::without_bodies(
+                &entry.summary,
+                entry.summary.http.as_ref().unwrap(),
+                entry.detail.as_ref().unwrap(),
+            ))
+            .unwrap();
+        }
+        let metadata_only_len = counter.0 + snapshot.len() - 1 + HAR_LOG_SUFFIX.len();
+        // Enough room for entry 1's small request+response bodies, not entry 2's 600B/2000B bodies,
+        // entry 3's 240B base64 body, or entry 4's 240B JSON-escaped body.
+        let limit = metadata_only_len + 120;
+        let bytes = requests.export_har_with_limit(Some(limit)).unwrap();
+        assert!(bytes.len() <= limit, "len {} > {}", bytes.len(), limit);
+
+        let har: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(har["log"]["version"], "1.2");
+        assert_eq!(har["log"]["creator"]["name"], "Clyntis");
+        assert!(har["log"]["pages"].as_array().unwrap().is_empty());
+        let entries = har["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 4);
+
+        // Entry 1 bodies fit.
+        assert_eq!(entries[0]["request"]["method"], "POST");
+        assert_eq!(
+            entries[0]["request"]["url"],
+            "https://first.test/submit?k=1&flag"
+        );
+        assert_eq!(entries[0]["request"]["queryString"][0]["name"], "k");
+        assert_eq!(entries[0]["request"]["postData"]["text"], "small-req");
+        assert_eq!(entries[0]["response"]["status"], 201);
+        assert_eq!(entries[0]["response"]["headers"][1]["value"], "first");
+        assert_eq!(entries[0]["response"]["content"]["text"], "small-resp");
+        assert!(entries[0]["response"]["content"].get("comment").is_none());
+
+        // Entry 2 bodies overflow and are omitted while keeping metadata.
+        assert_eq!(entries[1]["request"]["method"], "PUT");
+        assert_eq!(entries[1]["request"]["bodySize"], 600);
+        assert_eq!(entries[1]["request"]["postData"]["mimeType"], "text/plain");
+        assert_eq!(entries[1]["request"]["postData"]["text"], "");
+        assert_eq!(
+            entries[1]["request"]["postData"]["comment"],
+            OMITTED_BODY_COMMENT
+        );
+        assert_eq!(entries[1]["response"]["status"], 200);
+        assert_eq!(entries[1]["response"]["bodySize"], 2000);
+        assert_eq!(entries[1]["response"]["headers"][1]["value"], "second");
+        assert_eq!(entries[1]["response"]["content"]["size"], 2000);
+        assert_eq!(
+            entries[1]["response"]["content"]["mimeType"],
+            "application/json"
+        );
+        assert!(entries[1]["response"]["content"].get("text").is_none());
+        assert!(entries[1]["response"]["content"].get("encoding").is_none());
+        assert_eq!(
+            entries[1]["response"]["content"]["comment"],
+            OMITTED_BODY_COMMENT
+        );
+
+        // Entry 3 base64 and Entry 4 JSON-escaped bodies overflow and are omitted.
+        assert_eq!(entries[2]["request"]["url"], "https://third.test/bin");
+        assert!(entries[2]["request"].get("postData").is_none());
+        assert_eq!(entries[2]["response"]["content"]["size"], 180);
+        assert!(entries[2]["response"]["content"].get("text").is_none());
+        assert_eq!(
+            entries[2]["response"]["content"]["comment"],
+            OMITTED_BODY_COMMENT
+        );
+        assert_eq!(entries[3]["request"]["url"], "https://fourth.test/esc");
+        assert_eq!(entries[3]["response"]["content"]["size"], 40);
+        assert!(entries[3]["response"]["content"].get("text").is_none());
+        assert_eq!(
+            entries[3]["response"]["content"]["comment"],
+            OMITTED_BODY_COMMENT
+        );
+    }
+
+    #[test]
+    fn hosted_har_export_omits_compressible_gzip_without_inflating() {
+        let requests = Requests::new(true);
+        push_http_exchange(
+            &requests,
+            "small.test",
+            "GET",
+            "https://small.test/ok",
+            200,
+            vec![("Host", "small.test")],
+            b"",
+            vec![("Content-Type", "text/plain")],
+            b"ok",
+        );
+        let compressed = gzip_compress(&vec![b'Z'; 512 * 1024]);
+        assert!(compressed.len() < 4096);
+        push_http_exchange(
+            &requests,
+            "gzip.test",
+            "GET",
+            "https://gzip.test/payload",
+            200,
+            vec![("Host", "gzip.test")],
+            b"",
+            vec![("Content-Type", "text/plain"), ("Content-Encoding", "gzip")],
+            &compressed,
+        );
+
+        let limit = 4096;
+        let bytes = requests.export_har_with_limit(Some(limit)).unwrap();
+        assert!(bytes.len() <= limit);
+
+        let har: Value = serde_json::from_slice(&bytes).unwrap();
+        let entries = har["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["response"]["content"]["text"], "ok");
+        assert_eq!(entries[1]["request"]["url"], "https://gzip.test/payload");
+        assert_eq!(entries[1]["response"]["status"], 200);
+        assert_eq!(entries[1]["response"]["content"]["size"], compressed.len());
+        assert!(entries[1]["response"]["content"].get("text").is_none());
+        assert_eq!(
+            entries[1]["response"]["content"]["comment"],
+            OMITTED_BODY_COMMENT
+        );
+    }
+
+    #[test]
+    fn hosted_har_export_drops_older_entries_when_metadata_exceeds_limit() {
+        let requests = Requests::new(true);
+        let long_header = "x".repeat(60 << 10);
+        for i in 0..40 {
+            push_http_exchange(
+                &requests,
+                "older.test",
+                "GET",
+                &format!("https://older.test/{i}"),
+                200,
+                vec![("Host", "older.test")],
+                b"",
+                vec![("X-Large", &long_header)],
+                b"",
+            );
+        }
+        push_http_exchange(
+            &requests,
+            "cleared.test",
+            "POST",
+            "https://cleared.test/a",
+            200,
+            vec![("Host", "cleared.test"), ("Content-Type", "text/plain")],
+            b"cleared-req",
+            vec![("Content-Type", "text/plain")],
+            b"cleared-resp",
+        );
+        requests.relieve_memory();
+        push_http_exchange(
+            &requests,
+            "kept.test",
+            "POST",
+            "https://kept.test/b?x=1",
+            202,
+            vec![("Host", "kept.test"), ("Content-Type", "application/json")],
+            b"{\"a\":1}",
+            vec![("Content-Type", "application/json"), ("X-Id", "99")],
+            b"{\"b\":2}",
+        );
+
+        let bytes = requests.export_har_json().unwrap();
+        assert!(bytes.len() <= HOSTED_HAR_BYTES);
+        assert!(bytes.capacity() <= HOSTED_HAR_BYTES);
+        assert!(requests.export_har_with_limit(Some(64)).is_err());
+        let har: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(har["log"]["version"], "1.2");
+        assert!(har["log"]["comment"].as_str().unwrap().contains("omitted"));
+        let entries = har["log"]["entries"].as_array().unwrap();
+        assert!((3..42).contains(&entries.len()));
+        assert_ne!(entries[0]["request"]["url"], "https://older.test/0");
+        let entries = &entries[entries.len() - 2..];
+
+        // Relieved entry keeps pre-existing empty/truncated HAR behavior.
+        assert_eq!(entries[0]["request"]["url"], "https://cleared.test/a");
+        assert_eq!(entries[0]["request"]["postData"]["text"], "");
+        assert!(entries[0]["request"]["postData"].get("comment").is_none());
+        assert_eq!(entries[0]["response"]["content"]["text"], "");
+        assert_eq!(entries[0]["response"]["content"]["size"], 12);
+        assert_eq!(
+            entries[0]["response"]["content"]["comment"],
+            TRUNCATED_BODY_COMMENT
+        );
+
+        // The newest entry retains its metadata and small bodies.
+        assert_eq!(entries[1]["request"]["method"], "POST");
+        assert_eq!(entries[1]["request"]["url"], "https://kept.test/b?x=1");
+        assert_eq!(entries[1]["request"]["queryString"][0]["value"], "1");
+        assert_eq!(
+            entries[1]["request"]["postData"]["mimeType"],
+            "application/json"
+        );
+        assert_eq!(entries[1]["request"]["postData"]["text"], "{\"a\":1}");
+        assert_eq!(entries[1]["response"]["status"], 202);
+        assert_eq!(entries[1]["response"]["headers"][1]["value"], "99");
+        assert_eq!(entries[1]["response"]["content"]["size"], 7);
+        assert_eq!(entries[1]["response"]["content"]["text"], "{\"b\":2}");
+    }
+
+    #[test]
+    fn hosted_default_har_export_stays_within_two_mib_for_compressible_bodies() {
+        let requests = Requests::new(true);
+        // ~100 KiB incompressible prefix + 1 MiB zeros -> ~102 KiB gzipped (< 128 KiB body_cap),
+        // decompressing to > 1.1 MiB each. 9 entries store ~920 KiB compressed (<= 1 MiB log cap)
+        // and > 9.9 MiB decompressed (> 8 MiB).
+        let mut raw = Vec::with_capacity(100 * 1024 + (1 << 20));
+        let mut state: u32 = 0x1234_5678;
+        for _ in 0..(100 * 1024) {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            raw.push((state & 0x3f) as u8 + b'!');
+        }
+        raw.resize(raw.len() + (1 << 20), b'0');
+        let compressed = gzip_compress(&raw);
+        assert!(compressed.len() < HOSTED.body_cap);
+        assert!(compressed.len() * 9 < HOSTED.body_bytes);
+
+        for i in 0..9 {
+            push_http_exchange(
+                &requests,
+                &format!("h{i}.test"),
+                "GET",
+                &format!("https://h{i}.test/data"),
+                200,
+                vec![("Host", "h.test")],
+                b"",
+                vec![("Content-Type", "text/plain"), ("Content-Encoding", "gzip")],
+                &compressed,
+            );
+        }
+        assert_eq!(requests.list(0, 100).0.len(), 9);
+
+        let json_bytes = requests.export_har_json().unwrap();
+        assert!(
+            json_bytes.len() <= HOSTED_HAR_BYTES,
+            "hosted HAR {} exceeded {}",
+            json_bytes.len(),
+            HOSTED_HAR_BYTES
+        );
+        let har: Value = serde_json::from_slice(&json_bytes).unwrap();
+        let entries = har["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 9);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["response"]["content"]["comment"] == OMITTED_BODY_COMMENT)
+        );
+        for entry in entries {
+            let content = &entry["response"]["content"];
+            assert_eq!(content["size"], compressed.len());
+            if content.get("text").is_none() {
+                assert_eq!(content["comment"], OMITTED_BODY_COMMENT);
+            }
+        }
+
+        let har_value = requests.export_har();
+        assert_eq!(har_value["log"]["entries"].as_array().unwrap().len(), 9);
+        assert!(serde_json::to_vec(&har_value).unwrap().len() <= HOSTED_HAR_BYTES);
+    }
+
+    #[test]
+    fn desktop_har_export_remains_unbounded() {
+        let requests = Requests::new(false);
+        let body_a = vec![b'a'; 1536 << 10];
+        let body_b = vec![b'b'; 1536 << 10];
+        push_http_exchange(
+            &requests,
+            "desk1.test",
+            "POST",
+            "https://desk1.test/a?q=1",
+            200,
+            vec![("Host", "desk1.test"), ("Content-Type", "text/plain")],
+            b"req-body",
+            vec![("Content-Type", "text/plain")],
+            &body_a,
+        );
+        push_http_exchange(
+            &requests,
+            "desk2.test",
+            "GET",
+            "https://desk2.test/b",
+            200,
+            vec![("Host", "desk2.test")],
+            b"",
+            vec![("Content-Type", "text/plain")],
+            &body_b,
+        );
+
+        let har = requests.export_har();
+        let json_bytes = requests.export_har_json().unwrap();
+        assert!(json_bytes.len() > HOSTED_HAR_BYTES);
+        assert!(json_bytes.contains(&b'\n'));
+        let entries = har["log"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]["response"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            body_a.len()
+        );
+        assert_eq!(
+            entries[1]["response"]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            body_b.len()
+        );
+        let streamed: Value =
+            serde_json::from_slice(&requests.export_har_with_limit(None).unwrap()).unwrap();
+        assert_eq!(streamed, har);
     }
 }

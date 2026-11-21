@@ -124,7 +124,6 @@ struct RequestsView: View {
     @State private var filter = Filter.all
     @State private var query = ""
     @State private var failure: String?
-    @State private var confirmClear = false
 
     /// Rows kept in the app; the tunnel keeps 500 itself.
     private static let limit = 2000
@@ -202,16 +201,13 @@ struct RequestsView: View {
                     }
                 }
             }
-            Button(L("清空"), systemImage: "trash") { confirmClear = true }
-                .disabled(rows.isEmpty)
-        }
-        .confirmationDialog(L("清空所有记录？"), isPresented: $confirmClear, titleVisibility: .visible) {
-            Button(L("清空"), role: .destructive) {
+            Button(L("清空"), systemImage: "trash") {
                 Task {
                     if model.connected { try? await model.clearRequests() }
                     rows = []
                 }
             }
+            .disabled(rows.isEmpty)
         }
         .task(id: model.connected && !paused && scenePhase == .active) {
             guard model.connected, !paused, scenePhase == .active else { return }
@@ -614,7 +610,9 @@ struct MitmView: View {
         if authority == nil { return L("需要先生成证书") }
         if let error = model.mitm?.error { return error }
         if !trusted { return L("证书未被系统信任") }
-        if settings.hostnames.isEmpty { return L("还没有填写要解密的域名") }
+        if settings.hostnames.isEmpty && model.overrides.rewrite?.enabled != true {
+            return L("还没有填写要解密的域名")
+        }
         if !model.connected { return L("连接后生效") }
         return model.mitm?.active == true ? L("已开启") : L("重新连接后生效")
     }
@@ -626,9 +624,13 @@ struct MitmView: View {
     }
 
     private func refresh() {
+        let wasTrusted = trusted
         authority = MitmAuthority.load()
         check = authority.flatMap { try? $0.check() }
         trusted = check.map(MitmAuthority.trusted) ?? false
+        if trusted && !wasTrusted && model.connected && !(model.mitm?.bypassed.isEmpty ?? true) {
+            Task { try? await model.clearMitmBypass() }
+        }
     }
 
     private func generate() async throws {

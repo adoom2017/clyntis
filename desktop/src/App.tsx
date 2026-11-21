@@ -376,7 +376,16 @@ export default function App() {
               confirm={setModal}
             />
           )}
-          {page === "logs" && <LogPage logs={logs} perform={perform} />}
+          {page === "logs" && (
+            <LogPage
+              logs={logs}
+              perform={perform}
+              onClear={() => {
+                setLogs([]);
+                hidden.current.logs = [];
+              }}
+            />
+          )}
           {page === "settings" && (
             <SettingsPage
               updates={updates}

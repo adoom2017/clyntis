@@ -126,7 +126,11 @@ impl Engine {
 }
 
 /// Runs a script on a blocking thread, waiting for a free slot first.
-pub(crate) async fn run(core: &Arc<crate::Core>, job: Job) -> Result<Outcome> {
+pub(crate) async fn run(
+    core: &Arc<crate::Core>,
+    job: Job,
+    body_slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+) -> Result<Outcome> {
     let timeout = job.timeout.min(MAX_TIMEOUT);
     let deadline = tokio::time::Instant::now() + timeout;
     let permit = tokio::time::timeout_at(deadline, core.scripts.permits.clone().acquire_owned())
@@ -137,6 +141,7 @@ pub(crate) async fn run(core: &Arc<crate::Core>, job: Job) -> Result<Outcome> {
     let deadline = deadline.into_std();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _body_slot = body_slot;
         let mut source = Vec::new();
         std::fs::File::open(&job.path)?
             .take(SOURCE_LIMIT as u64 + 1)
@@ -187,6 +192,21 @@ mod imp {
         source: String,
         deadline: Instant,
     ) -> Result<Outcome> {
+        let name = job.name.clone();
+        let (result, logs) = run_capture(core, handle, job, source, deadline)?;
+        for line in logs {
+            tracing::info!(script = %name, "{line}");
+        }
+        result
+    }
+
+    pub(super) fn run_capture(
+        core: Arc<crate::Core>,
+        handle: tokio::runtime::Handle,
+        job: Job,
+        source: String,
+        deadline: Instant,
+    ) -> Result<(Result<Outcome>, Vec<String>)> {
         let runtime = Runtime::new()?;
         runtime.set_memory_limit(core.scripts.memory);
         runtime.set_max_stack_size(1 << 20);
@@ -280,15 +300,14 @@ mod imp {
             }
         })();
         let mut state = state.borrow_mut();
-        for line in state.logs.drain(..) {
-            tracing::info!(script = %name, "{line}");
-        }
-        match result {
+        let logs = std::mem::take(&mut state.logs);
+        let outcome = match result {
             Ok(()) => Ok(state.done.take().unwrap_or_default()),
             // A script that called `$done` and then failed still counts.
             Err(_) if state.done.is_some() => Ok(state.done.take().unwrap_or_default()),
             Err(error) => Err(error.context(format!("script {name}"))),
-        }
+        };
+        Ok((outcome, logs))
     }
 
     struct HttpCall {
@@ -747,6 +766,10 @@ mod imp {
 mod tests {
     use super::*;
 
+    async fn run(core: &Arc<crate::Core>, job: Job) -> Result<Outcome> {
+        super::run(core, job, None).await
+    }
+
     fn job(path: PathBuf, timeout: Duration, binary: bool) -> Job {
         Job {
             name: "test".into(),
@@ -926,6 +949,20 @@ response if ${url} ~= /^https:\/\/a\.test\/x$/ then script("https://cdn.test/obj
         obj_job.argument = parsed_script.argument.clone();
         let outcome = run(&core, obj_job).await.unwrap();
         assert_eq!(outcome.body.as_deref(), Some(&b"typed-ok"[..]));
+
+        let (_, logs) = imp::run_capture(
+            core.clone(),
+            tokio::runtime::Handle::current(),
+            job(script("logbin.js", ""), DEFAULT_TIMEOUT, true),
+            "console.log(new Uint8Array(64), { buf: new ArrayBuffer(16), view: $response.body });"
+                .into(),
+            std::time::Instant::now() + DEFAULT_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(
+            logs,
+            [r#"[Uint8Array(64)] {"buf":"[ArrayBuffer(16)]","view":"[Uint8Array(3)]"}"#]
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }

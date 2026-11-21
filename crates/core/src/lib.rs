@@ -1892,6 +1892,28 @@ impl Core {
             cancel.cancel();
         }
     }
+    fn relieve_caches(&self, include_network: bool) -> u64 {
+        if let Some(rewriter) = self.rewriter() {
+            rewriter.relieve_memory();
+        }
+        self.mitm.relieve_memory();
+        self.requests.relieve_memory();
+        if include_network {
+            self.resolver.clear_cache();
+            clyntis_protocol::tls::clear_caches();
+        }
+        memory::relieve()
+    }
+    /// Drops reconstructible inspection caches under rising memory pressure
+    /// without clearing DNS or TLS caches used by active flows.
+    pub(crate) fn relieve_inspection_memory(&self) -> u64 {
+        self.relieve_caches(false)
+    }
+    /// Drops reconstructible caches under memory pressure and returns unused
+    /// allocator pages to the OS.
+    pub(crate) fn relieve_memory(&self) -> u64 {
+        self.relieve_caches(true)
+    }
     /// Records the device network reported by the host and applies the
     /// hosts and DNS policy of the network-overrides entry for it. Hosts
     /// report it before [`Core::network_changed`].

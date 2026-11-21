@@ -56,8 +56,12 @@ pub fn now() -> u64 {
 /// Logs are untrusted text. Never export URL credentials/query strings or UUIDs.
 pub fn redact(text: &str) -> String {
     use std::sync::LazyLock;
-    static URL: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r#"(?i)(?:https?|vless)://[^\s\"<>]+"#).unwrap());
+    static VLESS_URL: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?i)vless://[^\s"<>]+"#).unwrap());
+    static URL_USERINFO: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?i)(https?://)[^\s"<>/@]+@"#).unwrap());
+    static URL_QUERY: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#"(?i)(https?://[^\s"<>?#]+)[?#][^\s"<>]*"#).unwrap());
     static UUID: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"(?i)\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b").unwrap()
     });
@@ -72,11 +76,11 @@ pub fn redact(text: &str) -> String {
         ("[已隐藏]", "[URL 已隐藏]", "[UUID 已隐藏]")
     };
     let text = BEARER.replace_all(text, format!("Bearer {hidden}"));
+    let text = VLESS_URL.replace_all(&text, url);
+    let text = URL_USERINFO.replace_all(&text, "$1***@");
+    let text = URL_QUERY.replace_all(&text, "$1?…");
     SECRET
-        .replace_all(
-            &UUID.replace_all(&URL.replace_all(&text, url), uuid),
-            format!("$1$2{hidden}"),
-        )
+        .replace_all(&UUID.replace_all(&text, uuid), format!("$1$2{hidden}"))
         .into_owned()
 }
 
@@ -98,10 +102,18 @@ mod tests {
     #[test]
     fn log_redaction_hides_authorization_json_fields_urls_and_uuid() {
         let output = super::redact(
-            r#"Authorization: Bearer abcdef123 password=private "secret":"hidden" https://example.com/sub?token=private 11111111-1111-4111-8111-111111111111"#,
+            r#"Authorization: Bearer abcdef123 password=private "secret":"hidden" https://user:secretpass@example.com/sub?token=private vless://node.example/path 11111111-1111-4111-8111-111111111111"#,
         );
-        for secret in ["abcdef123", "private", "hidden", "example.com", "11111111"] {
+        for secret in [
+            "abcdef123",
+            "private",
+            "hidden",
+            "secretpass",
+            "node.example",
+            "11111111",
+        ] {
             assert!(!output.contains(secret), "{output}");
         }
+        assert!(output.contains("example.com/sub?…"), "{output}");
     }
 }

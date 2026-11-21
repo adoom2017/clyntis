@@ -64,8 +64,11 @@ fn parse_alpn(mut value: &[u8]) -> ClientHelloAlpn {
     let Some(mut list) = take(&mut value, list_len) else {
         return ClientHelloAlpn::Malformed;
     };
-    if !value.is_empty() || list.is_empty() {
+    if !value.is_empty() {
         return ClientHelloAlpn::Malformed;
+    }
+    if list.is_empty() {
+        return ClientHelloAlpn::Absent;
     }
     let mut supports_http1 = false;
     while !list.is_empty() {
@@ -177,9 +180,6 @@ pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
     let Some(mut extensions) = take(&mut input, ext_len) else {
         return ClientHelloStatus::Invalid;
     };
-    if !input.is_empty() {
-        return ClientHelloStatus::Invalid;
-    }
     let mut sni = None;
     let mut alpn = ClientHelloAlpn::Absent;
     while !extensions.is_empty() {

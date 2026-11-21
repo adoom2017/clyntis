@@ -1011,7 +1011,9 @@ async fn rewrite(
                     Ok(DownloadFile::Deferred(path, staged))
                 } else {
                     staged.commit()?;
-                    Ok(DownloadFile::Ready(crate::rewrite::RewriteFile::pin(&path)?))
+                    Ok(DownloadFile::Ready(crate::rewrite::RewriteFile::pin(
+                        &path,
+                    )?))
                 }
             });
             (url, result)
@@ -1109,9 +1111,10 @@ async fn rewrite(
         if !publish_urls.contains(&url) || kept_cached_urls.contains_key(&url) {
             continue;
         }
-        match staged.commit().and_then(|()| {
-            crate::rewrite::RewriteFile::pin(&path).map_err(anyhow::Error::from)
-        }) {
+        match staged
+            .commit()
+            .and_then(|()| crate::rewrite::RewriteFile::pin(&path).map_err(anyhow::Error::from))
+        {
             Ok(pinned) => {
                 file_sources.push((url.clone(), true));
                 files.insert(url, pinned);
@@ -1186,7 +1189,7 @@ async fn rewrite(
         tracing::debug!("rewrite modules unchanged; reusing compiled rules");
         active.reloaded(loaded, failed)
     } else {
-        crate::rewrite::Rewriter::new(loaded, failed)
+        crate::rewrite::Rewriter::new_hosted(loaded, failed, config.internal_host_packet_io)
     };
     for module in &mut rewriter.modules {
         module.update_error = update_errors.remove(&module.name);
@@ -2359,7 +2362,7 @@ mod tests {
         let rule = active.matching(clyntis_config::rewrite::Phase::Request, "https://test/body")[0];
         assert_eq!(
             std::fs::read(
-                crate::rewrite::answer(&active, active.rule(rule), "https://test/body")
+                crate::rewrite::answer(&active, rule, "https://test/body")
                     .unwrap()
                     .file
                     .unwrap()

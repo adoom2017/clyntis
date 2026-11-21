@@ -28,6 +28,20 @@ pub fn log_files(directory: &std::path::Path) -> Vec<PathBuf> {
         .filter(|path| path.is_file())
         .collect()
 }
+#[allow(dead_code)]
+pub fn clear_log_files(directory: &std::path::Path) {
+    for n in 1..=LOG_GENERATIONS {
+        let _ = std::fs::remove_file(generation(directory, n));
+    }
+    let _ = std::fs::remove_file(directory.join(format!("{LOG_NAME}.previous.log")));
+    let current = directory.join(format!("{LOG_NAME}.log"));
+    if current.is_file() {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&current);
+    }
+}
 fn generation(directory: &std::path::Path, n: usize) -> PathBuf {
     directory.join(format!("{LOG_NAME}.{n}.log"))
 }
@@ -94,6 +108,12 @@ impl Diagnostics {
         let written = (|| -> std::io::Result<()> {
             if inner.log.as_ref().is_none_or(|log| log.path != path) {
                 inner.log = Some(LogFile::open(path.clone())?);
+            }
+            if let Some(log) = inner.log.as_mut()
+                && log.size >= LOG_LIMIT
+                && let Ok(len) = log.file.metadata().map(|m| m.len())
+            {
+                log.size = len;
             }
             if inner.log.as_ref().is_some_and(|log| log.size >= LOG_LIMIT) {
                 // Closed before the rename, which Windows refuses otherwise.
@@ -185,6 +205,67 @@ mod tests {
         assert!(current.ends_with("after rotation\n"));
         assert!(!directory.join("clyntis-runner.previous.log").exists());
         assert!(!directory.join("clyntis-runner.6.log").exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn clear_log_files_truncates_open_log_without_premature_rotation() {
+        let directory =
+            std::env::temp_dir().join(format!("clyntis-diagnostics-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let diagnostics = Diagnostics::default();
+        let chunk = "x".repeat(64 * 1024);
+        // Rotate once so .1.log exists, then fill the active file close to LOG_LIMIT.
+        for _ in 0..(LOG_LIMIT as usize / chunk.len() + 1) {
+            diagnostics.record(&directory, &chunk);
+        }
+        for _ in 0..(LOG_LIMIT as usize / chunk.len()).saturating_sub(2) {
+            diagnostics.record(&directory, &chunk);
+        }
+        diagnostics.record(&directory, "before clear");
+        std::fs::write(directory.join("clyntis-runner.previous.log"), "legacy").unwrap();
+        let current = directory.join("clyntis-runner.log");
+        assert!(directory.join("clyntis-runner.1.log").is_file());
+        assert!(std::fs::metadata(&current).unwrap().len() < LOG_LIMIT);
+
+        clear_log_files(&directory);
+
+        assert!(current.is_file());
+        assert_eq!(std::fs::metadata(&current).unwrap().len(), 0);
+        assert!(!directory.join("clyntis-runner.1.log").exists());
+        assert!(!directory.join("clyntis-runner.previous.log").exists());
+
+        diagnostics.record(&directory, "after clear");
+        let after_first = std::fs::read_to_string(&current).unwrap();
+        assert!(after_first.ends_with("after clear\n"));
+        assert!(!after_first.contains("before clear"));
+        assert!(!after_first.contains(&chunk));
+        assert!(!directory.join("clyntis-runner.1.log").exists());
+
+        // Push the stale pre-clear counter past LOG_LIMIT and verify it refreshes
+        // from metadata instead of rotating a tiny file to .1.log.
+        diagnostics.record(&directory, &chunk);
+        diagnostics.record(&directory, &chunk);
+        assert!(!directory.join("clyntis-runner.1.log").exists());
+        let after_more = std::fs::read_to_string(&current).unwrap();
+        assert!(after_more.contains("after clear\n"));
+        assert!(after_more.contains(&chunk));
+
+        // Also clear when log.size is already >= LOG_LIMIT before the next record.
+        for _ in 0..(LOG_LIMIT as usize / chunk.len()).saturating_sub(2) {
+            diagnostics.record(&directory, &chunk);
+        }
+        assert!(std::fs::metadata(&current).unwrap().len() >= LOG_LIMIT);
+        assert!(!directory.join("clyntis-runner.1.log").exists());
+
+        clear_log_files(&directory);
+        assert_eq!(std::fs::metadata(&current).unwrap().len(), 0);
+        diagnostics.record(&directory, "after clear at limit");
+        let after_limit_clear = std::fs::read_to_string(&current).unwrap();
+        assert!(after_limit_clear.ends_with("after clear at limit\n"));
+        assert!(!after_limit_clear.contains(&chunk));
+        assert!(!directory.join("clyntis-runner.1.log").exists());
+
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
