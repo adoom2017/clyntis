@@ -2,7 +2,7 @@
 //! of resolvers that bypass DNS filtering, and counters.
 use clyntis_config::{
     adblock::{Adblock, HTTPDNS_ADDRESSES, HTTPDNS_DOMAINS, HTTPDNS_PORTS},
-    rule::{DomainSet, DomainSetBuilder},
+    rule::{DomainSet, DomainSetBuilder, IpSet},
 };
 use ipnet::IpNet;
 use serde::Serialize;
@@ -55,7 +55,7 @@ pub struct Filter {
     list_allow: Arc<DomainSet>,
     user_allow: RwLock<DomainSet>,
     /// Addresses from the lists.
-    addresses: Arc<Vec<IpNet>>,
+    addresses: Arc<IpSet>,
     endpoints: Arc<Endpoints>,
     block_httpdns: bool,
     quic_fallback: bool,
@@ -66,7 +66,7 @@ pub struct Filter {
 /// The built-in HTTPDNS and encrypted-DNS endpoints.
 struct Endpoints {
     domains: DomainSet,
-    addresses: Vec<IpNet>,
+    addresses: IpSet,
 }
 impl Endpoints {
     fn new() -> Self {
@@ -77,10 +77,10 @@ impl Endpoints {
         Self {
             domains: domains.build(),
             // Checked by clyntis-config's tests.
-            addresses: HTTPDNS_ADDRESSES
-                .iter()
-                .filter_map(|net| net.parse().ok())
-                .collect(),
+            addresses: IpSet::new(
+                HTTPDNS_ADDRESSES.iter().filter_map(|net| net.parse().ok()),
+                false,
+            ),
         }
     }
 }
@@ -96,7 +96,7 @@ impl Filter {
             block: Arc::new(block),
             list_allow: Arc::new(list_allow),
             user_allow: RwLock::new(allow_set(&settings.allow)),
-            addresses: Arc::new(addresses),
+            addresses: Arc::new(IpSet::new(addresses, false)),
             endpoints: Arc::new(Endpoints::new()),
             block_httpdns: settings.block_httpdns,
             quic_fallback: settings.quic_fallback,
@@ -152,11 +152,11 @@ impl Filter {
         let ip = ip.to_canonical();
         if self.block_httpdns
             && HTTPDNS_PORTS.contains(&port)
-            && self.endpoints.addresses.iter().any(|net| net.contains(&ip))
+            && self.endpoints.addresses.matches(ip)
         {
             return Some(Block::Endpoint);
         }
-        if self.addresses.iter().any(|net| net.contains(&ip)) {
+        if self.addresses.matches(ip) {
             return Some(Block::Address);
         }
         (self.quic_fallback && network == "udp" && port == 443).then_some(Block::Quic)
@@ -349,5 +349,52 @@ mod tests {
         assert_eq!(snapshot["top"][0]["domain"], "x.ads.test");
         assert_eq!(snapshot["top"][0]["count"], 2);
         assert_eq!(snapshot["recent"][0]["domain"], "y.ads.test");
+    }
+
+    #[test]
+    fn refuses_addresses_and_httpdns_endpoints_via_ip_set() {
+        let filter = Filter::new(
+            DomainSetBuilder::default().build(),
+            DomainSetBuilder::default().build(),
+            vec![
+                "203.0.113.0/25".parse().unwrap(),
+                "203.0.113.128/25".parse().unwrap(),
+                "2001:db8:ad::/48".parse().unwrap(),
+            ],
+            &Adblock {
+                block_httpdns: true,
+                quic_fallback: true,
+                ..Adblock::default()
+            },
+            vec![],
+        );
+        // Adjacent /25 ranges merge into one /24 in IpSet.
+        assert_eq!(filter.entries(), 2);
+        assert_eq!(
+            filter.refuses("203.0.113.1", 443, "tcp"),
+            Some(Block::Address)
+        );
+        assert_eq!(
+            filter.refuses("203.0.113.200", 80, "tcp"),
+            Some(Block::Address)
+        );
+        assert_eq!(filter.refuses("203.0.114.1", 80, "tcp"), None);
+        assert_eq!(
+            filter.refuses("[2001:db8:ad::1]", 443, "tcp"),
+            Some(Block::Address)
+        );
+        assert_eq!(filter.refuses("[2001:db8:ff::1]", 443, "tcp"), None);
+        // HTTPDNS endpoint blocked on HTTPDNS ports, not on unrelated ports.
+        assert_eq!(filter.refuses("1.1.1.1", 443, "tcp"), Some(Block::Endpoint));
+        assert_eq!(
+            filter.refuses("203.107.1.42", 80, "tcp"),
+            Some(Block::Endpoint)
+        );
+        assert_eq!(filter.refuses("1.1.1.1", 22, "tcp"), None);
+        // QUIC fallback still fires on unblocked UDP 443.
+        assert_eq!(
+            filter.refuses("198.51.100.1", 443, "udp"),
+            Some(Block::Quic)
+        );
     }
 }

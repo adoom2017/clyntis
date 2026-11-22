@@ -45,12 +45,65 @@ final class LogFile: @unchecked Sendable {
         url = directory.appendingPathComponent("clyntis.log")
     }
 
+    struct Record: Sendable {
+        let level: String
+        let source: String
+        let message: String
+        let date: Date
+    }
+
+    /// Cheap fingerprint of the active log file (modification timestamp, byte size, inode)
+    /// so polling UIs skip reading and parsing when nothing changed.
+    struct Stamp: Equatable, Sendable {
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let size: Int64
+        let inode: UInt64
+    }
+
+    private static let uuidRegex = try! NSRegularExpression(
+        pattern: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    private static let urlQueryRegex = try! NSRegularExpression(
+        pattern: "(https?://[^\\s?#]+)[?#][^\\s]*")
+
     func append(level: String, source: String, message: String, date: Date = Date()) {
-        guard let url else { return }
-        let text = Self.redact(message).replacingOccurrences(of: "\n", with: " ")
+        appendBatch([Record(level: level, source: source, message: message, date: date)])
+    }
+
+    /// Formats, redacts, and writes multiple structured log records in a single
+    /// open/fstat/write/close cycle.
+    func appendBatch(_ records: [Record]) {
+        guard let url, !records.isEmpty else { return }
+        let prepared = records.map { record in
+            (record.date, record.level, record.source,
+             Self.redact(record.message).replacingOccurrences(of: "\n", with: " "))
+        }
         lock.lock()
         defer { lock.unlock() }
-        let line = "\(formatter.string(from: date))\t\(level)\t\(source)\t\(text)\n"
+        var payload = ""
+        payload.reserveCapacity(prepared.count * 128)
+        for (date, level, source, text) in prepared {
+            payload += "\(formatter.string(from: date))\t\(level)\t\(source)\t\(text)\n"
+        }
+        writeLocked(payload, to: url)
+    }
+
+    /// Appends pre-formatted log lines in a single open/fstat/write/close cycle.
+    func appendBatch(_ lines: [String]) {
+        guard let url, !lines.isEmpty else { return }
+        var payload = ""
+        payload.reserveCapacity(lines.reduce(0) { $0 + $1.utf8.count + 1 })
+        for line in lines {
+            payload += line
+            if !line.hasSuffix("\n") { payload += "\n" }
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        writeLocked(payload, to: url)
+    }
+
+    /// Called with `lock` held.
+    private func writeLocked(_ payload: String, to url: URL) {
         let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
         guard fd >= 0 else { return }
         defer { close(fd) }
@@ -60,10 +113,10 @@ final class LogFile: @unchecked Sendable {
             let fresh = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o600)
             guard fresh >= 0 else { return }
             defer { close(fresh) }
-            write(fresh, line)
+            write(fresh, payload)
             return
         }
-        write(fd, line)
+        write(fd, payload)
     }
 
     /// Called with the lock held: drops the oldest file and shifts the rest.
@@ -74,6 +127,27 @@ final class LogFile: @unchecked Sendable {
             if let from = generation(n), let to = generation(n + 1) { try? manager.moveItem(at: from, to: to) }
         }
         if let url, let newest = generation(1) { try? manager.moveItem(at: url, to: newest) }
+    }
+
+    /// Current modification timestamp, byte size, and inode of the active log file.
+    func stamp() -> Stamp? {
+        guard let url else { return nil }
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        return Stamp(
+            modifiedSeconds: info.st_mtimespec.tv_sec,
+            modifiedNanoseconds: info.st_mtimespec.tv_nsec,
+            size: info.st_size,
+            inode: info.st_ino
+        )
+    }
+
+    /// Returns updated entries and the current stamp when the active log file changed
+    /// since `previous` (or when `force` is true); returns `nil` when unchanged.
+    func entries(since previous: Stamp?, force: Bool = false, maxBytes: Int = 512 * 1024) -> (entries: [LogEntry], stamp: Stamp?)? {
+        let current = stamp()
+        if !force, current == previous { return nil }
+        return (entries(maxBytes: maxBytes), current)
     }
 
     /// Newest entries last; reads at most `maxBytes` from the end of the log.
@@ -119,8 +193,22 @@ final class LogFile: @unchecked Sendable {
         return target
     }
 
-    private func write(_ fd: Int32, _ line: String) {
-        _ = line.utf8CString.withUnsafeBufferPointer { Foundation.write(fd, $0.baseAddress, $0.count - 1) }
+    private func write(_ fd: Int32, _ text: String) {
+        var copy = text
+        copy.withUTF8 { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var written = 0
+            while written < buffer.count {
+                let n = Foundation.write(fd, base.advanced(by: written), buffer.count - written)
+                if n > 0 {
+                    written += n
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    break
+                }
+            }
+        }
     }
 
     private func tail(of url: URL, maxBytes: Int) -> Data {
@@ -139,12 +227,16 @@ final class LogFile: @unchecked Sendable {
 
     /// UUIDs are VLESS credentials and URL queries usually hold subscription tokens.
     static func redact(_ text: String) -> String {
-        var text = text.replacingOccurrences(
-            of: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-            with: "<uuid>", options: .regularExpression)
-        text = text.replacingOccurrences(of: "(https?://[^\\s?#]+)[?#][^\\s]*", with: "$1?…",
-                                         options: .regularExpression)
-        return text
+        var result = text
+        if result.contains("-") {
+            let range = NSRange(result.startIndex..., in: result)
+            result = uuidRegex.stringByReplacingMatches(in: result, range: range, withTemplate: "<uuid>")
+        }
+        if result.contains("://") {
+            let range = NSRange(result.startIndex..., in: result)
+            result = urlQueryRegex.stringByReplacingMatches(in: result, range: range, withTemplate: "$1?…")
+        }
+        return result
     }
 }
 

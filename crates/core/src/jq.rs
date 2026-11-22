@@ -11,7 +11,7 @@ use jaq_json::Val;
 use std::{
     cell::Cell,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -59,18 +59,30 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// further inputs.
 const BLOCKED: &[&str] = &["env", "input", "inputs", "range"];
 
+type Def = jaq_core::load::parse::Def<&'static str>;
+
+/// The parsed jq prelude (budgeted `range` and the standard definitions),
+/// parsed once instead of on every filter compilation.
+fn prelude() -> &'static [Def] {
+    static DEFS: OnceLock<Vec<Def>> = OnceLock::new();
+    DEFS.get_or_init(|| {
+        jaq_core::load::parse(RANGE, |p| p.defs())
+            .expect("built-in jq range")
+            .into_iter()
+            .chain(jaq_core::defs())
+            .chain(jaq_std::defs())
+            .chain(jaq_json::defs())
+            .collect()
+    })
+}
+
 /// A compiled filter, shared by the connections that use it.
 #[derive(Clone)]
 pub(crate) struct Filter(Arc<Compiled>);
 
 impl Filter {
     pub(crate) fn compile(code: &str) -> Result<Self, String> {
-        let defs = jaq_core::load::parse(RANGE, |p| p.defs())
-            .expect("built-in jq range")
-            .into_iter()
-            .chain(jaq_core::defs())
-            .chain(jaq_std::defs())
-            .chain(jaq_json::defs());
+        let defs = prelude().iter().cloned();
         let funs = jaq_core::funs()
             .chain(jaq_std::funs())
             .chain(jaq_json::funs())

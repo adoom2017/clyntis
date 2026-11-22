@@ -23,7 +23,10 @@ struct LogView: View {
         }
     }
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var entries: [LogEntry] = []
+    @State private var lastStamp: LogFile.Stamp?
+    @State private var loaded = false
     @State private var level = Level.all
     @State private var query = ""
 
@@ -36,6 +39,7 @@ struct LogView: View {
     }
 
     var body: some View {
+        let visible = self.visible
         NavigationStack {
             List(visible) { entry in
                 VStack(alignment: .leading, spacing: 4) {
@@ -77,23 +81,33 @@ struct LogView: View {
                     Button(L("清空"), systemImage: "trash") {
                         LogFile.shared.clear()
                         entries = []
+                        lastStamp = nil
                     }
                     .disabled(entries.isEmpty)
                 }
             }
-            .refreshable { await reload() }
-            .task {
-                // Live view while the page is visible; the tunnel appends every second.
+            .refreshable { await reload(force: true) }
+            .task(id: scenePhase == .active) {
+                guard scenePhase == .active else { return }
+                // Live view while the page is visible and app is active.
                 while !Task.isCancelled {
-                    await reload()
-                    try? await Task.sleep(for: .seconds(2))
+                    await reload(force: !loaded)
+                    do { try await Task.sleep(for: .seconds(2)) } catch { break }
                 }
             }
         }
     }
 
-    private func reload() async {
-        entries = await Task.detached { LogFile.shared.entries() }.value
+    private func reload(force: Bool = false) async {
+        let previous = lastStamp
+        let result = await Task.detached {
+            LogFile.shared.entries(since: previous, force: force)
+        }.value
+        loaded = true
+        if let result {
+            entries = result.entries
+            lastStamp = result.stamp
+        }
     }
 
     private func color(_ level: String) -> Color {

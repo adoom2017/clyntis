@@ -172,30 +172,55 @@ impl Engine {
         let mut process = None;
         let mut service = None;
         let controller = if settings.capture == Capture::Tun {
+            const RESOURCE_LIMIT: usize = 128 * 1024 * 1024;
+            const RESOURCE_CHUNK: usize = 2 * 1024 * 1024;
             let mut connection = Client::connect_current().await?;
             let config = validate(&yaml)?;
-            let mut total = 0;
+            let mut total = 0usize;
+            let mut buffer = vec![0u8; RESOURCE_CHUNK];
             for name in resource_names(&config) {
                 let path = store.runtime_dir(profile.id).join(safe_relative(&name)?);
                 if !path.exists() {
                     continue;
                 }
-                let bytes = clyntis_desktop_model::read_limited(&path, 128 * 1024 * 1024)?;
-                total += bytes.len();
+                let mut file = tokio::fs::File::open(&path).await?;
+                let file_len = file.metadata().await?.len();
                 ensure!(
-                    total <= 128 * 1024 * 1024,
+                    file_len <= (RESOURCE_LIMIT - total) as u64,
                     "{}",
                     tr!(
                         "路由资源总量超过 128 MiB",
                         "Routing resources exceed 128 MiB in total"
                     )
                 );
-                for chunk in bytes.chunks(2 * 1024 * 1024) {
+                loop {
+                    use tokio::io::AsyncReadExt;
+                    let mut filled = 0;
+                    while filled < buffer.len() {
+                        let read = file.read(&mut buffer[filled..]).await?;
+                        if read == 0 {
+                            break;
+                        }
+                        filled += read;
+                    }
+                    if filled == 0 {
+                        break;
+                    }
+                    total = total.saturating_add(filled);
+                    ensure!(
+                        total <= RESOURCE_LIMIT,
+                        "{}",
+                        tr!(
+                            "路由资源总量超过 128 MiB",
+                            "Routing resources exceed 128 MiB in total"
+                        )
+                    );
                     connection
                         .request(&Request::Resource {
                             version: VERSION,
                             name: name.clone(),
-                            data: base64::engine::general_purpose::STANDARD.encode(chunk),
+                            data: base64::engine::general_purpose::STANDARD
+                                .encode(&buffer[..filled]),
                         })
                         .await?;
                 }

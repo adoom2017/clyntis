@@ -7,6 +7,7 @@ use serde_yaml::{Mapping, Value};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use uuid::Uuid;
 
@@ -80,14 +81,83 @@ const MITM_CERT: &str = "mitm-ca.pem";
 const MITM_KEY: &str = "mitm-ca.key";
 
 #[derive(Clone)]
+struct CachedProfile {
+    id: Uuid,
+    name: String,
+    url_host: Option<String>,
+    subscription: bool,
+    encrypted: bool,
+    pending: bool,
+    last_checked: u64,
+    last_error: Option<String>,
+    mode: String,
+}
+impl CachedProfile {
+    fn from_profile(profile: &Profile) -> Self {
+        Self {
+            id: profile.id,
+            name: profile.name.clone(),
+            url_host: profile
+                .url
+                .as_ref()
+                .and_then(|s| reqwest::Url::parse(s).ok())
+                .and_then(|url| url.host_str().map(str::to_owned)),
+            subscription: profile.url.is_some(),
+            encrypted: profile.password.is_some(),
+            pending: profile.pending.is_some(),
+            last_checked: profile.last_checked,
+            last_error: profile.last_error.clone(),
+            mode: profile.mode.clone(),
+        }
+    }
+    fn to_summary(&self) -> ProfileSummary {
+        ProfileSummary {
+            id: self.id,
+            name: self.name.clone(),
+            source: self
+                .url_host
+                .clone()
+                .unwrap_or_else(|| tr!("本地文件", "Local file")),
+            subscription: self.subscription,
+            encrypted: self.encrypted,
+            pending: self.pending,
+            last_checked: self.last_checked,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
+    summaries: Arc<Mutex<Option<Vec<CachedProfile>>>>,
 }
 impl Store {
     pub fn new(root: PathBuf) -> Result<Self> {
         private_dir(&root)?;
         private_dir(&root.join("profiles"))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            summaries: Arc::new(Mutex::new(None)),
+        })
+    }
+    fn upsert_cached(&self, profile: &Profile) {
+        let mut cache = self.summaries.lock().unwrap();
+        if let Some(entries) = cache.as_mut() {
+            let entry = CachedProfile::from_profile(profile);
+            if let Some(existing) = entries.iter_mut().find(|e| e.id == profile.id) {
+                *existing = entry;
+            } else {
+                entries.push(entry);
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+    }
+    fn remove_cached(&self, id: Uuid) {
+        let mut cache = self.summaries.lock().unwrap();
+        if let Some(entries) = cache.as_mut() {
+            entries.retain(|entry| entry.id != id);
+        }
     }
     pub fn directory(&self, id: Uuid) -> PathBuf {
         self.root.join("profiles").join(id.to_string())
@@ -96,15 +166,36 @@ impl Store {
         self.directory(id).join("runtime")
     }
     pub fn list(&self) -> Result<Vec<ProfileSummary>> {
-        let mut profiles = Vec::new();
-        for entry in fs::read_dir(self.root.join("profiles"))? {
-            let entry = entry?;
-            if let Ok(id) = Uuid::parse_str(&entry.file_name().to_string_lossy()) {
-                profiles.push(self.get(id)?.summary());
+        let mut cache = self.summaries.lock().unwrap();
+        if cache.is_none() {
+            let mut entries = Vec::new();
+            for entry in fs::read_dir(self.root.join("profiles"))? {
+                let entry = entry?;
+                if let Ok(id) = Uuid::parse_str(&entry.file_name().to_string_lossy()) {
+                    entries.push(CachedProfile::from_profile(&self.get(id)?));
+                }
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            *cache = Some(entries);
+        }
+        Ok(cache
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(CachedProfile::to_summary)
+            .collect())
+    }
+    /// Returns the saved routing mode for `id`, using the in-memory summary cache when populated.
+    pub fn mode(&self, id: Uuid) -> Result<String> {
+        {
+            let cache = self.summaries.lock().unwrap();
+            if let Some(entries) = cache.as_ref()
+                && let Some(entry) = entries.iter().find(|e| e.id == id)
+            {
+                return Ok(entry.mode.clone());
             }
         }
-        profiles.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(profiles)
+        Ok(self.get(id)?.mode)
     }
     pub fn get(&self, id: Uuid) -> Result<Profile> {
         let path = self.directory(id).join("profile.json");
@@ -121,7 +212,9 @@ impl Store {
         atomic_write(
             &self.directory(profile.id).join("profile.json"),
             &serde_json::to_vec(profile)?,
-        )
+        )?;
+        self.upsert_cached(profile);
+        Ok(())
     }
     pub fn create(
         &self,
@@ -165,6 +258,7 @@ impl Store {
     pub fn delete(&self, id: Uuid) -> Result<()> {
         self.get(id)?;
         fs::remove_dir_all(self.directory(id))?;
+        self.remove_cached(id);
         Ok(())
     }
     pub fn settings(&self) -> Result<Settings> {
@@ -267,10 +361,15 @@ impl Store {
         Ok(id.filter(|id| self.directory(*id).exists()))
     }
     pub fn select(&self, id: Option<Uuid>) -> Result<()> {
-        if let Some(id) = id {
-            self.get(id)?;
+        let profile = match id {
+            Some(id) => Some(self.get(id)?),
+            None => None,
+        };
+        atomic_write(&self.root.join("selected.json"), &serde_json::to_vec(&id)?)?;
+        if let Some(profile) = profile {
+            self.upsert_cached(&profile);
         }
-        atomic_write(&self.root.join("selected.json"), &serde_json::to_vec(&id)?)
+        Ok(())
     }
     pub fn import_file(&self, path: &Path, password: Option<&str>) -> Result<ImportResult> {
         let source = String::from_utf8(read_limited(path, CONFIG_LIMIT)?)
@@ -857,5 +956,53 @@ mod tests {
         assert!(validate(&YAML.replace("type: vless", "type: trojan")).is_err());
         assert!(validate("dmxlc3M6Ly9mb28=").is_err());
         assert!(subscription_url("http://example.com/sub").is_err());
+    }
+    #[test]
+    fn summary_cache_serves_list_and_mode_without_rereading_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().into()).unwrap();
+        let cloned = store.clone();
+        let mut p1 = store
+            .create("beta".into(), YAML.into(), None, None)
+            .unwrap();
+        let p2 = store
+            .create(
+                "alpha".into(),
+                YAML.into(),
+                Some("https://sub.example.com/p".into()),
+                None,
+            )
+            .unwrap();
+        let first = store.list().unwrap();
+        assert_eq!(
+            first.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(store.mode(p1.id).unwrap(), "rule");
+
+        // Corrupt p1's on-disk JSON to prove warm list() and mode() use the in-memory cache.
+        fs::write(store.directory(p1.id).join("profile.json"), b"not-json").unwrap();
+        let cached = cloned.list().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cloned.mode(p1.id).unwrap(), "rule");
+
+        // Saving updates both disk and the shared cache (including sort order and mode).
+        p1.name = "aardvark".into();
+        p1.mode = "global".into();
+        p1.pending = Some(YAML.into());
+        store.save(&p1).unwrap();
+        let updated = cloned.list().unwrap();
+        assert_eq!(
+            updated.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["aardvark", "alpha"]
+        );
+        assert!(updated[0].pending);
+        assert_eq!(cloned.mode(p1.id).unwrap(), "global");
+
+        // Deleting removes from both disk and the shared cache.
+        store.delete(p2.id).unwrap();
+        let after_delete = cloned.list().unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].id, p1.id);
     }
 }

@@ -261,6 +261,7 @@ export interface Profile extends Omit<
   mode: Mode;
 }
 export interface Log {
+  id?: number;
   type: string;
   payload: string;
   time: number;

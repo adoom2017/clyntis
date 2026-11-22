@@ -967,7 +967,8 @@ describe("Editor", () => {
         return { connections: [], uploadTotal: 256, downloadTotal: 1792 };
       if (command === "traffic_details") {
         detailsCalls += 1;
-        const host = (args as { host?: string | null } | undefined)?.host ?? null;
+        const host =
+          (args as { host?: string | null } | undefined)?.host ?? null;
         if (host) {
           return {
             ...sampleDetails,
@@ -1050,7 +1051,10 @@ describe("Editor", () => {
         if (command === "close_connection") {
           return Promise.resolve(null);
         }
-        return Promise.resolve({ ...structuredClone(initial), status: "running" });
+        return Promise.resolve({
+          ...structuredClone(initial),
+          status: "running",
+        });
       });
 
       const activePayload = {
@@ -1298,9 +1302,7 @@ describe("Editor", () => {
     // Switch back to hosts and drill down into beta.test while conn-a close is in flight.
     fireEvent.click(within(dialog).getByRole("button", { name: "按目标" }));
     fireEvent.click(await within(dialog).findByText("beta.test"));
-    expect(
-      within(dialog).getByText("目标：beta.test"),
-    ).toBeInTheDocument();
+    expect(within(dialog).getByText("目标：beta.test")).toBeInTheDocument();
     await within(dialog).findByRole("button", { name: "关闭 beta.test 连接" });
 
     const beforeCloseDone = requestedHosts.length;
@@ -1313,9 +1315,7 @@ describe("Editor", () => {
     );
     // The post-close refresh must target the currently selected host (beta.test), not alpha.test.
     expect(requestedHosts.slice(beforeCloseDone)).toEqual(["beta.test"]);
-    expect(
-      within(dialog).getByText("目标：beta.test"),
-    ).toBeInTheDocument();
+    expect(within(dialog).getByText("目标：beta.test")).toBeInTheDocument();
     expect(
       within(dialog).getByRole("button", { name: "关闭 beta.test 连接" }),
     ).toBeInTheDocument();
@@ -1361,5 +1361,193 @@ describe("Editor", () => {
     expect(rows[0]).toHaveTextContent("1.1 KB");
     expect(rows[1]).toHaveTextContent("light.test");
     expect(rows[1]).toHaveTextContent("150 B");
+  });
+  it("pauses connections polling during TrafficDetailsModal and stops polling undefined network_status", async () => {
+    vi.useFakeTimers();
+    try {
+      const detailsPayload = {
+        since: 1700000000,
+        uploadTotal: 100,
+        downloadTotal: 200,
+        activeConnections: 0,
+        totalConnections: 0,
+        totalHosts: 0,
+        hostsEvicted: false,
+        connectionHost: null,
+        hosts: [],
+        otherUpload: 0,
+        otherDownload: 0,
+        otherConnections: 0,
+        connections: [],
+      };
+      invoke.mockImplementation(async (command) => {
+        if (command === "connections") {
+          return { connections: [], uploadTotal: 100, downloadTotal: 200 };
+        }
+        if (command === "network_status") {
+          return {
+            defined: false,
+            networks: [],
+            override: null,
+            info: { addresses: [], gateways: [] },
+          };
+        }
+        if (command === "traffic_details") return detailsPayload;
+        return {
+          ...structuredClone(initial),
+          status: "running",
+          selected: "p1",
+        };
+      });
+
+      await act(async () => {
+        render(<App />);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      const countCalls = (name: string) =>
+        invoke.mock.calls.filter(([command]) => command === name).length;
+
+      // network_status returns defined: false -> stops polling after the initial check.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000);
+      });
+      expect(countCalls("network_status")).toBe(1);
+
+      // Opening TrafficDetailsModal on Overview pauses connections polling.
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: /总流量/ }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const overviewDuringOpen = countCalls("connections");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10000);
+      });
+      expect(countCalls("connections")).toBe(overviewDuringOpen);
+
+      // Closing TrafficDetailsModal resumes connections polling on Overview.
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(countCalls("connections")).toBeGreaterThan(overviewDuringOpen);
+
+      // On Connections page, opening TrafficDetailsModal also pauses connections polling.
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "连接" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "流量详情" }));
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const connectionsDuringOpen = countCalls("connections");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10000);
+      });
+      expect(countCalls("connections")).toBe(connectionsDuringOpen);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("skips auto-pretty-printing and truncates large request bodies in RequestsPage", async () => {
+    const largeJson = `{"payload":"${"x".repeat(270_000)}"}`;
+    const entry = {
+      id: 1,
+      time: Date.now(),
+      network: "tcp",
+      source: "127.0.0.1:5000",
+      host: "big.example.com",
+      port: 443,
+      rule: "Match",
+      chain: "DIRECT",
+      status: "http",
+      duration: 50,
+      upload: 0,
+      download: largeJson.length,
+      connection: "c1",
+      requests: 0,
+      http: {
+        method: "GET",
+        url: "https://big.example.com/data.json",
+        decrypted: true,
+        status: 200,
+        requestSize: 0,
+        responseSize: largeJson.length,
+      },
+    };
+    let served = false;
+    invoke.mockImplementation(async (command) => {
+      if (command === "requests") {
+        if (served) return { requests: [], next: 1 };
+        served = true;
+        return { requests: [entry], next: 1 };
+      }
+      if (command === "request_detail") {
+        return {
+          ...entry,
+          requestHeaders: [],
+          responseHeaders: [],
+          requestBody: { size: 0, truncated: false, decoded: false },
+          responseBody: {
+            size: largeJson.length,
+            truncated: false,
+            decoded: false,
+            text: largeJson,
+          },
+        };
+      }
+      if (command === "mitm_info")
+        return { ca: null, trusted: false, core: null };
+      if (command === "connections")
+        return { connections: [], uploadTotal: 0, downloadTotal: 0 };
+      return { ...structuredClone(initial), status: "running" };
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "抓包" }));
+    fireEvent.click(await screen.findByText("/data.json"));
+
+    const dialog = await screen.findByRole("dialog");
+    // Auto-pretty-print is skipped above 256 KiB, so toggle offers "格式化" (Format).
+    expect(
+      await within(dialog).findByRole("button", { name: "格式化" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/仅显示前 100000 个字符/, { selector: "p" }),
+    ).toBeInTheDocument();
+    const pre = dialog.querySelector("pre")!;
+    expect(pre.textContent!.length).toBeLessThan(101_000);
+  });
+  it("preserves existing LogPage row DOM nodes when new logs or traffic ticks arrive", async () => {
+    const handlers: Record<string, (event: { payload: unknown }) => void> = {};
+    listen.mockImplementation(async (event: string, handler) => {
+      handlers[event] = handler;
+      return vi.fn();
+    });
+    invoke.mockResolvedValue({
+      ...structuredClone(initial),
+      logs: [{ type: "info", payload: "first entry", time: 1700000001 }],
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "日志" }));
+    const firstNode = await screen.findByText("first entry");
+    const firstRow = firstNode.closest(".log-row");
+    expect(firstRow).not.toBeNull();
+
+    act(() => {
+      handlers.log({
+        payload: { type: "info", payload: "second entry", time: 1700000002 },
+      });
+    });
+
+    expect(await screen.findByText("second entry")).toBeInTheDocument();
+    expect(screen.getByText("first entry").closest(".log-row")).toBe(firstRow);
+
+    act(() => {
+      handlers.traffic({ payload: { up: 1024, down: 2048 } });
+    });
+    expect(screen.getByText("first entry").closest(".log-row")).toBe(firstRow);
   });
 });

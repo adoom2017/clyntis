@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
@@ -38,8 +38,11 @@ import {
 /** Rows the page keeps; the core keeps its own, larger log. */
 const ROWS = 5000;
 const POLL_MS = 1500;
+const PRETTY_AUTO_LIMIT = 256 * 1024;
+const PREVIEW_CHAR_LIMIT = 100_000;
 
-type Row = RequestEntry & { key: string };
+type ParsedUrl = { host: string; rest: string };
+type Row = RequestEntry & { key: string; parsedUrl?: ParsedUrl };
 type Filter = "all" | "http" | "rewritten" | "rejected" | "connections";
 
 const time = (ms: number) =>
@@ -47,22 +50,28 @@ const time = (ms: number) =>
 const duration = (ms: number) =>
   ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`;
 
+function parseRequestUrl(host: string, url: string): ParsedUrl {
+  try {
+    const parsed = new URL(url);
+    return { host: parsed.host, rest: parsed.pathname + parsed.search };
+  } catch {
+    return { host, rest: url };
+  }
+}
+
 function isRewritten(row: RequestEntry) {
   return Boolean(row.http?.rewrite || row.rule === "Module(REJECT)");
 }
 
-function matches(row: Row, filter: Filter, query: string) {
+function matches(row: Row, filter: Filter, words: string[]) {
   if (filter === "http" && row.status !== "http") return false;
   if (filter === "rewritten" && !isRewritten(row)) return false;
   if (filter === "rejected" && row.status !== "rejected") return false;
   if (filter === "connections" && row.status !== "closed") return false;
-  if (!query) return true;
+  if (!words.length) return true;
   const text =
     `${row.host} ${row.http?.url ?? ""} ${row.rule} ${row.chain} ${row.http?.contentType ?? ""} ${row.http?.rewrite ?? ""}`.toLowerCase();
-  return query
-    .toLowerCase()
-    .split(/\s+/)
-    .every((word) => text.includes(word));
+  return words.every((word) => text.includes(word));
 }
 
 export function RequestsPage({
@@ -102,9 +111,10 @@ export function RequestsPage({
       cursor.current = result.next;
       if (result.requests.length) {
         const prefix = `${generation.current}:`;
-        const added = result.requests.map((r) => ({
+        const added: Row[] = result.requests.map((r) => ({
           ...r,
           key: prefix + r.id,
+          parsedUrl: r.http ? parseRequestUrl(r.host, r.http.url) : undefined,
         }));
         setRows((current) => {
           const next = current.concat(added);
@@ -131,20 +141,28 @@ export function RequestsPage({
   }, [running, shown, paused, fetchNew]);
 
   const visible = useMemo(() => {
-    const q = query.trim();
-    const list = rows.filter((row) => matches(row, filter, q));
-    return list.reverse();
+    const q = query.trim().toLowerCase();
+    const words = q ? q.split(/\s+/) : [];
+    const list: Row[] = [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (matches(row, filter, words)) list.push(row);
+    }
+    return list;
   }, [rows, filter, query]);
-  const counts = useMemo(
-    () => ({
-      all: rows.length,
-      http: rows.filter((r) => r.status === "http").length,
-      rewritten: rows.filter((r) => isRewritten(r)).length,
-      rejected: rows.filter((r) => r.status === "rejected").length,
-      connections: rows.filter((r) => r.status === "closed").length,
-    }),
-    [rows],
-  );
+  const counts = useMemo(() => {
+    let http = 0;
+    let rewritten = 0;
+    let rejected = 0;
+    let connections = 0;
+    for (const row of rows) {
+      if (row.status === "http") http += 1;
+      else if (row.status === "rejected") rejected += 1;
+      else if (row.status === "closed") connections += 1;
+      if (isRewritten(row)) rewritten += 1;
+    }
+    return { all: rows.length, http, rewritten, rejected, connections };
+  }, [rows]);
 
   const block = (host: string) =>
     confirm(
@@ -273,11 +291,7 @@ export function RequestsPage({
               </thead>
               <tbody>
                 {visible.slice(0, 1000).map((row) => (
-                  <RequestRow
-                    key={row.key}
-                    row={row}
-                    onOpen={() => setSelected(row)}
-                  />
+                  <RequestRow key={row.key} row={row} onOpen={setSelected} />
                 ))}
               </tbody>
             </table>
@@ -306,26 +320,29 @@ export function RequestsPage({
   );
 }
 
-function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
+const RequestRow = memo(function RequestRow({
+  row,
+  onOpen,
+}: {
+  row: Row;
+  onOpen: (row: Row) => void;
+}) {
   const http = row.http;
   const rewriteInfo = describeRewrite(http?.rewriteActions, http?.rewrite);
+  const parsedUrl = useMemo(
+    () =>
+      http ? (row.parsedUrl ?? parseRequestUrl(row.host, http.url)) : null,
+    [http, row.parsedUrl, row.host],
+  );
   let kind: string;
   let target: React.ReactNode;
   let state: React.ReactNode;
-  if (http) {
-    const url = (() => {
-      try {
-        const parsed = new URL(http.url);
-        return { host: parsed.host, rest: parsed.pathname + parsed.search };
-      } catch {
-        return { host: row.host, rest: http.url };
-      }
-    })();
+  if (http && parsedUrl) {
     kind = http.method;
     target = (
       <>
-        <strong>{url.host}</strong>
-        <span className="muted">{url.rest}</span>
+        <strong>{parsedUrl.host}</strong>
+        <span className="muted">{parsedUrl.rest}</span>
       </>
     );
     state = http.error ? (
@@ -365,11 +382,11 @@ function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
     <tr
       className={`request-row ${row.status}`}
       tabIndex={0}
-      onClick={onOpen}
+      onClick={() => onOpen(row)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onOpen();
+          onOpen(row);
         }
       }}
     >
@@ -407,35 +424,64 @@ function RequestRow({ row, onOpen }: { row: Row; onOpen: () => void }) {
       </td>
     </tr>
   );
-}
+});
 
 function BodyBlock({ body }: { body?: BodyView }) {
-  const [pretty, setPretty] = useState(true);
+  const rawText = body?.text;
+  const [pretty, setPretty] = useState(
+    () => (rawText?.length ?? 0) <= PRETTY_AUTO_LIMIT,
+  );
+  useEffect(() => {
+    setPretty((rawText?.length ?? 0) <= PRETTY_AUTO_LIMIT);
+  }, [rawText]);
+  const { preview, displayTruncated, totalChars } = useMemo(() => {
+    if (rawText === undefined) {
+      return { preview: undefined, displayTruncated: false, totalChars: 0 };
+    }
+    let text = rawText;
+    if (pretty) {
+      try {
+        text = JSON.stringify(JSON.parse(text), null, 2);
+      } catch {
+        /* not JSON */
+      }
+    }
+    if (text.length > PREVIEW_CHAR_LIMIT) {
+      return {
+        preview: text.slice(0, PREVIEW_CHAR_LIMIT),
+        displayTruncated: true,
+        totalChars: text.length,
+      };
+    }
+    return { preview: text, displayTruncated: false, totalChars: text.length };
+  }, [rawText, pretty]);
   if (!body || body.size === 0)
     return <p className="muted small">{t("无内容")}</p>;
-  let text = body.text;
-  if (text !== undefined && pretty) {
-    try {
-      text = JSON.stringify(JSON.parse(text), null, 2);
-    } catch {
-      /* not JSON */
-    }
-  }
+  const truncationNote = displayTruncated
+    ? t("仅显示前 {shown} 个字符（共 {total} 个字符）", {
+        shown: PREVIEW_CHAR_LIMIT,
+        total: totalChars,
+      })
+    : null;
   return (
     <div className="body-block">
       <p className="muted small">
         {bytes(body.size)}
         {body.decoded && ` · ${t("已解压")}`}
         {body.truncated && ` · ${t("只保留了开头部分")}`}
-        {body.text !== undefined && (
+        {truncationNote && ` · ${truncationNote}`}
+        {rawText !== undefined && (
           <button className="text-button" onClick={() => setPretty((p) => !p)}>
             {pretty ? t("原文") : t("格式化")}
           </button>
         )}
       </p>
       <pre>
-        {text ??
-          `${t("二进制内容（base64）")}\n${(body.base64 ?? "").slice(0, 20000)}`}
+        {preview !== undefined
+          ? truncationNote
+            ? `${preview}\n…\n[${truncationNote}]`
+            : preview
+          : `${t("二进制内容（base64）")}\n${(body.base64 ?? "").slice(0, 20000)}`}
       </pre>
     </div>
   );

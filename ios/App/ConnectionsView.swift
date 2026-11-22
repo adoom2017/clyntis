@@ -21,10 +21,8 @@ struct ConnectionInfo: Decodable, Identifiable, Equatable {
     }
     var started: Date? { Double(start).map(Date.init(timeIntervalSince1970:)) }
 
-    static func decode(_ object: Any?) -> [ConnectionInfo] {
-        guard let object, let data = try? JSONSerialization.data(withJSONObject: object),
-              let list = try? JSONDecoder().decode([ConnectionInfo].self, from: data) else { return [] }
-        return list.sorted {
+    static func sorted(_ list: [ConnectionInfo]) -> [ConnectionInfo] {
+        list.sorted {
             let lhs = $0.download + $0.upload
             let rhs = $1.download + $1.upload
             if lhs != rhs { return lhs > rhs }
@@ -33,6 +31,12 @@ struct ConnectionInfo: Decodable, Identifiable, Equatable {
             if lhsDate != rhsDate { return lhsDate > rhsDate }
             return $0.id < $1.id
         }
+    }
+
+    static func decode(_ object: Any?) -> [ConnectionInfo] {
+        guard let object, let data = try? JSONSerialization.data(withJSONObject: object),
+              let list = try? JSONDecoder().decode([ConnectionInfo].self, from: data) else { return [] }
+        return sorted(list)
     }
 }
 

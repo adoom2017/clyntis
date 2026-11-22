@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Activity,
@@ -32,15 +32,17 @@ import { usePageVisible } from "../visibility";
 
 export function ConnectionStats({
   running,
+  paused = false,
   onOpenConnections,
   onOpenTraffic,
 }: {
   running: boolean;
+  paused?: boolean;
   onOpenConnections?: () => void;
   onOpenTraffic?: () => void;
 }) {
-  const [value, setValue] = useState<Connections>({
-    connections: [],
+  const [value, setValue] = useState({
+    count: 0,
     uploadTotal: 0,
     downloadTotal: 0,
   });
@@ -48,28 +50,46 @@ export function ConnectionStats({
   useEffect(() => {
     let live = true;
     if (!running) {
-      setValue({ connections: [], uploadTotal: 0, downloadTotal: 0 });
+      setValue({ count: 0, uploadTotal: 0, downloadTotal: 0 });
       return;
     }
-    if (!visible) return;
-    const update = () =>
-      void invoke<Connections>("connections")
-        .then((v) => {
-          if (live) setValue(v);
-        })
-        .catch(() => {});
-    update();
-    const timer = setInterval(update, 2000);
+    if (!visible || paused) return;
+    let timer: number | undefined;
+    const loop = async () => {
+      try {
+        const v = await invoke<Connections>("connections");
+        if (live) {
+          const count = v.connections.length;
+          setValue((prev) =>
+            prev.count === count &&
+            prev.uploadTotal === v.uploadTotal &&
+            prev.downloadTotal === v.downloadTotal
+              ? prev
+              : {
+                  count,
+                  uploadTotal: v.uploadTotal,
+                  downloadTotal: v.downloadTotal,
+                },
+          );
+        }
+      } catch {
+        /* ignore transient errors */
+      }
+      if (live) {
+        timer = window.setTimeout(() => void loop(), 2000);
+      }
+    };
+    void loop();
     return () => {
       live = false;
-      clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [running, visible]);
+  }, [running, visible, paused]);
   return (
     <>
       <Stat
         label={t("连接数")}
-        value={String(value.connections.length)}
+        value={String(value.count)}
         icon={<Network size={14} />}
         onClick={running ? onOpenConnections : undefined}
         title={running ? t("查看活跃连接") : undefined}
@@ -151,19 +171,47 @@ export function TrafficChart({ values }: { values: Traffic[] }) {
   );
 }
 /** The profile's networks the device is on, while the profile defines any. */
-export function NetworkPanel() {
+export function NetworkPanel({
+  profileId = null,
+}: {
+  profileId?: string | null;
+} = {}) {
   const [status, setStatus] = useState<NetworkStatus | null>(null);
   const visible = usePageVisible();
+  const lastProfile = useRef(profileId);
+  const stopForCurrent = useRef(false);
   useEffect(() => {
-    if (!visible) return;
-    const load = () =>
-      void invoke<NetworkStatus>("network_status")
-        .then(setStatus)
-        .catch(() => setStatus(null));
-    load();
-    const timer = window.setInterval(load, 5000);
-    return () => window.clearInterval(timer);
-  }, [visible]);
+    if (lastProfile.current !== profileId) {
+      lastProfile.current = profileId;
+      stopForCurrent.current = false;
+      setStatus(null);
+    }
+    if (!visible || stopForCurrent.current) return;
+    let alive = true;
+    let timer: number | undefined;
+    const load = async () => {
+      try {
+        const next = await invoke<NetworkStatus>("network_status");
+        if (!alive) return;
+        setStatus(next);
+        if (next?.defined === false) {
+          stopForCurrent.current = true;
+          return;
+        }
+      } catch {
+        if (!alive) return;
+        setStatus(null);
+      }
+      if (alive) {
+        timer = window.setTimeout(() => void load(), 5000);
+      }
+    };
+    void load();
+    return () => {
+      alive = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [visible, profileId]);
   if (!status?.defined) return null;
   const facts = [
     status.info.type &&
@@ -283,6 +331,7 @@ export function OverviewPage({
         />
         <ConnectionStats
           running={running}
+          paused={trafficOpen}
           onOpenConnections={onOpenConnections}
           onOpenTraffic={() => setTrafficOpen(true)}
         />
@@ -352,7 +401,7 @@ export function OverviewPage({
           ))}
         </section>
       </div>
-      {running && <NetworkPanel />}
+      {running && <NetworkPanel profileId={state.selected} />}
       {running && <AdblockPanel settings={state.settings} perform={perform} />}
       {running && <RewritePanel compact perform={perform} />}
       {running && trafficOpen && (

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Network, Search, X } from "lucide-react";
 import { TrafficDetailsModal } from "../features/TrafficDetails";
@@ -27,19 +27,43 @@ export function ConnectionPage({
   }, []);
   const shown = usePageVisible();
   useEffect(() => {
-    if (!running || !shown) return;
+    if (!running) setTrafficOpen(false);
+  }, [running]);
+  useEffect(() => {
+    if (!running || !shown || trafficOpen) return;
     let alive = true;
-    const tick = () =>
-      void refresh().catch(() => {
+    let timer: number | undefined;
+    const loop = async () => {
+      try {
+        await refresh();
+      } catch {
         if (alive) setFailed(true);
-      });
-    tick();
-    const timer = setInterval(tick, 2000);
+      }
+      if (alive) {
+        timer = window.setTimeout(() => void loop(), 2000);
+      }
+    };
+    void loop();
     return () => {
       alive = false;
-      clearInterval(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [running, shown, refresh]);
+  }, [running, shown, trafficOpen, refresh]);
+  const visible = useMemo(() => {
+    const q = query.toLowerCase();
+    return items
+      .filter((item) =>
+        `${item.metadata.host} ${item.chains.join(" ")}`
+          .toLowerCase()
+          .includes(q),
+      )
+      .sort(
+        (a, b) =>
+          b.download + b.upload - (a.download + a.upload) ||
+          Number(b.start) - Number(a.start) ||
+          a.id.localeCompare(b.id),
+      );
+  }, [items, query]);
   if (!running)
     return (
       <Empty
@@ -47,18 +71,6 @@ export function ConnectionPage({
         title={t("未连接")}
         text={t("连接后显示活跃连接。")}
       />
-    );
-  const visible = items
-    .filter((item) =>
-      `${item.metadata.host} ${item.chains.join(" ")}`
-        .toLowerCase()
-        .includes(query.toLowerCase()),
-    )
-    .sort(
-      (a, b) =>
-        b.download + b.upload - (a.download + a.upload) ||
-        Number(b.start) - Number(a.start) ||
-        a.id.localeCompare(b.id),
     );
   return (
     <>

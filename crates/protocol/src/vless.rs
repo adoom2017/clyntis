@@ -169,9 +169,28 @@ pub fn request(id: uuid::Uuid, target: &Target, command: u8, flow: &str) -> Resu
 }
 
 pub(crate) fn encode_address(target: &Target, out: &mut Vec<u8>) -> Result<()> {
-    Target::new(&target.host, target.port)?;
+    ensure!(
+        !target.host.is_empty()
+            && target.host.len() <= 253
+            && target.port != 0
+            && !target
+                .host
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace()),
+        "invalid target"
+    );
+    let ip = target.ip();
+    if ip.is_none() {
+        ensure!(
+            !target
+                .host
+                .chars()
+                .any(|c| matches!(c, ':' | '[' | ']' | '/' | '?' | '#' | '@')),
+            "invalid target host"
+        );
+    }
     out.extend_from_slice(&target.port.to_be_bytes());
-    match target.ip() {
+    match ip {
         Some(IpAddr::V4(ip)) => {
             out.push(1);
             out.extend_from_slice(&ip.octets());
@@ -396,6 +415,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&request[17..], b"\x12\x0a\x10xtls-rprx-vision\x03");
+        for bad in [
+            Target {
+                host: String::new(),
+                port: 80,
+            },
+            Target {
+                host: "example.com".into(),
+                port: 0,
+            },
+            Target {
+                host: "bad/host".into(),
+                port: 80,
+            },
+            Target {
+                host: "bad host".into(),
+                port: 80,
+            },
+            Target {
+                host: "a".repeat(254),
+                port: 80,
+            },
+        ] {
+            let mut out = vec![0xaa];
+            assert!(encode_address(&bad, &mut out).is_err(), "{bad:?}");
+            assert_eq!(out, [0xaa]);
+        }
     }
     #[tokio::test]
     async fn malformed_response_cannot_be_retried_as_payload() {

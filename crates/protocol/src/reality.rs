@@ -5,14 +5,14 @@ use aes_gcm::{
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use foreign_types_shared::ForeignType;
+use foreign_types_shared::ForeignTypeRef;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
 use std::{
     ffi::c_void,
     panic::AssertUnwindSafe,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -31,32 +31,19 @@ struct State {
     failed: AtomicBool,
 }
 
-/// Keeps the callback state alive until after the associated SSL object drops.
-pub struct RealityGuard {
-    state: *mut State,
+fn state_index() -> boring::ex_data::Index<boring::ssl::Ssl, Arc<State>> {
+    static INDEX: OnceLock<boring::ex_data::Index<boring::ssl::Ssl, Arc<State>>> = OnceLock::new();
+    *INDEX.get_or_init(|| boring::ssl::Ssl::new_ex_index().expect("REALITY Ssl ex_data index"))
 }
-unsafe impl Send for RealityGuard {}
 
-impl Drop for RealityGuard {
-    fn drop(&mut self) {
-        if !self.state.is_null() {
-            // SAFETY: install creates exactly one Box and this guard is its sole owner.
-            unsafe {
-                drop(Box::from_raw(self.state));
-            }
-            self.state = std::ptr::null_mut();
-        }
-    }
+/// Keeps the per-connection callback state accessible for post-handshake verification.
+pub struct RealityGuard {
+    state: Arc<State>,
 }
 
 impl RealityGuard {
     pub fn succeeded(&self) -> bool {
-        if self.state.is_null() {
-            return false;
-        }
-        // SAFETY: state remains owned by this guard.
-        let state = unsafe { &*self.state };
-        state.succeeded.load(Ordering::Acquire) && !state.failed.load(Ordering::Acquire)
+        self.state.succeeded.load(Ordering::Acquire) && !self.state.failed.load(Ordering::Acquire)
     }
 
     pub fn verify_peer(&self, ssl: &boring::ssl::SslRef) -> Result<()> {
@@ -80,9 +67,8 @@ impl RealityGuard {
             cert.public_key().subject_public_key.data.len() == 32,
             "invalid REALITY public key"
         );
-        // SAFETY: state remains owned by this guard.
-        let state = unsafe { &*self.state };
-        let key = state
+        let key = self
+            .state
             .auth_key
             .lock()
             .map_err(|_| anyhow::anyhow!("REALITY authentication state poisoned"))?;
@@ -99,11 +85,18 @@ extern "C" fn callback(
     ssl: *mut boring_sys::SSL,
     msg: *mut u8,
     msg_len: usize,
-    arg: *mut c_void,
+    _arg: *mut c_void,
 ) -> i32 {
+    if ssl.is_null() {
+        return 0;
+    }
+    // SAFETY: BoringSSL passes a valid live `SSL*` pointer for the duration of this callback.
+    let ssl_ref = unsafe { boring::ssl::SslRef::from_ptr(ssl) };
+    let Some(state) = ssl_ref.ex_data(state_index()) else {
+        return 0;
+    };
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if ssl.is_null() || arg.is_null() || msg.is_null() || msg_len < SESSION_OFFSET + SESSION_LEN
-        {
+        if msg.is_null() || msg_len < SESSION_OFFSET + SESSION_LEN {
             return false;
         }
         // SAFETY: BoringSSL provides a mutable ClientHello buffer for this callback.
@@ -118,8 +111,6 @@ extern "C" fn callback(
         {
             return false;
         }
-        // SAFETY: arg points to the State owned by RealityGuard.
-        let state = unsafe { &*(arg.cast::<State>()) };
         let shared = StaticSecret::from(*private).diffie_hellman(&PublicKey::from(state.public));
         if !shared.was_contributory() {
             return false;
@@ -161,15 +152,21 @@ extern "C" fn callback(
         true
     }));
     if !matches!(result, Ok(true)) {
-        if !arg.is_null() {
-            // SAFETY: arg points to callback state for the lifetime of the SSL object.
-            unsafe { &*(arg.cast::<State>()) }
-                .failed
-                .store(true, Ordering::Release);
-        }
+        state.failed.store(true, Ordering::Release);
         0
     } else {
         1
+    }
+}
+
+/// Installs the shared REALITY ClientHello callback onto an `SslContextRef`
+/// before publication into the connector cache; per-connection state is read
+/// from `SSL` `ex_data`.
+pub(crate) fn configure_context(ctx: &boring::ssl::SslContextRef) {
+    // SAFETY: `ctx` is a valid BoringSSL `SSL_CTX*`; `callback` retrieves per-handshake
+    // state from the `SSL` object's `ex_data` and ignores `arg`.
+    unsafe {
+        boring_sys::SSL_CTX_set_client_hello_cb(ctx.as_ptr(), Some(callback), std::ptr::null_mut());
     }
 }
 
@@ -191,7 +188,7 @@ pub(crate) fn install(
         short_id[index] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
     }
     let now = clock.unix_seconds().context("invalid REALITY clock")? as u32;
-    let state = Box::new(State {
+    let state = Arc::new(State {
         public,
         short_id,
         now,
@@ -199,15 +196,6 @@ pub(crate) fn install(
         succeeded: AtomicBool::new(false),
         failed: AtomicBool::new(false),
     });
-    let state = Box::into_raw(state);
-    // SAFETY: ssl is live and state is retained by the returned guard.
-    unsafe {
-        let ctx = boring_sys::SSL_get_SSL_CTX(ssl.as_ptr());
-        if ctx.is_null() {
-            drop(Box::from_raw(state));
-            anyhow::bail!("REALITY SSL context missing");
-        }
-        boring_sys::SSL_CTX_set_client_hello_cb(ctx, Some(callback), state.cast());
-    }
+    ssl.set_ex_data(state_index(), Arc::clone(&state));
     Ok(RealityGuard { state })
 }

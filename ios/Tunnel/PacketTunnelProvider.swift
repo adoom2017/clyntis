@@ -18,7 +18,8 @@ private final class PacketWake {
 }
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
-    private let queue = DispatchQueue(label: "org.clyntis.ios.packet-tunnel")
+    private let queue = DispatchQueue(label: "org.clyntis.ios.packet-tunnel", autoreleaseFrequency: .workItem)
+    private let metricsQueue = DispatchQueue(label: "org.clyntis.ios.tunnel-metrics", qos: .utility, autoreleaseFrequency: .workItem)
     private var core: CoreSession?
     private var epoch = UUID()
     /// Outlives its core: shutdown destroys the core (joining its callbacks)
@@ -26,6 +27,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var packetWake: PacketWake?
     /// Reused by every drain on `queue`; each packet is copied out of it.
     private var packetBuffer = [UInt8](repeating: 0, count: 65_535)
+    private var drainScheduled = false
     private var monitor: NWPathMonitor?
     private var receivedInitialPath = false
     /// The network the core last adapted to, and the coalescing of path updates.
@@ -53,6 +55,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Open descriptors allowed; see `Diagnostics.raiseFileLimit`.
     private static let fileLimit = 4096
+    private static let packetBatch = 64
+    private static let inetProtocol = NSNumber(value: AF_INET)
+    private static let inet6Protocol = NSNumber(value: AF_INET6)
+
+    /// Builds the core session inside nested autorelease pools so intermediate
+    /// raw, custom-rule, and override YAML `Data` buffers are freed before
+    /// `core.start()` loads routing resources.
+    private func createCore(for id: UUID, in store: ProfileStore, hooks: inout meta_hooks_v1, step: inout String) throws -> CoreSession {
+        let directory = store.directory(for: id)
+        return try autoreleasepool {
+            let configuration: Data = try autoreleasepool {
+                step = "apply custom rules"
+                let withRules: Data = try autoreleasepool {
+                    let source = try store.configuration(for: id)
+                    let (merged, skipped) = try CustomRules.applied(to: source)
+                    if !skipped.isEmpty {
+                        log.warning("start: \(skipped.count) custom rule(s) not usable with this profile: "
+                                    + skipped.map { "\($0.rule) (\($0.reason))" }.joined(separator: "; "))
+                    }
+                    return merged
+                }
+                step = "apply app settings"
+                let overrides = AppOverrides.load().withMitmAuthority()
+                let applied = try overrides.applied(to: withRules)
+                if !overrides.isEmpty {
+                    log.info("start: app settings override the profile: log=\(overrides.logLevel ?? "profile") "
+                             + "ipv6=\(overrides.ipv6.map(String.init) ?? "profile") sniffing=\(overrides.sniffing.map(String.init) ?? "profile")")
+                }
+                return applied
+            }
+            step = "create core"
+            return try CoreSession(configuration: configuration, directory: directory, hooks: &hooks)
+        }
+    }
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         // The app passes "source"; iOS starts the tunnel without options when
@@ -86,24 +122,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     let wake = Unmanaged<PacketWake>.fromOpaque(context).takeUnretainedValue()
                     guard let provider = wake.provider else { return }
                     let epoch = wake.epoch
-                    provider.queue.async { provider.drainPackets(epoch: epoch) }
+                    provider.queue.async { provider.drainOnWake(epoch: epoch) }
                 }
-                step = "apply custom rules"
-                let (withRules, skipped) = try CustomRules.applied(to: store.configuration(for: id))
-                if !skipped.isEmpty {
-                    log.warning("start: \(skipped.count) custom rule(s) not usable with this profile: "
-                                + skipped.map { "\($0.rule) (\($0.reason))" }.joined(separator: "; "))
-                }
-                step = "apply app settings"
-                let overrides = AppOverrides.load().withMitmAuthority()
-                let configuration = try overrides.applied(to: withRules)
-                if !overrides.isEmpty {
-                    log.info("start: app settings override the profile: log=\(overrides.logLevel ?? "profile") "
-                             + "ipv6=\(overrides.ipv6.map(String.init) ?? "profile") sniffing=\(overrides.sniffing.map(String.init) ?? "profile")")
-                }
-                step = "create core"
-                self.core = try CoreSession(configuration: configuration,
-                                            directory: store.directory(for: id), hooks: &hooks)
+                self.core = try self.createCore(for: id, in: store, hooks: &hooks, step: &step)
                 log.info("start: core created memory=\(memory())")
                 self.collectLogs()
                 // Loads cached resources only; downloads and hot updates run after startup.
@@ -134,7 +155,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             return
                         }
                         self.readPackets(epoch: epoch)
-                        self.drainPackets(epoch: epoch)
+                        self.scheduleDrain(epoch: epoch)
                         self.watchCore()
                         log.info("start: tunnel up memory=\(memory())")
                         StartFailures.clear()
@@ -178,6 +199,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         logTimer?.cancel()
         logTimer = nil
         epoch = UUID()
+        drainScheduled = false
         droppedPackets = 0
         monitor?.cancel()
         monitor = nil
@@ -209,37 +231,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard self.epoch == epoch, let core else { return }
         watchdog.begin("write packets")
         defer { watchdog.end() }
-        var index = index
-        while index < packets.count {
-            let packet = packets[index]
-            index += 1
-            // One malformed packet must not end the VPN: the core refuses it
-            // with the same error as a stopped core, so drop it here.
-            guard (20...65_535).contains(packet.count),
-                  [4, 6].contains(packet[packet.startIndex] >> 4) else {
-                dropped("malformed packet from the system (\(packet.count) bytes)")
-                continue
-            }
-            let result = packet.withUnsafeBytes {
-                meta_write_packet_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
-            }
-            if result == META_WOULD_BLOCK {
-                // Keep unread packets rather than silently dropping a saturated batch.
-                let retry = index - 1, total = waited + delay
-                if waited < 5_000, total >= 5_000 {
-                    log.warning("core packet input full for 5 s; still retrying memory=\(memory())")
+        let finished: Bool = autoreleasepool {
+            var index = index
+            while index < packets.count {
+                let packet = packets[index]
+                index += 1
+                // One malformed packet must not end the VPN: the core refuses it
+                // with the same error as a stopped core, so drop it here.
+                guard (20...65_535).contains(packet.count),
+                      [4, 6].contains(packet[packet.startIndex] >> 4) else {
+                    dropped("malformed packet from the system (\(packet.count) bytes)")
+                    continue
                 }
-                queue.asyncAfter(deadline: .now() + .milliseconds(delay)) {
-                    self.submit(packets, index: retry, epoch: epoch, delay: min(delay * 2, 100), waited: total)
+                let result = packet.withUnsafeBytes {
+                    meta_write_packet_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
                 }
-                return
+                if result == META_WOULD_BLOCK {
+                    // Keep unread packets rather than silently dropping a saturated batch.
+                    let retry = index - 1, total = waited + delay
+                    if waited < 5_000, total >= 5_000 {
+                        log.warning("core packet input full for 5 s; still retrying memory=\(memory())")
+                    }
+                    queue.asyncAfter(deadline: .now() + .milliseconds(delay)) {
+                        self.submit(packets, index: retry, epoch: epoch, delay: min(delay * 2, 100), waited: total)
+                    }
+                    return false
+                }
+                if result != META_OK {
+                    self.fail(ClientError.message(L("无法向内核写入 IP 数据包。")))
+                    return false
+                }
             }
-            if result != META_OK {
-                self.fail(ClientError.message(L("无法向内核写入 IP 数据包。")))
-                return
-            }
+            return true
         }
-        readPackets(epoch: epoch)
+        if finished { readPackets(epoch: epoch) }
     }
 
     private func dropped(_ reason: String) {
@@ -251,49 +276,66 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func scheduleDrain(epoch: UUID) {
+        guard self.epoch == epoch, core != nil, !drainScheduled else { return }
+        drainScheduled = true
+        queue.async { self.drainPackets(epoch: epoch) }
+    }
+
+    private func drainOnWake(epoch: UUID) {
+        guard self.epoch == epoch, core != nil, !drainScheduled else { return }
+        drainPackets(epoch: epoch)
+    }
+
     /// Drains the core's packets, at most 64 per turn so the queue still
     /// serves uploads and network changes; continues until the core reports
     /// none left, which re-arms its next notification.
     private func drainPackets(epoch: UUID) {
         guard self.epoch == epoch, let core else { return }
+        drainScheduled = false
         watchdog.begin("read packets")
         defer { watchdog.end() }
-        var packets: [Data] = [], protocols: [NSNumber] = []
-        var emptied = false
-        for _ in 0..<64 {
-            var length = 0
-            var packet = Data()
-            let result = packetBuffer.withUnsafeMutableBytes { buffer -> Int32 in
-                let result = meta_read_packet_v1(core.handle, buffer.bindMemory(to: UInt8.self).baseAddress,
-                                                 buffer.count, &length)
-                // Copied out: the next read reuses the buffer.
-                if result == META_OK, length > 0, let base = buffer.baseAddress {
-                    packet = Data(bytes: base, count: length)
+        let shouldContinue: Bool = autoreleasepool {
+            var packets: [Data] = [], protocols: [NSNumber] = []
+            packets.reserveCapacity(Self.packetBatch)
+            protocols.reserveCapacity(Self.packetBatch)
+            var emptied = false
+            for _ in 0..<Self.packetBatch {
+                var length = 0
+                var packet = Data()
+                let result = packetBuffer.withUnsafeMutableBytes { buffer -> Int32 in
+                    let result = meta_read_packet_v1(core.handle, buffer.bindMemory(to: UInt8.self).baseAddress,
+                                                     buffer.count, &length)
+                    // Copied out: the next read reuses the buffer.
+                    if result == META_OK, length > 0, let base = buffer.baseAddress {
+                        packet = Data(bytes: base, count: length)
+                    }
+                    return result
                 }
-                return result
+                if result == META_WOULD_BLOCK {
+                    emptied = true
+                    break
+                }
+                guard result == META_OK else {
+                    fail(ClientError.message(L("无法读取内核 IP 数据包。")))
+                    return false
+                }
+                guard length > 0 else { continue }
+                let version = packet[packet.startIndex] >> 4
+                guard version == 4 || version == 6 else {
+                    dropped("invalid packet from the core (version \(version))")
+                    continue
+                }
+                packets.append(packet)
+                protocols.append(version == 4 ? Self.inetProtocol : Self.inet6Protocol)
             }
-            if result == META_WOULD_BLOCK {
-                emptied = true
-                break
+            if !packets.isEmpty, !packetFlow.writePackets(packets, withProtocols: protocols) {
+                // The flow refuses while it is being torn down; stopTunnel follows.
+                dropped("the system refused \(packets.count) packet(s)")
             }
-            guard result == META_OK else {
-                fail(ClientError.message(L("无法读取内核 IP 数据包。")))
-                return
-            }
-            guard length > 0 else { continue }
-            let version = packet[packet.startIndex] >> 4
-            guard version == 4 || version == 6 else {
-                dropped("invalid packet from the core (version \(version))")
-                continue
-            }
-            packets.append(packet)
-            protocols.append(NSNumber(value: version == 4 ? AF_INET : AF_INET6))
+            return !emptied
         }
-        if !packets.isEmpty, !packetFlow.writePackets(packets, withProtocols: protocols) {
-            // The flow refuses while it is being torn down; stopTunnel follows.
-            dropped("the system refused \(packets.count) packet(s)")
-        }
-        if !emptied { queue.async { self.drainPackets(epoch: epoch) } }
+        if shouldContinue { scheduleDrain(epoch: epoch) }
     }
 
     /// Routes for the tunnel; IPv6 only when `ipv6`. Completes on `queue`.
@@ -566,11 +608,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 ticks += 1
                 if ticks % 6 == 0 {
                     let connections = (state?["connections"] as? NSNumber)?.intValue ?? 0
-                    let files = Diagnostics.openFileDescriptors()
-                    let limit = Diagnostics.fileLimit()
-                    let line = "running: memory=\(memory()) connections=\(connections) files=\(files)/\(limit)"
-                    // Near the limit new sockets fail; say so above the routine line.
-                    if limit > 0, files * 10 >= limit * 8 { log.warning(line) } else { log.info(line) }
+                    // Counting open descriptors scans up to RLIMIT_NOFILE via fcntl; keep it off the packet queue.
+                    self.metricsQueue.async {
+                        let files = Diagnostics.openFileDescriptors()
+                        let limit = Diagnostics.fileLimit()
+                        let line = "running: memory=\(memory()) connections=\(connections) files=\(files)/\(limit)"
+                        // Near the limit new sockets fail; say so above the routine line.
+                        if limit > 0, files * 10 >= limit * 8 { log.warning(line) } else { log.info(line) }
+                    }
                 }
             } catch { self.fail(error) }
         }
@@ -787,7 +832,8 @@ private struct NetworkSnapshot: Equatable, CustomStringConvertible {
 /// next start can tell an exit without `stopTunnel` (a crash or a kill by the
 /// system) and when it happened.
 private final class TunnelWatchdog {
-    private let queue = DispatchQueue(label: "org.clyntis.ios.tunnel-watchdog")
+    private static let isoFormatter = ISO8601DateFormatter()
+    private let queue = DispatchQueue(label: "org.clyntis.ios.tunnel-watchdog", autoreleaseFrequency: .workItem)
     private let lock = NSLock()
     private var operation = "starting"
     private var operationSince = TunnelWatchdog.uptime()
@@ -873,7 +919,7 @@ private final class TunnelWatchdog {
         }
         guard let heartbeat else { return }
         let beat: [String: Any] = [
-            "time": ISO8601DateFormatter().string(from: Date()),
+            "time": Self.isoFormatter.string(from: Date()),
             "operation": operation,
             "memory": footprint,
             "blocked": Int(blocked),

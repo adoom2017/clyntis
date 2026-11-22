@@ -15,6 +15,20 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 const MAX_HEADERS: usize = 32 * 1024;
+/// Largest WebSocket frame accepted from the peer. Mihomo and Xray write at
+/// most a few tens of KiB per frame; anything larger only buffers memory.
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+/// Largest data frame we write; one `poll_write` frames at most this much.
+const WRITE_CHUNK: usize = 16 * 1024;
+/// Buffers grown past this by an unusually large frame are released once
+/// drained instead of being kept for the life of the stream.
+const KEEP_CAPACITY: usize = 64 * 1024;
+
+fn release_if_large(buffer: &mut Vec<u8>) {
+    if buffer.is_empty() && buffer.capacity() > KEEP_CAPACITY {
+        *buffer = Vec::new();
+    }
+}
 
 fn split_ed(path: &str, configured: usize, header: &str) -> (String, usize, String) {
     let mut max = configured;
@@ -175,6 +189,7 @@ impl WsStream {
             );
         }
         self.incoming.drain(..end + 4);
+        release_if_large(&mut self.incoming);
         self.upgraded = true;
         Ok(true)
     }
@@ -190,11 +205,15 @@ impl WsStream {
         }
         self.outgoing.clear();
         self.outgoing_at = 0;
+        release_if_large(&mut self.outgoing);
         Pin::new(&mut self.inner).poll_flush(cx)
     }
-    fn frame(bytes: &[u8], opcode: u8) -> Vec<u8> {
-        let mut out = vec![0x80 | opcode];
+    /// Appends one masked client frame to `out`, reserving its full size
+    /// up front (at most 14 header bytes plus the payload).
+    fn frame(out: &mut Vec<u8>, bytes: &[u8], opcode: u8) {
         let len = bytes.len();
+        out.reserve(14 + len);
+        out.push(0x80 | opcode);
         if len < 126 {
             out.push(0x80 | len as u8);
         } else if len <= u16::MAX as usize {
@@ -208,7 +227,6 @@ impl WsStream {
         rand::thread_rng().fill_bytes(&mut mask);
         out.extend_from_slice(&mask);
         out.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
-        out
     }
     fn parse_frame(&mut self) -> io::Result<bool> {
         if self.incoming.len() < 2 {
@@ -229,8 +247,11 @@ impl WsStream {
                 return Ok(false);
             }
             let n = u64::from_be_bytes(self.incoming[2..10].try_into().unwrap());
-            len = usize::try_from(n).map_err(|_| io::Error::other("oversized WebSocket frame"))?;
+            len = usize::try_from(n).unwrap_or(usize::MAX);
             at = 10;
+        }
+        if len > MAX_FRAME {
+            return Err(io::Error::other("oversized WebSocket frame"));
         }
         let mask = if masked {
             if self.incoming.len() < at + 4 {
@@ -242,29 +263,55 @@ impl WsStream {
         } else {
             None
         };
-        if self.incoming.len() < at + len {
+        let end = at
+            .checked_add(len)
+            .ok_or_else(|| io::Error::other("oversized WebSocket frame"))?;
+        if self.incoming.len() < end {
             return Ok(false);
         }
-        let mut data = self.incoming[at..at + len].to_vec();
-        self.incoming.drain(..at + len);
         if let Some(mask) = mask {
-            for (i, b) in data.iter_mut().enumerate() {
+            for (i, b) in self.incoming[at..end].iter_mut().enumerate() {
                 *b ^= mask[i % 4];
             }
         }
         match opcode {
+            0 | 2 if len == 0 => {}
+            0 | 2 if end == self.incoming.len() => {
+                // The common case: the buffer holds exactly this frame. Hand
+                // the buffer itself over instead of copying the payload out.
+                self.payload.clear();
+                std::mem::swap(&mut self.payload, &mut self.incoming);
+                self.payload_at = at;
+                release_if_large(&mut self.incoming);
+                return Ok(true);
+            }
+            0 | 2 if self.incoming.len() - end < len => {
+                // Remaining bytes for the next frame are smaller than this
+                // payload: move the smaller tail instead of copying the
+                // larger payload so peak memory never hits 2x frame size.
+                self.payload.clear();
+                self.payload.extend_from_slice(&self.incoming[end..]);
+                self.incoming.truncate(end);
+                std::mem::swap(&mut self.payload, &mut self.incoming);
+                self.payload_at = at;
+                release_if_large(&mut self.incoming);
+                return Ok(true);
+            }
             0 | 2 => {
-                self.payload = data;
+                self.payload.clear();
+                self.payload.extend_from_slice(&self.incoming[at..end]);
                 self.payload_at = 0;
             }
             8 => {
                 self.closed = true;
-                self.outgoing.extend(Self::frame(&data, 8));
+                Self::frame(&mut self.outgoing, &self.incoming[at..end], 8);
             }
-            9 => self.outgoing.extend(Self::frame(&data, 10)),
+            9 => Self::frame(&mut self.outgoing, &self.incoming[at..end], 10),
             10 => {}
             _ => return Err(io::Error::other("unsupported WebSocket frame")),
         }
+        self.incoming.drain(..end);
+        release_if_large(&mut self.incoming);
         Ok(true)
     }
 }
@@ -312,6 +359,7 @@ impl AsyncRead for WsStream {
                     let count = out.remaining().min(self.incoming.len());
                     out.put_slice(&self.incoming[..count]);
                     self.incoming.drain(..count);
+                    release_if_large(&mut self.incoming);
                     return Poll::Ready(Ok(()));
                 }
                 return Pin::new(&mut self.inner).poll_read(cx, out);
@@ -320,6 +368,11 @@ impl AsyncRead for WsStream {
                 let n = out.remaining().min(self.payload.len() - self.payload_at);
                 out.put_slice(&self.payload[self.payload_at..self.payload_at + n]);
                 self.payload_at += n;
+                if self.payload_at == self.payload.len() {
+                    self.payload.clear();
+                    self.payload_at = 0;
+                    release_if_large(&mut self.payload);
+                }
                 return Poll::Ready(Ok(()));
             }
             if self.closed {
@@ -367,8 +420,9 @@ impl AsyncWrite for WsStream {
         if self.raw {
             return Pin::new(&mut self.inner).poll_write(cx, bytes);
         }
-        let n = bytes.len().min(16 * 1024);
-        self.outgoing = Self::frame(&bytes[..n], 2);
+        let n = bytes.len().min(WRITE_CHUNK);
+        // flush_outgoing left `outgoing` empty; reuse its capacity.
+        Self::frame(&mut self.outgoing, &bytes[..n], 2);
         Poll::Ready(Ok(n))
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -578,5 +632,41 @@ mod tests {
         stream.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"world");
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_rejected_without_overflow() {
+        for length in [(MAX_FRAME + 1) as u64, u64::MAX] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut stream = upgraded_stream(client);
+            let mut header = vec![0x82, 127];
+            header.extend_from_slice(&length.to_be_bytes());
+            server.write_all(&header).await.unwrap();
+            let err = stream.read(&mut [0; 16]).await.unwrap_err();
+            assert!(err.to_string().contains("oversized"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn large_frame_buffers_shrink_after_drain() {
+        let payload = vec![0x5a; 128 * 1024];
+        let (client, mut server) = tokio::io::duplex(256 * 1024);
+        let mut stream = upgraded_stream(client);
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            let mut frame = vec![0x82, 127];
+            frame.extend_from_slice(&(expected.len() as u64).to_be_bytes());
+            frame.extend_from_slice(&expected);
+            // Append a second small frame so the tail-swap path is also exercised.
+            frame.extend_from_slice(&[0x82, 4, b't', b'a', b'i', b'l']);
+            server.write_all(&frame).await.unwrap();
+        });
+        let mut received = vec![0u8; payload.len() + 4];
+        stream.read_exact(&mut received).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(&received[..payload.len()], &payload[..]);
+        assert_eq!(&received[payload.len()..], b"tail");
+        assert!(stream.incoming.capacity() <= KEEP_CAPACITY);
+        assert!(stream.payload.capacity() <= KEEP_CAPACITY);
     }
 }

@@ -332,9 +332,7 @@ async fn close(State(core): State<Arc<Core>>, Path(id): Path<String>) -> Json<Va
     Json(json!({}))
 }
 async fn close_all(State(core): State<Arc<Core>>) -> Json<Value> {
-    for c in core.connections() {
-        c.cancel.cancel();
-    }
+    core.close_connections();
     Json(json!({}))
 }
 async fn traffic(State(core): State<Arc<Core>>, ws: WebSocketUpgrade) -> Response {

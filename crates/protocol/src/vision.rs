@@ -17,6 +17,12 @@ struct InnerTls {
     remaining: usize,
 }
 impl InnerTls {
+    fn release(&mut self) {
+        self.remaining = 0;
+        self.client = Vec::new();
+        self.server.finish();
+    }
+
     fn observe(&mut self, bytes: &[u8], server: bool) {
         if self.remaining == 0 || self.tls13 {
             return;
@@ -27,7 +33,7 @@ impl InnerTls {
                 self.tls = true;
                 self.tls13 = tls13;
             }
-        } else {
+        } else if !self.tls {
             let count = bytes.len().min(8usize.saturating_sub(self.client.len()));
             self.client.extend_from_slice(&bytes[..count]);
             if self.client.len() >= 6
@@ -37,6 +43,13 @@ impl InnerTls {
             {
                 self.tls = true;
             }
+        }
+        if self.tls {
+            self.client = Vec::new();
+        }
+        if self.remaining == 0 || self.tls13 {
+            self.client = Vec::new();
+            self.server.finish();
         }
     }
 }
@@ -48,6 +61,12 @@ struct TlsHello {
     done: bool,
 }
 impl TlsHello {
+    fn finish(&mut self) {
+        self.done = true;
+        self.record = Vec::new();
+        self.handshake = Vec::new();
+    }
+
     fn observe(&mut self, mut bytes: &[u8]) -> Option<bool> {
         while !bytes.is_empty() && !self.done {
             let need = if self.record.len() < 5 {
@@ -56,7 +75,7 @@ impl TlsHello {
                 5 + u16::from_be_bytes([self.record[3], self.record[4]]) as usize
             };
             if need > 18437 {
-                self.done = true;
+                self.finish();
                 return None;
             }
             let count = bytes.len().min(need - self.record.len());
@@ -66,7 +85,7 @@ impl TlsHello {
                 continue;
             }
             if self.record[0] != 22 || self.record[1] != 3 {
-                self.done = true;
+                self.finish();
                 return None;
             }
             let need = 5 + u16::from_be_bytes([self.record[3], self.record[4]]) as usize;
@@ -76,26 +95,27 @@ impl TlsHello {
             self.handshake.extend_from_slice(&self.record[5..]);
             self.record.clear();
             if self.handshake.len() > 18432 {
-                self.done = true;
+                self.finish();
                 return None;
             }
             if self.handshake.len() < 4 {
                 continue;
             }
             if self.handshake[0] != 2 {
-                self.done = true;
+                self.finish();
                 return None;
             }
             let length =
                 u32::from_be_bytes([0, self.handshake[1], self.handshake[2], self.handshake[3]])
                     as usize;
             if length > 18428 {
-                self.done = true;
+                self.finish();
                 return None;
             }
             if self.handshake.len() >= length + 4 {
-                self.done = true;
-                return server_hello(&self.handshake[4..length + 4]);
+                let result = server_hello(&self.handshake[4..length + 4]);
+                self.finish();
+                return result;
             }
         }
         None
@@ -208,6 +228,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStream<S> {
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
         self.pending.clear();
         self.written = 0;
+        if self.write_plain {
+            self.pending = Vec::new();
+        }
         if self.switch_write {
             self.inner.inner_mut().write_direct();
             self.switch_write = false;
@@ -275,6 +298,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
                     let n = this.read_header.len().min(buf.remaining());
                     buf.put_slice(&this.read_header[..n]);
                     this.read_header.drain(..n);
+                    if this.read_header.is_empty() {
+                        this.read_header = Vec::new();
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 return Pin::new(&mut this.inner).poll_read(cx, buf);
@@ -308,6 +334,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
                     this.inner.inner_mut().read_direct();
                 }
                 this.read_plain = true;
+                this.read_header = Vec::new();
+                this.sniff.server.finish();
                 continue;
             }
             let need = if this.read_first { 21 } else { 5 };
@@ -335,9 +363,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
                     // unpadded downlink (and older compatible servers).
                     this.read_first = false;
                     this.read_plain = true;
+                    this.sniff.server.finish();
                     let n = this.read_header.len().min(buf.remaining());
                     buf.put_slice(&this.read_header[..n]);
                     this.read_header.drain(..n);
+                    if this.read_header.is_empty() {
+                        this.read_header = Vec::new();
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 this.read_first = false;
@@ -405,6 +437,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
         this.pending.resize(this.pending.len() + padding, 0);
         if command != 0 {
             this.write_plain = true;
+            this.sniff.release();
         }
         this.switch_write = command == 2;
         Poll::Ready(Ok(bytes.len()))
@@ -554,5 +587,40 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_mode_and_completed_sniff_release_buffer_capacities() {
+        let mut sniff = InnerTls {
+            remaining: 65536,
+            ..Default::default()
+        };
+        sniff.observe(&tls_record(&hello(0x1301, true)), true);
+        assert!(sniff.tls && sniff.tls13);
+        assert_eq!(sniff.server.record.capacity(), 0);
+        assert_eq!(sniff.server.handshake.capacity(), 0);
+        assert_eq!(sniff.client.capacity(), 0);
+
+        let (mut client, mut server) = pair().await;
+        // Drive client write into plain mode (non-TLS >= 8 bytes triggers command 1).
+        client.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        client.flush().await.unwrap();
+        assert!(client.write_plain);
+        assert_eq!(client.pending.capacity(), 0);
+        assert_eq!(client.sniff.client.capacity(), 0);
+        assert_eq!(client.sniff.server.record.capacity(), 0);
+        assert_eq!(client.sniff.server.handshake.capacity(), 0);
+
+        // Drive client read into direct/plain mode (command 2).
+        let mut bytes = vec![0, 0];
+        bytes.extend(frame(true, 2, b"hi", 4));
+        bytes.extend_from_slice(b"raw");
+        server.write_all(&bytes).await.unwrap();
+        server.flush().await.unwrap();
+        let mut out = [0u8; 5];
+        client.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"hiraw");
+        assert!(client.read_plain);
+        assert_eq!(client.read_header.capacity(), 0);
     }
 }

@@ -125,6 +125,7 @@ impl TrafficDetails {
         if bytes.len() <= max_bytes {
             return Ok(bytes);
         }
+        drop(bytes);
         let mut capped = self.clone();
         if capped.connection_host.is_some() {
             while capped.trim_hosts_half() {
@@ -429,31 +430,36 @@ impl Ledger {
         }
 
         if total > 0 && self.limits.max_closed > 0 {
-            let record = ConnectionTraffic {
-                id: state.info.id.clone(),
-                host: state.info.metadata.host.clone(),
-                port: state.info.metadata.port,
-                network: state.info.network.clone(),
-                chains: state.info.chains.clone(),
-                rule: state.info.rule.clone(),
-                source: state.info.source.clone(),
-                upload,
-                download,
-                start: state.started_unix,
-                duration,
-                active: false,
+            let slot = if self.closed_connections.len() < self.limits.max_closed {
+                Some(None)
+            } else {
+                self.closed_connections
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, c)| (idx, (c.upload.saturating_add(c.download), c.start)))
+                    .min_by_key(|(_, key)| *key)
+                    .filter(|(_, min_key)| (total, state.started_unix) > *min_key)
+                    .map(|(min_idx, _)| Some(min_idx))
             };
-            if self.closed_connections.len() < self.limits.max_closed {
-                self.closed_connections.push(record);
-            } else if let Some((min_idx, min_key)) = self
-                .closed_connections
-                .iter()
-                .enumerate()
-                .map(|(idx, c)| (idx, (c.upload.saturating_add(c.download), c.start)))
-                .min_by_key(|(_, key)| *key)
-                && (total, state.started_unix) > min_key
-            {
-                self.closed_connections[min_idx] = record;
+            if let Some(replace_idx) = slot {
+                let record = ConnectionTraffic {
+                    id: state.info.id.clone(),
+                    host: state.info.metadata.host.clone(),
+                    port: state.info.metadata.port,
+                    network: state.info.network.clone(),
+                    chains: state.info.chains.clone(),
+                    rule: state.info.rule.clone(),
+                    source: state.info.source.clone(),
+                    upload,
+                    download,
+                    start: state.started_unix,
+                    duration,
+                    active: false,
+                };
+                match replace_idx {
+                    None => self.closed_connections.push(record),
+                    Some(min_idx) => self.closed_connections[min_idx] = record,
+                }
             }
         }
     }
@@ -468,6 +474,53 @@ impl Ledger {
 
     pub(crate) fn active_cancel(&self, id: &str) -> Option<tokio_util::sync::CancellationToken> {
         self.active.get(id).map(|s| s.info.cancel.clone())
+    }
+
+    /// Cancels every active connection in place, without cloning
+    /// [`Connection`] snapshots. Returns how many were signalled.
+    pub fn cancel_all(&self) -> usize {
+        for state in self.active.values() {
+            state.info.cancel.cancel();
+        }
+        self.active.len()
+    }
+
+    /// Counts open connections per proxy chain name, without cloning
+    /// [`Connection`] snapshots.
+    pub fn active_chain_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for state in self.active.values() {
+            for chain in &state.info.chains {
+                if let Some(count) = counts.get_mut(chain.as_str()) {
+                    *count += 1;
+                } else {
+                    counts.insert(chain.clone(), 1);
+                }
+            }
+        }
+        counts
+    }
+
+    /// Drops retained closed-connection history and returns spare capacity
+    /// to the allocator under memory pressure. Aggregate byte totals are
+    /// folded into `other_*` so session totals stay reconciled.
+    pub fn relieve_memory(&mut self) {
+        for (_, entry) in self
+            .closed_hosts
+            .drain()
+            .chain(self.candidate_hosts.drain())
+        {
+            self.other_upload = self.other_upload.saturating_add(entry.upload);
+            self.other_download = self.other_download.saturating_add(entry.download);
+            self.other_connections = self.other_connections.saturating_add(entry.connections);
+            if entry.upload.saturating_add(entry.download) > 0 {
+                self.hosts_evicted = true;
+            }
+        }
+        self.closed_hosts.shrink_to_fit();
+        self.candidate_hosts.shrink_to_fit();
+        self.closed_connections = Vec::new();
+        self.active.shrink_to_fit();
     }
 
     pub(crate) fn details(&self, host_filter: Option<&str>) -> TrafficDetails {
@@ -1416,5 +1469,87 @@ mod tests {
             decoded_b.connections.iter().filter(|c| !c.active).count() < 12,
             "expected closed connections to be trimmed before active"
         );
+    }
+
+    #[test]
+    fn ledger_cancel_all_and_active_chain_counts() {
+        let log = Arc::new(crate::requests::Requests::new(false));
+        let mut ledger = Ledger::new(false);
+        let a = make_state(
+            log.clone(),
+            "a",
+            "a.test",
+            443,
+            "ProxyA",
+            "Match",
+            1,
+            10,
+            20,
+        );
+        let b = make_state(
+            log.clone(),
+            "b",
+            "b.test",
+            443,
+            "ProxyA",
+            "Match",
+            2,
+            30,
+            40,
+        );
+        let c = make_state(log, "c", "c.test", 443, "DIRECT", "Match", 3, 50, 60);
+        ledger.insert_active(a.clone()).unwrap();
+        ledger.insert_active(b.clone()).unwrap();
+        ledger.insert_active(c.clone()).unwrap();
+
+        let counts = ledger.active_chain_counts();
+        assert_eq!(counts.get("ProxyA"), Some(&2));
+        assert_eq!(counts.get("DIRECT"), Some(&1));
+
+        assert_eq!(ledger.cancel_all(), 3);
+        assert!(a.info.cancel.is_cancelled());
+        assert!(b.info.cancel.is_cancelled());
+        assert!(c.info.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn ledger_relieve_memory_reconciles_totals() {
+        let log = Arc::new(crate::requests::Requests::new(false));
+        let mut ledger = Ledger::with_limits(LedgerLimits {
+            max_hosts: 2,
+            max_candidates: 2,
+            max_closed: 2,
+            snapshot_hosts: 10,
+            snapshot_active: 10,
+            snapshot_closed: 10,
+        });
+        for i in 0..4 {
+            let s = make_state(
+                log.clone(),
+                &format!("closed-{i}"),
+                &format!("host-{i}.test"),
+                443,
+                "Proxy",
+                "Match",
+                100 + i,
+                100,
+                200,
+            );
+            ledger.insert_active(s.clone()).unwrap();
+            ledger.remove_and_record(&s);
+        }
+        let active = make_state(log, "live", "live.test", 443, "Proxy", "Match", 200, 50, 75);
+        ledger.insert_active(active).unwrap();
+
+        let before = ledger.details(None);
+        ledger.relieve_memory();
+        let after = ledger.details(None);
+
+        assert_eq!(after.upload_total, before.upload_total);
+        assert_eq!(after.download_total, before.download_total);
+        assert_eq!(after.total_connections, before.total_connections);
+        assert_eq!(after.active_connections, 1);
+        assert_eq!(after.retained_closed_connections, 0);
+        assert_reconciled(&after);
     }
 }

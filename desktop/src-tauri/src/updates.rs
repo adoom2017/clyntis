@@ -2,6 +2,8 @@ use crate::app::Desktop;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -46,10 +48,70 @@ impl Default for UpdateState {
     }
 }
 
+/// Holds a verified update package on disk so idle updates do not pin tens of
+/// MiB in RAM while waiting to be installed.
+pub(crate) struct StagedArchive {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    len: usize,
+}
+
+impl StagedArchive {
+    fn write(dir: &Path, bytes: &[u8]) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("clyntis-update-{}.bin", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        let write_result = (|| -> std::io::Result<()> {
+            file.write_all(bytes)?;
+            file.flush()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        Ok(Self {
+            path,
+            file: Some(file),
+            len: bytes.len(),
+        })
+    }
+
+    pub(crate) fn read_bytes(&mut self) -> Result<Vec<u8>> {
+        let file = self
+            .file
+            .as_mut()
+            .context("staged update archive handle missing")?;
+        ensure!(
+            file.metadata()?.len() == self.len as u64,
+            "staged update archive size changed unexpectedly"
+        );
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = vec![0u8; self.len];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+impl Drop for StagedArchive {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     update: Option<Update>,
-    bytes: Option<Vec<u8>>,
+    archive: Option<StagedArchive>,
 }
 #[derive(Default)]
 pub struct Updates {
@@ -74,7 +136,7 @@ impl Updates {
             "This build has no update signing public key"
         );
         // A periodic check must not discard an already downloaded, verified package.
-        if pending.bytes.is_some() {
+        if pending.archive.is_some() {
             return Ok(self.view.lock().unwrap().clone());
         }
         self.publish(app, |s| {
@@ -148,7 +210,7 @@ impl Updates {
             .operation
             .try_lock()
             .context("An update operation is already in progress")?;
-        if pending.bytes.is_some() {
+        if pending.archive.is_some() {
             return Ok(());
         }
         let mut update = pending
@@ -182,13 +244,31 @@ impl Updates {
         match result {
             Ok(bytes) => {
                 // download() returns only after verifying the artifact and its signed version.
-                self.publish(app, |s| {
-                    s.phase = "ready";
-                    s.downloaded = bytes.len() as u64;
-                    s.total = Some(bytes.len() as u64);
-                });
-                pending.bytes = Some(bytes);
-                Ok(())
+                let len = bytes.len() as u64;
+                let dir = app
+                    .path()
+                    .app_cache_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir());
+                let staged =
+                    tokio::task::spawn_blocking(move || StagedArchive::write(&dir, &bytes))
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|res| res);
+                match staged {
+                    Ok(archive) => {
+                        self.publish(app, |s| {
+                            s.phase = "ready";
+                            s.downloaded = len;
+                            s.total = Some(len);
+                        });
+                        pending.archive = Some(archive);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        self.fail(app, &error);
+                        Err(error)
+                    }
+                }
             }
             Err(error) => {
                 let error = error.into();
@@ -207,15 +287,15 @@ impl Updates {
             .update
             .clone()
             .context("Check for an update first")?;
-        let bytes = pending
-            .bytes
+        let archive = pending
+            .archive
             .take()
             .context("Download and verify the update first")?;
         self.publish(app, |s| {
             s.phase = "installing";
             s.error = None;
         });
-        match app.state::<Desktop>().install_update(update, bytes).await {
+        match app.state::<Desktop>().install_update(update, archive).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.fail(app, &error);
@@ -275,5 +355,26 @@ pub async fn background(app: tauri::AppHandle) {
                 };
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_archive_round_trips_and_cleans_up_on_drop() {
+        let dir =
+            std::env::temp_dir().join(format!("clyntis-update-test-{}", uuid::Uuid::new_v4()));
+        let payload = b"verified-installer-archive-bytes".to_vec();
+        let path = {
+            let mut staged = StagedArchive::write(&dir, &payload).unwrap();
+            let path = staged.path.clone();
+            assert!(path.exists());
+            assert_eq!(staged.read_bytes().unwrap(), payload);
+            path
+        };
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

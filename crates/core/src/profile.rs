@@ -42,6 +42,41 @@ impl Core {
         }
         Ok(())
     }
+    fn profile_needs_save(&self) -> bool {
+        if !self.config.profile.store_selected && !self.config.profile.store_fake_ip {
+            return false;
+        }
+        let generation = if self.config.profile.store_fake_ip {
+            self.resolver.fake_generation()
+        } else {
+            0
+        };
+        let Ok(last) = self.saved_profile.try_lock() else {
+            return true;
+        };
+        let Some((saved, saved_generation)) = last.as_ref() else {
+            return true;
+        };
+        if *saved_generation != generation {
+            return true;
+        }
+        if self.config.profile.store_selected {
+            let policy = self.policy.read().unwrap();
+            if *saved != policy.selection {
+                return true;
+            }
+        }
+        false
+    }
+    pub(crate) async fn save_profile_async(self: &std::sync::Arc<Self>) -> Result<()> {
+        if !self.profile_needs_save() {
+            return Ok(());
+        }
+        let core = std::sync::Arc::clone(self);
+        tokio::task::spawn_blocking(move || core.save_profile())
+            .await
+            .context("profile save task failed")?
+    }
     pub(crate) fn save_profile(&self) -> Result<()> {
         if !self.config.profile.store_selected && !self.config.profile.store_fake_ip {
             return Ok(());

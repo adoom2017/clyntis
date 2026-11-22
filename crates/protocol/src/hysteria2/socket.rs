@@ -23,6 +23,9 @@ use std::{
 pub type Binder = Arc<dyn Fn(SocketAddr) -> io::Result<std::net::UdpSocket> + Send + Sync>;
 
 const SALT: usize = 8;
+/// How long the previous UDP socket is kept after a port hop to receive
+/// packets still in flight before closing it.
+const PREVIOUS_GRACE: Duration = Duration::from_secs(5);
 
 /// Salamander: each packet is an 8-byte random salt followed by the payload
 /// XORed with BLAKE2b-256(password || salt).
@@ -64,8 +67,9 @@ impl Salamander {
 
 struct Sockets {
     current: Arc<dyn AsyncUdpSocket>,
-    /// The socket before the last hop, kept for packets still in flight.
-    previous: Option<Arc<dyn AsyncUdpSocket>>,
+    /// The socket before the last hop, kept briefly for packets still in flight,
+    /// along with the instant after which it is dropped.
+    previous: Option<(Arc<dyn AsyncUdpSocket>, Instant)>,
     port: u16,
     /// Bumped on every hop so the write poller follows the new socket.
     generation: u64,
@@ -73,6 +77,19 @@ struct Sockets {
     /// quinn's receive task: the new socket has no readiness interest yet,
     /// so a hop has to wake it to poll that socket.
     receiver: Option<Waker>,
+}
+impl Sockets {
+    fn expire_previous(&mut self, now: Instant) -> Option<Arc<dyn AsyncUdpSocket>> {
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|(_, expires)| now >= *expires)
+        {
+            self.previous.take().map(|(socket, _)| socket)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Transport {
@@ -124,28 +141,36 @@ impl Transport {
     }
     /// Moves to a new local socket and a random server port, as Hysteria
     /// does, so a middlebox throttling one UDP flow loses track of it.
-    fn hop_if_due(&self, sockets: &mut Sockets) {
+    fn hop_if_due(&self, sockets: &mut Sockets) -> Option<Arc<dyn AsyncUdpSocket>> {
         let (Some(interval), Some(due)) = (self.hop_interval, sockets.next_hop) else {
-            return;
+            return None;
         };
         let now = Instant::now();
+        let expired = sockets.expire_previous(now);
         if now < due {
-            return;
+            return expired;
         }
         sockets.next_hop = Some(now + interval);
         let socket = match (self.bind)(self.server).and_then(|s| TokioRuntime.wrap_udp_socket(s)) {
             Ok(socket) => socket,
             Err(error) => {
                 tracing::debug!(%error, "Hysteria2 port hop skipped");
-                return;
+                return expired;
             }
         };
-        sockets.previous = Some(std::mem::replace(&mut sockets.current, socket));
+        let replaced = sockets
+            .previous
+            .replace((
+                std::mem::replace(&mut sockets.current, socket),
+                now + PREVIOUS_GRACE,
+            ))
+            .map(|(old, _)| old);
         sockets.port = self.ports[rand::thread_rng().gen_range(0..self.ports.len())];
         sockets.generation += 1;
         if let Some(receiver) = sockets.receiver.take() {
             receiver.wake();
         }
+        replaced.or(expired)
     }
     /// Turns what one socket received into what quinn expects: the fixed
     /// server address and, under Salamander, the unscrambled packets.
@@ -193,10 +218,10 @@ impl AsyncUdpSocket for Transport {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        let (socket, port) = {
+        let (socket, port, _expired) = {
             let mut sockets = self.sockets.lock().unwrap();
-            self.hop_if_due(&mut sockets);
-            (sockets.current.clone(), sockets.port)
+            let expired = self.hop_if_due(&mut sockets);
+            (sockets.current.clone(), sockets.port, expired)
         };
         let mut destination = transmit.destination;
         if destination == self.server {
@@ -226,10 +251,19 @@ impl AsyncUdpSocket for Transport {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        let (current, previous) = {
+        let (current, previous, _expired) = {
             let mut sockets = self.sockets.lock().unwrap();
             sockets.receiver = Some(cx.waker().clone());
-            (sockets.current.clone(), sockets.previous.clone())
+            let expired = if sockets.previous.is_some() {
+                sockets.expire_previous(Instant::now())
+            } else {
+                None
+            };
+            (
+                sockets.current.clone(),
+                sockets.previous.as_ref().map(|(socket, _)| socket.clone()),
+                expired,
+            )
         };
         if let Poll::Ready(result) = current.poll_recv(cx, bufs, meta) {
             let count = result?;
@@ -242,7 +276,20 @@ impl AsyncUdpSocket for Transport {
                     self.received(bufs, meta, count);
                     return Poll::Ready(Ok(count));
                 }
-                Poll::Ready(Err(_)) => self.sockets.lock().unwrap().previous = None,
+                Poll::Ready(Err(_)) => {
+                    let _dropped = {
+                        let mut sockets = self.sockets.lock().unwrap();
+                        if sockets
+                            .previous
+                            .as_ref()
+                            .is_some_and(|(socket, _)| Arc::ptr_eq(socket, &previous))
+                        {
+                            sockets.previous.take()
+                        } else {
+                            None
+                        }
+                    };
+                }
                 Poll::Pending => {}
             }
         }
@@ -330,5 +377,35 @@ mod tests {
         assert_eq!(len, 40);
         assert_eq!(&packet[..32], &key[..]);
         assert_eq!(&packet[32..40], &key[..8]);
+    }
+
+    #[tokio::test]
+    async fn previous_socket_expires_after_grace_period() {
+        let bind: Binder = Arc::new(|_| std::net::UdpSocket::bind("127.0.0.1:0"));
+        let server: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let transport =
+            Transport::new(server, vec![443, 444], Duration::from_secs(30), None, bind).unwrap();
+        let now = Instant::now();
+        {
+            let mut sockets = transport.sockets.lock().unwrap();
+            // Force a hop immediately.
+            sockets.next_hop = Some(now);
+            transport.hop_if_due(&mut sockets);
+            assert!(sockets.previous.is_some());
+            // Before grace period elapses, previous socket is still retained.
+            assert!(
+                sockets
+                    .expire_previous(now + PREVIOUS_GRACE - Duration::from_secs(1))
+                    .is_none()
+            );
+            assert!(sockets.previous.is_some());
+            // Once grace period elapses, previous socket is dropped.
+            assert!(
+                sockets
+                    .expire_previous(now + PREVIOUS_GRACE + Duration::from_millis(1))
+                    .is_some()
+            );
+            assert!(sockets.previous.is_none());
+        }
     }
 }

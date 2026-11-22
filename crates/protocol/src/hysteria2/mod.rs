@@ -34,7 +34,7 @@ pub use socket::Binder;
 const TCP_REQUEST: u64 = 0x401;
 const AUTH_OK: u16 = 233;
 /// Queued UDP packets per session before new ones are dropped.
-const SESSION_QUEUE: usize = 256;
+const SESSION_QUEUE: usize = 64;
 
 /// Everything needed to reach one Hysteria2 server.
 #[derive(Clone)]
@@ -121,6 +121,28 @@ pub struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.connection.close(0u32.into(), b"");
+        self.endpoint.close(0u32.into(), b"");
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Ensures the QUIC endpoint, connection, and helper tasks created during
+/// `connect_to` are torn down on any error return or future cancellation.
+struct ConnectGuard {
+    endpoint: Option<quinn::Endpoint>,
+    connection: Option<quinn::Connection>,
+    tasks: Vec<JoinHandle<()>>,
+}
+impl Drop for ConnectGuard {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.connection {
+            connection.close(0u32.into(), b"");
+        }
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(0u32.into(), b"");
+        }
         for task in &self.tasks {
             task.abort();
         }
@@ -157,26 +179,39 @@ impl Client {
             options.obfs.as_deref().map(socket::Salamander::new),
             bind,
         )?;
-        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::new(Arc::new(quic::ResetKey::random())),
             None,
             Arc::new(transport),
             Arc::new(quinn::TokioRuntime),
         )?;
+        let mut guard = ConnectGuard {
+            endpoint: Some(endpoint),
+            connection: None,
+            tasks: Vec::new(),
+        };
         let rate = brutal::Rate::default();
-        endpoint.set_default_client_config(client_config(options, clock, rate.clone())?);
-        let connection = endpoint
+        guard
+            .endpoint
+            .as_mut()
+            .unwrap()
+            .set_default_client_config(client_config(options, clock, rate.clone())?);
+        let connection = guard
+            .endpoint
+            .as_ref()
+            .unwrap()
             .connect(remote, &options.server_name)?
             .await
             .context("QUIC handshake")?;
+        guard.connection = Some(connection.clone());
         let (mut driver, mut requests) = h3::client::builder()
             .send_grease(false)
             .build::<_, _, Bytes>(h3_quinn::Connection::new(connection.clone()))
             .await
             .context("HTTP/3 setup")?;
-        let mut tasks = vec![tokio::spawn(async move {
+        guard.tasks.push(tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        })];
+        }));
         let request = http::Request::post("https://hysteria/auth")
             .header("Hysteria-Auth", &options.password)
             .header("Hysteria-CC-RX", options.down.unwrap_or(0).to_string())
@@ -186,9 +221,6 @@ impl Client {
         stream.finish().await?;
         let response = stream.recv_response().await.context("authentication")?;
         if response.status().as_u16() != AUTH_OK {
-            for task in tasks {
-                task.abort();
-            }
             bail!(
                 "authentication failed (HTTP {})",
                 response.status().as_u16()
@@ -216,12 +248,15 @@ impl Client {
         }
         let udp = udp.then(|| {
             let sessions = Arc::new(Sessions::default());
-            tasks.push(tokio::spawn(Sessions::receive(
+            guard.tasks.push(tokio::spawn(Sessions::receive(
                 sessions.clone(),
                 connection.clone(),
             )));
             sessions
         });
+        let connection = guard.connection.take().unwrap();
+        let endpoint = guard.endpoint.take().unwrap();
+        let tasks = std::mem::take(&mut guard.tasks);
         Ok(Self {
             connection,
             endpoint,
@@ -334,6 +369,14 @@ fn client_config(
 }
 
 /// QUIC variable-length integer (RFC 9000 §16).
+fn varint_len(value: u64) -> usize {
+    match value {
+        0..0x40 => 1,
+        0x40..0x4000 => 2,
+        0x4000..0x4000_0000 => 4,
+        _ => 8,
+    }
+}
 fn put_varint(out: &mut Vec<u8>, value: u64) {
     match value {
         0..0x40 => out.push(value as u8),
@@ -381,20 +424,35 @@ struct Message {
 }
 impl Message {
     fn header_len(address: &str) -> usize {
-        let mut varint = Vec::new();
-        put_varint(&mut varint, address.len() as u64);
-        8 + varint.len() + address.len()
+        8 + varint_len(address.len() as u64) + address.len()
+    }
+    fn encode_parts(
+        session: u32,
+        packet: u16,
+        fragment: u8,
+        fragments: u8,
+        address: &str,
+        payload: &[u8],
+    ) -> Bytes {
+        let mut out = Vec::with_capacity(Self::header_len(address) + payload.len());
+        out.extend_from_slice(&session.to_be_bytes());
+        out.extend_from_slice(&packet.to_be_bytes());
+        out.push(fragment);
+        out.push(fragments);
+        put_varint(&mut out, address.len() as u64);
+        out.extend_from_slice(address.as_bytes());
+        out.extend_from_slice(payload);
+        out.into()
     }
     fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(Self::header_len(&self.address) + self.payload.len());
-        out.extend_from_slice(&self.session.to_be_bytes());
-        out.extend_from_slice(&self.packet.to_be_bytes());
-        out.push(self.fragment);
-        out.push(self.fragments);
-        put_varint(&mut out, self.address.len() as u64);
-        out.extend_from_slice(self.address.as_bytes());
-        out.extend_from_slice(&self.payload);
-        out.into()
+        Self::encode_parts(
+            self.session,
+            self.packet,
+            self.fragment,
+            self.fragments,
+            &self.address,
+            &self.payload,
+        )
     }
     fn decode(datagram: Bytes) -> Option<Self> {
         let header = datagram.get(..8)?;
@@ -535,6 +593,14 @@ impl Drop for UdpSession {
         self.sessions.open.lock().unwrap().remove(&self.id);
     }
 }
+fn format_target<'a>(target: &Target, buf: &'a mut [u8; 264]) -> Option<&'a str> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    write!(cursor, "{target}").ok()?;
+    let len = cursor.position() as usize;
+    std::str::from_utf8(&buf[..len]).ok()
+}
+
 #[async_trait]
 impl Datagram for UdpSession {
     async fn send(&self, target: &Target, bytes: &[u8]) -> Result<()> {
@@ -543,7 +609,25 @@ impl Datagram for UdpSession {
             .max_datagram_size()
             .context("server does not accept datagrams")?;
         let packet = self.packet.fetch_add(1, Ordering::Relaxed);
-        for message in Message::split(self.id, packet, target.to_string(), bytes, max)? {
+        let mut addr_buf = [0u8; 264];
+        let owned;
+        let address = match format_target(target, &mut addr_buf) {
+            Some(s) => s,
+            None => {
+                owned = target.to_string();
+                owned.as_str()
+            }
+        };
+        let room = max
+            .checked_sub(Message::header_len(address))
+            .filter(|&room| room > 0)
+            .context("UDP address too long for a datagram")?;
+        if bytes.len() <= room {
+            let datagram = Message::encode_parts(self.id, packet, 0, 1, address, bytes);
+            self.connection.send_datagram(datagram)?;
+            return Ok(());
+        }
+        for message in Message::split(self.id, packet, address.to_owned(), bytes, max)? {
             self.connection.send_datagram(message.encode())?;
         }
         Ok(())
@@ -576,6 +660,7 @@ mod tests {
         ] {
             let mut out = Vec::new();
             put_varint(&mut out, value);
+            assert_eq!(varint_len(value), len, "{value}");
             assert_eq!(out.len(), len, "{value}");
             assert_eq!(parse_varint(&out), Some((value, len)));
         }
@@ -611,16 +696,22 @@ mod tests {
         assert_eq!(&whole[..], &payload[..]);
 
         // A small packet is one message; an empty one still is.
-        assert_eq!(
-            Message::split(1, 1, "a:1".into(), b"x", 1200)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            Message::split(1, 1, "a:1".into(), b"", 1200).unwrap().len(),
-            1
-        );
+        for (host, payload) in [
+            ("1.2.3.4", b"x".as_slice()),
+            ("2001:db8::1", b"hello".as_slice()),
+            ("example.com", b"".as_slice()),
+        ] {
+            let target = Target::new(host, 53).unwrap();
+            let mut addr_buf = [0u8; 264];
+            let address = format_target(&target, &mut addr_buf).unwrap();
+            assert_eq!(address, target.to_string());
+            let parts = Message::split(1, 2, address.to_owned(), payload, 1200).unwrap();
+            assert_eq!(parts.len(), 1);
+            assert_eq!(
+                Message::encode_parts(1, 2, 0, 1, address, payload),
+                parts[0].encode()
+            );
+        }
         // Malformed datagrams are rejected rather than misread.
         assert_eq!(Message::decode(Bytes::from_static(&[0; 7])), None);
         assert_eq!(

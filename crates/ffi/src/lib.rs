@@ -21,6 +21,7 @@ pub const ERROR: i32 = 1;
 pub const WOULD_BLOCK: i32 = 2;
 pub const BUFFER_TOO_SMALL: i32 = 3;
 const LIMIT: usize = 16 * 1024 * 1024;
+const CONFIG_LIMIT: usize = 24 * 1024 * 1024;
 const SNAPSHOT_CACHE_LIMIT: usize = 1024 * 1024;
 const REQUEST_CACHE_LIMIT: usize = 4 * 1024 * 1024;
 struct PendingOutput {
@@ -66,6 +67,22 @@ fn boundary(operation: impl FnOnce() -> Result<i32>) -> i32 {
         }
         Err(_) => {
             PENDING_OUTPUT.with(|slot| *slot.borrow_mut() = None);
+            ERROR_TEXT.with(|text| *text.borrow_mut() = "panic contained at C ABI boundary".into());
+            ERROR
+        }
+    }
+}
+/// Lightweight C ABI boundary for high-frequency packet I/O.
+/// Avoids touching `PENDING_OUTPUT` / `CURRENT_PENDING` thread-locals on every
+/// packet while still containing panics and recording thread-local error text.
+fn packet_boundary(operation: impl FnOnce() -> Result<i32>) -> i32 {
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            ERROR_TEXT.with(|text| *text.borrow_mut() = format!("{error:#}"));
+            ERROR
+        }
+        Err(_) => {
             ERROR_TEXT.with(|text| *text.borrow_mut() = "panic contained at C ABI boundary".into());
             ERROR
         }
@@ -313,7 +330,7 @@ pub unsafe extern "C" fn meta_custom_rules_apply_v1(
         let rules_bytes = unsafe { input(rules, rules_len)? };
         let key = (1, bytes_hash(yaml_bytes), bytes_hash(rules_bytes), 0);
         unsafe {
-            cached_output(key, LIMIT, buffer, capacity, length, || {
+            cached_output(key, CONFIG_LIMIT, buffer, capacity, length, || {
                 let yaml = std::str::from_utf8(yaml_bytes)?;
                 let rules: Vec<String> = serde_json::from_slice(rules_bytes)?;
                 let applied = clyntis_config::custom::apply(yaml, &rules)?;
@@ -345,7 +362,7 @@ pub unsafe extern "C" fn meta_overrides_apply_v1(
         let overrides_bytes = unsafe { input(overrides, overrides_len)? };
         let key = (2, bytes_hash(yaml_bytes), bytes_hash(overrides_bytes), 0);
         unsafe {
-            cached_output(key, LIMIT, buffer, capacity, length, || {
+            cached_output(key, CONFIG_LIMIT, buffer, capacity, length, || {
                 let yaml = std::str::from_utf8(yaml_bytes)?;
                 let overrides: clyntis_config::overrides::Overrides =
                     serde_json::from_slice(overrides_bytes)?;
@@ -372,6 +389,20 @@ pub unsafe extern "C" fn meta_yaml_check_v1(
         let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
         let error = clyntis_config::syntax::check(yaml);
         unsafe { output(&serde_json::to_vec(&error)?, buffer, capacity, length) }
+    })
+}
+
+/// Validate a YAML configuration without creating a Tokio runtime or `Core`.
+///
+/// # Safety
+/// `config_ptr` must be readable for `config_len` bytes when `config_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_validate_config_v1(config_ptr: *const u8, config_len: usize) -> i32 {
+    boundary(|| {
+        let bytes = unsafe { input(config_ptr, config_len)? };
+        ensure!(!bytes.is_empty(), "configuration is empty");
+        clyntis_config::Config::parse(bytes)?;
+        Ok(OK)
     })
 }
 
@@ -721,8 +752,19 @@ pub unsafe extern "C" fn meta_snapshot_v1(
                 capacity,
                 length,
                 || {
+                    let mut config = handle.core.snapshot_config();
+                    if let Some(obj) = config.as_object_mut() {
+                        obj.insert(
+                            "log-level".into(),
+                            serde_json::Value::String(handle.core.config.log_level.clone()),
+                        );
+                        obj.insert(
+                            "mixed-port".into(),
+                            serde_json::Value::from(handle.core.config.mixed_port),
+                        );
+                    }
                     let snapshot = Snapshot {
-                        config: handle.core.configuration(),
+                        config,
                         selections: handle.core.selections(),
                         connections: handle.core.connections(),
                         proxies: handle.core.proxy_status(),
@@ -1127,7 +1169,7 @@ pub unsafe extern "C" fn meta_dns_leak_v1(
 /// Data must be readable for len bytes. The packet is copied before return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn meta_write_packet_v1(id: u64, data: *const u8, len: usize) -> i32 {
-    boundary(|| {
+    packet_boundary(|| {
         ensure!((20..=65535).contains(&len), "invalid IP packet length");
         let packet = unsafe { input(data, len)? };
         ensure!(matches!(packet[0] >> 4, 4 | 6), "invalid IP version");
@@ -1152,7 +1194,7 @@ pub unsafe extern "C" fn meta_read_packet_v1(
     capacity: usize,
     length: *mut usize,
 ) -> i32 {
-    boundary(|| {
+    packet_boundary(|| {
         ensure!(!length.is_null(), "output length is required");
         unsafe {
             *length = 0;

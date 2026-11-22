@@ -14,6 +14,8 @@ pub enum Matcher {
     Suffix(String),
     /// Subdomains only, not the domain itself (`.example.com`).
     Subdomain(String),
+    /// Domain pattern with `*` wildcards within labels (never crossing `.`).
+    Glob(Box<str>),
     Keyword(String),
     Regex(regex::Regex),
     Net(ipnet::IpNet),
@@ -56,6 +58,7 @@ pub fn compile_regex(pattern: &str) -> Result<regex::Regex> {
     Ok(regex::RegexBuilder::new(pattern)
         .case_insensitive(true)
         .size_limit(2 * 1024 * 1024)
+        .dfa_size_limit(256 << 10)
         .build()?)
 }
 /// Keyed 64-bit hash of a domain. One random key per process: sets are built
@@ -266,8 +269,9 @@ pub struct DomainSetBuilder {
     subdomain: ListBuilder,
     globs: Vec<Box<str>>,
     keywords: Vec<Box<str>>,
-    /// Sources only; compiled once in `build` (see `compile_regexes`).
-    regex: Vec<String>,
+    /// Compiled regexes; combined into one alternation in `build` when there
+    /// are multiple, or kept as-is without recompiling otherwise.
+    regex: Vec<regex::Regex>,
 }
 impl DomainSetBuilder {
     pub fn exact(&mut self, domain: &str) {
@@ -286,8 +290,10 @@ impl DomainSetBuilder {
     }
     /// A case-insensitive regex source, as accepted by [`compile_regex`].
     pub fn regex(&mut self, source: &str) -> Result<()> {
-        compile_regex(source)?; // reject invalid patterns where they are added
-        self.regex.push(source.to_owned());
+        if self.regex.iter().any(|r| r.as_str() == source) {
+            return Ok(());
+        }
+        self.regex.push(compile_regex(source)?);
         Ok(())
     }
     /// Adds a Clash-style pattern: `+.x` (x and subdomains), `.x` (subdomains),
@@ -297,8 +303,7 @@ impl DomainSetBuilder {
             Matcher::Domain(d) => self.exact.push(&d),
             Matcher::Suffix(d) => self.suffix.push(&d),
             Matcher::Subdomain(d) => self.subdomain.push(&d),
-            // Validated by `domain_pattern`; matched as a glob, not a regex.
-            Matcher::Regex(_) => self.globs.push(pattern.trim().to_ascii_lowercase().into()),
+            Matcher::Glob(g) => self.globs.push(g),
             _ => unreachable!("domain_pattern returns only domain matchers"),
         }
         Ok(())
@@ -309,13 +314,24 @@ impl DomainSetBuilder {
             Matcher::Domain(d) => self.exact(&d),
             Matcher::Suffix(d) => self.suffix(&d),
             Matcher::Subdomain(d) => self.subdomain(&d),
+            Matcher::Glob(g) => self.globs.push(g.trim().to_ascii_lowercase().into()),
             Matcher::Keyword(k) => self.keyword(&k),
-            Matcher::Regex(r) => self.regex.push(r.as_str().to_owned()),
+            Matcher::Regex(r) => {
+                if !self
+                    .regex
+                    .iter()
+                    .any(|existing| existing.as_str() == r.as_str())
+                {
+                    self.regex.push(r);
+                }
+            }
             other => return Some(other),
         }
         None
     }
-    pub fn build(self) -> DomainSet {
+    pub fn build(mut self) -> DomainSet {
+        self.keywords.sort_unstable();
+        self.keywords.dedup();
         DomainSet {
             exact: self.exact.build(),
             suffix: self.suffix.build(),
@@ -326,36 +342,52 @@ impl DomainSetBuilder {
         }
     }
 }
-/// Every compiled `Regex` carries its own engines and caches, so the set's
-/// patterns compile once, as one alternation; if that exceeds the size limit
-/// they compile separately.
-fn compile_regexes(sources: Vec<String>) -> Box<[regex::Regex]> {
-    if sources.len() > 1 {
-        let combined = sources
+/// Every compiled `Regex` carries its own engines and caches, so multiple
+/// patterns combine into one alternation; a single pattern or a set whose
+/// alternation exceeds the size limit reuses the already-compiled regexes.
+fn compile_regexes(regexes: Vec<regex::Regex>) -> Box<[regex::Regex]> {
+    if regexes.len() > 1 {
+        let combined = regexes
             .iter()
-            .map(|s| format!("(?:{s})"))
+            .map(|r| format!("(?:{})", r.as_str()))
             .collect::<Vec<_>>()
             .join("|");
         if let Ok(regex) = regex::RegexBuilder::new(&combined)
             .case_insensitive(true)
             .size_limit(8 * 1024 * 1024)
+            .dfa_size_limit(256 << 10)
             .build()
         {
             return Box::new([regex]);
         }
     }
-    // Each source was validated when it was added.
-    sources
-        .iter()
-        .filter_map(|s| compile_regex(s).ok())
-        .collect()
+    regexes.into_boxed_slice()
 }
 fn normalize(domain: &str) -> String {
     domain.trim().trim_matches('.').to_ascii_lowercase()
 }
+fn merge_ranges<T: Copy + Ord>(ranges: &mut Vec<(T, T)>, next: impl Fn(T) -> T) {
+    ranges.sort_unstable();
+    let mut out = 0;
+    for i in 0..ranges.len() {
+        let (a, b) = ranges[i];
+        if out > 0 && a <= next(ranges[out - 1].1) {
+            ranges[out - 1].1 = ranges[out - 1].1.max(b);
+        } else {
+            ranges[out] = (a, b);
+            out += 1;
+        }
+    }
+    ranges.truncate(out);
+    ranges.shrink_to_fit();
+}
+fn range_contains<T: Copy + Ord>(ranges: &[(T, T)], n: T) -> bool {
+    let i = ranges.partition_point(|r| r.0 <= n);
+    i > 0 && n <= ranges[i - 1].1
+}
 #[derive(Clone, Debug, Default)]
 pub struct IpSet {
-    v4: Vec<(u128, u128)>,
+    v4: Vec<(u32, u32)>,
     v6: Vec<(u128, u128)>,
     pub inverse: bool,
 }
@@ -367,38 +399,30 @@ impl IpSet {
         };
         for n in nets {
             match n {
-                ipnet::IpNet::V4(n) => s.v4.push((
-                    u32::from(n.network()) as u128,
-                    u32::from(n.broadcast()) as u128,
-                )),
+                ipnet::IpNet::V4(n) => {
+                    s.v4.push((u32::from(n.network()), u32::from(n.broadcast())))
+                }
                 ipnet::IpNet::V6(n) => {
                     s.v6.push((u128::from(n.network()), u128::from(n.broadcast())))
                 }
             }
         }
-        for ranges in [&mut s.v4, &mut s.v6] {
-            ranges.sort_unstable();
-            let mut merged: Vec<(u128, u128)> = vec![];
-            for &(a, b) in ranges.iter() {
-                if let Some(last) = merged.last_mut()
-                    && a <= last.1.saturating_add(1)
-                {
-                    last.1 = last.1.max(b);
-                } else {
-                    merged.push((a, b));
-                }
-            }
-            *ranges = merged;
-        }
+        merge_ranges(&mut s.v4, |n| n.saturating_add(1));
+        merge_ranges(&mut s.v6, |n| n.saturating_add(1));
         s
     }
     pub fn matches(&self, ip: IpAddr) -> bool {
-        let (ranges, n) = match ip {
-            IpAddr::V4(ip) => (&self.v4, u32::from(ip) as u128),
-            IpAddr::V6(ip) => (&self.v6, u128::from(ip)),
+        let hit = match ip {
+            IpAddr::V4(ip) => range_contains(&self.v4, u32::from(ip)),
+            IpAddr::V6(ip) => range_contains(&self.v6, u128::from(ip)),
         };
-        let i = ranges.partition_point(|r| r.0 <= n);
-        (i > 0 && n <= ranges[i - 1].1) ^ self.inverse
+        hit ^ self.inverse
+    }
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
     }
 }
 #[derive(Clone, Debug)]
@@ -580,6 +604,7 @@ impl Matcher {
             Self::Subdomain(d) => host
                 .strip_suffix(d)
                 .is_some_and(|p| p.len() > 1 && p.ends_with('.')),
+            Self::Glob(g) => glob_matches(g, host),
             Self::Keyword(k) => host.contains(k),
             Self::Regex(r) => r.is_match(host),
             Self::Domains(s) => s.matches(host),
@@ -685,8 +710,7 @@ pub fn domain_pattern(pattern: &str) -> Result<Matcher> {
     if !p.contains('*') {
         return Ok(Matcher::Domain(p));
     }
-    let re = format!("^{}$", regex::escape(&p).replace("\\*", "[^.]*"));
-    Ok(Matcher::Regex(regex::Regex::new(&re)?))
+    Ok(Matcher::Glob(p.into_boxed_str()))
 }
 #[cfg(test)]
 mod tests {
@@ -1005,5 +1029,176 @@ mod tests {
         assert!(s.matches("10.0.1.255".parse().unwrap()));
         assert!(!s.matches("10.0.2.0".parse().unwrap()));
         assert!(s.matches("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn domain_pattern_uses_glob_without_crossing_dots() {
+        let m = domain_pattern("  *.Example.COM  ").unwrap();
+        assert!(matches!(m, Matcher::Glob(ref g) if &**g == "*.example.com"));
+        let eval = |p: &str, host: &str| {
+            domain_pattern(p)
+                .unwrap()
+                .evaluate(host, None, 0, "", false)
+                == Some(true)
+        };
+        assert!(eval("*.example.com", "a.example.com"));
+        assert!(eval("*.example.com", "A.EXAMPLE.COM"));
+        assert!(eval("*.example.com", ".example.com"));
+        assert!(!eval("*.example.com", "example.com"));
+        assert!(!eval("*.example.com", "a.b.example.com"));
+        assert!(eval("a*b*c.example.com", "abc.example.com"));
+        assert!(eval("a*b*c.example.com", "a123b456c.example.com"));
+        assert!(!eval("a*b*c.example.com", "a.b.c.example.com"));
+        assert!(eval("**.example.com", "sub.example.com"));
+        assert!(!eval("**.example.com", "a.b.example.com"));
+        // Regex metacharacters are matched literally.
+        assert!(eval("a+b(1)?*.example.com", "a+b(1)?x.example.com"));
+        assert!(!eval("a+b(1)?*.example.com", "aab1x.example.com"));
+        // Adversarial multi-star pattern completes without backtracking blowup.
+        let evil_pat = format!("{}.example.com", "a*".repeat(32) + "b");
+        let evil_host = format!("{}.example.com", "a".repeat(60) + "c");
+        assert!(!eval(&evil_pat, &evil_host));
+        assert!(eval(
+            &evil_pat,
+            &format!("{}.example.com", "a".repeat(60) + "b")
+        ));
+
+        // Verify parity with the previous `[^.]*` regex translation.
+        for pattern in [
+            "*.example.com",
+            "a*b.example.com",
+            "*.*.example.com",
+            "ad-*.cdn*.net",
+            "prefix*.com",
+            "*.com",
+            "**",
+            "a+b?*.test",
+        ] {
+            let re = regex::RegexBuilder::new(&format!(
+                "^{}$",
+                regex::escape(pattern).replace("\\*", "[^.]*")
+            ))
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+            let glob = domain_pattern(pattern).unwrap();
+            for host in [
+                "a.example.com",
+                "A.EXAMPLE.COM",
+                "a.b.example.com",
+                "example.com",
+                "ab.example.com",
+                "axxxb.example.com",
+                "ad-1.cdn9.net",
+                "ad-.cdn.net",
+                "ad-1.x.cdn9.net",
+                "prefix.com",
+                "prefix123.com",
+                "foo.com",
+                "a.b.com",
+                "anything",
+                "",
+                "a+b?z.test",
+                "aabz.test",
+            ] {
+                assert_eq!(
+                    glob.evaluate(host, None, 0, "", false) == Some(true),
+                    re.is_match(host),
+                    "pattern={pattern} host={host}"
+                );
+            }
+        }
+
+        // DomainSetBuilder::absorb accepts Matcher::Glob directly.
+        let mut b = DomainSetBuilder::default();
+        assert!(b.absorb(Matcher::Glob("*.Absorb.Test".into())).is_none());
+        let set = b.build();
+        assert!(set.matches("foo.absorb.test"));
+        assert!(!set.matches("a.b.absorb.test"));
+    }
+
+    #[test]
+    fn ip_set_v4_compact_merge_boundaries_and_shrink() {
+        assert!(IpSet::new([], false).is_empty());
+        let s = IpSet::new(
+            [
+                "10.0.2.0/24".parse().unwrap(),
+                "10.0.0.0/24".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap(),
+                "10.0.1.128/25".parse().unwrap(),
+                "10.0.0.0/24".parse().unwrap(),
+                "0.0.0.0/32".parse().unwrap(),
+                "255.255.255.254/32".parse().unwrap(),
+                "255.255.255.255/32".parse().unwrap(),
+                "::/128".parse().unwrap(),
+                "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe/128"
+                    .parse()
+                    .unwrap(),
+                "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128"
+                    .parse()
+                    .unwrap(),
+            ],
+            false,
+        );
+        // Compact IPv4 range representation: (u32, u32) = 8 bytes.
+        assert_eq!(std::mem::size_of_val(&s.v4[0]), 8);
+        assert_eq!(s.v4.len(), 3);
+        assert_eq!(s.v6.len(), 2);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.v4.capacity(), s.v4.len());
+        assert_eq!(s.v6.capacity(), s.v6.len());
+
+        for (ip, expected) in [
+            ("0.0.0.0", true),
+            ("0.0.0.1", false),
+            ("9.255.255.255", false),
+            ("10.0.0.0", true),
+            ("10.0.1.200", true),
+            ("10.0.2.255", true),
+            ("10.0.3.0", false),
+            ("255.255.255.253", false),
+            ("255.255.255.254", true),
+            ("255.255.255.255", true),
+            ("::", true),
+            ("::1", false),
+            ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffd", false),
+            ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe", true),
+            ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+        ] {
+            assert_eq!(s.matches(ip.parse().unwrap()), expected, "{ip}");
+        }
+
+        let inv = IpSet::new(["192.168.0.0/16".parse().unwrap()], true);
+        assert!(!inv.matches("192.168.1.1".parse().unwrap()));
+        assert!(inv.matches("192.169.0.1".parse().unwrap()));
+        assert!(inv.matches("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn domain_set_builder_dedups_keywords_and_regexes() {
+        let mut b = DomainSetBuilder::default();
+        b.keyword("AdTrack");
+        b.keyword("adtrack");
+        b.keyword("banner");
+        b.keyword("BANNER");
+        b.regex("^re[0-9]+\\.test$").unwrap();
+        b.regex("^re[0-9]+\\.test$").unwrap();
+        assert!(b.regex("[invalid").is_err());
+        let set = b.build();
+        assert_eq!(set.keywords.len(), 2);
+        assert_eq!(set.regex.len(), 1);
+        assert!(set.matches("my-adtrack-host.test"));
+        assert!(set.matches("my-banner-host.test"));
+        assert!(set.matches("re123.test"));
+        assert!(!set.matches("clean.test"));
+
+        let mut multi = DomainSetBuilder::default();
+        multi.regex("^alpha[0-9]+\\.test$").unwrap();
+        multi.regex("^beta[0-9]+\\.test$").unwrap();
+        let combined = multi.build();
+        assert_eq!(combined.regex.len(), 1);
+        assert!(combined.matches("alpha7.test"));
+        assert!(combined.matches("BETA9.test"));
+        assert!(!combined.matches("gamma1.test"));
     }
 }

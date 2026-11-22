@@ -44,8 +44,8 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Per-host certificates kept; the cache starts over when full. Each holds
-/// a TLS context: the iOS tunnel, within about 50 MiB, keeps few.
+/// Per-host certificates kept; evicts the least recently used entry when full.
+/// Each holds a TLS context: the iOS tunnel, within about 50 MiB, keeps few.
 const LEAVES: usize = 512;
 const HOSTED_LEAVES: usize = 32;
 const HOSTED_INSPECTIONS: usize = 32;
@@ -198,7 +198,8 @@ struct Authority {
     fingerprint: String,
     /// One key for every host certificate.
     leaf_key: PKey<Private>,
-    leaves: Mutex<HashMap<String, Arc<SslAcceptor>>>,
+    leaves: Mutex<HashMap<String, (u64, Arc<SslAcceptor>)>>,
+    leaf_tick: AtomicU64,
 }
 impl Authority {
     fn load(mitm: &Mitm) -> Result<Self> {
@@ -221,10 +222,12 @@ impl Authority {
             fingerprint,
             leaf_key: ec_key()?,
             leaves: Mutex::default(),
+            leaf_tick: AtomicU64::new(0),
         })
     }
     fn acceptor(&self, host: &str, limit: usize) -> Result<Arc<SslAcceptor>> {
-        if let Some(acceptor) = self.leaves.lock().unwrap().get(host) {
+        if let Some((used, acceptor)) = self.leaves.lock().unwrap().get_mut(host) {
+            *used = self.leaf_tick.fetch_add(1, Ordering::Relaxed);
             return Ok(acceptor.clone());
         }
         let leaf = self.leaf(host)?;
@@ -249,11 +252,23 @@ impl Authority {
             Err(AlpnError::NOACK)
         });
         let acceptor = Arc::new(builder.build());
-        let mut leaves = self.leaves.lock().unwrap();
-        if leaves.len() >= limit {
-            leaves.clear();
+        if limit > 0 {
+            let mut leaves = self.leaves.lock().unwrap();
+            if let Some((used, existing)) = leaves.get_mut(host) {
+                *used = self.leaf_tick.fetch_add(1, Ordering::Relaxed);
+                return Ok(existing.clone());
+            }
+            if leaves.len() >= limit
+                && let Some(evict) = leaves
+                    .iter()
+                    .min_by_key(|(_, (used, _))| *used)
+                    .map(|(k, _)| k.clone())
+            {
+                leaves.remove(&evict);
+            }
+            let tick = self.leaf_tick.fetch_add(1, Ordering::Relaxed);
+            leaves.insert(host.to_owned(), (tick, acceptor.clone()));
         }
-        leaves.insert(host.to_owned(), acceptor.clone());
         Ok(acceptor)
     }
     fn leaf(&self, host: &str) -> Result<X509> {
@@ -335,11 +350,175 @@ struct PersistedBypass {
     entries: Vec<PersistedBypassEntry>,
 }
 
+fn with_normalized_host<R>(host: &str, f: impl FnOnce(&str) -> R) -> R {
+    let host = host.trim_end_matches('.');
+    if !host.bytes().any(|b| b.is_ascii_uppercase()) {
+        return f(host);
+    }
+    if host.len() <= 256 {
+        let mut buf = [0u8; 256];
+        for (dst, &src) in buf[..host.len()].iter_mut().zip(host.as_bytes()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        let lower = std::str::from_utf8(&buf[..host.len()]).unwrap();
+        f(lower)
+    } else {
+        f(&host.to_ascii_lowercase())
+    }
+}
+
+fn dedup_host_patterns(hosts: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(hosts.len());
+    let mut out = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let trimmed = host.trim();
+        let key = if let Some(excluded) = trimmed.strip_prefix('-') {
+            let excluded = excluded.trim().trim_end_matches('.');
+            if excluded.is_empty() {
+                continue;
+            }
+            (true, excluded.to_ascii_lowercase())
+        } else {
+            let included = trimmed.trim_end_matches('.');
+            if included.is_empty() {
+                continue;
+            }
+            (false, included.to_ascii_lowercase())
+        };
+        if seen.insert(key) {
+            out.push(host);
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct PatternGroup {
+    match_all: bool,
+    exact: HashSet<Box<str>>,
+    dot_suffix: HashSet<Box<str>>,
+    wildcards: Vec<Box<str>>,
+}
+
+impl PatternGroup {
+    fn insert(&mut self, pattern: &str) {
+        let pattern = pattern.trim_end_matches('.');
+        if pattern.is_empty() {
+            return;
+        }
+        if pattern.bytes().all(|b| b == b'*') {
+            self.match_all = true;
+            return;
+        }
+        let lower = pattern.to_ascii_lowercase();
+        if !lower.contains('*') && !lower.contains('?') {
+            self.exact.insert(lower.into_boxed_str());
+        } else if let Some(suffix) = lower.strip_prefix("*.")
+            && !suffix.is_empty()
+            && !suffix.contains('*')
+            && !suffix.contains('?')
+        {
+            self.dot_suffix.insert(suffix.into());
+        } else if !self.wildcards.iter().any(|existing| &**existing == lower) {
+            self.wildcards.push(lower.into_boxed_str());
+        }
+    }
+
+    fn matches(&self, lower_host: &str) -> bool {
+        if self.match_all {
+            return true;
+        }
+        if self.exact.contains(lower_host) {
+            return true;
+        }
+        if !self.dot_suffix.is_empty() {
+            for (idx, &b) in lower_host.as_bytes().iter().enumerate() {
+                if b == b'.' && self.dot_suffix.contains(&lower_host[idx + 1..]) {
+                    return true;
+                }
+            }
+        }
+        self.wildcards
+            .iter()
+            .any(|pattern| clyntis_config::mitm::wildcard(pattern, lower_host))
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.match_all
+            && self.exact.is_empty()
+            && self.dot_suffix.is_empty()
+            && self.wildcards.is_empty()
+    }
+}
+
+/// Pre-compiled MITM hostname matcher combining user settings and module hosts.
+#[derive(Default)]
+struct HostMatcher {
+    user_include: PatternGroup,
+    user_exclude: PatternGroup,
+    module_include: PatternGroup,
+    module_exclude: PatternGroup,
+}
+
+impl HostMatcher {
+    fn new(user: &[String], modules: &[String]) -> Self {
+        let mut out = Self::default();
+        for pattern in user {
+            let pattern = pattern.trim();
+            if let Some(excluded) = pattern.strip_prefix('-') {
+                out.user_exclude.insert(excluded.trim());
+            } else if !pattern.is_empty() {
+                out.user_include.insert(pattern);
+            }
+        }
+        for pattern in modules {
+            let pattern = pattern.trim();
+            if let Some(excluded) = pattern.strip_prefix('-') {
+                out.module_exclude.insert(excluded.trim());
+            } else if !pattern.is_empty() {
+                out.module_include.insert(pattern);
+            }
+        }
+        out
+    }
+
+    /// Listed by the user or a module; the user's exclusions win, and the
+    /// user's explicit inclusions override module exclusions.
+    fn listed(&self, host: &str) -> bool {
+        with_normalized_host(host, |lower| {
+            if self.user_exclude.matches(lower) {
+                return false;
+            }
+            if self.user_include.matches(lower) {
+                return true;
+            }
+            if self.module_exclude.matches(lower) {
+                return false;
+            }
+            self.module_include.matches(lower)
+        })
+    }
+
+    /// Listed by a module and not excluded by either the user or a module.
+    fn matches_module(&self, host: &str) -> bool {
+        if self.module_include.is_empty() {
+            return false;
+        }
+        with_normalized_host(host, |lower| {
+            !self.user_exclude.matches(lower)
+                && !self.module_exclude.matches(lower)
+                && self.module_include.matches(lower)
+        })
+    }
+}
+
 /// The decryption settings and state of a running core.
 pub(crate) struct Interceptor {
     settings: RwLock<Mitm>,
     /// Hosts the rewrite modules decrypt, besides the user's.
     module_hosts: RwLock<Vec<String>>,
+    /// Pre-compiled combined matcher updated whenever `settings` or `module_hosts` changes.
+    host_matcher: RwLock<HostMatcher>,
     authority: RwLock<Option<Arc<Authority>>>,
     /// Fingerprint of the active/most recent CA authority for detecting CA changes.
     active_fingerprint: RwLock<Option<String>>,
@@ -376,6 +555,7 @@ impl Interceptor {
         let interceptor = Self {
             settings: RwLock::default(),
             module_hosts: RwLock::default(),
+            host_matcher: RwLock::default(),
             authority: RwLock::default(),
             active_fingerprint: RwLock::default(),
             error: RwLock::default(),
@@ -573,7 +753,12 @@ impl Interceptor {
             });
         }
         *self.error.write().unwrap() = result.as_ref().err().map(|e| format!("{e:#}"));
-        *self.settings.write().unwrap() = mitm;
+        {
+            let mut settings = self.settings.write().unwrap();
+            *settings = mitm;
+            let modules = self.module_hosts.read().unwrap();
+            *self.host_matcher.write().unwrap() = HostMatcher::new(&settings.hostname, &modules);
+        }
         result
     }
     fn active(&self) -> Option<Arc<Authority>> {
@@ -661,45 +846,23 @@ impl Interceptor {
     }
     /// Listed by the user or a module; the user's exclusions win.
     fn listed(&self, host: &str) -> bool {
-        let settings = self.settings.read().unwrap();
-        if settings.matches(host) {
-            return true;
-        }
-        let modules = self.module_hosts.read().unwrap();
-        if modules.is_empty() {
-            return false;
-        }
-        let excluded: Vec<String> = settings
-            .hostname
-            .iter()
-            .filter(|p| p.trim().starts_with('-'))
-            .cloned()
-            .collect();
-        let mut patterns = modules.clone();
-        patterns.extend(excluded);
-        clyntis_config::mitm::host_matches(&patterns, host)
+        self.host_matcher.read().unwrap().listed(host)
     }
     pub(crate) fn set_module_hosts(&self, hosts: Vec<String>) {
-        *self.module_hosts.write().unwrap() = hosts;
+        let hosts = dedup_host_patterns(hosts);
+        let settings = self.settings.read().unwrap();
+        let mut modules = self.module_hosts.write().unwrap();
+        *modules = hosts;
+        *self.host_matcher.write().unwrap() = HostMatcher::new(&settings.hostname, &modules);
     }
     fn filter_module_hosts(&self, hosts: impl IntoIterator<Item = String>) -> Vec<String> {
-        let excluded: Vec<String> = self
-            .settings
-            .read()
-            .unwrap()
-            .hostname
-            .iter()
-            .filter(|p| p.trim().starts_with('-'))
-            .cloned()
-            .collect();
-        let mut patterns = self.module_hosts.read().unwrap().clone();
-        if patterns.is_empty() {
+        let matcher = self.host_matcher.read().unwrap();
+        if matcher.module_include.is_empty() {
             return vec![];
         }
-        patterns.extend(excluded);
         let mut out: Vec<String> = hosts
             .into_iter()
-            .filter(|host| clyntis_config::mitm::host_matches(&patterns, host))
+            .filter(|host| matcher.matches_module(host))
             .collect();
         out.sort();
         out
@@ -922,10 +1085,18 @@ impl Core {
         crate::sniff::read_first_bytes(&mut stream, &mut prefix, self.mitm.first_bytes_timeout())
             .await?;
         let tls = prefix.first() == Some(&22);
-        let hello_status = tls.then(|| crate::sniff::parse_client_hello(&prefix));
-        let sniffed_host = route
-            .ip()
-            .and_then(|_| crate::sniff::tls(&prefix).or_else(|| crate::sniff::http(&prefix)));
+        let mut hello_status = tls.then(|| crate::sniff::parse_client_hello(&prefix));
+        let http_host = (!tls).then(|| crate::sniff::http(&prefix)).flatten();
+        let sniffed_host = route.ip().and_then(|_| {
+            if tls {
+                match &mut hello_status {
+                    Some(crate::sniff::ClientHelloStatus::Complete(hello)) => hello.sni.take(),
+                    _ => None,
+                }
+            } else {
+                http_host.clone()
+            }
+        });
         if wants_sniff && let Some(host) = sniffed_host.as_ref() {
             route.host = host.clone();
         }
@@ -936,7 +1107,7 @@ impl Core {
         } else {
             self.dial_logged(&target, None, &source).await?
         };
-        let http = !tls && crate::sniff::http(&prefix).is_some();
+        let http = http_host.is_some();
         let tls_http1 = match hello_status {
             Some(crate::sniff::ClientHelloStatus::Complete(hello)) => match hello.alpn {
                 crate::sniff::ClientHelloAlpn::Absent
@@ -3105,5 +3276,76 @@ hostname = ads.test
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn host_matcher_preserves_precedence_and_deduplicates() {
+        let user = vec![
+            "user.test".into(),
+            "*.Sub.Test.".into(),
+            "-blocked.sub.test".into(),
+            "-*.apple.com".into(),
+        ];
+        let modules = dedup_host_patterns(vec![
+            "api.mod.test".into(),
+            "API.MOD.TEST.".into(),
+            "*.mod.test".into(),
+            "*pcdn*.cdn.test".into(),
+            "-user.test".into(),
+            "-skip.mod.test".into(),
+            "-SKIP.MOD.TEST".into(),
+        ]);
+        assert_eq!(
+            modules,
+            vec![
+                "api.mod.test",
+                "*.mod.test",
+                "*pcdn*.cdn.test",
+                "-user.test",
+                "-skip.mod.test",
+            ]
+        );
+        let matcher = HostMatcher::new(&user, &modules);
+        // User inclusion beats module exclusion (`-user.test`).
+        assert!(matcher.listed("USER.test."));
+        assert!(!matcher.matches_module("user.test"));
+        // `*.sub.test` matches subdomains but not bare `sub.test`.
+        assert!(matcher.listed("a.b.sub.test"));
+        assert!(!matcher.listed("sub.test"));
+        // User exclusion beats both user and module inclusions.
+        assert!(!matcher.listed("blocked.sub.test"));
+        assert!(!matcher.listed("gs.apple.com"));
+        // Module inclusions, wildcards, and module exclusions.
+        assert!(matcher.listed("api.mod.test"));
+        assert!(matcher.matches_module("x.mod.test"));
+        assert!(!matcher.listed("mod.test"));
+        assert!(!matcher.listed("skip.mod.test"));
+        assert!(!matcher.matches_module("skip.mod.test"));
+        assert!(matcher.listed("edge-pcdn-1.cdn.test"));
+        assert!(!matcher.listed("cdn.test"));
+    }
+
+    #[test]
+    fn authority_leaves_evicts_single_lru_entry() {
+        let (ca_cert, ca_key) = generate_authority().unwrap();
+        let authority = Authority::load(&Mitm {
+            enable: true,
+            ca_cert,
+            ca_key,
+            ..Default::default()
+        })
+        .unwrap();
+        let a1 = authority.acceptor("a.test", 2).unwrap();
+        let _b = authority.acceptor("b.test", 2).unwrap();
+        // Touch `a.test` so `b.test` becomes the least recently used entry.
+        let a2 = authority.acceptor("a.test", 2).unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2));
+        // Inserting `c.test` at capacity 2 must evict only `b.test`, not clear `a.test`.
+        let _c = authority.acceptor("c.test", 2).unwrap();
+        let leaves = authority.leaves.lock().unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.contains_key("a.test"));
+        assert!(leaves.contains_key("c.test"));
+        assert!(!leaves.contains_key("b.test"));
     }
 }

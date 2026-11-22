@@ -454,6 +454,7 @@ struct ContextKey {
     profile: TlsFingerprint,
     alpn: Vec<String>,
     verify: bool,
+    reality: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionKey {
@@ -595,7 +596,11 @@ fn build_connector(
     } else {
         builder.set_verify(SslVerifyMode::NONE);
     }
-    Ok(builder.build())
+    let connector = builder.build();
+    if reality {
+        crate::reality::configure_context(connector.context());
+    }
+    Ok(connector)
 }
 
 fn connector(
@@ -622,19 +627,13 @@ fn connector(
     } else {
         config.alpn.clone()
     };
-    if config.reality.is_some() {
-        return Ok((
-            build_connector(&profile, &alpn, false, true, None)?,
-            profile,
-            alpn,
-            None,
-        ));
-    }
+    let reality = config.reality.is_some();
+    let verify = config.verify_cert && !reality;
     // A connection using a custom name check must not seed the strict
     // connector's session cache before the caller has checked the names.
-    if selected == TlsFingerprint::Randomized || !check_name {
+    if selected == TlsFingerprint::Randomized || (!reality && !check_name) {
         return Ok((
-            build_connector(&profile, &alpn, config.verify_cert, false, None)?,
+            build_connector(&profile, &alpn, verify, reality, None)?,
             profile,
             alpn,
             None,
@@ -643,22 +642,23 @@ fn connector(
     let context_key = ContextKey {
         profile: selected,
         alpn: alpn.clone(),
-        verify: config.verify_cert,
+        verify,
+        reality,
     };
-    let session_key = SessionKey {
+    let session_key = (!reality).then(|| SessionKey {
         context: context_key.clone(),
         server_name: config.server_name.clone(),
-    };
+    });
     let cache = CONTEXTS.get_or_init(Default::default);
     if let Some(found) = cache.lock().unwrap().get(&context_key).cloned() {
-        return Ok((found, profile, alpn, Some(session_key)));
+        return Ok((found, profile, alpn, session_key));
     }
     let built = build_connector(
         &profile,
         &alpn,
-        config.verify_cert,
-        false,
-        Some(context_key.clone()),
+        verify,
+        reality,
+        (!reality).then(|| context_key.clone()),
     )?;
     let result = built.clone();
     let mut cache = cache.lock().unwrap();
@@ -666,7 +666,7 @@ fn connector(
         cache.clear();
     }
     cache.insert(context_key, built);
-    Ok((result, profile, alpn, Some(session_key)))
+    Ok((result, profile, alpn, session_key))
 }
 
 fn configure_ssl(
@@ -2014,5 +2014,71 @@ mod tests {
         let (conn2, ..) = connector(&config, true).unwrap();
         let root_ptr2 = foreign_types_shared::ForeignTypeRef::as_ptr(conn2.context().cert_store());
         assert_eq!(root_ptr, root_ptr2);
+    }
+
+    #[tokio::test]
+    async fn reality_connector_reuses_cached_context_without_sharing_non_reality() {
+        let reality_opts = clyntis_config::Reality {
+            public_key: "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM".into(),
+            short_id: "01020304".into(),
+            support_x25519mlkem768: None,
+        };
+        let reality_config = TlsConnectConfig {
+            server_name: "reality.test".into(),
+            alpn: Vec::new(),
+            verify_cert: true,
+            fingerprint: TlsFingerprint::Chrome,
+            reality: Some(reality_opts.clone()),
+        };
+        let plain_config = TlsConnectConfig {
+            reality: None,
+            ..reality_config.clone()
+        };
+
+        let (r1, _, _, s1) = connector(&reality_config, true).unwrap();
+        let (r2, _, _, s2) = connector(&reality_config, true).unwrap();
+        let (plain, _, _, sp) = connector(&plain_config, true).unwrap();
+
+        let r1_ptr = foreign_types_shared::ForeignTypeRef::as_ptr(r1.context());
+        let r2_ptr = foreign_types_shared::ForeignTypeRef::as_ptr(r2.context());
+        let plain_ptr = foreign_types_shared::ForeignTypeRef::as_ptr(plain.context());
+        assert_eq!(r1_ptr, r2_ptr);
+        assert_ne!(r1_ptr, plain_ptr);
+        assert!(s1.is_none());
+        assert!(s2.is_none());
+        assert!(sp.is_some());
+
+        async fn run_reality_hello(config: &TlsConnectConfig) -> Vec<u8> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut header = [0; 5];
+                stream.read_exact(&mut header).await.unwrap();
+                let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+                let mut record = header.to_vec();
+                record.resize(5 + len, 0);
+                stream.read_exact(&mut record[5..]).await.unwrap();
+                record
+            });
+            let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let clock = Arc::new(Clock::default());
+            let (mut ssl, _) = configure_ssl(config, &clock).unwrap();
+            let guard = crate::reality::install(&mut ssl, config.reality.as_ref().unwrap(), &clock)
+                .unwrap();
+            let _ = tokio_boring::SslStreamBuilder::new(ssl, DebugStream(stream))
+                .connect()
+                .await;
+            assert!(guard.succeeded());
+            let record = server.await.unwrap();
+            let hello = &record[9..];
+            let sid_len = hello[34] as usize;
+            assert_eq!(sid_len, 32);
+            hello[35..35 + sid_len].to_vec()
+        }
+
+        let sid1 = run_reality_hello(&reality_config).await;
+        let sid2 = run_reality_hello(&reality_config).await;
+        assert_ne!(sid1, sid2);
     }
 }

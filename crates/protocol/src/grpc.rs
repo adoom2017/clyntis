@@ -17,6 +17,25 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+const WRITE_CHUNK: usize = 16 * 1024;
+const KEEP_CAPACITY: usize = 64 * 1024;
+
+fn release_if_large(buffer: &mut Vec<u8>) {
+    if buffer.is_empty() && buffer.capacity() > KEEP_CAPACITY {
+        *buffer = Vec::new();
+    }
+}
+
+fn varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
 fn varint(mut value: usize, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -34,7 +53,8 @@ fn varint(mut value: usize, out: &mut Vec<u8>) {
 fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut value = 0usize;
     for (i, byte) in bytes.iter().copied().take(10).enumerate() {
-        value |= usize::from(byte & 0x7f) << (i * 7);
+        let shifted = usize::from(byte & 0x7f).checked_shl((i * 7) as u32)?;
+        value |= shifted;
         if byte & 0x80 == 0 {
             return Some((value, i + 1));
         }
@@ -42,15 +62,18 @@ fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+fn gun_frame_len(payload_len: usize) -> usize {
+    5 + 1 + varint_len(payload_len) + payload_len
+}
+
 fn gun_frame(payload: &[u8]) -> Bytes {
-    let mut proto = Vec::with_capacity(payload.len() + 10);
-    proto.push(0x0a);
-    varint(payload.len(), &mut proto);
-    proto.extend_from_slice(payload);
-    let mut frame = Vec::with_capacity(proto.len() + 5);
+    let proto_len = 1 + varint_len(payload.len()) + payload.len();
+    let mut frame = Vec::with_capacity(5 + proto_len);
     frame.push(0);
-    frame.extend_from_slice(&(proto.len() as u32).to_be_bytes());
-    frame.extend(proto);
+    frame.extend_from_slice(&(proto_len as u32).to_be_bytes());
+    frame.push(0x0a);
+    varint(payload.len(), &mut frame);
+    frame.extend_from_slice(payload);
     Bytes::from(frame)
 }
 
@@ -293,6 +316,8 @@ pub async fn connect(
         incoming: vec![],
         payload: vec![],
         payload_at: 0,
+        unreleased_incoming: 0,
+        unreleased_payload: 0,
         closed: false,
         active: lease.transfer(),
     }))
@@ -305,6 +330,8 @@ pub struct GrpcStream {
     incoming: Vec<u8>,
     payload: Vec<u8>,
     payload_at: usize,
+    unreleased_incoming: usize,
+    unreleased_payload: usize,
     closed: bool,
     active: Arc<AtomicUsize>,
 }
@@ -316,6 +343,14 @@ impl Drop for GrpcStream {
 }
 
 impl GrpcStream {
+    fn release_capacity(&mut self, bytes: usize) {
+        if bytes > 0
+            && let Some(recv) = self.recv.as_mut()
+        {
+            let _ = recv.flow_control().release_capacity(bytes);
+        }
+    }
+
     fn parse(&mut self) -> io::Result<bool> {
         if self.incoming.len() < 5 {
             return Ok(false);
@@ -324,25 +359,54 @@ impl GrpcStream {
             return Err(io::Error::other("compressed gRPC messages are unsupported"));
         }
         let length = u32::from_be_bytes(self.incoming[1..5].try_into().unwrap()) as usize;
-        if length > 16 * 1024 * 1024 {
+        if length > MAX_FRAME {
             return Err(io::Error::other("oversized gRPC message"));
         }
-        if self.incoming.len() < 5 + length {
+        let total = 5 + length;
+        if self.incoming.len() < total {
             return Ok(false);
         }
-        let proto = &self.incoming[5..5 + length];
+        let proto = &self.incoming[5..total];
         if proto.first() != Some(&0x0a) {
             return Err(io::Error::other("invalid Gun protobuf message"));
         }
         let (payload_len, prefix) = decode_varint(&proto[1..])
             .ok_or_else(|| io::Error::other("invalid Gun protobuf length"))?;
         let start = 1 + prefix;
-        if start + payload_len != proto.len() {
+        if start.checked_add(payload_len) != Some(proto.len()) {
             return Err(io::Error::other("invalid Gun protobuf payload"));
         }
-        self.payload = proto[start..].to_vec();
-        self.payload_at = 0;
-        self.incoming.drain(..5 + length);
+        let payload_start = 5 + start;
+        let remaining = self.incoming.len() - total;
+        let drained_unreleased = self.unreleased_incoming.saturating_sub(remaining);
+        self.unreleased_incoming = self.unreleased_incoming.min(remaining);
+        let release_now = drained_unreleased.saturating_sub(payload_len);
+        self.unreleased_payload += drained_unreleased - release_now;
+        self.release_capacity(release_now);
+
+        if payload_len == 0 {
+            self.incoming.drain(..total);
+            release_if_large(&mut self.incoming);
+        } else if total == self.incoming.len() {
+            self.payload.clear();
+            std::mem::swap(&mut self.payload, &mut self.incoming);
+            self.payload_at = payload_start;
+            release_if_large(&mut self.incoming);
+        } else if remaining < payload_len {
+            self.payload.clear();
+            self.payload.extend_from_slice(&self.incoming[total..]);
+            self.incoming.truncate(total);
+            std::mem::swap(&mut self.payload, &mut self.incoming);
+            self.payload_at = payload_start;
+            release_if_large(&mut self.incoming);
+        } else {
+            self.payload.clear();
+            self.payload
+                .extend_from_slice(&self.incoming[payload_start..total]);
+            self.payload_at = 0;
+            self.incoming.drain(..total);
+            release_if_large(&mut self.incoming);
+        }
         Ok(true)
     }
 }
@@ -353,15 +417,32 @@ impl AsyncRead for GrpcStream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.payload_at < self.payload.len() {
-            let n = out.remaining().min(self.payload.len() - self.payload_at);
-            out.put_slice(&self.payload[self.payload_at..self.payload_at + n]);
-            self.payload_at += n;
+        if out.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+        let mut frames = 0;
         loop {
+            if self.payload_at < self.payload.len() {
+                let n = out.remaining().min(self.payload.len() - self.payload_at);
+                out.put_slice(&self.payload[self.payload_at..self.payload_at + n]);
+                self.payload_at += n;
+                let release = self.unreleased_payload.min(n);
+                self.unreleased_payload -= release;
+                self.release_capacity(release);
+                if self.payload_at == self.payload.len() {
+                    self.payload.clear();
+                    self.payload_at = 0;
+                    release_if_large(&mut self.payload);
+                }
+                return Poll::Ready(Ok(()));
+            }
             if self.parse()? {
-                return self.poll_read(cx, out);
+                frames += 1;
+                if frames >= 64 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                continue;
             }
             if self.closed {
                 return Poll::Ready(Ok(()));
@@ -386,18 +467,28 @@ impl AsyncRead for GrpcStream {
                 self.response = None;
             }
             let next = {
-                let recv = self.recv.as_mut().expect("gRPC response body initialized");
-                match ready!(Pin::new(&mut *recv).poll_data(cx)) {
-                    Some(Ok(data)) => {
-                        let _ = recv.flow_control().release_capacity(data.len());
-                        Some(Ok(data))
+                let this = self.as_mut().get_mut();
+                let recv = this.recv.as_mut().expect("gRPC response body initialized");
+                match Pin::new(&mut *recv).poll_data(cx) {
+                    Poll::Ready(item) => item,
+                    Poll::Pending => {
+                        // We need more bytes to finish an incomplete frame
+                        // (already validated <= MAX_FRAME); release held
+                        // capacity for those buffered bytes so frames larger
+                        // than the HTTP/2 receive window cannot stall.
+                        if this.unreleased_incoming > 0 {
+                            let release = std::mem::take(&mut this.unreleased_incoming);
+                            let _ = recv.flow_control().release_capacity(release);
+                        }
+                        return Poll::Pending;
                     }
-                    Some(Err(error)) => Some(Err(error)),
-                    None => None,
                 }
             };
             match next {
-                Some(Ok(data)) => self.incoming.extend_from_slice(&data),
+                Some(Ok(data)) => {
+                    self.incoming.extend_from_slice(&data);
+                    self.unreleased_incoming += data.len();
+                }
                 Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
                 None => self.closed = true,
             }
@@ -414,16 +505,19 @@ impl AsyncWrite for GrpcStream {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let n = bytes.len().min(16 * 1024);
-        let frame = gun_frame(&bytes[..n]);
-        self.send.reserve_capacity(frame.len());
-        while self.send.capacity() < frame.len() {
-            match ready!(self.send.poll_capacity(cx)) {
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
-                None => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+        let n = bytes.len().min(WRITE_CHUNK);
+        let framed = gun_frame_len(n);
+        if self.send.capacity() < framed {
+            self.send.reserve_capacity(framed);
+            while self.send.capacity() < framed {
+                match ready!(self.send.poll_capacity(cx)) {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
+                    None => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                }
             }
         }
+        let frame = gun_frame(&bytes[..n]);
         self.send
             .send_data(frame, false)
             .map_err(io::Error::other)?;
@@ -449,6 +543,10 @@ mod tests {
         let frame = gun_frame(b"hello");
         assert_eq!(&frame[..7], &[0, 0, 0, 0, 7, 0x0a, 5]);
         assert_eq!(&frame[7..], b"hello");
+        for size in [0, 1, 127, 128, 16383, 16384, 65536] {
+            let payload = vec![0u8; size];
+            assert_eq!(gun_frame_len(size), gun_frame(&payload).len(), "{size}");
+        }
     }
 
     #[tokio::test]
@@ -714,5 +812,90 @@ mod tests {
         stream.shutdown().await.unwrap();
         let framed_size = server_task.await.unwrap();
         assert!(framed_size > payload.len());
+    }
+
+    #[tokio::test]
+    async fn large_download_frame_completes_under_h2_flow_control_and_rejects_oversized() {
+        let large_payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+        let expected = large_payload.clone();
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let handler = tokio::spawn(async move {
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                let mut combined = gun_frame(&expected).to_vec();
+                combined.extend_from_slice(&gun_frame(b"after"));
+                let mut offset = 0;
+                while offset < combined.len() {
+                    let want = (combined.len() - offset).min(16 * 1024);
+                    send.reserve_capacity(want);
+                    let cap = loop {
+                        if send.capacity() > 0 {
+                            break send.capacity().min(combined.len() - offset);
+                        }
+                        std::future::poll_fn(|cx| send.poll_capacity(cx))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    };
+                    send.send_data(
+                        Bytes::copy_from_slice(&combined[offset..offset + cap]),
+                        false,
+                    )
+                    .unwrap();
+                    offset += cap;
+                }
+                // Follow with an oversized frame header (> MAX_FRAME).
+                let mut oversized = vec![0u8];
+                oversized.extend_from_slice(&((MAX_FRAME + 1) as u32).to_be_bytes());
+                send.reserve_capacity(oversized.len());
+                while send.capacity() < oversized.len() {
+                    std::future::poll_fn(|cx| send.poll_capacity(cx))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                send.send_data(Bytes::from(oversized), true).unwrap();
+            });
+            tokio::pin!(handler);
+            let mut handler_done = false;
+            loop {
+                tokio::select! {
+                    result = &mut handler, if !handler_done => {
+                        result.unwrap();
+                        handler_done = true;
+                    }
+                    _ = &mut done_rx, if handler_done => break,
+                    incoming = connection.accept() => {
+                        assert!(incoming.is_none());
+                    }
+                }
+            }
+        });
+        let options = clyntis_config::GrpcOptions::default();
+        let mut stream = connect(
+            Box::new(client),
+            "large-dl.example:443",
+            "large-dl.example",
+            &options,
+            None,
+            "large-dl-test",
+        )
+        .await
+        .unwrap();
+        let mut received = vec![0u8; large_payload.len() + 5];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+            .await
+            .expect("large gRPC frame deadlocked against H2 flow control")
+            .unwrap();
+        assert_eq!(&received[..large_payload.len()], &large_payload[..]);
+        assert_eq!(&received[large_payload.len()..], b"after");
+        let err = stream.read(&mut [0u8; 8]).await.unwrap_err();
+        assert!(err.to_string().contains("oversized"), "{err}");
+        let _ = done_tx.send(());
+        server_task.await.unwrap();
     }
 }

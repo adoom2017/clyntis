@@ -142,9 +142,10 @@ export default function App() {
     );
   }, [interfaceLanguage]);
   const refresh = useCallback(async () => {
-    const next = await invoke<Snapshot>("snapshot");
-    setState(next);
-    return next;
+    const next = await invoke<Snapshot>("snapshot", { includeLogs: false });
+    const trimmed = next.logs?.length ? { ...next, logs: [] } : next;
+    setState(trimmed);
+    return trimmed;
   }, []);
   const perform = useCallback(
     async (action: () => Promise<unknown>, success?: string) => {
@@ -163,6 +164,12 @@ export default function App() {
       }
     },
     [refresh],
+  );
+  const nextLogId = useRef(1);
+  const tagLog = useCallback(
+    (entry: Log): Log =>
+      entry.id !== undefined ? entry : { ...entry, id: nextLogId.current++ },
+    [],
   );
   // Ticks and log lines that arrive while the page is hidden are kept here
   // and applied when it is shown, instead of re-rendering every second.
@@ -194,7 +201,9 @@ export default function App() {
     };
     void (async () => {
       await Promise.all([
-        register<Snapshot>("state", (next) => setState(next)),
+        register<Snapshot>("state", (next) =>
+          setState(next.logs?.length ? { ...next, logs: [] } : next),
+        ),
         register<Traffic>("traffic", (tick) => {
           if (pageVisible())
             setTraffic((values) => [...values.slice(-59), tick]);
@@ -204,18 +213,19 @@ export default function App() {
           }
         }),
         register<Log>("log", (entry) => {
+          const tagged = tagLog(entry);
           if (pageVisible())
-            setLogs((values) => [...values.slice(-1999), entry]);
+            setLogs((values) => [...values.slice(-1999), tagged]);
           else {
             const held = hidden.current;
-            held.logs = [...held.logs.slice(-1999), entry];
+            held.logs = [...held.logs.slice(-1999), tagged];
           }
         }),
       ]);
       const next = await invoke<Snapshot>("snapshot");
       if (alive) {
-        setState(next);
-        setLogs(next.logs);
+        setLogs((next.logs ?? []).map(tagLog));
+        setState(next.logs?.length ? { ...next, logs: [] } : next);
         setLoaded(true);
       }
     })().catch(() => {

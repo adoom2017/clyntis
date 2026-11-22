@@ -11,7 +11,6 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const HEADER: usize = 5;
-const SCRATCH: usize = 16 * 1024;
 
 #[derive(Debug)]
 pub struct RecordBoundedStream<S> {
@@ -65,19 +64,17 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordBoundedStream<S> {
         } else {
             self.record_remaining
         };
-        let limit = remaining.min(output.remaining()).min(SCRATCH);
+        let limit = remaining.min(output.remaining());
         let this = self.as_mut().get_mut();
-        let mut bytes = [0u8; SCRATCH];
-        let mut read = ReadBuf::new(&mut bytes[..limit]);
+        let mut read = ReadBuf::new(output.initialize_unfilled_to(limit));
         ready!(Pin::new(&mut this.inner).poll_read(cx, &mut read))?;
-        let bytes = read.filled();
-        if bytes.is_empty() {
+        let n = read.filled().len();
+        if n == 0 {
             return Poll::Ready(Ok(()));
         }
-        output.put_slice(bytes);
         if header {
-            let end = this.header_filled + bytes.len();
-            this.header[this.header_filled..end].copy_from_slice(bytes);
+            let end = this.header_filled + n;
+            this.header[this.header_filled..end].copy_from_slice(read.filled());
             this.header_filled = end;
             if end == HEADER {
                 this.record_remaining =
@@ -88,12 +85,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for RecordBoundedStream<S> {
                 }
             }
         } else {
-            this.record_remaining -= bytes.len();
+            this.record_remaining -= n;
             if this.record_remaining == 0 {
                 this.header_filled = 0;
                 this.yield_after_record = true;
             }
         }
+        output.advance(n);
         Poll::Ready(Ok(()))
     }
 }
@@ -216,5 +214,80 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RecordStream<S> {
             Inner::Tls(stream) if direct => Pin::new(stream.get_mut()).poll_shutdown(cx),
             Inner::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Cursor, mem::MaybeUninit, task::Waker};
+
+    #[test]
+    fn record_bounded_reads_directly_into_output_at_record_boundaries() {
+        let mut wire = Vec::new();
+        // Record 1: 5-byte header + 4-byte body
+        wire.extend_from_slice(&[23, 3, 3, 0, 4]);
+        wire.extend_from_slice(b"body");
+        // Record 2: 5-byte header + 0-byte body
+        wire.extend_from_slice(&[23, 3, 3, 0, 0]);
+        // Record 3: 5-byte header + 2-byte body
+        wire.extend_from_slice(&[23, 3, 3, 0, 2]);
+        wire.extend_from_slice(b"ok");
+
+        let mut stream = RecordBoundedStream::new(Cursor::new(wire));
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut raw = [MaybeUninit::<u8>::uninit(); 32];
+
+        // Poll 1: reads only the 5-byte header of record 1.
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), &[23, 3, 3, 0, 4]);
+
+        // Poll 2: reads only the 4-byte body of record 1, never reading ahead into record 2.
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"body");
+
+        // Poll 3: yields once after completing a record.
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Pending
+        ));
+
+        // Poll 4: reads the zero-length record 2 header and schedules yield.
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), &[23, 3, 3, 0, 0]);
+
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Pending
+        ));
+
+        // Polls 5-6: record 3 header and body.
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), &[23, 3, 3, 0, 2]);
+
+        let mut buf = ReadBuf::uninit(&mut raw);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"ok");
     }
 }

@@ -74,6 +74,13 @@ final class CoreSession {
         })
     }
 
+    /// Validates a YAML configuration without creating a core handle or runtime.
+    static func validate(configuration: Data) throws {
+        try check(configuration.withUnsafeBytes {
+            meta_validate_config_v1($0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+        })
+    }
+
     /// Names usable as a rule target in this configuration (DIRECT, REJECT, groups, proxies).
     static func ruleTargets(configuration: Data) throws -> [String] {
         let data = try configuration.withUnsafeBytes { config in

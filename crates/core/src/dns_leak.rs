@@ -173,8 +173,8 @@ impl Core {
             let policy = self.policy.read().unwrap();
             (
                 policy.mode.clone(),
-                policy.rules.clone(),
-                policy.raw_rules.clone(),
+                std::sync::Arc::clone(&policy.rules),
+                std::sync::Arc::clone(&policy.raw_rules),
             )
         };
         if dns.enhanced_mode == "redir-host" && (dns.enable || tun.enable) {

@@ -454,17 +454,22 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                 }
             }
             Action::BodyReplace(_) | Action::JsonDelete(_) | Action::JsonSet(_) => {
-                let changed = message.body.as_mut().is_some_and(|body| {
-                    rewrite::apply_body_with(
+                let updated = message.body.as_deref().and_then(|body| {
+                    rewrite::rewrite_body_with(
                         &rewrites.rewriter,
                         index,
-                        Arc::make_mut(body),
+                        body,
                         allow_compile,
                         group_runtimes.as_ref(),
                     )
                 });
-                message.body_changed |= changed;
-                changed
+                if let Some(updated) = updated {
+                    message.body = Some(Arc::new(updated));
+                    message.body_changed = true;
+                    true
+                } else {
+                    false
+                }
             }
             Action::Script(script) => {
                 if script.requires_body
@@ -478,9 +483,11 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                 let Some(path) = rewrites.rewriter.file(&script.url) else {
                     continue;
                 };
-                let mut body = script
-                    .requires_body
-                    .then(|| message.body.as_deref().cloned().unwrap_or_default());
+                let mut body = if script.requires_body {
+                    message.body.clone()
+                } else {
+                    None
+                };
                 let job = script::Job {
                     name: script.name.clone(),
                     path: path.clone(),
@@ -1171,13 +1178,10 @@ where
                 writer.flush().await?;
                 continue;
             }
-            break (
-                head.clone(),
-                code,
-                response.version.unwrap_or(1),
-                response.reason.unwrap_or_default().to_owned(),
-                header_list(response.headers),
-            );
+            let version = response.version.unwrap_or(1);
+            let reason = response.reason.unwrap_or_default().to_owned();
+            let headers = header_list(response.headers);
+            break (head, code, version, reason, headers);
         };
         // After a switch the bytes that follow belong to another protocol.
         let switched = code == 101 || request.method == "CONNECT" && (200..300).contains(&code);
@@ -1583,6 +1587,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let had_bytes = remaining > 0;
     while remaining > 0 {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -1593,6 +1598,8 @@ where
         tap(&available[..n]);
         reader.consume(n);
         remaining -= n as u64;
+    }
+    if had_bytes {
         writer.flush().await?;
     }
     Ok(())

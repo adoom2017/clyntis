@@ -89,7 +89,7 @@ impl Reassembly {
                     prefix: bytes[..offset].to_vec(),
                     previous,
                     next,
-                    bytes: vec![0; MAX_PACKET - offset],
+                    bytes: Vec::with_capacity(end.min(2048)),
                     received: Assembler::new(),
                     total: None,
                     rejected: false,
@@ -102,7 +102,7 @@ impl Reassembly {
         }
         let invalid = payload.is_empty()
             || (more && !payload.len().is_multiple_of(8))
-            || end > value.bytes.len()
+            || end > MAX_PACKET - value.prefix.len()
             || value.prefix.len() != offset
             || value.previous != previous
             || value.next != next
@@ -122,6 +122,9 @@ impl Reassembly {
         }
         if start == 0 {
             value.prefix.copy_from_slice(&bytes[..offset]);
+        }
+        if end > value.bytes.len() {
+            value.bytes.resize(end, 0);
         }
         value.bytes[start..end].copy_from_slice(payload);
         if !more {
@@ -227,6 +230,7 @@ mod tests {
             assert!(queue.accept(&first, now).is_none());
         }
         assert_eq!(queue.pending.len(), MAX_PACKETS);
+        assert!(queue.pending.values().next().unwrap().bytes.capacity() < 8192);
         let mut truncated = frames[0].clone();
         truncated.truncate(44);
         assert!(queue.accept(&truncated, now).is_none());

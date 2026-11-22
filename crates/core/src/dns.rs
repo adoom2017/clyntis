@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
-        Mutex, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -35,6 +35,9 @@ const CACHE_ENTRIES: usize = 4096;
 const CACHE_BYTES: usize = 1024 * 1024;
 /// Per-entry allocator and table overhead beyond the key and response bytes.
 const CACHE_OVERHEAD: usize = 256;
+/// Fallback negative cache TTL (seconds) for NODATA/NXDOMAIN responses that
+/// omit an authority SOA record, so IPv4-only hosts cache negative AAAA answers.
+const NEGATIVE_FALLBACK_TTL: u32 = 30;
 /// How long nameserver-policy servers not yet heard from on this network
 /// answer alone before the plain nameservers are asked too.
 const POLICY_HEAD_START: Duration = Duration::from_millis(500);
@@ -50,10 +53,173 @@ fn answered(response: &Message) -> bool {
         ResponseCode::NoError | ResponseCode::NXDomain
     )
 }
+fn cache_key(request: &Message) -> Result<Vec<u8>> {
+    // Keep EDNS, DNSSEC, recursion flags and query class in the cache key.
+    let mut key_request = request.clone();
+    key_request.set_id(0);
+    Ok(key_request.to_vec()?)
+}
+fn cache_ttl(response: &Message) -> u32 {
+    if !answered(response) || response.truncated() {
+        return 0;
+    }
+    let negative =
+        response.response_code() == ResponseCode::NXDomain || response.answers().is_empty();
+    let ttl = if negative {
+        response
+            .name_servers()
+            .iter()
+            .filter_map(|r| match r.data() {
+                RData::SOA(soa) => Some(r.ttl().min(soa.minimum())),
+                _ => None,
+            })
+            .min()
+            .unwrap_or_else(|| {
+                if response.answers().is_empty() {
+                    NEGATIVE_FALLBACK_TTL
+                } else {
+                    0
+                }
+            })
+    } else {
+        response
+            .answers()
+            .iter()
+            .chain(response.name_servers())
+            .chain(response.additionals())
+            .map(Record::ttl)
+            .min()
+            .unwrap_or(0)
+    };
+    ttl.min(3600)
+}
 #[derive(Default)]
 struct Cache {
     entries: HashMap<Vec<u8>, CacheEntry>,
-    size: usize,
+    total_bytes: usize,
+}
+impl Cache {
+    fn get(&mut self, key: &[u8], id: u16) -> Option<Message> {
+        let now = Instant::now();
+        let expired = match self.entries.get(key) {
+            Some(entry) if entry.expires > now => {
+                if let Ok(mut response) = Message::from_vec(&entry.response) {
+                    response.set_id(id);
+                    let elapsed = now
+                        .saturating_duration_since(entry.inserted)
+                        .as_secs()
+                        .min(u32::MAX as u64) as u32;
+                    for record in response.answers_mut().iter_mut() {
+                        record.set_ttl(record.ttl().saturating_sub(elapsed));
+                    }
+                    for record in response.name_servers_mut().iter_mut() {
+                        record.set_ttl(record.ttl().saturating_sub(elapsed));
+                    }
+                    for record in response.additionals_mut().iter_mut() {
+                        record.set_ttl(record.ttl().saturating_sub(elapsed));
+                    }
+                    return Some(response);
+                }
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if expired && let Some(prev) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.size);
+        }
+        None
+    }
+    fn prune_expired(&mut self, now: Instant) {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|_, entry| {
+            if entry.expires > now {
+                true
+            } else {
+                removed_bytes += entry.size;
+                false
+            }
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+    }
+    fn insert(&mut self, mut key: Vec<u8>, mut bytes: Vec<u8>, ttl: u32) {
+        bytes.shrink_to_fit();
+        key.shrink_to_fit();
+        let size = key.len() + bytes.len() + CACHE_OVERHEAD;
+        if let Some(prev) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.size);
+        }
+        if size > CACHE_BYTES {
+            return;
+        }
+        let now = Instant::now();
+        if self.entries.len() >= CACHE_ENTRIES || self.total_bytes + size > CACHE_BYTES {
+            self.prune_expired(now);
+        }
+        while self.entries.len() >= CACHE_ENTRIES || self.total_bytes + size > CACHE_BYTES {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.size);
+            }
+        }
+        self.entries.insert(
+            key,
+            CacheEntry {
+                response: bytes,
+                inserted: now,
+                expires: now + Duration::from_secs(ttl as u64),
+                size,
+            },
+        );
+        self.total_bytes += size;
+    }
+}
+
+type InflightResult = std::result::Result<Message, String>;
+type InflightSlot = tokio::sync::watch::Receiver<Option<InflightResult>>;
+
+struct InflightGuard<'a> {
+    map: &'a Mutex<HashMap<(bool, Vec<u8>), InflightSlot>>,
+    key: Option<(bool, Vec<u8>)>,
+    tx: Option<tokio::sync::watch::Sender<Option<InflightResult>>>,
+}
+impl InflightGuard<'_> {
+    fn finish_ok(mut self, response: &Message) {
+        if let Some(key) = self.key.take() {
+            self.map.lock().unwrap().remove(&key);
+        }
+        if let Some(tx) = self.tx.take()
+            && tx.receiver_count() > 0
+        {
+            let _ = tx.send(Some(Ok(response.clone())));
+        }
+    }
+    fn finish_err(mut self, error: &anyhow::Error) {
+        if let Some(key) = self.key.take() {
+            self.map.lock().unwrap().remove(&key);
+        }
+        if let Some(tx) = self.tx.take()
+            && tx.receiver_count() > 0
+        {
+            let _ = tx.send(Some(Err(format!("{error:#}"))));
+        }
+    }
+}
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take()
+            && let Ok(mut map) = self.map.lock()
+        {
+            map.remove(&key);
+        }
+    }
 }
 
 /// Fake-IP mappings up to `capacity` names; past it the least recently
@@ -61,9 +227,10 @@ struct Cache {
 /// pool before any is reused, so a client still holding an evicted address
 /// reaches nothing rather than an unrelated name.
 struct FakeMap {
-    /// Address and the use stamp of its latest query.
-    by_name: HashMap<(String, bool), (IpAddr, u64)>,
-    by_ip: HashMap<IpAddr, String>,
+    /// Address and the use stamp of its latest query, indexed by
+    /// `usize::from(v6)` so lookups borrow `&str` directly without allocating.
+    by_name: [HashMap<Arc<str>, (IpAddr, u64)>; 2],
+    by_ip: HashMap<IpAddr, Arc<str>>,
     /// (address, stamp) in use order, oldest first; an entry whose stamp is
     /// no longer the name's latest is stale and skipped.
     order: VecDeque<(IpAddr, u64)>,
@@ -79,7 +246,7 @@ pub const FAKE_CAPACITY: usize = 32768;
 impl FakeMap {
     fn new(capacity: usize) -> Self {
         Self {
-            by_name: HashMap::new(),
+            by_name: [HashMap::new(), HashMap::new()],
             by_ip: HashMap::new(),
             order: VecDeque::new(),
             stamp: 0,
@@ -89,8 +256,14 @@ impl FakeMap {
             generation: 0,
         }
     }
-    fn get(&mut self, key: &(String, bool)) -> Option<IpAddr> {
-        let (ip, stamp) = self.by_name.get_mut(key)?;
+    fn len(&self) -> usize {
+        self.by_name[0].len() + self.by_name[1].len()
+    }
+    fn contains_name(&self, name: &str, v6: bool) -> bool {
+        self.by_name[usize::from(v6)].contains_key(name)
+    }
+    fn get(&mut self, name: &str, v6: bool) -> Option<IpAddr> {
+        let (ip, stamp) = self.by_name[usize::from(v6)].get_mut(name)?;
         self.stamp += 1;
         *stamp = self.stamp;
         let ip = *ip;
@@ -100,12 +273,12 @@ impl FakeMap {
         }
         Some(ip)
     }
-    fn insert(&mut self, name: String, ip: IpAddr) {
+    fn insert(&mut self, name: Arc<str>, ip: IpAddr) {
         self.stamp += 1;
         self.generation += 1;
         self.order.push_back((ip, self.stamp));
-        self.by_ip.insert(ip, name.clone());
-        self.by_name.insert((name, ip.is_ipv6()), (ip, self.stamp));
+        self.by_ip.insert(ip, Arc::clone(&name));
+        self.by_name[usize::from(ip.is_ipv6())].insert(name, (ip, self.stamp));
     }
     /// Drops the least recently queried mapping.
     fn evict(&mut self) {
@@ -113,9 +286,12 @@ impl FakeMap {
             let Some(name) = self.by_ip.get(&ip) else {
                 continue;
             };
-            let key = (name.clone(), ip.is_ipv6());
-            if self.by_name.get(&key).is_some_and(|entry| entry.1 == stamp) {
-                self.by_name.remove(&key);
+            let table = &mut self.by_name[usize::from(ip.is_ipv6())];
+            if table
+                .get(name.as_ref())
+                .is_some_and(|entry| entry.1 == stamp)
+            {
+                table.remove(name.as_ref());
                 self.by_ip.remove(&ip);
                 self.generation += 1;
                 return;
@@ -123,7 +299,11 @@ impl FakeMap {
         }
     }
     fn compact(&mut self) {
-        let mut live: Vec<_> = self.by_name.values().copied().collect();
+        let mut live: Vec<_> = self
+            .by_name
+            .iter()
+            .flat_map(|table| table.values().copied())
+            .collect();
         live.sort_by_key(|entry| entry.1);
         self.order = live.into();
     }
@@ -132,12 +312,13 @@ impl FakeMap {
         let mut entries: Vec<_> = self
             .by_name
             .iter()
-            .map(|((name, _), (ip, stamp))| (*stamp, name.clone(), *ip))
+            .flat_map(|table| table.iter())
+            .map(|(name, (ip, stamp))| (*stamp, name, *ip))
             .collect();
         entries.sort_by_key(|entry| entry.0);
         entries
             .into_iter()
-            .map(|(_, name, ip)| (name, ip))
+            .map(|(_, name, ip)| (name.to_string(), ip))
             .collect()
     }
     /// The next unmapped address, wrapping around the pool.
@@ -180,55 +361,97 @@ impl FakeMap {
 pub struct Resolver {
     pub config: Dns,
     hooks: Hooks,
-    clock: std::sync::Arc<clyntis_protocol::tls::Clock>,
+    clock: Arc<clyntis_protocol::tls::Clock>,
     cache: Mutex<Cache>,
+    proxy_cache: Mutex<Cache>,
+    inflight: Mutex<HashMap<(bool, Vec<u8>), InflightSlot>>,
     fake: Mutex<FakeMap>,
     policy: RwLock<DnsPolicy>,
     /// Whether each nameserver-policy server list answered on this network;
     /// forgotten with the cache when the network changes.
     reachable: Mutex<HashMap<Vec<String>, bool>>,
     tailnet: RwLock<Option<TailnetNames>>,
-    adblock: RwLock<Option<std::sync::Arc<crate::adblock::Filter>>>,
+    adblock: RwLock<Option<Arc<crate::adblock::Filter>>>,
     /// Kept across resource refreshes so counts survive list updates.
-    pub(crate) adblock_stats: std::sync::Arc<crate::adblock::Stats>,
+    pub(crate) adblock_stats: Arc<crate::adblock::Stats>,
     configured: AtomicBool,
 }
 /// MagicDNS names of the running Tailscale proxies.
-pub type TailnetNames = std::sync::Arc<dyn Fn(&str) -> Option<IpAddr> + Send + Sync>;
+pub type TailnetNames = Arc<dyn Fn(&str) -> Option<IpAddr> + Send + Sync>;
 #[derive(Clone, Default)]
 struct DnsPolicy {
-    hosts: std::collections::BTreeMap<String, clyntis_config::Strings>,
+    hosts: HashMap<String, clyntis_config::Strings>,
+    wildcard_hosts: Vec<(clyntis_config::rule::Matcher, clyntis_config::Strings)>,
     nameservers: Vec<(clyntis_config::rule::Matcher, Vec<String>)>,
     filters: Vec<clyntis_config::rule::Matcher>,
+}
+fn compile_hosts(
+    hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>,
+) -> (
+    HashMap<String, clyntis_config::Strings>,
+    Vec<(clyntis_config::rule::Matcher, clyntis_config::Strings)>,
+) {
+    let mut exact = HashMap::new();
+    let mut wildcards = Vec::new();
+    for (key, value) in hosts {
+        if key.contains('*') || key.starts_with('+') {
+            wildcards.push((key, value));
+        } else {
+            exact.insert(key.clone(), value.clone());
+        }
+    }
+    // Longest pattern first (reverse lexicographical tie-break preserves
+    // `BTreeMap::iter().max_by_key(|(k, _)| k.len())`).
+    wildcards.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
+    let wildcard_hosts = wildcards
+        .into_iter()
+        .filter_map(|(key, value)| {
+            clyntis_config::rule::domain_pattern(key)
+                .ok()
+                .map(|matcher| (matcher, value.clone()))
+        })
+        .collect();
+    (exact, wildcard_hosts)
 }
 impl Resolver {
     pub fn new(config: Dns, hooks: Hooks) -> Self {
         Self::new_with_clock(
             config,
             hooks,
-            std::sync::Arc::new(clyntis_protocol::tls::Clock::default()),
+            Arc::new(clyntis_protocol::tls::Clock::default()),
         )
     }
     pub fn new_with_clock(
         config: Dns,
         hooks: Hooks,
-        clock: std::sync::Arc<clyntis_protocol::tls::Clock>,
+        clock: Arc<clyntis_protocol::tls::Clock>,
     ) -> Self {
+        let filters = config
+            .fake_ip_filter
+            .iter()
+            .filter(|p| !p.starts_with("geosite:") && !p.starts_with("rule-set:"))
+            .filter_map(|p| clyntis_config::rule::domain_pattern(p).ok())
+            .collect();
         Self {
             config,
             hooks,
             clock,
-            policy: RwLock::new(DnsPolicy::default()),
+            policy: RwLock::new(DnsPolicy {
+                filters,
+                ..DnsPolicy::default()
+            }),
             reachable: Mutex::new(HashMap::new()),
             tailnet: RwLock::new(None),
             adblock: RwLock::new(None),
             adblock_stats: Default::default(),
             configured: AtomicBool::new(false),
             cache: Mutex::new(Cache::default()),
+            proxy_cache: Mutex::new(Cache::default()),
+            inflight: Mutex::new(HashMap::new()),
             fake: Mutex::new(FakeMap::new(FAKE_CAPACITY)),
         }
     }
-    pub fn clock(&self) -> std::sync::Arc<clyntis_protocol::tls::Clock> {
+    pub fn clock(&self) -> Arc<clyntis_protocol::tls::Clock> {
         self.clock.clone()
     }
     pub(crate) fn is_configured(&self) -> bool {
@@ -299,10 +522,11 @@ impl Resolver {
             .chain(ordered(&self.config.nameserver_policy))
             .map(|(key, value)| Ok((matcher(key, resources)?, value.values())))
             .collect::<Result<Vec<_>>>()?;
-        let mut hosts = hosts.clone();
+        let mut merged_hosts = hosts.clone();
         if let Some(network) = network {
-            hosts.extend(network.hosts.clone());
+            merged_hosts.extend(network.hosts.clone());
         }
+        let (hosts, wildcard_hosts) = compile_hosts(&merged_hosts);
         let filters = self
             .config
             .fake_ip_filter
@@ -311,6 +535,7 @@ impl Resolver {
             .collect::<Result<Vec<_>>>()?;
         *self.policy.write().unwrap() = DnsPolicy {
             hosts,
+            wildcard_hosts,
             nameservers,
             filters,
         };
@@ -326,52 +551,56 @@ impl Resolver {
     pub fn set_tailnet_names(&self, names: Option<TailnetNames>) {
         *self.tailnet.write().unwrap() = names;
     }
-    pub(crate) fn adblock(&self) -> Option<std::sync::Arc<crate::adblock::Filter>> {
+    pub(crate) fn adblock(&self) -> Option<Arc<crate::adblock::Filter>> {
         self.adblock.read().unwrap().clone()
     }
     pub fn set_hosts(&self, hosts: &std::collections::BTreeMap<String, clyntis_config::Strings>) {
-        self.policy.write().unwrap().hosts = hosts.clone();
+        let (exact, wildcard_hosts) = compile_hosts(hosts);
+        let mut policy = self.policy.write().unwrap();
+        policy.hosts = exact;
+        policy.wildcard_hosts = wildcard_hosts;
     }
     fn host_values(&self, host: &str) -> Option<Vec<String>> {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
         let policy = self.policy.read().unwrap();
+        if policy.hosts.is_empty() && policy.wildcard_hosts.is_empty() {
+            return None;
+        }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         if let Some(v) = policy.hosts.get(&host) {
             return Some(v.values());
         }
         policy
-            .hosts
+            .wildcard_hosts
             .iter()
-            .filter(|(key, _)| key.contains('*') || key.starts_with('+'))
-            .filter(|(key, _)| {
-                clyntis_config::rule::domain_pattern(key)
-                    .is_ok_and(|m| m.evaluate(&host, None, 0, "", false) == Some(true))
-            })
-            .max_by_key(|(key, _)| key.len())
+            .find(|(m, _)| m.evaluate(&host, None, 0, "", false) == Some(true))
             .map(|(_, v)| v.values())
     }
     pub async fn lookup_proxy(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-        if self.config.proxy_server_nameserver.is_empty() {
-            return self.lookup(host, port).await;
-        }
-        let mut config = self.config.clone();
-        config.nameserver = config.proxy_server_nameserver.clone();
-        config.nameserver_policy.clear();
-        let resolver = Self::new_with_clock(config, self.hooks.clone(), self.clock.clone());
-        resolver.set_hosts(&self.policy.read().unwrap().hosts);
-        resolver.lookup(host, port).await
+        let proxy = !self.config.proxy_server_nameserver.is_empty();
+        self.lookup_inner(host, port, proxy).await
     }
-    pub fn original(&self, ip: IpAddr) -> Option<String> {
-        self.fake.lock().unwrap().by_ip.get(&ip).cloned()
-    }
-    /// An address from the fake-IP pool with no domain behind it, e.g. one a
-    /// client cached before the core restarted. Dialing it can only time out.
-    pub fn is_unmapped_fake(&self, ip: IpAddr) -> bool {
+    fn is_fake_ip(&self, ip: IpAddr) -> bool {
         self.config.enhanced_mode == "fake-ip"
             && match ip {
                 IpAddr::V4(ip) => self.config.fake_ip_range.contains(&ip),
                 IpAddr::V6(ip) => self.config.fake_ip_range6.contains(&ip),
             }
-            && self.original(ip).is_none()
+    }
+    pub fn original(&self, ip: IpAddr) -> Option<String> {
+        if !self.is_fake_ip(ip) {
+            return None;
+        }
+        self.fake
+            .lock()
+            .unwrap()
+            .by_ip
+            .get(&ip)
+            .map(|name| name.to_string())
+    }
+    /// An address from the fake-IP pool with no domain behind it, e.g. one a
+    /// client cached before the core restarted. Dialing it can only time out.
+    pub fn is_unmapped_fake(&self, ip: IpAddr) -> bool {
+        self.is_fake_ip(ip) && !self.fake.lock().unwrap().by_ip.contains_key(&ip)
     }
     /// Mappings, least recently queried first.
     pub fn export_fake(&self) -> Vec<(String, IpAddr)> {
@@ -385,7 +614,7 @@ impl Resolver {
     pub fn set_fake_capacity(&self, capacity: usize) {
         let mut map = self.fake.lock().unwrap();
         map.capacity = capacity.max(1);
-        while map.by_name.len() > map.capacity {
+        while map.len() > map.capacity {
             map.evict();
         }
     }
@@ -440,13 +669,12 @@ impl Resolver {
                 continue;
             }
             ensure!(
-                !map.by_ip.contains_key(ip)
-                    && !map.by_name.contains_key(&(name.clone(), ip.is_ipv6())),
+                !map.by_ip.contains_key(ip) && !map.contains_name(&name, ip.is_ipv6()),
                 "duplicate saved fake-IP"
             );
-            map.insert(name, *ip);
+            map.insert(Arc::<str>::from(name), *ip);
         }
-        while map.by_name.len() > map.capacity {
+        while map.len() > map.capacity {
             map.evict();
         }
         map.generation = 0;
@@ -467,33 +695,25 @@ impl Resolver {
     }
     pub fn clear_cache(&self) {
         *self.cache.lock().unwrap() = Cache::default();
+        *self.proxy_cache.lock().unwrap() = Cache::default();
         self.reachable.lock().unwrap().clear();
     }
     #[cfg(test)]
     pub(crate) fn seed_test_cache_entry(&self) {
-        let now = Instant::now();
-        let key = b"test.example".to_vec();
-        let response = b"cached-dns-response".to_vec();
-        let size = key.len() + response.len() + CACHE_OVERHEAD;
-        let mut cache = self.cache.lock().unwrap();
-        if let Some(prev) = cache.entries.insert(
-            key,
-            CacheEntry {
-                response,
-                inserted: now,
-                expires: now + Duration::from_secs(60),
-                size,
-            },
-        ) {
-            cache.size = cache.size.saturating_sub(prev.size);
-        }
-        cache.size += size;
+        self.cache.lock().unwrap().insert(
+            b"test.example".to_vec(),
+            b"cached-dns-response".to_vec(),
+            60,
+        );
     }
     #[cfg(test)]
     pub(crate) fn cache_entry_count(&self) -> usize {
         self.cache.lock().unwrap().entries.len()
     }
     pub async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        self.lookup_inner(host, port, false).await
+    }
+    async fn lookup_inner(&self, host: &str, port: u16, proxy: bool) -> Result<Vec<SocketAddr>> {
         let mut host = host.trim_end_matches('.').to_ascii_lowercase();
         // hosts entries come first: a device's LAN address configured for one
         // network wins over its tailnet name (same short name in MagicDNS).
@@ -516,18 +736,20 @@ impl Resolver {
             );
             host = values[0].trim_end_matches('.').to_ascii_lowercase();
         }
-        let tailnet = self.tailnet.read().unwrap().clone();
-        if let Some(ip) = tailnet.and_then(|names| names(&host)) {
-            return Ok(vec![SocketAddr::new(ip, port)]);
+        if !proxy {
+            let tailnet = self.tailnet.read().unwrap().clone();
+            if let Some(ip) = tailnet.and_then(|names| names(&host)) {
+                return Ok(vec![SocketAddr::new(ip, port)]);
+            }
         }
         let host = host.as_str();
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
-        let a = self.records(host, RecordType::A);
+        let a = self.records_in(host, RecordType::A, proxy);
         let aaaa = async {
             if self.config.ipv6 {
-                self.records(host, RecordType::AAAA).await
+                self.records_in(host, RecordType::AAAA, proxy).await
             } else {
                 Ok(vec![])
             }
@@ -580,14 +802,14 @@ impl Resolver {
         }
         Ok(addresses)
     }
-    async fn records(&self, host: &str, kind: RecordType) -> Result<Vec<Record>> {
+    async fn records_in(&self, host: &str, kind: RecordType, proxy: bool) -> Result<Vec<Record>> {
         let query = Query::query(absolute_name(host)?, kind);
         let mut request = Message::new();
         request
             .set_id(uuid::Uuid::new_v4().as_u128() as u16)
             .set_recursion_desired(true)
             .add_query(query);
-        let response = self.cached_exchange(&request).await?;
+        let response = self.cached_exchange_in(&request, proxy).await?;
         tracing::debug!(
             %host,
             record_type = ?kind,
@@ -602,93 +824,99 @@ impl Resolver {
         );
         Ok(response.answers().to_vec())
     }
+    fn cache_store(cache: &Mutex<Cache>, key: Vec<u8>, response: &Message) -> Result<()> {
+        let ttl = cache_ttl(response);
+        if ttl > 0 {
+            // Encoders reserve far more than a typical answer needs.
+            let bytes = response.to_vec()?;
+            cache.lock().unwrap().insert(key, bytes, ttl);
+        }
+        Ok(())
+    }
     async fn cached_exchange(&self, request: &Message) -> Result<Message> {
-        // Keep EDNS, DNSSEC, recursion flags and query class in the cache key.
-        let mut key_request = request.clone();
-        key_request.set_id(0);
-        let key = key_request.to_vec()?;
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some(entry) = cache.entries.get(&key)
-                && entry.expires > Instant::now()
-                && let Ok(mut response) = Message::from_vec(&entry.response)
-            {
-                response.set_id(request.id());
-                let elapsed = entry.inserted.elapsed().as_secs().min(u32::MAX as u64) as u32;
-                for record in response.answers_mut().iter_mut() {
-                    record.set_ttl(record.ttl().saturating_sub(elapsed));
-                }
-                for record in response.name_servers_mut().iter_mut() {
-                    record.set_ttl(record.ttl().saturating_sub(elapsed));
-                }
-                for record in response.additionals_mut().iter_mut() {
-                    record.set_ttl(record.ttl().saturating_sub(elapsed));
-                }
+        self.cached_exchange_in(request, false).await
+    }
+    async fn cached_exchange_in(&self, request: &Message, proxy: bool) -> Result<Message> {
+        let cache = if proxy {
+            &self.proxy_cache
+        } else {
+            &self.cache
+        };
+        let key = cache_key(request)?;
+        loop {
+            if let Some(response) = cache.lock().unwrap().get(&key, request.id()) {
                 return Ok(response);
             }
-        }
-        let response = self.exchange(request).await?;
-        let negative =
-            response.response_code() == ResponseCode::NXDomain || response.answers().is_empty();
-        let ttl = if negative {
-            response
-                .name_servers()
-                .iter()
-                .filter_map(|r| match r.data() {
-                    RData::SOA(soa) => Some(r.ttl().min(soa.minimum())),
-                    _ => None,
-                })
-                .min()
-                .unwrap_or(0)
-        } else {
-            response
-                .answers()
-                .iter()
-                .chain(response.name_servers())
-                .chain(response.additionals())
-                .map(Record::ttl)
-                .min()
-                .unwrap_or(0)
-        }
-        .min(3600);
-        if ttl > 0 && !response.truncated() && answered(&response) {
-            // Encoders reserve far more than a typical answer needs.
-            let mut bytes = response.to_vec()?;
-            bytes.shrink_to_fit();
-            let mut key = key;
-            key.shrink_to_fit();
-            let size = key.len() + bytes.len() + CACHE_OVERHEAD;
-            let mut cache = self.cache.lock().unwrap();
-            cache
-                .entries
-                .retain(|_, entry| entry.expires > Instant::now());
-            cache.entries.remove(&key);
-            cache.size = cache.entries.values().map(|entry| entry.size).sum();
-            while cache.entries.len() >= CACHE_ENTRIES || cache.size + size > CACHE_BYTES {
-                let Some(oldest) = cache
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.inserted)
-                    .map(|(key, _)| key.clone())
-                else {
-                    break;
-                };
-                cache.size -= cache.entries.remove(&oldest).unwrap().size;
+            let inflight_key = (proxy, key.clone());
+            let role = {
+                let mut inflight = self.inflight.lock().unwrap();
+                if let Some(rx) = inflight.get(&inflight_key) {
+                    Err(rx.clone())
+                } else {
+                    // Re-check cache under the inflight lock so a leader that
+                    // just stored into cache and removed its slot cannot race
+                    // with a new caller and trigger a duplicate upstream query.
+                    if let Some(response) = cache.lock().unwrap().get(&key, request.id()) {
+                        return Ok(response);
+                    }
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    inflight.insert(inflight_key.clone(), rx);
+                    Ok(InflightGuard {
+                        map: &self.inflight,
+                        key: Some(inflight_key),
+                        tx: Some(tx),
+                    })
+                }
+            };
+            match role {
+                Ok(guard) => {
+                    let result = if proxy {
+                        self.race(&self.config.proxy_server_nameserver, request)
+                            .await
+                    } else {
+                        self.exchange(request).await
+                    };
+                    match result {
+                        Ok(response) => {
+                            if let Err(error) = Self::cache_store(cache, key, &response) {
+                                guard.finish_err(&error);
+                                return Err(error);
+                            }
+                            guard.finish_ok(&response);
+                            return Ok(response);
+                        }
+                        Err(error) => {
+                            guard.finish_err(&error);
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(mut rx) => loop {
+                    if let Some(result) = rx.borrow_and_update().clone() {
+                        return match result {
+                            Ok(mut response) => {
+                                response.set_id(request.id());
+                                Ok(response)
+                            }
+                            Err(error) => Err(anyhow::anyhow!(error)),
+                        };
+                    }
+                    if rx.changed().await.is_err() {
+                        if let Some(result) = rx.borrow_and_update().clone() {
+                            return match result {
+                                Ok(mut response) => {
+                                    response.set_id(request.id());
+                                    Ok(response)
+                                }
+                                Err(error) => Err(anyhow::anyhow!(error)),
+                            };
+                        }
+                        // Leader was cancelled before finishing; retry.
+                        break;
+                    }
+                },
             }
-            if size <= CACHE_BYTES {
-                cache.entries.insert(
-                    key,
-                    CacheEntry {
-                        response: bytes,
-                        inserted: Instant::now(),
-                        expires: Instant::now() + Duration::from_secs(ttl as u64),
-                        size,
-                    },
-                );
-                cache.size += size;
-            }
         }
-        Ok(response)
     }
     async fn exchange(&self, request: &Message) -> Result<Message> {
         let host = request
@@ -835,10 +1063,23 @@ impl Resolver {
         }
         rejected.ok_or(error)
     }
+    fn first_bootstrap_addr(&self, response: &Message, port: u16) -> Option<SocketAddr> {
+        for r in response.answers() {
+            match r.data() {
+                RData::A(ip) => return Some(SocketAddr::new(IpAddr::V4(ip.0), port)),
+                RData::AAAA(ip) if self.config.ipv6 => {
+                    return Some(SocketAddr::new(IpAddr::V6(ip.0), port));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
     async fn bootstrap(&self, host: &str, port: u16) -> Result<SocketAddr> {
         if let Ok(ip) = host.parse() {
             return Ok(SocketAddr::new(ip, port));
         }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
         for kind in [RecordType::A, RecordType::AAAA] {
             if kind == RecordType::AAAA && !self.config.ipv6 {
                 continue;
@@ -846,7 +1087,15 @@ impl Resolver {
             let mut msg = Message::new();
             msg.set_id(uuid::Uuid::new_v4().as_u128() as u16)
                 .set_recursion_desired(true)
-                .add_query(Query::query(absolute_name(host)?, kind));
+                .add_query(Query::query(absolute_name(&host)?, kind));
+            let key = cache_key(&msg)?;
+            if let Some(cached) = self.cache.lock().unwrap().get(&key, msg.id()) {
+                if let Some(addr) = self.first_bootstrap_addr(&cached, port) {
+                    return Ok(addr);
+                }
+                continue;
+            }
+            let mut negative = None;
             for server in &self.config.default_nameserver {
                 let (raw, default_port) = if let Some(raw) = server.strip_prefix("tls://") {
                     (raw, 853)
@@ -860,16 +1109,17 @@ impl Resolver {
                     continue;
                 };
                 if let Ok(response) = self.raw_udp(SocketAddr::new(ip, addr.port), &msg).await {
-                    for r in response.answers() {
-                        match r.data() {
-                            RData::A(ip) => return Ok(SocketAddr::new(IpAddr::V4(ip.0), port)),
-                            RData::AAAA(ip) if self.config.ipv6 => {
-                                return Ok(SocketAddr::new(IpAddr::V6(ip.0), port));
-                            }
-                            _ => {}
-                        }
+                    if let Some(found) = self.first_bootstrap_addr(&response, port) {
+                        let _ = Self::cache_store(&self.cache, key, &response);
+                        return Ok(found);
+                    }
+                    if answered(&response) && negative.is_none() {
+                        negative = Some(response);
                     }
                 }
+            }
+            if let Some(response) = negative {
+                let _ = Self::cache_store(&self.cache, key, &response);
             }
         }
         anyhow::bail!("DNS bootstrap failed")
@@ -979,21 +1229,23 @@ impl Resolver {
         let socket = clyntis_platform::udp_bind_for(bind, Some(addr), &*self.hooks)?;
         socket.connect(addr).await?;
         let query = request.to_vec()?;
-        let mut bytes = vec![0; 65535];
         // A lost datagram is common on mobile networks: resend after 1 s and
         // 2 s instead of waiting out the whole 3 s on one packet.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             socket.send(&query).await?;
             let resend = (tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline);
-            match tokio::time::timeout_at(resend, socket.recv(&mut bytes)).await {
-                Ok(n) => {
-                    let response = Message::from_vec(&bytes[..n?])?;
-                    validate_response(request, &response)?;
-                    return Ok(response);
+            loop {
+                match tokio::time::timeout_at(resend, socket.readable()).await {
+                    Ok(Ok(())) => match try_recv_dns_message(&socket, request) {
+                        Ok(result) => return result,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e.into()),
+                    },
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) if resend < deadline => break,
+                    Err(elapsed) => return Err(elapsed.into()),
                 }
-                Err(_) if resend < deadline => continue,
-                Err(elapsed) => return Err(elapsed.into()),
             }
         }
     }
@@ -1014,6 +1266,14 @@ impl Resolver {
         let response = Message::from_vec(&bytes)?;
         validate_response(request, &response)?;
         Ok(response)
+    }
+    fn is_fake_ip_excluded(&self, host: &str) -> bool {
+        self.policy
+            .read()
+            .unwrap()
+            .filters
+            .iter()
+            .any(|m| m.evaluate(host, None, 0, "", false) == Some(true))
     }
     pub async fn answer(&self, bytes: &[u8]) -> Result<Vec<u8>> {
         let request = Message::from_vec(bytes)?;
@@ -1061,19 +1321,6 @@ impl Resolver {
             }
             return Ok(response.to_vec()?);
         }
-        let excluded = self
-            .policy
-            .read()
-            .unwrap()
-            .filters
-            .iter()
-            .any(|m| m.evaluate(&host, None, 0, "", false) == Some(true))
-            || self.config.fake_ip_filter.iter().any(|pattern| {
-                host == *pattern
-                    || pattern.strip_prefix("*.").is_some_and(|suffix| {
-                        host == suffix || host.ends_with(&format!(".{suffix}"))
-                    })
-            });
         let mut response = Message::new();
         response
             .set_id(request.id())
@@ -1114,9 +1361,9 @@ impl Resolver {
             return Ok(response.to_vec()?);
         }
         if self.config.enhanced_mode == "fake-ip"
-            && !excluded
             && query.query_class() == DNSClass::IN
             && matches!(query.query_type(), RecordType::A | RecordType::AAAA)
+            && !self.is_fake_ip_excluded(&host)
         {
             if absolute_name(&host).is_err() {
                 response.set_response_code(ResponseCode::FormErr);
@@ -1149,17 +1396,31 @@ impl Resolver {
     pub(crate) fn fake_address(&self, host: &str, v6: bool) -> Result<IpAddr> {
         absolute_name(host).context("unsupported fake-IP hostname")?;
         let mut map = self.fake.lock().unwrap();
-        let key = (host.to_owned(), v6);
-        if let Some(ip) = map.get(&key) {
+        if let Some(ip) = map.get(host, v6) {
             return Ok(ip);
         }
-        if map.by_name.len() >= map.capacity {
+        if map.len() >= map.capacity {
             map.evict();
         }
         let ip = map.allocate(self.config.fake_ip_range, self.config.fake_ip_range6, v6)?;
-        map.insert(key.0, ip);
+        map.insert(Arc::<str>::from(host), ip);
         Ok(ip)
     }
+}
+/// Non-async UDP receive helper keeping the 4 KiB scratch buffer off the
+/// `raw_udp` async future state machine and off the heap.
+fn try_recv_dns_message(
+    socket: &tokio::net::UdpSocket,
+    request: &Message,
+) -> std::io::Result<Result<Message>> {
+    let mut scratch = [std::mem::MaybeUninit::uninit(); 4096];
+    let mut buf = tokio::io::ReadBuf::uninit(&mut scratch);
+    socket.try_recv_buf(&mut buf)?;
+    Ok((|| {
+        let response = Message::from_vec(buf.filled())?;
+        validate_response(request, &response)?;
+        Ok(response)
+    })())
 }
 fn parse_server(server: &str, default: u16) -> Result<Target> {
     if let Ok(ip) = server.parse::<IpAddr>() {
@@ -1187,4 +1448,347 @@ fn validate_response(request: &Message, response: &Message) -> Result<()> {
         "DNS response mismatch"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use hickory_proto::rr::rdata::SOA;
+    use std::sync::atomic::AtomicUsize;
+
+    fn make_query(name: &str, id: u16, kind: RecordType) -> Message {
+        let mut msg = Message::new();
+        msg.set_id(id)
+            .set_recursion_desired(true)
+            .add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
+        msg
+    }
+
+    #[tokio::test]
+    async fn singleflight_coalesces_concurrent_misses_and_recovers_on_cancel() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = udp.local_addr().unwrap().to_string();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_server = hits.clone();
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let udp = Arc::new(udp);
+                let mut buf = [0u8; 4096];
+                loop {
+                    let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                    let mut reply = Message::from_vec(&buf[..n]).unwrap();
+                    hits_server.fetch_add(1, Ordering::SeqCst);
+                    let qname = reply.queries()[0].name().clone();
+                    reply
+                        .set_message_type(MessageType::Response)
+                        .set_recursion_available(true);
+                    reply.add_answer(Record::from_rdata(
+                        qname,
+                        60,
+                        RData::A(A("192.0.2.55".parse().unwrap())),
+                    ));
+                    let udp = udp.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        let _ = udp.send_to(&reply.to_vec().unwrap(), peer).await;
+                    });
+                }
+            }));
+            let resolver = Arc::new(Resolver::new(
+                Dns {
+                    nameserver: vec![address],
+                    enhanced_mode: "redir-host".into(),
+                    ipv6: false,
+                    ..Dns::default()
+                },
+                Arc::new(clyntis_platform::DefaultHooks),
+            ));
+
+            // 4 concurrent misses with different IDs coalesce into 1 upstream query.
+            let mut tasks = Vec::new();
+            for id in 10..14u16 {
+                let r = resolver.clone();
+                tasks.push(tokio::spawn(async move {
+                    let req = make_query("coalesce.test", id, RecordType::A)
+                        .to_vec()
+                        .unwrap();
+                    let raw = r.answer(&req).await.unwrap();
+                    (id, Message::from_vec(&raw).unwrap())
+                }));
+            }
+            for task in tasks {
+                let (expected_id, reply) = task.await.unwrap();
+                assert_eq!(reply.id(), expected_id);
+                assert_eq!(
+                    reply.answers()[0].data(),
+                    &RData::A(A("192.0.2.55".parse().unwrap()))
+                );
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert!(resolver.inflight.lock().unwrap().is_empty());
+
+            // Leader cancellation frees the inflight slot so follower retries and succeeds.
+            let leader = {
+                let r = resolver.clone();
+                tokio::spawn(async move {
+                    let req = make_query("cancel.test", 20, RecordType::A)
+                        .to_vec()
+                        .unwrap();
+                    r.answer(&req).await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let follower = {
+                let r = resolver.clone();
+                tokio::spawn(async move {
+                    let req = make_query("cancel.test", 21, RecordType::A)
+                        .to_vec()
+                        .unwrap();
+                    r.answer(&req).await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            leader.abort();
+            let reply = Message::from_vec(&follower.await.unwrap().unwrap()).unwrap();
+            assert_eq!(reply.id(), 21);
+            assert_eq!(
+                reply.answers()[0].data(),
+                &RData::A(A("192.0.2.55".parse().unwrap()))
+            );
+            assert!(resolver.inflight.lock().unwrap().is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn nodata_without_soa_caches_with_fallback_ttl() {
+        let mut nodata = Message::new();
+        nodata
+            .set_message_type(MessageType::Response)
+            .set_response_code(ResponseCode::NoError);
+        assert_eq!(cache_ttl(&nodata), NEGATIVE_FALLBACK_TTL);
+
+        let mut nodata_zero_soa = nodata.clone();
+        nodata_zero_soa.add_name_server(Record::from_rdata(
+            Name::from_ascii("test.").unwrap(),
+            60,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns.test.").unwrap(),
+                Name::from_ascii("host.test.").unwrap(),
+                1,
+                60,
+                60,
+                60,
+                0,
+            )),
+        ));
+        assert_eq!(cache_ttl(&nodata_zero_soa), 0);
+
+        let mut servfail = Message::new();
+        servfail
+            .set_message_type(MessageType::Response)
+            .set_response_code(ResponseCode::ServFail);
+        assert_eq!(cache_ttl(&servfail), 0);
+
+        // End-to-end: second lookup of an IPv4-only host hits cached NODATA AAAA.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = udp.local_addr().unwrap().to_string();
+            let aaaa_hits = Arc::new(AtomicUsize::new(0));
+            let aaaa_server = aaaa_hits.clone();
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                    let mut reply = Message::from_vec(&buf[..n]).unwrap();
+                    let query = reply.queries()[0].clone();
+                    reply
+                        .set_message_type(MessageType::Response)
+                        .set_response_code(ResponseCode::NoError);
+                    if query.query_type() == RecordType::A {
+                        reply.add_answer(Record::from_rdata(
+                            query.name().clone(),
+                            60,
+                            RData::A(A("192.0.2.77".parse().unwrap())),
+                        ));
+                    } else if query.query_type() == RecordType::AAAA {
+                        aaaa_server.fetch_add(1, Ordering::SeqCst);
+                        // Empty answers, no authority SOA (NODATA).
+                    }
+                    udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                }
+            }));
+            let resolver = Resolver::new(
+                Dns {
+                    nameserver: vec![address],
+                    ipv6: true,
+                    ..Dns::default()
+                },
+                Arc::new(clyntis_platform::DefaultHooks),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    resolver.lookup("v4only.test", 443).await.unwrap(),
+                    vec!["192.0.2.77:443".parse::<SocketAddr>().unwrap()]
+                );
+            }
+            assert_eq!(aaaa_hits.load(Ordering::SeqCst), 1);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn cache_tracks_total_bytes_incrementally() {
+        let sum = |cache: &Cache| -> usize { cache.entries.values().map(|e| e.size).sum() };
+        let mut cache = Cache::default();
+        assert_eq!(cache.total_bytes, 0);
+
+        // Insert and overwrite with different payload sizes.
+        cache.insert(b"k1".to_vec(), vec![1u8; 100], 60);
+        assert_eq!(cache.total_bytes, sum(&cache));
+        cache.insert(b"k1".to_vec(), vec![2u8; 250], 60);
+        assert_eq!(cache.total_bytes, sum(&cache));
+        cache.insert(b"k2".to_vec(), vec![3u8; 150], 60);
+        assert_eq!(cache.total_bytes, sum(&cache));
+
+        // Lazy expiry on get decrements total_bytes.
+        cache.entries.get_mut(b"k2".as_slice()).unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
+        assert!(cache.get(b"k2", 1).is_none());
+        assert!(!cache.entries.contains_key(b"k2".as_slice()));
+        assert_eq!(cache.total_bytes, sum(&cache));
+
+        // Prune expired and byte-limit eviction maintain exact total_bytes.
+        let big = vec![0u8; 64 * 1024];
+        for i in 0..24u32 {
+            cache.insert(format!("big-{i}").into_bytes(), big.clone(), 60);
+            assert!(cache.total_bytes <= CACHE_BYTES);
+            assert_eq!(cache.total_bytes, sum(&cache));
+        }
+        for entry in cache.entries.values_mut() {
+            entry.expires = Instant::now() - Duration::from_secs(1);
+        }
+        cache.prune_expired(Instant::now());
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn lookup_proxy_and_bootstrap_use_caches() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = udp.local_addr().unwrap().to_string();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_server = hits.clone();
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                    let mut reply = Message::from_vec(&buf[..n]).unwrap();
+                    hits_server.fetch_add(1, Ordering::SeqCst);
+                    let qname = reply.queries()[0].name().clone();
+                    reply.set_message_type(MessageType::Response);
+                    reply.add_answer(Record::from_rdata(
+                        qname,
+                        60,
+                        RData::A(A("192.0.2.88".parse().unwrap())),
+                    ));
+                    udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                }
+            }));
+            let resolver = Resolver::new(
+                Dns {
+                    nameserver: vec!["127.0.0.1:1".into()],
+                    proxy_server_nameserver: vec![address.clone()],
+                    default_nameserver: vec![address],
+                    ipv6: false,
+                    ..Dns::default()
+                },
+                Arc::new(clyntis_platform::DefaultHooks),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    resolver.lookup_proxy("node.proxy.test", 443).await.unwrap(),
+                    vec!["192.0.2.88:443".parse::<SocketAddr>().unwrap()]
+                );
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(resolver.cache.lock().unwrap().entries.len(), 0);
+            assert_eq!(resolver.proxy_cache.lock().unwrap().entries.len(), 1);
+
+            for _ in 0..2 {
+                assert_eq!(
+                    resolver.bootstrap("doh.bootstrap.test", 443).await.unwrap(),
+                    "192.0.2.88:443".parse::<SocketAddr>().unwrap()
+                );
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert_eq!(resolver.cache.lock().unwrap().entries.len(), 1);
+
+            resolver.clear_cache();
+            assert_eq!(resolver.cache.lock().unwrap().entries.len(), 0);
+            assert_eq!(resolver.proxy_cache.lock().unwrap().entries.len(), 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn wildcard_hosts_fake_map_arc_and_original_fast_path() {
+        let mut config = Dns::default();
+        config.enhanced_mode = "redir-host".into();
+        let redir = Resolver::new(config, Arc::new(clyntis_platform::DefaultHooks));
+        let ip = redir.fake_address("shared.test", false).unwrap();
+        // Fast path skips fake map when enhanced_mode != "fake-ip".
+        assert_eq!(redir.original(ip), None);
+
+        let resolver = Resolver::new(Dns::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let fake_ip = resolver.fake_address("shared.test", false).unwrap();
+        assert_eq!(
+            resolver.fake_address("shared.test", false).unwrap(),
+            fake_ip
+        );
+        assert_eq!(resolver.original(fake_ip).as_deref(), Some("shared.test"));
+        assert_eq!(resolver.original("1.1.1.1".parse().unwrap()), None);
+        {
+            let map = resolver.fake.lock().unwrap();
+            let (name_key, _) = map.by_name[0].get_key_value("shared.test").unwrap();
+            let ip_val = map.by_ip.get(&fake_ip).unwrap();
+            assert!(Arc::ptr_eq(name_key, ip_val));
+        }
+
+        let mut hosts = std::collections::BTreeMap::new();
+        hosts.insert(
+            "+.example.test".into(),
+            clyntis_config::Strings::One("192.0.2.1".into()),
+        );
+        hosts.insert(
+            "+.sub.example.test".into(),
+            clyntis_config::Strings::One("192.0.2.2".into()),
+        );
+        hosts.insert(
+            "exact.sub.example.test".into(),
+            clyntis_config::Strings::One("192.0.2.3".into()),
+        );
+        resolver
+            .configure(&hosts, None, &crate::resources::Resources::default())
+            .unwrap();
+        assert_eq!(
+            resolver.host_values("a.example.test"),
+            Some(vec!["192.0.2.1".into()])
+        );
+        assert_eq!(
+            resolver.host_values("a.sub.example.test"),
+            Some(vec!["192.0.2.2".into()])
+        );
+        assert_eq!(
+            resolver.host_values("exact.sub.example.test"),
+            Some(vec!["192.0.2.3".into()])
+        );
+        assert!(resolver.is_fake_ip_excluded("localhost"));
+        assert!(resolver.is_fake_ip_excluded("printer.local"));
+        assert!(!resolver.is_fake_ip_excluded("example.com"));
+    }
 }

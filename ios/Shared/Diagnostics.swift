@@ -9,16 +9,25 @@ enum Diagnostics {
     static let app = DiagnosticLog(category: "app")
     static let tunnel = DiagnosticLog(category: "tunnel")
 
-    /// Moves buffered core log lines into the shared log file.
+    private struct CoreLogLine: Decodable {
+        let time: Double?
+        let type: String?
+        let payload: String
+    }
+
+    /// Moves buffered core log lines into the shared log file in a single batched write.
     static func collectCoreLogs() {
         guard let data = try? CoreSession.drainLogs(), !data.isEmpty else { return }
+        let decoder = JSONDecoder()
+        let now = Date()
+        var records: [LogFile.Record] = []
         for line in data.split(separator: UInt8(ascii: "\n")) {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  let message = object["payload"] as? String else { continue }
-            let date = (object["time"] as? Double).map(Date.init(timeIntervalSince1970:)) ?? Date()
-            LogFile.shared.append(level: object["type"] as? String ?? "info", source: "core",
-                                  message: message, date: date)
+            guard let entry = try? decoder.decode(CoreLogLine.self, from: line) else { continue }
+            let date = entry.time.map(Date.init(timeIntervalSince1970:)) ?? now
+            records.append(LogFile.Record(level: entry.type ?? "info", source: "core",
+                                          message: entry.payload, date: date))
         }
+        LogFile.shared.appendBatch(records)
     }
 
     /// Localized text plus NSError domain/code, which identify system failures

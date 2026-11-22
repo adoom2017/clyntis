@@ -1142,3 +1142,88 @@ fn output_above_the_retry_cache_limit_still_reports_its_length() {
     assert_eq!(length, SNAPSHOT_CACHE_LIMIT + 1);
     assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_none()));
 }
+
+#[test]
+fn snapshot_config_is_lightweight_and_omits_rules_and_secrets() {
+    let config = concat!(
+        "mixed-port: 7890\n",
+        "log-level: warning\n",
+        "authentication: ['user:secret']\n",
+        "proxies:\n",
+        "  - {name: node, type: vless, server: example.com, port: 443, uuid: '11111111-1111-4111-8111-111111111111'}\n",
+        "proxy-groups:\n",
+        "  - {name: Auto, type: select, proxies: [node, DIRECT]}\n",
+        "rules:\n",
+        "  - DOMAIN,example.com,Auto\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let id = create(config.as_bytes(), std::ptr::null());
+    let snap = snapshot(id);
+    assert_eq!(snap["config"]["mode"], "rule");
+    assert_eq!(snap["config"]["log-level"], "warning");
+    assert_eq!(snap["config"]["mixed-port"], 7890);
+    assert_eq!(snap["config"]["proxy-groups"][0]["name"], "Auto");
+    assert_eq!(snap["config"]["proxies"][0]["name"], "node");
+    assert!(snap["config"].get("rules").is_none());
+    assert!(snap["config"].get("authentication").is_none());
+    assert!(snap["config"].get("dns").is_none());
+    assert_eq!(meta_destroy_v1(id), OK);
+}
+
+#[test]
+fn validate_config_checks_yaml_without_creating_a_core_handle() {
+    let valid = b"mode: rule\nrules: ['MATCH,DIRECT']\n";
+    assert_eq!(
+        unsafe { meta_validate_config_v1(valid.as_ptr(), valid.len()) },
+        OK
+    );
+
+    for invalid in [
+        &b""[..],
+        &b"not: [valid"[..],
+        &b"unknown-field: true\n"[..],
+        &b"proxies: [{name: bad, type: socks5}]\n"[..],
+    ] {
+        assert_eq!(
+            unsafe { meta_validate_config_v1(invalid.as_ptr(), invalid.len()) },
+            ERROR
+        );
+        let err = ERROR_TEXT.with(|text| text.borrow().clone());
+        assert!(!err.is_empty());
+    }
+    assert_eq!(
+        unsafe { meta_validate_config_v1(std::ptr::null(), 4) },
+        ERROR
+    );
+}
+
+#[test]
+fn packet_io_does_not_clear_pending_output_and_records_errors() {
+    let id = create(b"tun: {enable: true}\n", std::ptr::null());
+
+    let mut length = 0;
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        unsafe { meta_mitm_generate_ca_v1(tiny.as_mut_ptr(), tiny.len(), &mut length) },
+        BUFFER_TOO_SMALL
+    );
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_some()));
+
+    // Packet calls use packet_boundary and leave PENDING_OUTPUT untouched.
+    let mut read_len = 0;
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        unsafe { meta_read_packet_v1(id, buf.as_mut_ptr(), buf.len(), &mut read_len) },
+        WOULD_BLOCK
+    );
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_some()));
+    assert_eq!(
+        unsafe { meta_write_packet_v1(id, b"short".as_ptr(), 5) },
+        ERROR
+    );
+    assert!(ERROR_TEXT.with(|text| text.borrow().contains("invalid IP packet length")));
+    assert!(PENDING_OUTPUT.with(|slot| slot.borrow().is_some()));
+
+    meta_discard_pending_output_v1();
+    assert_eq!(meta_destroy_v1(id), OK);
+}

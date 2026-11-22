@@ -74,11 +74,10 @@ impl Desktop {
         let store = Store::new(root)?;
         let selected = store.selected()?;
         let settings = store.settings()?;
-        let mode = selected
-            .and_then(|id| store.get(id).ok())
-            .map(|p| p.mode)
-            .unwrap_or_else(|| "rule".into());
         let profiles = store.list()?;
+        let mode = selected
+            .and_then(|id| store.mode(id).ok())
+            .unwrap_or_else(|| "rule".into());
         Ok(Self {
             app,
             store,
@@ -104,20 +103,23 @@ impl Desktop {
             subscription_lock: tokio::sync::Mutex::new(()),
         })
     }
-    fn snapshot(&self) -> Result<Snapshot> {
+    fn snapshot_with_logs(&self, include_logs: bool) -> Result<Snapshot> {
         let mut view = self.view.lock().unwrap().clone();
         view.profiles = self.store.list()?;
         view.settings = self.store.settings()?;
         view.selected = self.store.selected()?;
         if let Some(id) = view.selected {
-            view.mode = self.store.get(id)?.mode;
+            view.mode = self.store.mode(id)?;
         }
-        view.logs = self.logs.lock().unwrap().iter().cloned().collect();
+        view.logs = if include_logs {
+            self.logs.lock().unwrap().iter().cloned().collect()
+        } else {
+            Vec::new()
+        };
         Ok(view)
     }
     fn notify(&self) {
-        if let Ok(mut snapshot) = self.snapshot() {
-            snapshot.logs.clear();
+        if let Ok(snapshot) = self.snapshot_with_logs(false) {
             let _ = self.app.emit("state", snapshot);
         }
     }
@@ -593,7 +595,7 @@ impl Desktop {
     pub async fn install_update(
         &self,
         update: tauri_plugin_updater::Update,
-        bytes: Vec<u8>,
+        mut archive: crate::updates::StagedArchive,
     ) -> Result<()> {
         // Keep starts, profile switches and shutdown serialized until replacement finishes.
         let mut op = self.operation.lock().await;
@@ -610,13 +612,18 @@ impl Desktop {
             return Err(error.context("Update cancelled: could not restore network settings; restart Clyntis before retrying"));
         }
         self.exiting.store(true, Ordering::SeqCst);
-        let result = tokio::task::spawn_blocking(move || update.install(bytes)).await;
+        let result = tokio::task::spawn_blocking(move || {
+            let bytes = archive.read_bytes()?;
+            drop(archive);
+            update.install(bytes).map_err(anyhow::Error::from)
+        })
+        .await;
         match result {
             Ok(Ok(())) => self.app.restart(),
             result => {
                 self.exiting.store(false, Ordering::SeqCst);
                 match result {
-                    Ok(Err(error)) => Err(error.into()),
+                    Ok(Err(error)) => Err(error),
                     Err(error) => Err(error.into()),
                     Ok(Ok(())) => unreachable!(),
                 }
@@ -626,8 +633,10 @@ impl Desktop {
 }
 
 #[tauri::command]
-pub fn snapshot(state: State<'_, Desktop>) -> Reply<Snapshot> {
-    state.snapshot().map_err(error)
+pub fn snapshot(state: State<'_, Desktop>, include_logs: Option<bool>) -> Reply<Snapshot> {
+    state
+        .snapshot_with_logs(include_logs.unwrap_or(true))
+        .map_err(error)
 }
 #[tauri::command]
 pub async fn start(state: State<'_, Desktop>) -> Reply<()> {
@@ -869,16 +878,17 @@ pub async fn save_profile(state: State<'_, Desktop>, id: Uuid, yaml: String) -> 
 pub async fn select_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<()> {
     let mut op = state.operation.lock().await;
     let previous = state.store.selected().map_err(error)?;
-    let profile = state.store.get(id).map_err(error)?;
     state.store.select(Some(id)).map_err(error)?;
-    if op.engine.is_some()
-        && let Err(failure) = state
+    if op.engine.is_some() {
+        let profile = state.store.get(id).map_err(error)?;
+        if let Err(failure) = state
             .replace(&mut op, profile, state.store.settings().map_err(error)?)
             .await
-    {
-        state.store.select(previous).map_err(error)?;
-        state.notify();
-        return Err(error(failure));
+        {
+            state.store.select(previous).map_err(error)?;
+            state.notify();
+            return Err(error(failure));
+        }
     }
     state.notify();
     Ok(())
@@ -1276,15 +1286,14 @@ pub async fn background(app: tauri::AppHandle) {
                 && let Ok(profiles) = state.store.list()
             {
                 for summary in profiles {
-                    if summary.pending {
+                    if summary.pending
+                        || !summary.subscription
+                        || clyntis_desktop_model::now().saturating_sub(summary.last_checked)
+                            < u64::from(hours) * 3600
+                    {
                         continue;
                     }
-                    if let Ok(profile) = state.store.get(summary.id)
-                        && profile.url.is_some()
-                        && clyntis_desktop_model::now().saturating_sub(profile.last_checked)
-                            >= u64::from(hours) * 3600
-                        && let Err(error) = state.update(profile.id).await
-                    {
+                    if let Err(error) = state.update(summary.id).await {
                         state.report(&error);
                     }
                 }

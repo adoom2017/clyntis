@@ -142,7 +142,7 @@ final class AppModel {
             if !skipped.isEmpty { log.warning("connect: \(skipped.count) custom rule(s) skipped for this profile") }
             step = "validate configuration"
             log.info("connect: \(step) (\(bytes.count) bytes)")
-            try await validate(bytes, directory: store.directory(for: selected.id))
+            try await validate(bytes)
             // The tunnel reads cached resources at startup and downloads missing
             // data after connecting, then applies it without reconnecting.
             Diagnostics.collectCoreLogs()
@@ -329,9 +329,8 @@ final class AppModel {
 
     private func add(name: String, configuration: Data, in store: ProfileStore) async throws {
         let profile = try await Task.detached {
-            try store.add(name: name, configuration: configuration) { bytes, directory in
-                let session = try CoreSession(configuration: bytes, directory: directory)
-                session.close()
+            try store.add(name: name, configuration: configuration) { bytes, _ in
+                try CoreSession.validate(configuration: bytes)
             }
         }.value
         profiles = try store.profiles()
@@ -542,8 +541,8 @@ final class AppModel {
         guard let store else { throw ClientError.message(L("配置存储不可用。")) }
         let data = Data(text.utf8)
         try await Task.detached {
-            _ = try store.replaceConfiguration(profile.id, with: data) { bytes, directory in
-                try CoreSession(configuration: bytes, directory: directory).close()
+            _ = try store.replaceConfiguration(profile.id, with: data) { bytes, _ in
+                try CoreSession.validate(configuration: bytes)
             }
         }.value
         Diagnostics.app.info("profile \(profile.id.uuidString): configuration edited (\(data.count) bytes)")
@@ -563,18 +562,17 @@ final class AppModel {
         let body = try await RemoteConfigImporter.download(from: url, encrypted: !password.isEmpty)
         try await Task.detached {
             let plaintext = try RemoteConfigImporter.plaintext(body, password: password)
-            _ = try store.replaceConfiguration(profile.id, with: plaintext) { bytes, directory in
-                try CoreSession(configuration: bytes, directory: directory).close()
+            _ = try store.replaceConfiguration(profile.id, with: plaintext) { bytes, _ in
+                try CoreSession.validate(configuration: bytes)
             }
         }.value
         Diagnostics.app.info("profile \(profile.id.uuidString): updated from \(url.host ?? "link") (\(body.count) bytes)")
         profiles = try store.profiles()
     }
 
-    private func validate(_ data: Data, directory: URL) async throws {
+    private func validate(_ data: Data) async throws {
         try await Task.detached {
-            let session = try CoreSession(configuration: data, directory: directory)
-            session.close()
+            try CoreSession.validate(configuration: data)
         }.value
     }
 
@@ -693,32 +691,94 @@ final class AppModel {
         }
     }
 
+    private struct CoreSnapshot: Decodable {
+        struct Config: Decodable {
+            struct Group: Decodable {
+                let name: String
+                let type: String?
+                let proxies: [String]
+            }
+            struct Proxy: Decodable {
+                let name: String
+            }
+            let mode: String?
+            let proxyGroups: [Group]?
+            let proxies: [Proxy]?
+
+            private enum CodingKeys: String, CodingKey {
+                case mode
+                case proxyGroups = "proxy-groups"
+                case proxies
+            }
+        }
+
+        struct Network: Decodable {
+            let defined: Bool?
+            let networks: [String]?
+        }
+
+        let error: String?
+        let stopped: Bool?
+        let upload: UInt64?
+        let download: UInt64?
+        let connections: [ConnectionInfo]?
+        let selections: [String: String]?
+        let proxies: [String: NodeStatus]?
+        let adblock: AdblockStatus?
+        let mitm: MitmStatus?
+        let rewrite: RewriteStatus?
+        let config: Config?
+        let network: Network?
+
+        private enum CodingKeys: String, CodingKey {
+            case error, stopped, upload, download, connections, selections, proxies, adblock, mitm, rewrite, config, network
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            error = try? container.decodeIfPresent(String.self, forKey: .error)
+            stopped = try? container.decodeIfPresent(Bool.self, forKey: .stopped)
+            upload = try? container.decodeIfPresent(UInt64.self, forKey: .upload)
+            download = try? container.decodeIfPresent(UInt64.self, forKey: .download)
+            connections = try? container.decodeIfPresent([ConnectionInfo].self, forKey: .connections)
+            selections = try? container.decodeIfPresent([String: String].self, forKey: .selections)
+            proxies = try? container.decodeIfPresent([String: NodeStatus].self, forKey: .proxies)
+            adblock = try? container.decodeIfPresent(AdblockStatus.self, forKey: .adblock)
+            mitm = try? container.decodeIfPresent(MitmStatus.self, forKey: .mitm)
+            rewrite = try? container.decodeIfPresent(RewriteStatus.self, forKey: .rewrite)
+            config = try? container.decodeIfPresent(Config.self, forKey: .config)
+            network = try? container.decodeIfPresent(Network.self, forKey: .network)
+        }
+    }
+
     private func applySnapshot(_ data: Data) throws {
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let snapshot: CoreSnapshot
+        do {
+            snapshot = try JSONDecoder().decode(CoreSnapshot.self, from: data)
+        } catch {
             throw ClientError.message(L("无效的内核状态。"))
         }
-        if let error = object["error"] as? String { throw ClientError.message(error) }
-        if object["stopped"] as? Bool == true { throw ClientError.message(L("内核已停止，请重新连接。")) }
-        upload = (object["upload"] as? NSNumber)?.uint64Value ?? 0
-        download = (object["download"] as? NSNumber)?.uint64Value ?? 0
-        connectionCount = (object["connections"] as? [Any])?.count ?? 0
-        connections = ConnectionInfo.decode(object["connections"])
-        adblock = AdblockStatus.decode(object["adblock"])
-        mitm = MitmStatus.decode(object["mitm"])
-        rewrite = RewriteStatus.decode(object["rewrite"])
-        if let config = object["config"] as? [String: Any] {
-            mode = config["mode"] as? String ?? "rule"
-            let selections = object["selections"] as? [String: String] ?? [:]
-            groups = (config["proxy-groups"] as? [[String: Any]] ?? []).compactMap { group in
-                guard let name = group["name"] as? String, let nodes = group["proxies"] as? [String] else { return nil }
-                return ProxyGroup(name: name, type: group["type"] as? String ?? "", nodes: nodes,
-                                  selected: selections[name])
+        if let error = snapshot.error { throw ClientError.message(error) }
+        if snapshot.stopped == true { throw ClientError.message(L("内核已停止，请重新连接。")) }
+        upload = snapshot.upload ?? 0
+        download = snapshot.download ?? 0
+        let decodedConnections = snapshot.connections ?? []
+        connectionCount = decodedConnections.count
+        connections = ConnectionInfo.sorted(decodedConnections)
+        adblock = snapshot.adblock
+        mitm = snapshot.mitm
+        rewrite = snapshot.rewrite
+        if let config = snapshot.config {
+            mode = config.mode ?? "rule"
+            let selections = snapshot.selections ?? [:]
+            groups = (config.proxyGroups ?? []).map { group in
+                ProxyGroup(name: group.name, type: group.type ?? "", nodes: group.proxies,
+                           selected: selections[group.name])
             }
-            proxies = (config["proxies"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
+            proxies = (config.proxies ?? []).map(\.name)
         }
-        nodeStatus = NodeStatus.decode(object["proxies"])
-        let defined = ((object["config"] as? [String: Any])?["networks"] as? [String: Any])?.isEmpty == false
-        currentNetworks = defined ? ((object["network"] as? [String: Any])?["networks"] as? [String] ?? []) : nil
+        nodeStatus = snapshot.proxies ?? [:]
+        currentNetworks = snapshot.network?.defined == true ? (snapshot.network?.networks ?? []) : nil
     }
 }
 

@@ -28,6 +28,11 @@ struct TailscaleStatus: Decodable, Equatable {
     let endpoints: [String]
     let peers: [TailscalePeer]
 
+    private enum CodingKeys: String, CodingKey {
+        case state, error, name, addresses, endpoints, peers
+        case homeDerp = "home_derp"
+    }
+
     var onlinePeers: Int { peers.filter { $0.online == true }.count }
     var directPeers: Int { peers.filter { $0.path == "direct" }.count }
     var stateText: String {
@@ -53,6 +58,12 @@ struct TailscalePeer: Decodable, Equatable, Identifiable {
     let derp: String?
     let exitNode: Bool
 
+    private enum CodingKeys: String, CodingKey {
+        case name, address, os, online, path, direct, derp
+        case rttMs = "rtt_ms"
+        case exitNode = "exit_node"
+    }
+
     var pathText: String {
         switch path {
         case "direct": L("直连") + (rttMs.map { " \($0) ms" } ?? "")
@@ -65,9 +76,7 @@ struct TailscalePeer: Decodable, Equatable, Identifiable {
 extension NodeStatus {
     static func decode(_ object: Any?) -> [String: NodeStatus] {
         guard let object, let data = try? JSONSerialization.data(withJSONObject: object) else { return [:] }
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return (try? decoder.decode([String: NodeStatus].self, from: data)) ?? [:]
+        return (try? JSONDecoder().decode([String: NodeStatus].self, from: data)) ?? [:]
     }
 
     /// Outbounds the core can delay-test (a Tailscale node has no URL test).

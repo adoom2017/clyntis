@@ -239,15 +239,15 @@ fn multiplexed_metadata(bytes: &[u8]) -> Result<MuxMetadata> {
 
 async fn read_multiplexed(mut reader: ReadHalf<BoxStream>, shared: Weak<Shared>) {
     let result = async {
+        let mut header = [0u8; MAX_METADATA];
         loop {
             let length = reader.read_u16().await? as usize;
             ensure!(
                 (4..=MAX_METADATA).contains(&length),
                 "invalid XUDP metadata length"
             );
-            let mut header = vec![0; length];
-            reader.read_exact(&mut header).await?;
-            let metadata = multiplexed_metadata(&header)?;
+            reader.read_exact(&mut header[..length]).await?;
+            let metadata = multiplexed_metadata(&header[..length])?;
             let payload = if metadata.data {
                 let length = reader.read_u16().await? as usize;
                 ensure!(length <= MAX_PAYLOAD, "XUDP payload exceeds limit");
@@ -399,7 +399,8 @@ fn packet(
     global_id: Option<[u8; 8]>,
 ) -> Result<Vec<u8>> {
     ensure!(payload.len() <= MAX_PAYLOAD, "XUDP payload exceeds limit");
-    let mut frame = vec![0, 0];
+    let mut frame = Vec::with_capacity(32 + target.host.len() + payload.len());
+    frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&session_id.to_be_bytes());
     frame.extend_from_slice(&[if first { NEW } else { KEEP }, DATA, UDP]);
     vless::encode_address(target, &mut frame)?;
@@ -472,15 +473,15 @@ impl Datagram for Session {
         let mut reader = self.reader.lock().await;
         ensure!(reader.usable, "XUDP reader interrupted or closed");
         reader.usable = false;
+        let mut header = [0u8; MAX_METADATA];
         for _ in 0..256 {
             let length = reader.stream.read_u16().await? as usize;
             ensure!(
                 (4..=MAX_METADATA).contains(&length),
                 "invalid XUDP metadata length"
             );
-            let mut header = vec![0; length];
-            reader.stream.read_exact(&mut header).await?;
-            let (target, data) = metadata(&header, &self.target)?;
+            reader.stream.read_exact(&mut header[..length]).await?;
+            let (target, data) = metadata(&header[..length], &self.target)?;
             if !data {
                 continue;
             }

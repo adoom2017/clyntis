@@ -93,9 +93,8 @@ enum RemoteConfigImporter {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             let profile = try store.add(name: name.isEmpty ? L("远程配置") : name, configuration: plaintext,
-                                        source: link?.absoluteString, encrypted: encrypted) { bytes, directory in
-                let core = try CoreSession(configuration: bytes, directory: directory)
-                core.close()
+                                        source: link?.absoluteString, encrypted: encrypted) { bytes, _ in
+                try CoreSession.validate(configuration: bytes)
                 try Task.checkCancellation()
             }
             if Task.isCancelled {

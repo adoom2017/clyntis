@@ -429,19 +429,25 @@ pub(crate) struct PacketDevice {
     pub(crate) mtu: usize,
 }
 pub(crate) struct Receive(Vec<u8>);
-pub(crate) struct Transmit(mpsc::OwnedPermit<Vec<u8>>);
+pub(crate) enum Transmit {
+    Reserved(mpsc::OwnedPermit<Vec<u8>>),
+    BestEffort(mpsc::Sender<Vec<u8>>),
+}
 impl Device for PacketDevice {
     type RxToken<'a> = Receive;
     type TxToken<'a> = Transmit;
     fn receive(&mut self, _: NetInstant) -> Option<(Receive, Transmit)> {
-        if self.incoming.is_empty() {
-            return None;
-        }
-        let permit = self.outgoing.clone().try_reserve_owned().ok()?;
-        Some((Receive(self.incoming.pop_front()?), Transmit(permit)))
+        let packet = self.incoming.pop_front()?;
+        // Do not block incoming packets (such as pure TCP ACKs) when `outgoing`
+        // is full; only `transmit` reserves an outgoing slot for egress.
+        Some((Receive(packet), Transmit::BestEffort(self.outgoing.clone())))
     }
     fn transmit(&mut self, _: NetInstant) -> Option<Transmit> {
-        self.outgoing.clone().try_reserve_owned().ok().map(Transmit)
+        self.outgoing
+            .clone()
+            .try_reserve_owned()
+            .ok()
+            .map(Transmit::Reserved)
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
@@ -460,7 +466,14 @@ impl TxToken for Transmit {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut bytes = vec![0; len];
         let result = f(&mut bytes);
-        self.0.send(bytes);
+        match self {
+            Self::Reserved(permit) => {
+                let _ = permit.send(bytes);
+            }
+            Self::BestEffort(sender) => {
+                let _ = sender.try_send(bytes);
+            }
+        }
         result
     }
 }
@@ -580,15 +593,13 @@ fn sniff(bytes: &[u8]) -> Option<(Flow, bool)> {
     let (source_port, target_port, tcp, syn) = match protocol {
         IpProtocol::Tcp => {
             let packet = TcpPacket::new_checked(payload).ok()?;
+            if !packet.syn() || packet.ack() {
+                return None;
+            }
             if !packet.verify_checksum(&source, &target) {
                 return None;
             }
-            (
-                packet.src_port(),
-                packet.dst_port(),
-                true,
-                packet.syn() && !packet.ack(),
-            )
+            (packet.src_port(), packet.dst_port(), true, true)
         }
         IpProtocol::Udp => {
             // The initial fragment may contain only part of a UDP datagram.
@@ -694,26 +705,68 @@ fn checksum(data: &[u8], initial: u32) -> u16 {
     !(sum as u16)
 }
 
-fn hijack_dns(core: &Core, endpoint: IpEndpoint, tcp: bool) -> bool {
-    core.config.tun.dns_hijack.iter().any(|entry| {
-        let entry = if let Some(e) = entry.strip_prefix("tcp://") {
-            if !tcp {
-                return false;
-            }
-            e
-        } else if let Some(e) = entry.strip_prefix("udp://") {
-            if tcp {
-                return false;
-            }
-            e
-        } else {
-            entry
-        };
-        entry == format!("any:{}", endpoint.port) || entry == endpoint.to_string()
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HijackProto {
+    Any,
+    Tcp,
+    Udp,
 }
-async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> Result<()> {
-    if hijack_dns(&core, flow.target, true) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HijackTarget {
+    AnyPort(u16),
+    Endpoint(IpEndpoint),
+}
+#[derive(Clone, Debug, Default)]
+struct DnsHijack {
+    rules: Vec<(HijackProto, HijackTarget)>,
+}
+impl DnsHijack {
+    fn parse(entries: &[String]) -> Self {
+        let mut rules = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (proto, rest) = if let Some(rest) = entry.strip_prefix("tcp://") {
+                (HijackProto::Tcp, rest)
+            } else if let Some(rest) = entry.strip_prefix("udp://") {
+                (HijackProto::Udp, rest)
+            } else {
+                (HijackProto::Any, entry.as_str())
+            };
+            if let Some(port) = rest
+                .strip_prefix("any:")
+                .and_then(|p| p.parse::<u16>().ok())
+            {
+                rules.push((proto, HijackTarget::AnyPort(port)));
+            } else if let Ok(addr) = rest.parse::<std::net::SocketAddr>() {
+                rules.push((
+                    proto,
+                    HijackTarget::Endpoint(IpEndpoint::new(addr.ip().into(), addr.port())),
+                ));
+            }
+        }
+        Self { rules }
+    }
+    fn matches(&self, endpoint: IpEndpoint, tcp: bool) -> bool {
+        self.rules.iter().any(|&(proto, target)| {
+            let proto_ok = match proto {
+                HijackProto::Any => true,
+                HijackProto::Tcp => tcp,
+                HijackProto::Udp => !tcp,
+            };
+            proto_ok
+                && match target {
+                    HijackTarget::AnyPort(port) => endpoint.port == port,
+                    HijackTarget::Endpoint(rule_ep) => rule_ep == endpoint,
+                }
+        })
+    }
+}
+async fn tcp_session(
+    core: Arc<Core>,
+    flow: Flow,
+    hijack: bool,
+    mut stream: ChannelStream,
+) -> Result<()> {
+    if hijack {
         let serve = async {
             for _ in 0..100 {
                 let n = stream.read_u16().await?;
@@ -748,10 +801,23 @@ async fn tcp_session(core: Arc<Core>, flow: Flow, mut stream: ChannelStream) -> 
     let (outbound, name) = core.dial_logged(&target, None, &source).await?;
     core.relay(Box::new(stream), target, outbound, name).await
 }
+#[cfg(test)]
 async fn udp_session(
     core: Arc<Core>,
     flow: Flow,
     generation: u64,
+    input: mpsc::Receiver<Vec<u8>>,
+    output: mpsc::Sender<Reply>,
+    drops: Arc<Drops>,
+) -> Result<()> {
+    let hijack = DnsHijack::parse(&core.config.tun.dns_hijack).matches(flow.target, false);
+    udp_session_with_hijack(core, flow, generation, hijack, input, output, drops).await
+}
+async fn udp_session_with_hijack(
+    core: Arc<Core>,
+    flow: Flow,
+    generation: u64,
+    hijack: bool,
     mut input: mpsc::Receiver<Vec<u8>>,
     output: mpsc::Sender<Reply>,
     drops: Arc<Drops>,
@@ -768,7 +834,7 @@ async fn udp_session(
             drops.reply_full.fetch_add(1, Ordering::Relaxed);
         }
     };
-    if hijack_dns(&core, flow.target, false) {
+    if hijack {
         while let Some(packet) =
             tokio::time::timeout(Budget::for_config(&core.config).dns_idle(), input.recv()).await?
         {
@@ -948,6 +1014,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     // once instead of a new session (and log line) each.
     let mut refused: HashMap<Flow, Instant> = HashMap::new();
     let mut guard = Guard::new(budget);
+    let dns_hijack = DnsHijack::parse(&core.config.tun.dns_hijack);
     loop {
         tokio::select! {
             biased;
@@ -992,10 +1059,11 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                         let (sender, output) = mpsc::channel(budget.tcp_queue);
                         let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
                         let core = core.clone();
-                        let task = tasks.spawn(async move { (flow, 0, tcp_session(core, flow, stream).await) });
+                        let dns = dns_hijack.matches(flow.target, true);
+                        let task = tasks.spawn(async move { (flow, 0, tcp_session(core, flow, dns, stream).await) });
                         tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
                     } else if !flow.tcp && !udp.ports.contains_key(&flow.target) {
-                        let dns = hijack_dns(&core, flow.target, false);
+                        let dns = dns_hijack.matches(flow.target, false);
                         let socket = || {
                             let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; budget.udp_buffer]);
                             let mut socket = udp::Socket::new(buffer(), buffer());
@@ -1026,6 +1094,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
             fragments.expire(last_expiry.into());
+            udp.expire(budget.udp_idle, last_expiry, &mut sockets);
             refused.retain(|_, since| since.elapsed() < REFUSED_FOR);
             if drops_logged.1.elapsed() >= DROPS_LOG_EVERY {
                 let now = drops.snapshot();
@@ -1089,14 +1158,24 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 // Closing the tracked connections misses flows still dialing
                 // and leaves UDP sockets that would invite new sessions.
                 let (udp_sessions, udp_ports) = udp.purge(&mut sockets);
-                for state in tcp_flows.values() {
+                let tcp_count = tcp_flows.len();
+                for (_, state) in tcp_flows.drain() {
                     state.task.abort();
                     sockets.get_mut::<tcp::Socket>(state.handle).abort();
+                    sockets.remove(state.handle);
                 }
+                tcp_flows.shrink_to_fit();
+                device.incoming = VecDeque::new();
+                fragments = ipv6::Reassembly::default();
+                reply = None;
+                finished = None;
+                while tasks.try_join_next().is_some() {}
+                let released = memory::relieve();
                 tracing::warn!(
                     udp_sessions,
                     udp_ports,
-                    tcp_flows = tcp_flows.len(),
+                    tcp_flows = tcp_count,
+                    released_kib = released / 1024,
                     "memory critical; released the TUN's flows"
                 );
             }
@@ -1208,7 +1287,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 refuse(&device, &flow);
                 continue;
             }
-            let dns = !udp.flows.contains_key(&flow) && hijack_dns(&core, flow.target, false);
+            let dns = !udp.flows.contains_key(&flow) && dns_hijack.matches(flow.target, false);
             match udp.admit_session(&flow, dns, guard.refuses_new_flow()) {
                 Ok(false) => {}
                 Ok(true) => {
@@ -1221,8 +1300,10 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     let drops = drops.clone();
                     udp.insert(flow, dns, input, |generation| {
                         tasks.spawn(async move {
-                            let result =
-                                udp_session(core, flow, generation, receiver, replies, drops).await;
+                            let result = udp_session_with_hijack(
+                                core, flow, generation, dns, receiver, replies, drops,
+                            )
+                            .await;
                             (flow, generation, result)
                         })
                     });
@@ -1281,7 +1362,6 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 poll(&mut iface, now(), &mut device, &mut sockets);
             }
         }
-        udp.expire(budget.udp_idle, Instant::now(), &mut sockets);
         poll(&mut iface, now(), &mut device, &mut sockets);
         for handle in retired {
             sockets.remove(handle);
@@ -1292,13 +1372,14 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 Duration::from_micros(delay.total_micros())
             })
             .min(IDLE_WAKE.saturating_sub(last_expiry.elapsed()));
-        if room.capacity() == 0 {
+        if !device.incoming.is_empty() {
+            delay = Duration::ZERO;
+        } else if room.capacity() == 0 {
             // smoltcp has segments to send but the writer's queue is full:
             // its room wakes the loop; spinning on a zero delay would not.
             delay = IDLE_WAKE.saturating_sub(last_expiry.elapsed());
-        } else if !device.incoming.is_empty() || reply.is_some() {
-            // Packets or a reply left over while the writer has room: go on
-            // at once.
+        } else if reply.is_some() {
+            // A reply left over while the writer has room: go on at once.
             delay = Duration::ZERO;
         }
         let mut deadline = Instant::now() + delay;
@@ -1639,5 +1720,56 @@ mod budget_tests {
         // Hijacked DNS flows end quickly in both modes.
         assert_eq!(hosted.dns_idle(), Duration::from_secs(15));
         assert_eq!(Budget::DESKTOP.dns_idle(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn dns_hijack_preparsed_matches_rules() {
+        let rules = DnsHijack::parse(&[
+            "any:53".into(),
+            "tcp://8.8.8.8:853".into(),
+            "udp://[2001:4860:4860::8888]:5353".into(),
+        ]);
+        let v4_53 = IpEndpoint::new("1.1.1.1".parse().unwrap(), 53);
+        let v4_853 = IpEndpoint::new("8.8.8.8".parse().unwrap(), 853);
+        let v6_5353 = IpEndpoint::new("2001:4860:4860::8888".parse().unwrap(), 5353);
+        assert!(rules.matches(v4_53, false));
+        assert!(rules.matches(v4_53, true));
+        assert!(rules.matches(v4_853, true));
+        assert!(!rules.matches(v4_853, false));
+        assert!(rules.matches(v6_5353, false));
+        assert!(!rules.matches(v6_5353, true));
+        assert!(!rules.matches(IpEndpoint::new("1.1.1.1".parse().unwrap(), 443), true));
+    }
+
+    #[test]
+    fn packet_device_receive_succeeds_when_outgoing_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(vec![1, 2, 3]).unwrap();
+        let mut device = PacketDevice {
+            incoming: VecDeque::from([vec![4, 5, 6]]),
+            outgoing: tx,
+            mtu: 1500,
+        };
+        assert!(device.transmit(NetInstant::ZERO).is_none());
+        let (rx_token, tx_token) = device
+            .receive(NetInstant::ZERO)
+            .expect("receive must not block on full outgoing queue");
+        assert_eq!(rx_token.consume(|b| b.to_vec()), vec![4, 5, 6]);
+        tx_token.consume(4, |buf| buf.copy_from_slice(&[9, 8, 7, 6]));
+        assert!(device.incoming.is_empty());
+    }
+
+    #[test]
+    fn sniff_skips_non_syn_tcp_packets() {
+        let mut pkt = ipv4_header([10, 0, 0, 2], [1, 1, 1, 1], 6, 20);
+        // Minimal 20-byte TCP ACK header with intentionally bogus checksum.
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = 0x10; // ACK only
+        tcp[16..18].copy_from_slice(&0xdead_u16.to_be_bytes());
+        pkt.extend_from_slice(&tcp);
+        assert!(sniff(&pkt).is_none());
     }
 }

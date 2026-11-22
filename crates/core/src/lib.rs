@@ -100,8 +100,8 @@ pub struct Core {
 }
 struct Policy {
     mode: Mode,
-    rules: Vec<Rule>,
-    raw_rules: Vec<String>,
+    rules: Arc<[Rule]>,
+    raw_rules: Arc<[String]>,
     selection: HashMap<String, String>,
     delay: HashMap<String, u64>,
     /// The last probe of each proxy: delay or error, and when (Unix seconds).
@@ -332,7 +332,7 @@ impl Running {
         Ok(())
     }
     pub async fn shutdown(mut self) {
-        if self.core.save_profile().is_err() {
+        if self.core.save_profile_async().await.is_err() {
             tracing::warn!("cannot save profile");
         }
         self.core.stop.cancel();
@@ -382,8 +382,8 @@ impl Core {
             .collect::<Result<Vec<_>>>()?;
         let policy = Policy {
             mode: config.mode.clone(),
-            raw_rules: config.rules.clone(),
-            rules,
+            raw_rules: Arc::from(config.rules.clone()),
+            rules: Arc::from(rules),
             selection,
             delay: HashMap::new(),
             probes: HashMap::new(),
@@ -534,7 +534,19 @@ impl Core {
         }
         if self.config.profile.store_fake_ip || self.config.profile.store_selected {
             let core = self.clone();
-            tasks.spawn(async move{let mut interval=tokio::time::interval(Duration::from_secs(5));loop{tokio::select!{_=core.stop.cancelled()=>break,_=interval.tick()=>{if core.save_profile().is_err(){tracing::warn!("cannot save profile");}}}}});
+            tasks.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        _ = interval.tick() => {
+                            if core.save_profile_async().await.is_err() {
+                                tracing::warn!("cannot save profile");
+                            }
+                        }
+                    }
+                }
+            });
         }
         if let Some(packets) = packets {
             let core = self.clone();
@@ -837,7 +849,7 @@ impl Core {
     /// Whether the referenced routing files are present and current.
     pub fn resource_freshness(&self) -> Result<Freshness> {
         let mut config = self.config.clone();
-        config.rules = self.policy.read().unwrap().raw_rules.clone();
+        config.rules = self.policy.read().unwrap().raw_rules.to_vec();
         resources::freshness(&config)
     }
     pub async fn prepare_resources(&self, refresh: bool) -> Result<()> {
@@ -850,7 +862,7 @@ impl Core {
     async fn prepare_resources_with(&self, refresh: bool, mode: resources::LoadMode) -> Result<()> {
         let _loading = self.resource_loading.lock().await;
         let mut config = self.config.clone();
-        config.rules = self.policy.read().unwrap().raw_rules.clone();
+        config.rules = self.policy.read().unwrap().raw_rules.to_vec();
         let previous = self.resources.read().unwrap().clone();
         let next = Arc::new(
             resources::Resources::load_with(
@@ -891,7 +903,7 @@ impl Core {
                 .unwrap_or_default(),
         );
         self.mark_networks(&rules);
-        policy.rules = rules;
+        policy.rules = Arc::from(rules);
         *resources = next_with_geo;
         Ok(())
     }
@@ -941,7 +953,11 @@ impl Core {
         }
         let (mode, rules, raw_rules) = {
             let p = self.policy.read().unwrap();
-            (p.mode.clone(), p.rules.clone(), p.raw_rules.clone())
+            (
+                p.mode.clone(),
+                Arc::clone(&p.rules),
+                Arc::clone(&p.raw_rules),
+            )
         };
         if mode == Mode::Direct {
             return Ok(Trace::new("DIRECT", "DIRECT", "Mode(Direct)", None));
@@ -958,7 +974,7 @@ impl Core {
         let mut resolved = ip.is_some();
         let mut looked_up = false;
         let host = target.host.trim_end_matches('.').to_ascii_lowercase();
-        for (index, rule) in rules.into_iter().enumerate() {
+        for (index, rule) in rules.iter().enumerate() {
             let matched = rule.matcher.evaluate(
                 &host,
                 ip,
@@ -1048,8 +1064,8 @@ impl Core {
     pub fn set_mode(&self, mode: Mode) {
         self.policy.write().unwrap().mode = mode;
     }
-    pub fn replace_rules(&self, rules: Vec<String>) -> Result<()> {
-        self.update_policy(None, Some(rules))
+    pub fn replace_rules(&self, rules: impl AsRef<[String]>) -> Result<()> {
+        self.update_policy(None, Some(rules.as_ref().to_vec()))
     }
     pub fn update_policy(&self, mode: Option<Mode>, rules: Option<Vec<String>>) -> Result<()> {
         let update_rules = rules.is_some();
@@ -1057,7 +1073,7 @@ impl Core {
         if let Some(rules) = rules {
             cfg.rules = rules;
         } else {
-            cfg.rules = self.policy.read().unwrap().raw_rules.clone();
+            cfg.rules = self.policy.read().unwrap().raw_rules.to_vec();
         }
         if let Some(mode) = &mode {
             cfg.mode = mode.clone();
@@ -1083,8 +1099,8 @@ impl Core {
                 *resources = next_resources;
             }
             self.mark_networks(&rules);
-            policy.rules = rules;
-            policy.raw_rules = cfg.rules;
+            policy.rules = Arc::from(rules);
+            policy.raw_rules = Arc::from(cfg.rules);
             if resources.incomplete() {
                 self.resource_notify.notify_one();
             }
@@ -1098,8 +1114,18 @@ impl Core {
         let mut config = serde_json::to_value(&self.config).unwrap();
         let policy = self.policy.read().unwrap();
         config["mode"] = serde_json::to_value(&policy.mode).unwrap();
-        config["rules"] = serde_json::to_value(&policy.raw_rules).unwrap();
+        config["rules"] = serde_json::to_value(policy.raw_rules.as_ref()).unwrap();
         config
+    }
+    /// Lightweight configuration subset for FFI snapshots: avoids serializing
+    /// thousands of rules, hosts, and DNS sections on every poll.
+    pub fn snapshot_config(&self) -> serde_json::Value {
+        let mode = self.policy.read().unwrap().mode.clone();
+        serde_json::json!({
+            "mode": mode,
+            "proxy-groups": &self.config.proxy_groups,
+            "proxies": &self.config.proxies,
+        })
     }
     pub fn selections(&self) -> HashMap<String, String> {
         self.policy.read().unwrap().selection.clone()
@@ -1785,12 +1811,7 @@ impl Core {
     /// and the number of open connections through it.
     pub fn proxy_status(&self) -> serde_json::Map<String, serde_json::Value> {
         use serde_json::json;
-        let mut open: HashMap<String, usize> = HashMap::new();
-        for connection in self.connections() {
-            for name in &connection.chains {
-                *open.entry(name.clone()).or_default() += 1;
-            }
-        }
+        let open = self.traffic.lock().unwrap().active_chain_counts();
         let probes = self.policy.read().unwrap().probes.clone();
         let nodes = self.tailscale.lock().unwrap().clone();
         let mut out = serde_json::Map::new();
@@ -1881,11 +1902,7 @@ impl Core {
     }
     /// Cancels every proxied connection; returns how many.
     pub fn close_connections(&self) -> usize {
-        let connections = self.connections();
-        for connection in &connections {
-            connection.cancel.cancel();
-        }
-        connections.len()
+        self.traffic.lock().unwrap().cancel_all()
     }
     pub fn close_connection(&self, id: &str) {
         if let Some(cancel) = self.traffic.lock().unwrap().active_cancel(id) {
@@ -1899,6 +1916,7 @@ impl Core {
         self.mitm.relieve_memory();
         self.requests.relieve_memory();
         self.scripts.relieve_memory();
+        self.traffic.lock().unwrap().relieve_memory();
         if include_network {
             self.resolver.clear_cache();
             clyntis_protocol::tls::clear_caches();
@@ -1989,9 +2007,7 @@ impl Core {
         })
     }
     pub async fn network_changed(&self) {
-        for connection in self.connections() {
-            connection.cancel.cancel();
-        }
+        self.close_connections();
         // Multiplexed transports outlive the cancelled connections: new
         // streams on them would stall until the dead link timed out (30 s
         // for Hysteria2, TCP keepalive for gRPC).
@@ -2088,6 +2104,15 @@ impl Core {
         Ok(elapsed)
     }
 }
+fn try_recv_datagram(
+    socket: &tokio::net::UdpSocket,
+    target: &Target,
+) -> std::io::Result<(Target, Vec<u8>)> {
+    let mut scratch = [std::mem::MaybeUninit::<u8>::uninit(); 65535];
+    let mut buf = tokio::io::ReadBuf::uninit(&mut scratch);
+    socket.try_recv_buf(&mut buf)?;
+    Ok((target.clone(), buf.filled().to_vec()))
+}
 struct DirectUdp {
     socket: tokio::net::UdpSocket,
     target: Target,
@@ -2102,12 +2127,12 @@ impl Datagram for DirectUdp {
     async fn recv(&self) -> Result<(Target, Vec<u8>)> {
         // Copy out exactly the datagram: a truncated 64 KiB Vec keeps its full
         // capacity while queued for the TUN, which multiplied memory under
-        // QUIC-heavy direct traffic. The scratch buffer exists only per read.
+        // QUIC-heavy direct traffic. Reading in a non-async helper keeps the
+        // stack scratch buffer off the async future state and off the heap.
         loop {
             self.socket.readable().await?;
-            let mut scratch = vec![0; 65535];
-            match self.socket.try_recv(&mut scratch) {
-                Ok(n) => return Ok((self.target.clone(), scratch[..n].to_vec())),
+            match try_recv_datagram(&self.socket, &self.target) {
+                Ok(datagram) => return Ok(datagram),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(error) => return Err(error.into()),
             }

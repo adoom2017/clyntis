@@ -10,7 +10,7 @@ use clyntis_config::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex, Weak,
@@ -42,6 +42,14 @@ const HOSTED_LIMITS: PatternLimits = PatternLimits {
     bucket_cache_limit: 24,
     rule_cache_limit: 32,
 };
+
+const fn pattern_limits(hosted: bool) -> PatternLimits {
+    if hosted {
+        HOSTED_LIMITS
+    } else {
+        DESKTOP_LIMITS
+    }
+}
 
 /// One module as loaded, for status displays.
 #[derive(Clone, Debug, Serialize)]
@@ -148,9 +156,10 @@ struct CompiledRules {
 
 #[derive(Default)]
 struct MatcherCache {
+    tick: u64,
     global: Option<Arc<CompiledBucket>>,
-    hosts: HashMap<String, Arc<CompiledBucket>>,
-    rule_extras: HashMap<usize, Arc<RuleRuntime>>,
+    hosts: HashMap<String, (u64, Arc<CompiledBucket>)>,
+    rule_extras: HashMap<usize, (u64, Arc<RuleRuntime>)>,
 }
 
 struct CompiledBucket {
@@ -1048,6 +1057,50 @@ fn extract_required_host_suffix(pattern: &str) -> Option<String> {
     is_valid_dns_suffix(candidate).then(|| candidate.to_owned())
 }
 
+/// Cached per-rule validation results (`Ok(batchable)` or `Err((line, text))`)
+/// for a single [`Module`] under a specific `hosted` limit profile, so update
+/// checks and [`Rewriter::new_hosted_with_validations`] validate each rule at
+/// most once.
+pub(crate) struct RuleValidations {
+    hosted: bool,
+    results: Vec<Option<Result<bool, (usize, String)>>>,
+}
+
+impl RuleValidations {
+    pub(crate) fn new(rule_count: usize, hosted: bool) -> Self {
+        Self {
+            hosted,
+            results: vec![None; rule_count],
+        }
+    }
+
+    fn validate(
+        &mut self,
+        index: usize,
+        rule: &clyntis_config::rewrite::Rule,
+    ) -> Result<bool, (usize, String)> {
+        if let Some(Some(cached)) = self.results.get(index) {
+            return cached.clone();
+        }
+        let outcome = validate_rule_ref(rule, pattern_limits(self.hosted));
+        if let Some(slot) = self.results.get_mut(index) {
+            *slot = Some(outcome.clone());
+        }
+        outcome
+    }
+}
+
+fn normalize_hostname_key(pattern: &str) -> Option<(bool, String)> {
+    let pattern = pattern.trim();
+    if let Some(excluded) = pattern.strip_prefix('-') {
+        let excluded = excluded.trim().trim_end_matches('.');
+        (!excluded.is_empty()).then(|| (true, excluded.to_ascii_lowercase()))
+    } else {
+        let included = pattern.trim_end_matches('.');
+        (!included.is_empty()).then(|| (false, included.to_ascii_lowercase()))
+    }
+}
+
 /// A module's rules, its name, and where its downloads went.
 pub(crate) struct Loaded {
     pub(crate) name: String,
@@ -1065,25 +1118,37 @@ impl Rewriter {
         Self::new_hosted(loaded, failed, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_hosted(
         loaded: Vec<Loaded>,
         failed: Vec<(String, Option<u64>, String)>,
         hosted: bool,
     ) -> Self {
-        let limits = if hosted {
-            HOSTED_LIMITS
-        } else {
-            DESKTOP_LIMITS
-        };
+        Self::new_hosted_with_validations(
+            loaded.into_iter().map(|l| (l, None)).collect(),
+            failed,
+            hosted,
+        )
+    }
+
+    pub(crate) fn new_hosted_with_validations(
+        loaded: Vec<(Loaded, Option<RuleValidations>)>,
+        failed: Vec<(String, Option<u64>, String)>,
+        hosted: bool,
+    ) -> Self {
+        let limits = pattern_limits(hosted);
         let mut rules = Vec::new();
         let mut host_buckets: HashMap<String, Vec<usize>> = HashMap::new();
         let mut global_rules = Vec::new();
         let mut hostnames = Vec::new();
+        let mut seen_hostnames = HashSet::new();
         let mut reject = Vec::new();
         let mut modules = Vec::new();
         let mut files = HashMap::new();
-        for loaded in loaded {
+        for (loaded, validations) in loaded {
             let module = loaded.module;
+            let mut cached =
+                validations.filter(|v| v.hosted == hosted && v.results.len() == module.rules.len());
             let mut skipped: Vec<Skipped> = module
                 .skipped
                 .iter()
@@ -1095,7 +1160,7 @@ impl Rewriter {
             let mut count = 0;
             let mut scripts = 0;
             let mut failed_line: Option<usize> = None;
-            for rule in module.rules {
+            for (rule_idx, rule) in module.rules.into_iter().enumerate() {
                 let line = rule.line;
                 let is_continuation = rule.pipe_continuation;
                 if is_continuation && failed_line == Some(line) {
@@ -1110,8 +1175,16 @@ impl Rewriter {
                     }
                     continue;
                 }
-                match validate_rule(&loaded.name, rule, limits) {
-                    Ok(compiled) => {
+                let validated = match cached
+                    .as_mut()
+                    .and_then(|v| v.results.get_mut(rule_idx).and_then(Option::take))
+                {
+                    Some(outcome) => outcome,
+                    None => validate_rule_ref(&rule, limits),
+                };
+                match validated {
+                    Ok(batchable) => {
+                        let compiled = build_compiled(&loaded.name, rule, batchable);
                         if matches!(compiled.action, Action::Script(_)) {
                             scripts += 1;
                         }
@@ -1142,13 +1215,17 @@ impl Rewriter {
                 }
                 reject.push((loaded.name.clone(), module_reject.build()));
             }
-            hostnames.extend(
-                module
-                    .hostnames
-                    .iter()
-                    .filter(|h| count > 0 || h.starts_with('-'))
-                    .cloned(),
-            );
+            for hostname in module
+                .hostnames
+                .iter()
+                .filter(|h| count > 0 || h.starts_with('-'))
+            {
+                if let Some(key) = normalize_hostname_key(hostname)
+                    && seen_hostnames.insert(key)
+                {
+                    hostnames.push(hostname.clone());
+                }
+            }
             files.extend(loaded.files);
             modules.push(ModuleInfo {
                 name: loaded.name,
@@ -1246,8 +1323,15 @@ impl Rewriter {
 
     fn host_bucket(&self, suffix: &str, allow_compile: bool) -> Option<Arc<CompiledBucket>> {
         let indices = self.compiled.host_buckets.get(suffix)?;
-        if let Some(bucket) = self.compiled.cache.lock().unwrap().hosts.get(suffix) {
-            return Some(bucket.clone());
+        {
+            let mut cache = self.compiled.cache.lock().unwrap();
+            let tick = cache.tick.wrapping_add(1);
+            if let Some((used, bucket)) = cache.hosts.get_mut(suffix) {
+                *used = tick;
+                let bucket = bucket.clone();
+                cache.tick = tick;
+                return Some(bucket);
+            }
         }
         if !allow_compile {
             return None;
@@ -1258,19 +1342,37 @@ impl Rewriter {
             self.compiled.limits,
         ));
         let mut cache = self.compiled.cache.lock().unwrap();
-        if let Some(existing) = cache.hosts.get(suffix) {
+        let tick = cache.tick.wrapping_add(1);
+        cache.tick = tick;
+        if let Some((used, existing)) = cache.hosts.get_mut(suffix) {
+            *used = tick;
             return Some(existing.clone());
         }
-        if cache.hosts.len() >= self.compiled.limits.bucket_cache_limit {
-            cache.hosts.clear();
+        if self.compiled.limits.bucket_cache_limit > 0 {
+            if cache.hosts.len() >= self.compiled.limits.bucket_cache_limit
+                && let Some(evict) = cache
+                    .hosts
+                    .iter()
+                    .min_by_key(|(_, (used, _))| *used)
+                    .map(|(k, _)| k.clone())
+            {
+                cache.hosts.remove(&evict);
+            }
+            cache.hosts.insert(suffix.to_owned(), (tick, built.clone()));
         }
-        cache.hosts.insert(suffix.to_owned(), built.clone());
         Some(built)
     }
 
     fn rule_runtime(&self, index: usize, allow_compile: bool) -> Option<Arc<RuleRuntime>> {
-        if let Some(runtime) = self.compiled.cache.lock().unwrap().rule_extras.get(&index) {
-            return Some(runtime.clone());
+        {
+            let mut cache = self.compiled.cache.lock().unwrap();
+            let tick = cache.tick.wrapping_add(1);
+            if let Some((used, runtime)) = cache.rule_extras.get_mut(&index) {
+                *used = tick;
+                let runtime = runtime.clone();
+                cache.tick = tick;
+                return Some(runtime);
+            }
         }
         if !allow_compile {
             return None;
@@ -1280,13 +1382,24 @@ impl Rewriter {
             self.compiled.limits,
         ));
         let mut cache = self.compiled.cache.lock().unwrap();
-        if let Some(existing) = cache.rule_extras.get(&index) {
+        let tick = cache.tick.wrapping_add(1);
+        cache.tick = tick;
+        if let Some((used, existing)) = cache.rule_extras.get_mut(&index) {
+            *used = tick;
             return Some(existing.clone());
         }
-        if cache.rule_extras.len() >= self.compiled.limits.rule_cache_limit {
-            cache.rule_extras.clear();
+        if self.compiled.limits.rule_cache_limit > 0 {
+            if cache.rule_extras.len() >= self.compiled.limits.rule_cache_limit
+                && let Some(evict) = cache
+                    .rule_extras
+                    .iter()
+                    .min_by_key(|(_, (used, _))| *used)
+                    .map(|(&k, _)| k)
+            {
+                cache.rule_extras.remove(&evict);
+            }
+            cache.rule_extras.insert(index, (tick, built.clone()));
         }
-        cache.rule_extras.insert(index, built.clone());
         Some(built)
     }
 
@@ -1305,13 +1418,17 @@ impl Rewriter {
     /// [`RuleRuntime`], or `None` if any required stage is not cached.
     pub(crate) fn cached_group_runtimes(&self, group: &[usize]) -> Option<CachedGroup> {
         let mut pinned = Vec::new();
-        let cache = self.compiled.cache.lock().unwrap();
+        let mut cache = self.compiled.cache.lock().unwrap();
         for &index in group {
             if !self.action_needs_runtime(index) {
                 continue;
             }
-            let runtime = cache.rule_extras.get(&index)?;
-            pinned.push((index, runtime.clone()));
+            let tick = cache.tick.wrapping_add(1);
+            let (used, runtime) = cache.rule_extras.get_mut(&index)?;
+            *used = tick;
+            let runtime = runtime.clone();
+            cache.tick = tick;
+            pinned.push((index, runtime));
         }
         Some(CachedGroup(pinned))
     }
@@ -1544,11 +1661,10 @@ fn failed_module((name, updated, error): (String, Option<u64>, String)) -> Modul
     }
 }
 
-fn validate_rule(
-    module: &str,
-    rule: clyntis_config::rewrite::Rule,
+fn validate_rule_ref(
+    rule: &clyntis_config::rewrite::Rule,
     limits: PatternLimits,
-) -> Result<Compiled, (usize, String)> {
+) -> Result<bool, (usize, String)> {
     let failed = |what: &str| (rule.line, format!("{what}: {}", rule.pattern));
     let batchable = if regex::RegexBuilder::new(&rule.pattern)
         .size_limit(limits.set_limit)
@@ -1591,7 +1707,11 @@ fn validate_rule(
         }
         _ => {}
     }
-    Ok(Compiled {
+    Ok(batchable)
+}
+
+fn build_compiled(module: &str, rule: clyntis_config::rewrite::Rule, batchable: bool) -> Compiled {
+    Compiled {
         module: module.to_owned(),
         line: rule.line,
         phase: rule.phase,
@@ -1600,7 +1720,7 @@ fn validate_rule(
         conditions: rule.conditions,
         pipe_continuation: rule.pipe_continuation,
         action: rule.action,
-    })
+    }
 }
 
 fn rule_has_file(rule: &clyntis_config::rewrite::Rule, has_file: impl Fn(&str) -> bool) -> bool {
@@ -1614,17 +1734,54 @@ fn rule_has_file(rule: &clyntis_config::rewrite::Rule, has_file: impl Fn(&str) -
     }
 }
 
-/// Counts how many rules in `module` compile cleanly (used before committing a
-/// downloaded module update so an incompatible upgrade does not replace a
-/// working cached module).
-pub(crate) fn compilable_rule_count(module: &Module) -> usize {
-    runnable_rule_count(module, |_| true)
+/// Returns whether `module` has at least one rule that compiles cleanly,
+/// recording any checked rule outcomes in `validations` so later passes avoid
+/// re-validating them.
+pub(crate) fn has_compilable_rule(module: &Module, validations: &mut RuleValidations) -> bool {
+    has_runnable_rule(module, validations, |_| true)
+}
+
+/// Returns whether `module` has at least one runnable rule whose dependent
+/// script/mock files are available, reusing and populating `validations`.
+pub(crate) fn has_runnable_rule(
+    module: &Module,
+    validations: &mut RuleValidations,
+    has_file: impl Fn(&str) -> bool,
+) -> bool {
+    let mut failed_line: Option<usize> = None;
+    for (index, rule) in module.rules.iter().enumerate() {
+        if rule.pipe_continuation && failed_line == Some(rule.line) {
+            continue;
+        }
+        if !rule.pipe_continuation {
+            failed_line = None;
+        }
+        if rule_has_file(rule, &has_file) && validations.validate(index, rule).is_ok() {
+            return true;
+        } else if !rule.pipe_continuation {
+            failed_line = Some(rule.line);
+        }
+    }
+    false
+}
+
+/// Counts how many rules in `module` compile cleanly under the desktop or
+/// hosted limit profile.
+#[cfg(test)]
+pub(crate) fn compilable_rule_count(module: &Module, hosted: bool) -> usize {
+    runnable_rule_count(module, hosted, |_| true)
 }
 
 /// Counts how many rules in `module` both compile cleanly and have their
 /// dependent script/mock files available. If the leading stage of a piped line
 /// fails to load, the entire pipe line is excluded.
-pub(crate) fn runnable_rule_count(module: &Module, has_file: impl Fn(&str) -> bool) -> usize {
+#[cfg(test)]
+pub(crate) fn runnable_rule_count(
+    module: &Module,
+    hosted: bool,
+    has_file: impl Fn(&str) -> bool,
+) -> usize {
+    let limits = pattern_limits(hosted);
     let mut count = 0;
     let mut failed_line: Option<usize> = None;
     for rule in &module.rules {
@@ -1634,9 +1791,7 @@ pub(crate) fn runnable_rule_count(module: &Module, has_file: impl Fn(&str) -> bo
         if !rule.pipe_continuation {
             failed_line = None;
         }
-        if rule_has_file(rule, &has_file)
-            && validate_rule("", (*rule).clone(), DESKTOP_LIMITS).is_ok()
-        {
+        if rule_has_file(rule, &has_file) && validate_rule_ref(rule, limits).is_ok() {
             count += 1;
         } else if !rule.pipe_continuation {
             failed_line = Some(rule.line);
@@ -1896,33 +2051,39 @@ pub(crate) fn apply_body(rewriter: &Rewriter, index: usize, body: &mut Vec<u8>) 
     apply_body_with(rewriter, index, body, true, None)
 }
 
-/// Applies a body or JSON rewrite to a decoded body, returning `false` if a
-/// `BodyReplace` runtime is uncached when `allow_compile` is `false`.
-pub(crate) fn apply_body_with(
+/// Applies a body or JSON rewrite to a decoded body, returning the new body
+/// bytes only when a rewrite actually produced an updated body. Returns `None`
+/// if a `BodyReplace` runtime is uncached when `allow_compile` is `false`, or
+/// if no `BodyReplace` pattern matched.
+pub(crate) fn rewrite_body_with(
     rewriter: &Rewriter,
     index: usize,
-    body: &mut Vec<u8>,
+    body: &[u8],
     allow_compile: bool,
     pinned: Option<&CachedGroup>,
-) -> bool {
+) -> Option<Vec<u8>> {
     match &rewriter.rule(index).action {
         Action::BodyReplace(pairs) => {
-            let Ok(text) = std::str::from_utf8(body) else {
-                return false;
-            };
-            let Some(updated) = rewriter.with_runtime(index, allow_compile, pinned, |runtime| {
-                let mut text = text.to_owned();
-                for ((_, with), regex) in pairs.iter().zip(&runtime.extra) {
-                    text = regex
-                        .replace_all(&text, replacement(with).as_str())
-                        .into_owned();
-                }
-                text.into_bytes()
-            }) else {
-                return false;
-            };
-            *body = updated;
-            true
+            let text = std::str::from_utf8(body).ok()?;
+            rewriter
+                .with_runtime(index, allow_compile, pinned, |runtime| {
+                    let mut current = std::borrow::Cow::Borrowed(text);
+                    for ((_, with), regex) in pairs.iter().zip(&runtime.extra) {
+                        let repl = replacement(with);
+                        if let std::borrow::Cow::Owned(next) =
+                            regex.replace_all(&current, repl.as_str())
+                        {
+                            current = std::borrow::Cow::Owned(next);
+                        }
+                    }
+                    match current {
+                        std::borrow::Cow::Owned(updated) if updated.as_bytes() != body => {
+                            Some(updated.into_bytes())
+                        }
+                        _ => None,
+                    }
+                })
+                .flatten()
         }
         Action::JsonDelete(paths) => edit_json(body, |value| {
             for path in paths {
@@ -1936,22 +2097,32 @@ pub(crate) fn apply_body_with(
                 set_path(value, &segments(path), new);
             }
         }),
-        _ => false,
+        _ => None,
     }
 }
 
-fn edit_json(body: &mut Vec<u8>, edit: impl FnOnce(&mut Value)) -> bool {
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+/// Applies a body or JSON rewrite to a decoded body, returning `false` if a
+/// `BodyReplace` runtime is uncached when `allow_compile` is `false` or if no
+/// replacement occurred.
+#[cfg(test)]
+pub(crate) fn apply_body_with(
+    rewriter: &Rewriter,
+    index: usize,
+    body: &mut Vec<u8>,
+    allow_compile: bool,
+    pinned: Option<&CachedGroup>,
+) -> bool {
+    let Some(updated) = rewrite_body_with(rewriter, index, body, allow_compile, pinned) else {
         return false;
     };
+    *body = updated;
+    true
+}
+
+fn edit_json(body: &[u8], edit: impl FnOnce(&mut Value)) -> Option<Vec<u8>> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
     edit(&mut value);
-    match serde_json::to_vec(&value) {
-        Ok(bytes) => {
-            *body = bytes;
-            true
-        }
-        Err(_) => false,
-    }
+    serde_json::to_vec(&value).ok()
 }
 
 #[derive(Debug, PartialEq)]
@@ -2129,7 +2300,7 @@ mod tests {
         );
         {
             let cache = rewriter.compiled.cache.lock().unwrap();
-            let bucket = cache.hosts.get("a.test").unwrap();
+            let (_, bucket) = cache.hosts.get("a.test").unwrap();
             assert_eq!(
                 bucket
                     .request
@@ -2362,7 +2533,8 @@ response if ${url} ~= /^https:\/\/a\.test\/r$/ && ${response.status} == 200 && $
 "#;
         let module = clyntis_config::rewrite::parse_module(text);
         assert!(module.skipped.is_empty());
-        assert_eq!(compilable_rule_count(&module), 5);
+        assert_eq!(compilable_rule_count(&module, false), 5);
+        assert_eq!(compilable_rule_count(&module, true), 5);
         let rw = rewriter(text);
 
         assert!(rw.matches_conditions(0, "POST", &[], None, &[]));
@@ -2402,7 +2574,8 @@ hostname = a.test
         let module = clyntis_config::rewrite::parse_module(bad_pipe);
         assert!(module.skipped.is_empty(), "{:?}", module.skipped);
         assert_eq!(module.rules.len(), 2);
-        assert_eq!(compilable_rule_count(&module), 0);
+        assert_eq!(compilable_rule_count(&module, false), 0);
+        assert_eq!(compilable_rule_count(&module, true), 0);
         let compiled = Rewriter::new(
             vec![Loaded {
                 name: "badpipe".into(),
@@ -2994,5 +3167,114 @@ response if ${url} ~= /^https:\/\/a\.test\/simple$/ then response.header.delete(
 
         assert_eq!(rewriter.cached_bucket_count(), 0);
         assert_eq!(rewriter.cached_rule_runtime_count(), 0);
+    }
+
+    #[test]
+    fn deduplicates_hostnames_evicts_single_lru_and_skips_unmatched_body_replace() {
+        let mut text = String::from("[Rewrite]\n");
+        let rule_count = HOSTED_LIMITS
+            .bucket_cache_limit
+            .max(HOSTED_LIMITS.rule_cache_limit)
+            + 1;
+        for i in 0..rule_count {
+            text.push_str(&format!(
+                "^https://h{i}\\.example\\.test/ response-body-replace-regex ad ok\n"
+            ));
+        }
+        let m1 = clyntis_config::rewrite::parse_module(&format!(
+            "{text}[MITM]\nhostname = a.test, *.B.Test., -skip.test\n"
+        ));
+        let m2 = clyntis_config::rewrite::parse_module(
+            "[Rewrite]\n^https://extra\\.example\\.test/ response-body-replace-regex foo bar\n[MITM]\nhostname = A.TEST, *.b.test, c.test, -SKIP.TEST\n",
+        );
+        let mut validations = RuleValidations::new(m1.rules.len(), true);
+        assert!(has_compilable_rule(&m1, &mut validations));
+        assert!(has_runnable_rule(&m1, &mut validations, |_| true));
+        let rewriter = Rewriter::new_hosted_with_validations(
+            vec![
+                (
+                    Loaded {
+                        name: "m1".into(),
+                        module: m1,
+                        files: HashMap::new(),
+                        missing: vec![],
+                        updated: None,
+                    },
+                    Some(validations),
+                ),
+                (
+                    Loaded {
+                        name: "m2".into(),
+                        module: m2,
+                        files: HashMap::new(),
+                        missing: vec![],
+                        updated: None,
+                    },
+                    None,
+                ),
+            ],
+            vec![],
+            true,
+        );
+        // Hostnames deduplicated across modules in order.
+        assert_eq!(
+            rewriter.hostnames,
+            vec!["a.test", "*.b.test.", "-skip.test", "c.test"]
+        );
+
+        // Non-matching BodyReplace returns None / false without modifying body.
+        let mut unchanged = br#"{"clean":true}"#.to_vec();
+        assert!(rewrite_body_with(&rewriter, 0, &unchanged, true, None).is_none());
+        assert!(!apply_body(&rewriter, 0, &mut unchanged));
+        assert_eq!(unchanged, br#"{"clean":true}"#);
+
+        // Matching BodyReplace returns updated body.
+        let mut matched = br#"{"ad":true}"#.to_vec();
+        assert!(apply_body(&rewriter, 0, &mut matched));
+        assert_eq!(matched, br#"{"ok":true}"#);
+
+        // Fill host bucket cache to hosted limit (24), touch h0 to keep it hot, then add h24.
+        for i in 0..HOSTED_LIMITS.bucket_cache_limit {
+            assert_eq!(
+                rewriter.matching(Phase::Response, &format!("https://h{i}.example.test/")),
+                vec![i]
+            );
+        }
+        assert_eq!(
+            rewriter.matching(Phase::Response, "https://h0.example.test/"),
+            vec![0]
+        );
+        let overflow = HOSTED_LIMITS.bucket_cache_limit;
+        assert_eq!(
+            rewriter.matching(
+                Phase::Response,
+                &format!("https://h{overflow}.example.test/")
+            ),
+            vec![overflow]
+        );
+        {
+            let cache = rewriter.compiled.cache.lock().unwrap();
+            assert_eq!(cache.hosts.len(), HOSTED_LIMITS.bucket_cache_limit);
+            assert!(cache.hosts.contains_key("h0.example.test"));
+            assert!(
+                cache
+                    .hosts
+                    .contains_key(&format!("h{overflow}.example.test"))
+            );
+            assert!(!cache.hosts.contains_key("h1.example.test"));
+        }
+
+        // Fill rule_extras cache to hosted limit (32), touch rule 0, then add rule 32.
+        for i in 0..HOSTED_LIMITS.rule_cache_limit {
+            assert!(rewrite_body_with(&rewriter, i, b"ad", true, None).is_some());
+        }
+        assert!(rewrite_body_with(&rewriter, 0, b"ad", true, None).is_some());
+        let rule_overflow = HOSTED_LIMITS.rule_cache_limit;
+        assert!(rewrite_body_with(&rewriter, rule_overflow, b"ad", true, None).is_some());
+        let cache = rewriter.compiled.cache.lock().unwrap();
+        assert_eq!(cache.rule_extras.len(), HOSTED_LIMITS.rule_cache_limit);
+        assert!(cache.rule_extras.contains_key(&0));
+        assert!(cache.rule_extras.contains_key(&rule_overflow));
+        assert!(!cache.rule_extras.contains_key(&1));
     }
 }

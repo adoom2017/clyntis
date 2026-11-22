@@ -86,6 +86,9 @@ int32_t meta_overrides_apply_v1(const uint8_t *config, size_t length,
  * Follows the caller-buffer/size-query contract. */
 int32_t meta_yaml_check_v1(const uint8_t *config, size_t length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Validate a YAML configuration without creating a core handle or runtime.
+ * Returns META_OK when valid; on META_ERROR, meta_error_v1 describes the error. */
+int32_t meta_validate_config_v1(const uint8_t *config_ptr, size_t config_len);
 /* The Tencent COS target behind a URL: writes JSON {"bucket","region","key"},
  * or null when url is not a COS object URL. Caller-buffer contract. */
 int32_t meta_cos_target_v1(const uint8_t *url, size_t length,

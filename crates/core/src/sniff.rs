@@ -100,7 +100,7 @@ pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
         return ClientHelloStatus::Invalid;
     }
     let mut records = data;
-    let mut hello = Vec::new();
+    let mut hello: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(&[]);
     while !records.is_empty() {
         if records.len() < 5 {
             return ClientHelloStatus::Incomplete;
@@ -116,7 +116,12 @@ pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
         if records.len() < 5 + n {
             return ClientHelloStatus::Incomplete;
         }
-        hello.extend_from_slice(&records[5..5 + n]);
+        let fragment = &records[5..5 + n];
+        if hello.is_empty() {
+            hello = std::borrow::Cow::Borrowed(fragment);
+        } else {
+            hello.to_mut().extend_from_slice(fragment);
+        }
         records = &records[5 + n..];
         if hello.len() >= 4 {
             if hello[0] != 1 {

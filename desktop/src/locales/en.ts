@@ -627,4 +627,6 @@ export const en: Record<string, string> = {
     "Showing top {shown} of {total} active connections by traffic",
   "已结束连接仅保留高流量记录，显示 {shown} / {total} 条":
     "Only high-traffic closed connections are kept; showing {shown} of {total}",
+  "仅显示前 {shown} 个字符（共 {total} 个字符）":
+    "Showing the first {shown} of {total} characters",
 };

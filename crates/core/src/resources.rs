@@ -17,7 +17,12 @@ use std::{
 };
 
 const MODULE_LIMIT: usize = 2 << 20;
+const HOSTED_MOCK_LIMIT: usize = 2 << 20;
 const LIMIT: usize = 128 * 1024 * 1024;
+
+const fn rewrite_mock_limit(hosted: bool) -> usize {
+    if hosted { HOSTED_MOCK_LIMIT } else { LIMIT }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoadMode {
@@ -368,9 +373,7 @@ impl Resources {
                     };
                     let matcher = match previous.providers.get(name) {
                         Some((built, matcher)) if *built == source => matcher.clone(),
-                        _ => {
-                            provider_matcher(p, &parse_payload(&read_limited(&data)?, &p.format)?)?
-                        }
+                        _ => load_provider_matcher(p, &data)?,
                     };
                     staged.commit()?;
                     out.providers
@@ -504,6 +507,7 @@ fn same_matcher(a: &Matcher, b: &Matcher) -> bool {
         | (Matcher::GeoIp(a), Matcher::GeoIp(b))
         | (Matcher::GeoSite(a), Matcher::GeoSite(b))
         | (Matcher::RuleSet(a), Matcher::RuleSet(b)) => a == b,
+        (Matcher::Glob(a), Matcher::Glob(b)) => a == b,
         (Matcher::Regex(a), Matcher::Regex(b)) => a.as_str() == b.as_str(),
         (Matcher::Net(a), Matcher::Net(b)) => a == b,
         (Matcher::Port(a), Matcher::Port(b)) => a == b,
@@ -537,23 +541,34 @@ fn populate_geoip(
             .iter()
             .map(|tag| tag.trim_start_matches('!').to_ascii_lowercase())
             .collect();
-        let list = wire::read_entries(data, |code| wanted.contains(&code.to_ascii_lowercase()))
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .map(|bytes| Ok(GeoIp::decode(bytes.as_slice())?))
-                    .collect::<Result<Vec<_>>>()
+        // Keep entries as raw bytes and decode one CIDR at a time: decoding all
+        // wanted countries into `GeoIp` structs would allocate a heap `Vec<u8>`
+        // per CIDR alongside the resulting `IpSet`.
+        let mut entries: HashMap<String, Vec<u8>> = HashMap::new();
+        for bytes in wire::read_entries(data, |code| wanted.contains(&code.to_ascii_lowercase()))
+            .context("invalid geoip.dat")?
+        {
+            let mut code = String::new();
+            wire::each_field(&bytes, 1, |value| {
+                code = std::str::from_utf8(value)?.to_ascii_lowercase();
+                Ok(())
             })
             .context("invalid geoip.dat")?;
+            entries.entry(code).or_insert(bytes);
+        }
+        // Release each country's raw bytes once its last tag is built.
+        let mut remaining: HashMap<String, usize> = HashMap::new();
+        for tag in ip_refs {
+            let code = tag.trim_start_matches('!').to_ascii_lowercase();
+            *remaining.entry(code).or_default() += 1;
+        }
         for tag in ip_refs {
             let key_pair = ("geoip".to_owned(), tag.clone());
             let (key, inverse) = tag
                 .strip_prefix('!')
                 .map_or((tag.as_str(), false), |s| (s, true));
-            let Some(entry) = list
-                .iter()
-                .find(|e| e.country_code.eq_ignore_ascii_case(key))
-            else {
+            let code = key.to_ascii_lowercase();
+            let Some(entry) = entries.get(&code) else {
                 if !out.partial {
                     bail!("GEOIP category missing from data");
                 }
@@ -569,22 +584,33 @@ fn populate_geoip(
                 }
                 continue;
             };
-            let nets = entry
-                .cidr
-                .iter()
-                .map(|c| {
-                    let ip = match c.ip.len() {
-                        4 => IpAddr::from(<[u8; 4]>::try_from(c.ip.as_slice())?),
-                        16 => IpAddr::from(<[u8; 16]>::try_from(c.ip.as_slice())?),
-                        _ => bail!("invalid GeoIP address"),
-                    };
-                    Ok(ipnet::IpNet::new(ip, u8::try_from(c.prefix)?)?)
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut nets = Vec::new();
+            let mut entry_inverse = false;
+            wire::each_raw_field(entry, |number, wire_type, value| {
+                match number {
+                    1 => ensure!(wire_type == 2, "invalid geoip.dat"),
+                    2 => {
+                        ensure!(wire_type == 2, "invalid geoip.dat");
+                        nets.push(decode_geoip_cidr(value)?);
+                    }
+                    3 => {
+                        ensure!(wire_type == 0, "invalid geoip.dat");
+                        entry_inverse = wire::decode_varint(value)? != 0;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+            if let Some(count) = remaining.get_mut(&code) {
+                *count -= 1;
+                if *count == 0 {
+                    entries.remove(&code);
+                }
+            }
             out.missing_geo.remove(&key_pair);
             out.matchers.insert(
                 key_pair,
-                Matcher::Nets(Arc::new(IpSet::new(nets, entry.inverse_match ^ inverse))),
+                Matcher::Nets(Arc::new(IpSet::new(nets, entry_inverse ^ inverse))),
             );
         }
     } else {
@@ -871,7 +897,13 @@ async fn rewrite(
     if !settings.enable {
         return (None, None);
     }
-    let mut parsed = Vec::new();
+    let hosted = config.internal_host_packet_io;
+    let mut parsed: Vec<(
+        String,
+        clyntis_config::rewrite::Module,
+        Option<u64>,
+        Option<crate::rewrite::RuleValidations>,
+    )> = Vec::new();
     let mut failed = Vec::new();
     let mut module_sources = Vec::new();
     let mut update_errors = HashMap::new();
@@ -893,6 +925,7 @@ async fn rewrite(
         parsed.push((
             clyntis_config::rewrite::CUSTOM.to_owned(),
             parse_module(&settings.custom),
+            None,
             None,
         ));
     }
@@ -919,17 +952,36 @@ async fn rewrite(
         let loaded = data.and_then(|data| {
             match read_module(&data) {
                 Ok(module) => {
+                    let mut validations = None;
                     if data != path
                         && path.is_file()
                         && (!module.skipped.is_empty() || !module.rules.is_empty())
-                        && crate::rewrite::compilable_rule_count(&module) == 0
-                        && let Ok(cached) = read_module(&path)
-                        && crate::rewrite::compilable_rule_count(&cached) > 0
                     {
-                        let error = "updated module has no runnable rules";
-                        tracing::warn!(module = %source.name, "{error}; keeping cached rules");
-                        update_errors.insert(source.name.clone(), error.into());
-                        return Ok((cached, Stamp::of(&path)?, None));
+                        let mut candidate_validations =
+                            crate::rewrite::RuleValidations::new(module.rules.len(), hosted);
+                        if !crate::rewrite::has_compilable_rule(
+                            &module,
+                            &mut candidate_validations,
+                        ) && let Ok(cached) = read_module(&path)
+                        {
+                            let mut cached_validations =
+                                crate::rewrite::RuleValidations::new(cached.rules.len(), hosted);
+                            if crate::rewrite::has_compilable_rule(
+                                &cached,
+                                &mut cached_validations,
+                            ) {
+                                let error = "updated module has no runnable rules";
+                                tracing::warn!(module = %source.name, "{error}; keeping cached rules");
+                                update_errors.insert(source.name.clone(), error.into());
+                                return Ok((
+                                    cached,
+                                    Stamp::of(&path)?,
+                                    None,
+                                    Some(cached_validations),
+                                ));
+                            }
+                        }
+                        validations = Some(candidate_validations);
                     }
                     let stamp = Stamp::of(&data)?;
                     if data == path
@@ -938,7 +990,9 @@ async fn rewrite(
                         && before.modules.iter().any(|(old, cached)| {
                             old == source && cached.as_ref() == Some(&stamp)
                         })
-                        && let Some(error) = active.modules.iter()
+                        && let Some(error) = active
+                            .modules
+                            .iter()
                             .find(|module| module.name == source.name)
                             .and_then(|module| module.update_error.as_ref())
                     {
@@ -952,23 +1006,23 @@ async fn rewrite(
                         }
                         None
                     };
-                    Ok((module, stamp, deferred))
+                    Ok((module, stamp, deferred, validations))
                 }
                 Err(error) if data != path && path.is_file() => {
                     tracing::warn!(module = %source.name, %error, "invalid module update; keeping cached rules");
                     update_errors.insert(source.name.clone(), format!("{error:#}"));
-                    Ok((read_module(&path)?, Stamp::of(&path)?, None))
+                    Ok((read_module(&path)?, Stamp::of(&path)?, None, None))
                 }
                 Err(error) => Err(error),
             }
         });
         let updated = file_mtime(&path);
         match loaded {
-            Ok((module, stamp, deferred)) => {
+            Ok((module, stamp, deferred, validations)) => {
                 let source_index = module_sources.len();
                 let parsed_index = parsed.len();
                 module_sources.push((source.clone(), Some(stamp)));
-                parsed.push((source.name.clone(), module, updated));
+                parsed.push((source.name.clone(), module, updated, validations));
                 if let Some(staged) = deferred {
                     pending_commits.push(PendingCommit {
                         staged,
@@ -986,8 +1040,13 @@ async fn rewrite(
         }
     }
     // Scripts and response files, each once, several at a time.
-    let script_limit = crate::script::source_limit(config.internal_host_packet_io);
-    let urls = rewrite_file_urls(parsed.iter().map(|(_, module, _)| module), script_limit);
+    let script_limit = crate::script::source_limit(hosted);
+    let mock_limit = rewrite_mock_limit(hosted);
+    let urls = rewrite_file_urls(
+        parsed.iter().map(|(_, module, _, _)| module),
+        script_limit,
+        mock_limit,
+    );
     enum DownloadFile {
         Ready(Arc<crate::rewrite::RewriteFile>),
         Deferred(PathBuf, Staged),
@@ -1045,25 +1104,37 @@ async fn rewrite(
     let mut publish_urls = std::collections::HashSet::new();
     let deferred_indices: std::collections::HashSet<usize> =
         pending_commits.iter().map(|p| p.parsed_index).collect();
-    for (idx, (_, module, _)) in parsed.iter().enumerate() {
+    for (idx, (_, module, _, _)) in parsed.iter().enumerate() {
         if !deferred_indices.contains(&idx) {
-            publish_urls
-                .extend(rewrite_file_urls(std::iter::once(module), script_limit).into_keys());
+            publish_urls.extend(
+                rewrite_file_urls(std::iter::once(module), script_limit, mock_limit).into_keys(),
+            );
         }
     }
     let mut kept_cached_urls = std::collections::BTreeMap::new();
     for pending in pending_commits {
         let name = parsed[pending.parsed_index].0.clone();
-        let candidate = &parsed[pending.parsed_index].1;
-        let dropped_to_zero = (!candidate.rules.is_empty() || !candidate.skipped.is_empty())
-            && crate::rewrite::runnable_rule_count(candidate, |u| {
-                files.contains_key(u) || deferred_files.contains_key(u)
-            }) == 0;
+        let dropped_to_zero = {
+            let entry = &mut parsed[pending.parsed_index];
+            let candidate = &entry.1;
+            if candidate.rules.is_empty() && candidate.skipped.is_empty() {
+                false
+            } else {
+                let validations = entry.3.get_or_insert_with(|| {
+                    crate::rewrite::RuleValidations::new(candidate.rules.len(), hosted)
+                });
+                !crate::rewrite::has_runnable_rule(candidate, validations, |u| {
+                    files.contains_key(u) || deferred_files.contains_key(u)
+                })
+            }
+        };
         let mut kept_cached = false;
         if dropped_to_zero && let Ok(cached) = read_module(&pending.path) {
             let mut cached_pins = HashMap::new();
             let mut cached_urls = Vec::new();
-            for (url, limit) in rewrite_file_urls(std::iter::once(&cached), script_limit) {
+            for (url, limit) in
+                rewrite_file_urls(std::iter::once(&cached), script_limit, mock_limit)
+            {
                 cached_urls.push((url.clone(), limit));
                 if files.contains_key(&url) {
                     continue;
@@ -1077,10 +1148,11 @@ async fn rewrite(
                     cached_pins.insert(url, pinned);
                 }
             }
-            if crate::rewrite::runnable_rule_count(&cached, |u| {
+            let mut cached_validations =
+                crate::rewrite::RuleValidations::new(cached.rules.len(), hosted);
+            if crate::rewrite::has_runnable_rule(&cached, &mut cached_validations, |u| {
                 files.contains_key(u) || cached_pins.contains_key(u)
-            }) > 0
-            {
+            }) {
                 let error = "updated module has no runnable rules";
                 tracing::warn!(module = %name, "{error}; keeping cached rules");
                 update_errors.insert(name.clone(), error.into());
@@ -1092,6 +1164,7 @@ async fn rewrite(
                 }
                 parsed[pending.parsed_index].1 = cached;
                 parsed[pending.parsed_index].2 = file_mtime(&pending.path);
+                parsed[pending.parsed_index].3 = Some(cached_validations);
                 module_sources[pending.source_index].1 = Stamp::of(&pending.path).ok();
                 kept_cached = true;
             }
@@ -1100,6 +1173,7 @@ async fn rewrite(
             let candidate_urls = rewrite_file_urls(
                 std::iter::once(&parsed[pending.parsed_index].1),
                 script_limit,
+                mock_limit,
             );
             publish_urls.extend(candidate_urls.into_keys());
             if let Err(error) = pending.staged.commit() {
@@ -1153,9 +1227,12 @@ async fn rewrite(
         modules: module_sources,
         files: file_sources,
     };
-    let loaded = parsed
+    let loaded_with_validations: Vec<(
+        crate::rewrite::Loaded,
+        Option<crate::rewrite::RuleValidations>,
+    )> = parsed
         .into_iter()
-        .map(|(name, module, updated)| {
+        .map(|(name, module, updated, validations)| {
             let mut own = std::collections::HashMap::new();
             let mut own_missing = Vec::new();
             for rule in &module.rules {
@@ -1177,13 +1254,16 @@ async fn rewrite(
                     None => {}
                 }
             }
-            crate::rewrite::Loaded {
-                name,
-                module,
-                files: own,
-                missing: own_missing,
-                updated,
-            }
+            (
+                crate::rewrite::Loaded {
+                    name,
+                    module,
+                    files: own,
+                    missing: own_missing,
+                    updated,
+                },
+                validations,
+            )
         })
         .collect();
     let mut rewriter = if let (Some(active), Some(before)) =
@@ -1191,9 +1271,19 @@ async fn rewrite(
         && *before == source
     {
         tracing::debug!("rewrite modules unchanged; reusing compiled rules");
-        active.reloaded(loaded, failed)
+        active.reloaded(
+            loaded_with_validations
+                .into_iter()
+                .map(|(loaded, _)| loaded)
+                .collect(),
+            failed,
+        )
     } else {
-        crate::rewrite::Rewriter::new_hosted(loaded, failed, config.internal_host_packet_io)
+        crate::rewrite::Rewriter::new_hosted_with_validations(
+            loaded_with_validations,
+            failed,
+            hosted,
+        )
     };
     for module in &mut rewriter.modules {
         module.update_error = update_errors.remove(&module.name);
@@ -1226,25 +1316,35 @@ fn read_module(path: &Path) -> Result<clyntis_config::rewrite::Module> {
     Ok(module)
 }
 
+fn collect_rewrite_file_urls(
+    module: &clyntis_config::rewrite::Module,
+    script_limit: usize,
+    mock_limit: usize,
+    urls: &mut std::collections::BTreeMap<String, usize>,
+) {
+    use clyntis_config::rewrite::{Action, Mock, MockBody};
+    for rule in &module.rules {
+        let (url, limit) = match &rule.action {
+            Action::Script(script) => (&script.url, script_limit),
+            Action::Mock(Mock {
+                body: MockBody::Remote(url),
+                ..
+            }) => (url, mock_limit),
+            _ => continue,
+        };
+        let limit_for_url = urls.entry(url.clone()).or_insert(limit);
+        *limit_for_url = (*limit_for_url).min(limit);
+    }
+}
+
 fn rewrite_file_urls<'a>(
     modules: impl IntoIterator<Item = &'a clyntis_config::rewrite::Module>,
     script_limit: usize,
+    mock_limit: usize,
 ) -> std::collections::BTreeMap<String, usize> {
-    use clyntis_config::rewrite::{Action, Mock, MockBody};
     let mut urls = std::collections::BTreeMap::new();
     for module in modules {
-        for rule in &module.rules {
-            let (url, limit) = match &rule.action {
-                Action::Script(script) => (&script.url, script_limit),
-                Action::Mock(Mock {
-                    body: MockBody::Remote(url),
-                    ..
-                }) => (url, LIMIT),
-                _ => continue,
-            };
-            let limit_for_url = urls.entry(url.clone()).or_insert(limit);
-            *limit_for_url = (*limit_for_url).min(limit);
-        }
+        collect_rewrite_file_urls(module, script_limit, mock_limit, &mut urls);
     }
     urls
 }
@@ -1299,13 +1399,79 @@ pub enum Freshness {
     Missing,
 }
 
-/// The state of every referenced file. Cheap: no geo data is parsed, only
-/// rule-provider payloads (which can reference geo data themselves).
+fn contains_geo_token(line: &[u8], tag: &[u8]) -> bool {
+    let start = line
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        .unwrap_or(line.len());
+    let trimmed = &line[start..];
+    let trimmed = trimmed.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(trimmed);
+    if trimmed.is_empty() || trimmed[0] == b'#' {
+        return false;
+    }
+    let mut i = 0;
+    while i + tag.len() < trimmed.len() {
+        if &trimmed[i..i + tag.len()] == tag {
+            let boundary_before = i == 0
+                || matches!(
+                    trimmed[i - 1],
+                    b' ' | b'\t' | b'\'' | b'"' | b'(' | b'[' | b','
+                );
+            if boundary_before {
+                let mut after = i + tag.len();
+                while after < trimmed.len() && matches!(trimmed[after], b' ' | b'\t') {
+                    after += 1;
+                }
+                if after < trimmed.len() && trimmed[after] == b',' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn scan_classical_geo_file(
+    path: &Path,
+    want_geoip: bool,
+    want_geosite: bool,
+    needs_geoip: &mut bool,
+    needs_geosite: &mut bool,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader, Read};
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(16 * 1024, file.take(LIMIT as u64));
+    let mut line = Vec::with_capacity(256);
+    loop {
+        if (!want_geoip || *needs_geoip) && (!want_geosite || *needs_geosite) {
+            break;
+        }
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if want_geoip && !*needs_geoip && contains_geo_token(&line, b"GEOIP") {
+            *needs_geoip = true;
+        }
+        if want_geosite && !*needs_geosite && contains_geo_token(&line, b"GEOSITE") {
+            *needs_geosite = true;
+        }
+    }
+    Ok(())
+}
+
+/// The state of every referenced file. Cheap: no geo data is parsed, domain and
+/// ipcidr providers are only stat'd, and classical providers are lightly
+/// scanned for GEOIP/GEOSITE references only when those files could change the
+/// result.
 pub fn freshness(config: &Config) -> Result<Freshness> {
-    let mut refs = references(config)?;
+    let refs = references(config)?;
+    let mut needs_geoip = refs.iter().any(|r| r.0 == "geoip");
+    let mut needs_geosite = refs.iter().any(|r| r.0 == "geosite");
     let mut state = Freshness::Current;
-    let mut check = |path: &Path, interval: Option<u64>, limit: Option<usize>| {
-        let found = match std::fs::metadata(path) {
+    let probe =
+        |path: &Path, interval: Option<u64>, limit: Option<usize>| match std::fs::metadata(path) {
             Err(_) => Freshness::Missing,
             Ok(meta) if limit.is_some_and(|limit| exceeds_limit(&meta, limit)) => {
                 Freshness::Missing
@@ -1313,24 +1479,73 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
             Ok(meta) if expired(Some(&meta), interval) => Freshness::Expired,
             Ok(_) => Freshness::Current,
         };
-        state = state.max(found);
-        found
-    };
+    let check =
+        |state: &mut Freshness, path: &Path, interval: Option<u64>, limit: Option<usize>| {
+            let found = probe(path, interval, limit);
+            *state = (*state).max(found);
+            found
+        };
+    let interval = geo_interval(config);
+    let geoip_path = config.directory.join(if config.geodata_mode {
+        "geoip.dat"
+    } else {
+        "Country.mmdb"
+    });
+    let geosite_path = config.directory.join("geosite.dat");
     for p in config.rule_providers.values() {
-        let payload = if p.kind == "inline" {
-            p.payload.clone()
+        let file_path = if p.kind == "inline" {
+            None
         } else {
             let path = asset_path(&config.directory, &p.path)?;
-            if check(&path, (p.kind == "http").then_some(p.interval), None) == Freshness::Missing {
+            if check(
+                &mut state,
+                &path,
+                (p.kind == "http").then_some(p.interval),
+                None,
+            ) == Freshness::Missing
+            {
                 continue;
             }
-            parse_payload(&read_limited(&path)?, &p.format)?
+            Some(path)
         };
-        provider_matcher(p, &payload)?.references(&mut refs);
+        if p.behavior != "classical" {
+            continue;
+        }
+        let want_geoip = !needs_geoip && probe(&geoip_path, interval, None) > state;
+        let want_geosite = !needs_geosite && probe(&geosite_path, interval, None) > state;
+        if !want_geoip && !want_geosite {
+            continue;
+        }
+        match file_path {
+            None => {
+                for line in &p.payload {
+                    let bytes = line.as_bytes();
+                    if want_geoip && !needs_geoip && contains_geo_token(bytes, b"GEOIP") {
+                        needs_geoip = true;
+                    }
+                    if want_geosite && !needs_geosite && contains_geo_token(bytes, b"GEOSITE") {
+                        needs_geosite = true;
+                    }
+                    if (!want_geoip || needs_geoip) && (!want_geosite || needs_geosite) {
+                        break;
+                    }
+                }
+            }
+            Some(path) => {
+                let _ = scan_classical_geo_file(
+                    &path,
+                    want_geoip,
+                    want_geosite,
+                    &mut needs_geoip,
+                    &mut needs_geosite,
+                );
+            }
+        }
     }
     if config.adblock.enable {
         for list in &config.adblock.lists {
             check(
+                &mut state,
                 &config.directory.join(list.file_name()),
                 Some(config.adblock.interval),
                 None,
@@ -1338,43 +1553,47 @@ pub fn freshness(config: &Config) -> Result<Freshness> {
         }
     }
     if config.rewrite.enable {
-        let mut modules = Vec::new();
-        if !config.rewrite.custom.trim().is_empty() {
-            modules.push(clyntis_config::rewrite::parse_module(
-                &config.rewrite.custom,
-            ));
-        }
+        let mut present_modules = Vec::new();
         for module in &config.rewrite.modules {
             let path = config.directory.join(module.file_name());
-            if check(&path, Some(config.rewrite.interval), None) == Freshness::Missing {
-                continue;
-            }
-            if let Ok(module) = read_module(&path) {
-                modules.push(module);
+            if check(&mut state, &path, Some(config.rewrite.interval), None) != Freshness::Missing {
+                present_modules.push(path);
             }
         }
-        let script_limit = crate::script::source_limit(config.internal_host_packet_io);
-        for (url, limit) in rewrite_file_urls(&modules, script_limit) {
-            check(
-                &config
-                    .directory
-                    .join(clyntis_config::rewrite::cache_file(&url)),
-                Some(config.rewrite.interval),
-                Some(limit),
-            );
+        if state < Freshness::Missing {
+            let hosted = config.internal_host_packet_io;
+            let script_limit = crate::script::source_limit(hosted);
+            let mock_limit = rewrite_mock_limit(hosted);
+            let mut urls = std::collections::BTreeMap::new();
+            if !config.rewrite.custom.trim().is_empty() {
+                let module = clyntis_config::rewrite::parse_module(&config.rewrite.custom);
+                collect_rewrite_file_urls(&module, script_limit, mock_limit, &mut urls);
+            }
+            for path in present_modules {
+                if let Ok(module) = read_module(&path) {
+                    collect_rewrite_file_urls(&module, script_limit, mock_limit, &mut urls);
+                }
+            }
+            for (url, limit) in urls {
+                if check(
+                    &mut state,
+                    &config
+                        .directory
+                        .join(clyntis_config::rewrite::cache_file(&url)),
+                    Some(config.rewrite.interval),
+                    Some(limit),
+                ) == Freshness::Missing
+                {
+                    break;
+                }
+            }
         }
     }
-    let interval = geo_interval(config);
-    if refs.iter().any(|r| r.0 == "geoip") {
-        let file = if config.geodata_mode {
-            "geoip.dat"
-        } else {
-            "Country.mmdb"
-        };
-        check(&config.directory.join(file), interval, None);
+    if needs_geoip {
+        check(&mut state, &geoip_path, interval, None);
     }
-    if refs.iter().any(|r| r.0 == "geosite") {
-        check(&config.directory.join("geosite.dat"), interval, None);
+    if needs_geosite {
+        check(&mut state, &geosite_path, interval, None);
     }
     Ok(state)
 }
@@ -1628,6 +1847,25 @@ mod wire {
             }
         }
         Ok(())
+    }
+
+    /// Calls `each` with `(field_number, wire_type, raw_bytes)` for every field.
+    pub fn each_raw_field(
+        buf: &[u8],
+        mut each: impl FnMut(u64, u8, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (n, wire, value) = field(buf, &mut pos)?;
+            each(n, wire, value)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a varint field payload returned by [`each_raw_field`].
+    pub fn decode_varint(buf: &[u8]) -> Result<u64> {
+        let mut pos = 0;
+        varint(buf, &mut pos)
     }
 
     fn read_varint(reader: &mut impl std::io::Read) -> Result<Option<u64>> {
@@ -1888,6 +2126,71 @@ async fn download_with(
     .await
     .map_err(|_| anyhow::anyhow!("resource download exceeded {}s", timeouts.total.as_secs()))?
 }
+fn decode_geoip_cidr(bytes: &[u8]) -> Result<ipnet::IpNet> {
+    let mut ip: Option<IpAddr> = None;
+    let mut prefix: u32 = 0;
+    wire::each_raw_field(bytes, |number, wire_type, value| {
+        match number {
+            1 => {
+                ensure!(wire_type == 2, "invalid geoip.dat");
+                ip = Some(match value.len() {
+                    4 => IpAddr::from(<[u8; 4]>::try_from(value)?),
+                    16 => IpAddr::from(<[u8; 16]>::try_from(value)?),
+                    _ => bail!("invalid GeoIP address"),
+                });
+            }
+            2 => {
+                ensure!(wire_type == 0, "invalid geoip.dat");
+                prefix = u32::try_from(wire::decode_varint(value)?)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let Some(ip) = ip else {
+        bail!("invalid GeoIP address");
+    };
+    Ok(ipnet::IpNet::new(ip, u8::try_from(prefix)?)?)
+}
+
+fn load_provider_matcher(p: &RuleProvider, path: &Path) -> Result<Matcher> {
+    match p.format.as_str() {
+        "text" => {
+            use std::io::{BufRead, BufReader};
+            ensure!(
+                std::fs::metadata(path)?.len() <= LIMIT as u64,
+                "resource exceeds size limit"
+            );
+            let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+            let mut builder = ProviderMatcherBuilder::new(&p.behavior);
+            let mut line = String::new();
+            let mut read_bytes = 0usize;
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line)?;
+                if n == 0 {
+                    break;
+                }
+                read_bytes = read_bytes.saturating_add(n);
+                ensure!(read_bytes <= LIMIT, "resource exceeds size limit");
+                let value = line.trim();
+                if value.is_empty() || value.starts_with('#') {
+                    continue;
+                }
+                builder.push(value)?;
+            }
+            Ok(builder.build())
+        }
+        "yaml" => {
+            let bytes = read_limited(path)?;
+            let payload = parse_payload(&bytes, &p.format)?;
+            drop(bytes);
+            provider_matcher(p, &payload)
+        }
+        _ => bail!("unsupported rule provider format"),
+    }
+}
+
 fn parse_payload(data: &[u8], format: &str) -> Result<Vec<String>> {
     match format {
         "yaml" => {
@@ -1907,20 +2210,32 @@ fn parse_payload(data: &[u8], format: &str) -> Result<Vec<String>> {
         _ => bail!("unsupported rule provider format"),
     }
 }
-/// Domain conditions (all of a `domain` provider, and DOMAIN/DOMAIN-SUFFIX/
-/// DOMAIN-KEYWORD/DOMAIN-REGEX lines of a `classical` one) go into one compact
-/// [`DomainSet`] and CIDRs into one [`IpSet`], instead of one matcher per line
-/// scanned in order. A provider matches when any entry does, so grouping keeps
-/// the result.
-fn provider_matcher(p: &RuleProvider, payload: &[String]) -> Result<Matcher> {
-    ensure!(payload.len() <= 2_000_000, "too many provider rules");
-    let mut domains = DomainSetBuilder::default();
-    let mut nets = vec![];
-    let mut nodes = vec![];
-    for value in payload {
-        match p.behavior.as_str() {
-            "domain" => domains.pattern(value)?,
-            "ipcidr" => nets.push(value.parse()?),
+
+struct ProviderMatcherBuilder<'a> {
+    behavior: &'a str,
+    count: usize,
+    domains: DomainSetBuilder,
+    nets: Vec<ipnet::IpNet>,
+    nodes: Vec<Matcher>,
+}
+
+impl<'a> ProviderMatcherBuilder<'a> {
+    fn new(behavior: &'a str) -> Self {
+        Self {
+            behavior,
+            count: 0,
+            domains: DomainSetBuilder::default(),
+            nets: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, value: &str) -> Result<()> {
+        self.count += 1;
+        ensure!(self.count <= 2_000_000, "too many provider rules");
+        match self.behavior {
+            "domain" => self.domains.pattern(value)?,
+            "ipcidr" => self.nets.push(value.parse()?),
             "classical" => {
                 let m = Matcher::parse_condition(value)?;
                 let mut refs = vec![];
@@ -1930,21 +2245,40 @@ fn provider_matcher(p: &RuleProvider, payload: &[String]) -> Result<Matcher> {
                     "nested RULE-SET is not permitted in classical providers"
                 );
                 match m {
-                    Matcher::Net(net) => nets.push(net),
-                    m => nodes.extend(domains.absorb(m)),
+                    Matcher::Net(net) => self.nets.push(net),
+                    m => self.nodes.extend(self.domains.absorb(m)),
                 }
             }
             _ => bail!("unsupported provider behavior"),
         }
+        Ok(())
     }
-    let domains = domains.build();
-    if !domains.is_empty() {
-        nodes.insert(0, Matcher::Domains(Arc::new(domains)));
+
+    fn build(mut self) -> Matcher {
+        let domains = self.domains.build();
+        if !domains.is_empty() {
+            self.nodes.insert(0, Matcher::Domains(Arc::new(domains)));
+        }
+        if !self.nets.is_empty() {
+            self.nodes
+                .insert(0, Matcher::Nets(Arc::new(IpSet::new(self.nets, false))));
+        }
+        Matcher::Or(self.nodes.into())
     }
-    if !nets.is_empty() {
-        nodes.insert(0, Matcher::Nets(Arc::new(IpSet::new(nets, false))));
+}
+
+/// Domain conditions (all of a `domain` provider, and DOMAIN/DOMAIN-SUFFIX/
+/// DOMAIN-KEYWORD/DOMAIN-REGEX lines of a `classical` one) go into one compact
+/// [`DomainSet`] and CIDRs into one [`IpSet`], instead of one matcher per line
+/// scanned in order. A provider matches when any entry does, so grouping keeps
+/// the result.
+fn provider_matcher(p: &RuleProvider, payload: &[String]) -> Result<Matcher> {
+    ensure!(payload.len() <= 2_000_000, "too many provider rules");
+    let mut builder = ProviderMatcherBuilder::new(&p.behavior);
+    for value in payload {
+        builder.push(value)?;
     }
-    Ok(Matcher::Or(nodes.into()))
+    Ok(builder.build())
 }
 struct Country {
     db: Arc<maxminddb::Reader<Vec<u8>>>,
@@ -1977,6 +2311,7 @@ struct GeoIpList {
     #[prost(message, repeated, tag = "1")]
     entry: Vec<GeoIp>,
 }
+#[cfg(test)] // Only used to encode test fixtures; entries and CIDRs are decoded lazily.
 #[derive(Clone, PartialEq, Message)]
 struct GeoIp {
     #[prost(string, tag = "1")]
@@ -1986,6 +2321,7 @@ struct GeoIp {
     #[prost(bool, tag = "3")]
     inverse_match: bool,
 }
+#[cfg(test)] // Only used to encode test fixtures; CIDRs are decoded lazily.
 #[derive(Clone, PartialEq, Message)]
 struct Cidr {
     #[prost(bytes = "vec", tag = "1")]
@@ -3796,6 +4132,120 @@ rules:
             "REJECT"
         );
         running.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn freshness_skips_domain_provider_parsing_scans_classical_and_caps_hosted_mock() {
+        let dir = std::env::temp_dir().join(format!("meta-fresh-light-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::parse(
+            b"geodata-mode: true\nrule-providers:\n  dom: {type: file, path: dom.yaml, behavior: domain, format: yaml}\n  ip: {type: file, path: ip.txt, behavior: ipcidr, format: text}\n  cls: {type: file, path: cls.yaml, behavior: classical, format: yaml}\nrules: ['RULE-SET,dom,DIRECT', 'RULE-SET,ip,DIRECT', 'RULE-SET,cls,DIRECT', 'MATCH,DIRECT']\n",
+        )
+        .unwrap();
+        config.directory = dir.clone();
+        // Domain and ipcidr providers are stat'd without parsing YAML/text contents.
+        std::fs::write(dir.join("dom.yaml"), b":::not valid yaml:::").unwrap();
+        std::fs::write(dir.join("ip.txt"), b"not-a-cidr\n").unwrap();
+        std::fs::write(
+            dir.join("cls.yaml"),
+            b"payload:\n  - DOMAIN-SUFFIX,example.com\n  - 'AND,((GEOIP,CN),(DST-PORT,443))'\n",
+        )
+        .unwrap();
+        // Classical provider references GEOIP, so missing geoip.dat is detected.
+        assert_eq!(freshness(&config).unwrap(), Freshness::Missing);
+        std::fs::write(dir.join("geoip.dat"), b"").unwrap();
+        assert_eq!(freshness(&config).unwrap(), Freshness::Current);
+
+        // Hosted mode caps MockBody::Remote downloads to 2 MiB.
+        let mock_module = clyntis_config::rewrite::parse_module(
+            "[Map Local]\n^https://a\\.test/mock$ data=https://cdn.test/mock.json\n",
+        );
+        let hosted_urls = rewrite_file_urls(
+            std::iter::once(&mock_module),
+            crate::script::source_limit(true),
+            rewrite_mock_limit(true),
+        );
+        assert_eq!(
+            hosted_urls.get("https://cdn.test/mock.json"),
+            Some(&HOSTED_MOCK_LIMIT)
+        );
+        let desktop_urls = rewrite_file_urls(
+            std::iter::once(&mock_module),
+            crate::script::source_limit(false),
+            rewrite_mock_limit(false),
+        );
+        assert_eq!(desktop_urls.get("https://cdn.test/mock.json"), Some(&LIMIT));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn populate_geoip_decodes_cidrs_lazily_including_v6_and_inverse() {
+        let dir = std::env::temp_dir().join(format!("meta-geoip-lazy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("geoip.dat");
+        let list = GeoIpList {
+            entry: vec![
+                GeoIp {
+                    country_code: "CN".into(),
+                    cidr: vec![
+                        Cidr {
+                            ip: vec![1, 2, 3, 0],
+                            prefix: 24,
+                        },
+                        Cidr {
+                            ip: "2400:3200::"
+                                .parse::<std::net::Ipv6Addr>()
+                                .unwrap()
+                                .octets()
+                                .to_vec(),
+                            prefix: 32,
+                        },
+                    ],
+                    inverse_match: false,
+                },
+                GeoIp {
+                    country_code: "INV".into(),
+                    cidr: vec![Cidr {
+                        ip: vec![10, 0, 0, 0],
+                        prefix: 8,
+                    }],
+                    inverse_match: true,
+                },
+            ],
+        }
+        .encode_to_vec();
+        std::fs::write(&data, list).unwrap();
+
+        let previous = Resources::default();
+        let mut out = Resources::default();
+        populate_geoip(
+            &data,
+            true,
+            &["cn".into(), "!cn".into(), "inv".into()],
+            &previous,
+            false,
+            &mut out,
+        )
+        .unwrap();
+
+        let v4_cn: IpAddr = "1.2.3.4".parse().unwrap();
+        let v6_cn: IpAddr = "2400:3200::1".parse().unwrap();
+        let other: IpAddr = "8.8.8.8".parse().unwrap();
+        let priv_v4: IpAddr = "10.1.2.3".parse().unwrap();
+
+        let cn = out.matchers.get(&("geoip".into(), "cn".into())).unwrap();
+        let not_cn = out.matchers.get(&("geoip".into(), "!cn".into())).unwrap();
+        let inv = out.matchers.get(&("geoip".into(), "inv".into())).unwrap();
+        assert_eq!(cn.evaluate("", Some(v4_cn), 0, "", false), Some(true));
+        assert_eq!(cn.evaluate("", Some(v6_cn), 0, "", false), Some(true));
+        assert_eq!(cn.evaluate("", Some(other), 0, "", false), Some(false));
+        assert_eq!(not_cn.evaluate("", Some(v4_cn), 0, "", false), Some(false));
+        assert_eq!(not_cn.evaluate("", Some(other), 0, "", false), Some(true));
+        assert_eq!(inv.evaluate("", Some(priv_v4), 0, "", false), Some(false));
+        assert_eq!(inv.evaluate("", Some(other), 0, "", false), Some(true));
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

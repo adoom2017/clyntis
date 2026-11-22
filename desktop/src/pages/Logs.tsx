@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Download, Pause, Play, Search, Trash2 } from "lucide-react";
@@ -10,7 +10,7 @@ import { type Perform } from "../components/common";
  * addresses, arrows) so destinations and rules stand out. */
 const quietLogPart =
   /(\[(?:TCP|UDP)\]|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b|-->)/;
-function LogPayload({ text }: { text: string }) {
+const LogPayload = memo(function LogPayload({ text }: { text: string }) {
   return (
     <span>
       {text.split(quietLogPart).map((part, i) =>
@@ -24,7 +24,24 @@ function LogPayload({ text }: { text: string }) {
       )}
     </span>
   );
-}
+});
+
+const LogRow = memo(function LogRow({ log }: { log: Log }) {
+  return (
+    <div className={`log-row ${log.type}`}>
+      <time>
+        {new Date(log.time * 1000).toLocaleTimeString(locale(), {
+          hour12: false,
+        })}
+      </time>
+      <span className={`log-level ${log.type}`}>
+        {log.type === "warning" ? "WARN" : log.type.toUpperCase()}
+      </span>
+      <LogPayload text={log.payload} />
+    </div>
+  );
+});
+
 export function LogPage({
   logs,
   perform,
@@ -38,14 +55,22 @@ export function LogPage({
   const [paused, setPaused] = useState(false);
   const [frozen, setFrozen] = useState<Log[]>([]);
   const [query, setQuery] = useState("");
-  // Newest first: logs arrive oldest-first, so reverse the filtered copy.
-  const visible = (paused ? frozen : logs)
-    .filter(
-      (log) =>
+  const source = paused ? frozen : logs;
+  // Newest first: logs arrive oldest-first, so walk backwards to avoid extra copies.
+  const visible = useMemo(() => {
+    const q = query.toLowerCase();
+    const out: Log[] = [];
+    for (let i = source.length - 1; i >= 0; i--) {
+      const log = source[i];
+      if (
         (level === "all" || log.type === level) &&
-        log.payload.toLowerCase().includes(query.toLowerCase()),
-    )
-    .reverse();
+        (!q || log.payload.toLowerCase().includes(q))
+      ) {
+        out.push(log);
+      }
+    }
+    return out;
+  }, [source, level, query]);
   return (
     <>
       <div className="toolbar">
@@ -115,17 +140,10 @@ export function LogPage({
       <div className="panel logs-panel" role="log" aria-live="off">
         {visible.length ? (
           visible.map((log, i) => (
-            <div className={`log-row ${log.type}`} key={`${log.time}-${i}`}>
-              <time>
-                {new Date(log.time * 1000).toLocaleTimeString(locale(), {
-                  hour12: false,
-                })}
-              </time>
-              <span className={`log-level ${log.type}`}>
-                {log.type === "warning" ? "WARN" : log.type.toUpperCase()}
-              </span>
-              <LogPayload text={log.payload} />
-            </div>
+            <LogRow
+              key={log.id ?? `${log.time}-${visible.length - i}`}
+              log={log}
+            />
           ))
         ) : (
           <div className="table-empty">{t("暂无日志")}</div>

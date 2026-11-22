@@ -140,6 +140,7 @@ struct RequestsView: View {
     }
 
     var body: some View {
+        let visible = self.visible
         List {
             Section {
                 NavigationLink { MitmView(model: model) } label: {
@@ -433,20 +434,24 @@ private struct HeadersSection: View {
 }
 
 private struct BodySection: View {
+    nonisolated private static let prettyPrintLimit = 256 * 1024
+    nonisolated private static let displayCharLimit = 100_000
+
     let title: String
     let content: RequestDetail.Body?
     @State private var pretty = true
+    @State private var prettyText: String?
+
+    private var canPrettyPrint: Bool {
+        guard let text = content?.text else { return false }
+        return text.utf8.count <= Self.prettyPrintLimit
+    }
 
     private var shown: String {
         guard let body = content else { return "" }
         if let text = body.text {
-            if pretty, let data = text.data(using: .utf8),
-               let object = try? JSONSerialization.jsonObject(with: data),
-               let formatted = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .withoutEscapingSlashes]),
-               let string = String(data: formatted, encoding: .utf8) {
-                return string
-            }
-            return text
+            if pretty, let prettyText { return prettyText }
+            return String(text.prefix(Self.displayCharLimit))
         }
         return L("二进制内容（base64）") + "\n" + String((body.base64 ?? "").prefix(20_000))
     }
@@ -454,7 +459,7 @@ private struct BodySection: View {
     var body: some View {
         Section {
             if let body = content, body.size > 0 {
-                Text(String(shown.prefix(100_000))).font(.caption.monospaced()).textSelection(.enabled)
+                Text(shown).font(.caption.monospaced()).textSelection(.enabled)
             } else {
                 Text(L("无内容")).foregroundStyle(.secondary)
             }
@@ -462,7 +467,7 @@ private struct BodySection: View {
             HStack {
                 Text(title)
                 Spacer()
-                if content?.text != nil {
+                if canPrettyPrint {
                     Button(pretty ? L("原文") : L("格式化")) { pretty.toggle() }.font(.caption).textCase(nil)
                 }
             }
@@ -472,6 +477,26 @@ private struct BodySection: View {
                     .compactMap { $0 }.joined(separator: " · "))
             }
         }
+        .task(id: content) {
+            prettyText = nil
+            guard let text = content?.text, text.utf8.count <= Self.prettyPrintLimit else { return }
+            let formatted = await Task.detached(priority: .userInitiated) {
+                Self.formatJSON(text)
+            }.value
+            guard !Task.isCancelled else { return }
+            prettyText = formatted
+        }
+    }
+
+    nonisolated private static func formatJSON(_ text: String) -> String? {
+        guard text.utf8.count <= prettyPrintLimit,
+              let data = text.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let formatted = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .withoutEscapingSlashes]),
+              let string = String(data: formatted, encoding: .utf8) else {
+            return nil
+        }
+        return String(string.prefix(displayCharLimit))
     }
 }
 
@@ -480,13 +505,14 @@ private struct BodySection: View {
 struct MitmView: View {
     @Bindable var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
-    @State private var authority = MitmAuthority.load()
+    @State private var authority: MitmAuthority?
     @State private var check: MitmAuthority.Check?
     @State private var trusted = false
     @State private var hosts = ""
     @State private var failure: String?
     @State private var confirmRegenerate = false
     @State private var server: ProfileServer?
+    @State private var refreshTask: Task<Void, Never>?
 
     private var settings: MitmSettings { model.overrides.mitm ?? MitmSettings() }
 
@@ -599,6 +625,7 @@ struct MitmView: View {
         }
         // Back from Settings after installing or trusting the certificate.
         .onChange(of: scenePhase) { _, phase in if phase == .active { refresh() } }
+        .onDisappear { refreshTask?.cancel() }
         .confirmationDialog(L("重新生成证书？"), isPresented: $confirmRegenerate, titleVisibility: .visible) {
             Button(L("重新生成"), role: .destructive) { Task { await run { try await generate() } } }
         } message: {
@@ -624,18 +651,30 @@ struct MitmView: View {
     }
 
     private func refresh() {
+        refreshTask?.cancel()
+        refreshTask = Task { await performRefresh() }
+    }
+
+    private func performRefresh() async {
         let wasTrusted = trusted
-        authority = MitmAuthority.load()
-        check = authority.flatMap { try? $0.check() }
-        trusted = check.map(MitmAuthority.trusted) ?? false
+        let result: (authority: MitmAuthority?, check: MitmAuthority.Check?, trusted: Bool) = await Task.detached(priority: .userInitiated) {
+            let loaded = MitmAuthority.load()
+            let checked = loaded.flatMap { try? $0.check() }
+            let isTrusted = checked.map(MitmAuthority.trusted) ?? false
+            return (loaded, checked, isTrusted)
+        }.value
+        guard !Task.isCancelled else { return }
+        authority = result.authority
+        check = result.check
+        trusted = result.trusted
         if trusted && !wasTrusted && model.connected && !(model.mitm?.bypassed.isEmpty ?? true) {
-            Task { try? await model.clearMitmBypass() }
+            try? await model.clearMitmBypass()
         }
     }
 
     private func generate() async throws {
         _ = try await model.generateAuthority()
-        refresh()
+        await performRefresh()
     }
 
     private func install(_ check: MitmAuthority.Check) async {

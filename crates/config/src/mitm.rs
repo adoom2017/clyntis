@@ -31,14 +31,18 @@ pub struct Mitm {
 /// a name equal to it, or a wildcard `*.domain` with `host` anywhere below
 /// `domain` (not only one level, as TLS requires).
 pub fn loosely_covers(names: &[String], host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
     names.iter().any(|name| {
-        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let name = name.trim_end_matches('.');
         match name.strip_prefix("*.") {
             // At least two labels, so `*.com` covers nothing.
-            Some(domain) if domain.contains('.') => host.ends_with(&format!(".{domain}")),
+            Some(domain) if domain.contains('.') => {
+                host.len() > domain.len()
+                    && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+                    && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain)
+            }
             Some(_) => false,
-            None => name == host,
+            None => name.eq_ignore_ascii_case(host),
         }
     })
 }
@@ -53,29 +57,31 @@ impl Mitm {
 /// Whether `host` matches the patterns: one including pattern matches and no
 /// `-` pattern does.
 pub fn host_matches(patterns: &[String], host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.trim_end_matches('.');
     let mut included = false;
     for pattern in patterns {
         let pattern = pattern.trim();
         if let Some(excluded) = pattern.strip_prefix('-') {
-            if wildcard(excluded.trim(), &host) {
+            if wildcard(excluded.trim(), host) {
                 return false;
             }
         } else if !pattern.is_empty() && !included {
-            included = wildcard(pattern, &host);
+            included = wildcard(pattern, host);
         }
     }
     included
 }
 
 /// `*` matches any run of characters, `?` one character; case-insensitive.
-fn wildcard(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+/// Allocation-free: it runs for every connection checked for decryption.
+pub fn wildcard(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.trim_end_matches('.');
+    let host = host.trim_end_matches('.');
     let (p, h) = (pattern.as_bytes(), host.as_bytes());
     let (mut i, mut j) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while j < h.len() {
-        if i < p.len() && (p[i] == b'?' || p[i] == h[j]) {
+        if i < p.len() && (p[i] == b'?' || p[i].eq_ignore_ascii_case(&h[j])) {
             i += 1;
             j += 1;
         } else if i < p.len() && p[i] == b'*' {

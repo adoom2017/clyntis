@@ -46,13 +46,13 @@ pub(crate) struct Job {
     pub(crate) method: String,
     pub(crate) request_headers: Vec<(String, String)>,
     /// `None` when the script does not ask for bodies.
-    pub(crate) request_body: Option<Vec<u8>>,
+    pub(crate) request_body: Option<Arc<Vec<u8>>>,
     pub(crate) response: Option<ResponseInput>,
 }
 pub(crate) struct ResponseInput {
     pub(crate) status: u16,
     pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<Arc<Vec<u8>>>,
 }
 
 /// What `$done` asked for; `None` fields stay as they were.
@@ -567,19 +567,16 @@ mod imp {
     fn set_body<'js>(
         ctx: &Ctx<'js>,
         object: &Object<'js>,
-        body: Vec<u8>,
+        body: Arc<Vec<u8>>,
         binary: bool,
     ) -> Result<()> {
         if binary {
-            let bytes = TypedArray::<u8>::new(ctx.clone(), body)?;
+            let bytes = TypedArray::<u8>::new_copy(ctx.clone(), body.as_slice())?;
             object.set("bodyBytes", bytes.arraybuffer()?)?;
             object.set("body", bytes)?;
         } else {
-            let text = match String::from_utf8(body) {
-                Ok(s) => s,
-                Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
-            };
-            object.set("body", text.as_str())?;
+            let text = String::from_utf8_lossy(body.as_slice());
+            object.set("body", text.as_ref())?;
         }
         Ok(())
     }
@@ -812,7 +809,7 @@ mod tests {
             response: Some(ResponseInput {
                 status: 200,
                 headers: vec![("Content-Type".into(), "application/json".into())],
-                body: Some(b"\x01\x02\x03".to_vec()),
+                body: Some(Arc::new(b"\x01\x02\x03".to_vec())),
             }),
         }
     }
