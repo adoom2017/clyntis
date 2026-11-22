@@ -559,19 +559,20 @@ fn substitute_arguments<'a>(
         let mut i = 0;
         let mut brace_depth = 0usize;
         while i < bytes.len() {
-            if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
-                if let Some(rel_end) = out[i + 2..].find('}') {
-                    let name = &out[i + 2..i + 2 + rel_end];
-                    if brace_depth == 0
-                        && let Some((_, value)) = values.iter().find(|(k, _)| k == name)
-                    {
-                        replaced.push_str(script_value_text(value));
-                    } else {
-                        replaced.push_str(&out[i..i + 3 + rel_end]);
-                    }
-                    i += 3 + rel_end;
-                    continue;
+            if bytes[i] == b'$'
+                && bytes.get(i + 1) == Some(&b'{')
+                && let Some(rel_end) = out[i + 2..].find('}')
+            {
+                let name = &out[i + 2..i + 2 + rel_end];
+                if brace_depth == 0
+                    && let Some((_, value)) = values.iter().find(|(k, _)| k == name)
+                {
+                    replaced.push_str(script_value_text(value));
+                } else {
+                    replaced.push_str(&out[i..i + 3 + rel_end]);
                 }
+                i += 3 + rel_end;
+                continue;
             }
             if bytes[i] == b'{' {
                 brace_depth += 1;
@@ -1150,8 +1151,7 @@ fn build_script(
     let name = option(options, "tag")
         .filter(|t| !t.is_empty())
         .map_or_else(|| script_name(&url, number), str::to_owned);
-    let number_option =
-        |key| option(options, key).and_then(|v: &str| v.trim().parse::<u64>().ok());
+    let number_option = |key| option(options, key).and_then(|v: &str| v.trim().parse::<u64>().ok());
     Ok(Some(Rule {
         pattern,
         phase,
@@ -1220,18 +1220,28 @@ fn is_dsl_rule(line: &str) -> bool {
 
 fn strip_dsl_phase(line: &str) -> Option<(Phase, &str)> {
     let rest = line.trim_start();
-    let (phase, after) = if rest.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("request")) {
+    let (phase, after) = if rest
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("request"))
+    {
         (Phase::Request, &rest[7..])
-    } else if rest.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("response")) {
+    } else if rest
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("response"))
+    {
         (Phase::Response, &rest[8..])
     } else {
         return None;
     };
-    let after = after.strip_prefix(|c: char| c.is_ascii_whitespace())?.trim_start();
+    let after = after
+        .strip_prefix(|c: char| c.is_ascii_whitespace())?
+        .trim_start();
     if !after.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("if")) {
         return None;
     }
-    let cond = after[2..].strip_prefix(|c: char| c.is_ascii_whitespace())?.trim_start();
+    let cond = after[2..]
+        .strip_prefix(|c: char| c.is_ascii_whitespace())?
+        .trim_start();
     Some((phase, cond))
 }
 
@@ -1300,7 +1310,10 @@ fn split_dsl_then(s: &str) -> Option<(&str, &str)> {
             i = next;
             continue;
         }
-        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+        if bytes[i] == b'/'
+            && regex_allowed_before(bytes, i)
+            && let Some(next) = skip_regex(bytes, i)
+        {
             i = next;
             continue;
         }
@@ -1309,7 +1322,8 @@ fn split_dsl_then(s: &str) -> Option<(&str, &str)> {
             while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                 i += 1;
             }
-            if s.get(i..i + 4).is_some_and(|w| w.eq_ignore_ascii_case("then"))
+            if s.get(i..i + 4)
+                .is_some_and(|w| w.eq_ignore_ascii_case("then"))
                 && bytes.get(i + 4).is_some_and(u8::is_ascii_whitespace)
             {
                 let after = s[i + 4..].trim_start();
@@ -1333,7 +1347,10 @@ fn split_top_level(s: &str, sep: u8) -> Vec<&str> {
             i = next;
             continue;
         }
-        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+        if bytes[i] == b'/'
+            && regex_allowed_before(bytes, i)
+            && let Some(next) = skip_regex(bytes, i)
+        {
             i = next;
             continue;
         }
@@ -1478,7 +1495,10 @@ fn split_top_level_op<'a>(s: &'a str, op: &[u8; 2]) -> Vec<&'a str> {
             i = next;
             continue;
         }
-        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+        if bytes[i] == b'/'
+            && regex_allowed_before(bytes, i)
+            && let Some(next) = skip_regex(bytes, i)
+        {
             i = next;
             continue;
         }
@@ -1602,8 +1622,8 @@ fn parse_dsl_condition(cond: &str) -> Result<(String, Option<&str>, Vec<Conditio
             } else {
                 return Err(format!("unsupported method condition: {clause}"));
             };
-            let value = parse_dsl_value(rhs)
-                .map_err(|()| format!("invalid method condition: {clause}"))?;
+            let value =
+                parse_dsl_value(rhs).map_err(|()| format!("invalid method condition: {clause}"))?;
             conditions.push(Condition::Method { equals, value });
             continue;
         }
@@ -1663,7 +1683,10 @@ fn parse_dsl_call(stage: &str) -> Result<(&str, Vec<&str>, &str), String> {
             i = next;
             continue;
         }
-        if bytes[i] == b'/' && regex_allowed_before(bytes, i) && let Some(next) = skip_regex(bytes, i) {
+        if bytes[i] == b'/'
+            && regex_allowed_before(bytes, i)
+            && let Some(next) = skip_regex(bytes, i)
+        {
             i = next;
             continue;
         }
@@ -1770,7 +1793,9 @@ fn parse_dsl_script_argument(
     }
 }
 
-fn dsl_pipe_headers(stages: &[&str]) -> Result<(Option<String>, Vec<(String, String)>), String> {
+type PipedHeaders = (Option<String>, Vec<(String, String)>);
+
+fn dsl_pipe_headers(stages: &[&str]) -> Result<PipedHeaders, String> {
     let mut content_type = None;
     let mut headers = Vec::new();
     for stage in stages {
@@ -1811,6 +1836,7 @@ fn parse_dsl_status(raw: &str) -> Result<u16, String> {
     Ok(status)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_dsl_single_action(
     default_phase: Phase,
     pattern: &str,
@@ -2025,8 +2051,8 @@ fn parse_dsl_single_action(
             }
             let kind =
                 parse_string_literal(args[0]).map_err(|()| "invalid mock data type".to_owned())?;
-            let data =
-                parse_string_literal(args[1]).map_err(|()| "invalid mock body literal".to_owned())?;
+            let data = parse_string_literal(args[1])
+                .map_err(|()| "invalid mock body literal".to_owned())?;
             let status = args
                 .get(2)
                 .map(|s| parse_dsl_status(s))
@@ -2070,8 +2096,7 @@ fn parse_dsl_single_action(
                 Phase::Request,
                 Action::Mock(Mock {
                     status,
-                    content_type: content_type_override
-                        .unwrap_or_else(|| default_type.to_owned()),
+                    content_type: content_type_override.unwrap_or_else(|| default_type.to_owned()),
                     body: MockBody::Remote(url),
                     headers,
                 }),
@@ -2307,7 +2332,10 @@ fn dsl_line(
             arg_defs,
         )? {
             if idx > 0 {
-                if rules.first().is_some_and(|first: &Rule| first.phase != rule.phase) {
+                if rules
+                    .first()
+                    .is_some_and(|first: &Rule| first.phase != rule.phase)
+                {
                     return Err("mixed request/response phases in piped action".to_owned());
                 }
                 rule.pipe_continuation = true;
@@ -2544,12 +2572,25 @@ hostname = a.test, first.test.comhostname = second.test.com, -skip.test.com
 "#,
         );
         assert_eq!(module.skipped.len(), 3);
-        assert!(module.skipped[0].1.contains("unsupported action: reject_video"));
+        assert!(
+            module.skipped[0]
+                .1
+                .contains("unsupported action: reject_video")
+        );
         assert!(module.skipped[1].1.contains("unsupported regex flag 'u'"));
-        assert!(module.skipped[2].1.contains("unsupported logical OR condition"));
+        assert!(
+            module.skipped[2]
+                .1
+                .contains("unsupported logical OR condition")
+        );
         assert_eq!(
             module.hostnames,
-            ["a.test", "first.test.com", "second.test.com", "-skip.test.com"]
+            [
+                "a.test",
+                "first.test.com",
+                "second.test.com",
+                "-skip.test.com"
+            ]
         );
         assert_eq!(module.rules.len(), 18);
         let actions: Vec<_> = module.rules.iter().map(|r| &r.action).collect();
@@ -2593,10 +2634,7 @@ hostname = a.test, first.test.comhostname = second.test.com, -skip.test.com
         };
         assert_eq!(grpc_mock.status, 200);
         assert_eq!(grpc_mock.body, MockBody::Inline(vec![0, 0, 0]));
-        assert_eq!(
-            grpc_mock.headers,
-            vec![("grpc-status".into(), "0".into())]
-        );
+        assert_eq!(grpc_mock.headers, vec![("grpc-status".into(), "0".into())]);
         let Action::Mock(file_mock) = actions[9] else {
             panic!()
         };

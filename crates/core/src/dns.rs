@@ -1737,8 +1737,10 @@ mod perf_tests {
 
     #[test]
     fn wildcard_hosts_fake_map_arc_and_original_fast_path() {
-        let mut config = Dns::default();
-        config.enhanced_mode = "redir-host".into();
+        let config = Dns {
+            enhanced_mode: "redir-host".into(),
+            ..Default::default()
+        };
         let redir = Resolver::new(config, Arc::new(clyntis_platform::DefaultHooks));
         let ip = redir.fake_address("shared.test", false).unwrap();
         // Fast path skips fake map when enhanced_mode != "fake-ip".

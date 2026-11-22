@@ -279,6 +279,10 @@ impl PendingResources {
                 if let Some(parent) = destination.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                #[cfg(windows)]
+                if destination.exists() {
+                    std::fs::remove_file(&destination)?;
+                }
                 std::fs::rename(&staged, &destination)?;
             }
             Ok(())
@@ -300,105 +304,6 @@ impl PendingResources {
 impl Drop for PendingResources {
     fn drop(&mut self) {
         self.clear();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn runner_exit_reports_status_and_structured_error() {
-        let directory = std::env::temp_dir().join(format!("clyntis-exit-{}", Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "printf '%s\\n' '{\"event\":\"error\",\"version\":1,\"message\":\"cannot update TUN routing: File exists\"}'; exit 7"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
-        let input = child.stdin.take().unwrap();
-        let output = FrameReader::new(child.stdout.take().unwrap());
-        child.wait().await.unwrap();
-        let mut runner = Runner {
-            child,
-            input,
-            output,
-            directory: directory.clone(),
-            diagnostics: diagnostics::Diagnostics::default(),
-            stderr_task: tokio::spawn(async {}),
-            exit_error: None,
-        };
-        let error = runner.check().await.unwrap_err().to_string();
-        assert_eq!(runner.check().await.unwrap_err().to_string(), error);
-        assert!(error.contains("7"));
-        assert!(error.contains("cannot update TUN routing: File exists"));
-        assert!(
-            std::fs::read_to_string(directory.join("clyntis-runner.log"))
-                .unwrap()
-                .contains("File exists")
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn pending_resources_stream_to_disk_commit_and_cleanup() {
-        let root = tempfile::tempdir().unwrap();
-        let dest = root.path().join(Uuid::new_v4().to_string());
-        std::fs::create_dir(&dest).unwrap();
-
-        let mut pending = PendingResources::new(root.path().to_path_buf());
-        pending.append("geoip.dat".into(), b"hello ").unwrap();
-        pending
-            .append("rule_provider/list.yaml".into(), b"payload:\n")
-            .unwrap();
-        pending.append("geoip.dat".into(), b"world").unwrap();
-
-        let staging_dir = pending.staging_dir.clone().unwrap();
-        assert!(staging_dir.exists());
-
-        // Unreferenced resource is rejected without touching destination.
-        assert!(
-            pending
-                .commit_into(&dest, &["geoip.dat".into()])
-                .unwrap_err()
-                .to_string()
-                .contains("unreferenced")
-        );
-        assert!(!dest.join("geoip.dat").exists());
-
-        pending
-            .commit_into(
-                &dest,
-                &["geoip.dat".into(), "rule_provider/list.yaml".into()],
-            )
-            .unwrap();
-        assert!(!staging_dir.exists());
-        assert_eq!(
-            std::fs::read(dest.join("geoip.dat")).unwrap(),
-            b"hello world"
-        );
-        assert_eq!(
-            std::fs::read(dest.join("rule_provider/list.yaml")).unwrap(),
-            b"payload:\n"
-        );
-    }
-
-    #[test]
-    fn pending_resources_drop_removes_staging_directory_and_enforces_limits() {
-        let root = tempfile::tempdir().unwrap();
-        let staging_dir = {
-            let mut pending = PendingResources::new(root.path().to_path_buf());
-            assert!(pending.append("geoip.dat".into(), b"").is_err());
-            assert!(
-                pending
-                    .append("geoip.dat".into(), &vec![1u8; MAX_RESOURCE_CHUNK + 1])
-                    .is_err()
-            );
-            pending.append("geoip.dat".into(), b"chunk").unwrap();
-            let dir = pending.staging_dir.clone().unwrap();
-            assert!(dir.exists());
-            dir
-        };
-        assert!(!staging_dir.exists());
     }
 }
 
@@ -509,4 +414,103 @@ async fn session(
         .await;
     }
     result.and(runner_cleanup).and(proxy_cleanup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_exit_reports_status_and_structured_error() {
+        let directory = std::env::temp_dir().join(format!("clyntis-exit-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s\\n' '{\"event\":\"error\",\"version\":1,\"message\":\"cannot update TUN routing: File exists\"}'; exit 7"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = FrameReader::new(child.stdout.take().unwrap());
+        child.wait().await.unwrap();
+        let mut runner = Runner {
+            child,
+            input,
+            output,
+            directory: directory.clone(),
+            diagnostics: diagnostics::Diagnostics::default(),
+            stderr_task: tokio::spawn(async {}),
+            exit_error: None,
+        };
+        let error = runner.check().await.unwrap_err().to_string();
+        assert_eq!(runner.check().await.unwrap_err().to_string(), error);
+        assert!(error.contains("7"));
+        assert!(error.contains("cannot update TUN routing: File exists"));
+        assert!(
+            std::fs::read_to_string(directory.join("clyntis-runner.log"))
+                .unwrap()
+                .contains("File exists")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_resources_stream_to_disk_commit_and_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join(Uuid::new_v4().to_string());
+        std::fs::create_dir(&dest).unwrap();
+
+        let mut pending = PendingResources::new(root.path().to_path_buf());
+        pending.append("geoip.dat".into(), b"hello ").unwrap();
+        pending
+            .append("rule_provider/list.yaml".into(), b"payload:\n")
+            .unwrap();
+        pending.append("geoip.dat".into(), b"world").unwrap();
+
+        let staging_dir = pending.staging_dir.clone().unwrap();
+        assert!(staging_dir.exists());
+
+        // Unreferenced resource is rejected without touching destination.
+        assert!(
+            pending
+                .commit_into(&dest, &["geoip.dat".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("unreferenced")
+        );
+        assert!(!dest.join("geoip.dat").exists());
+
+        pending
+            .commit_into(
+                &dest,
+                &["geoip.dat".into(), "rule_provider/list.yaml".into()],
+            )
+            .unwrap();
+        assert!(!staging_dir.exists());
+        assert_eq!(
+            std::fs::read(dest.join("geoip.dat")).unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("rule_provider/list.yaml")).unwrap(),
+            b"payload:\n"
+        );
+    }
+
+    #[test]
+    fn pending_resources_drop_removes_staging_directory_and_enforces_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let staging_dir = {
+            let mut pending = PendingResources::new(root.path().to_path_buf());
+            assert!(pending.append("geoip.dat".into(), b"").is_err());
+            assert!(
+                pending
+                    .append("geoip.dat".into(), &vec![1u8; MAX_RESOURCE_CHUNK + 1])
+                    .is_err()
+            );
+            pending.append("geoip.dat".into(), b"chunk").unwrap();
+            let dir = pending.staging_dir.clone().unwrap();
+            assert!(dir.exists());
+            dir
+        };
+        assert!(!staging_dir.exists());
+    }
 }

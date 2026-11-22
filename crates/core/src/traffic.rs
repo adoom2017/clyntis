@@ -990,6 +990,7 @@ impl Datagram for PacketSession {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn make_state(
         log: Arc<crate::requests::Requests>,
         id: &str,

@@ -258,6 +258,7 @@ impl<'a, R: AsyncBufRead + Unpin> BodySource<'a, R> {
 
 /// Applies `rules` (indices into the rewriter) in order, lazily buffering and
 /// decoding the body only when a matching rule needs it.
+#[allow(clippy::too_many_arguments)]
 async fn apply_rules<R: AsyncBufRead + Unpin>(
     context: &Context,
     rewrites: &Rewrites,
@@ -1644,10 +1645,12 @@ mod tests {
     }
 
     fn hosted_core(dir: &Path, module_text: &str, files: Vec<(&str, &Path)>) -> Arc<Core> {
-        let mut config = clyntis_config::Config::default();
-        config.directory = dir.to_path_buf();
-        config.internal_host_packet_io = true;
-        config.mitm = crate::mitm::test_settings(&["ads.test"]);
+        let config = clyntis_config::Config {
+            directory: dir.to_path_buf(),
+            internal_host_packet_io: true,
+            mitm: crate::mitm::test_settings(&["ads.test"]),
+            ..Default::default()
+        };
         let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         if !module_text.is_empty() {
             let module = clyntis_config::rewrite::parse_module(module_text);

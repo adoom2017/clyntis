@@ -1621,6 +1621,7 @@ mod tests {
         assert_eq!(hosted.captured_bytes(), 0);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_http_exchange(
         requests: &Requests,
         host: &str,

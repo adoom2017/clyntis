@@ -419,7 +419,11 @@ impl PatternGroup {
             && !suffix.contains('?')
         {
             self.dot_suffix.insert(suffix.into());
-        } else if !self.wildcards.iter().any(|existing| &**existing == lower) {
+        } else if !self
+            .wildcards
+            .iter()
+            .any(|existing| existing.as_ref() == lower.as_str())
+        {
             self.wildcards.push(lower.into_boxed_str());
         }
     }
@@ -749,7 +753,7 @@ impl Interceptor {
         if mitm.lenient_upstream && !prev_lenient {
             let mut bypass = self.bypass.lock().unwrap();
             bypass.retain(|_, entry| {
-                !(entry.reason == BypassReason::UpstreamCertificate && !entry.lenient_upstream)
+                entry.reason != BypassReason::UpstreamCertificate || entry.lenient_upstream
             });
         }
         *self.error.write().unwrap() = result.as_ref().err().map(|e| format!("{e:#}"));
@@ -3173,10 +3177,12 @@ hostname = ads.test
     #[tokio::test]
     async fn hosted_observe_releases_slot_on_websocket_upgrade_and_idle_keepalive() {
         let dir = TestDir::new("clyntis-mitm-observe-slot");
-        let mut config = clyntis_config::Config::default();
-        config.directory = dir.path().to_path_buf();
-        config.internal_host_packet_io = true;
-        config.mitm = test_settings(&["ads.test"]);
+        let config = clyntis_config::Config {
+            directory: dir.path().to_path_buf(),
+            internal_host_packet_io: true,
+            mitm: test_settings(&["ads.test"]),
+            ..Default::default()
+        };
         let core = Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
         core.mitm
             .hosted_keepalive_idle_ms
