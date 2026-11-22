@@ -2403,7 +2403,9 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let old = "[URL Rewrite]\n/ad - reject";
         std::fs::write(&path, old).unwrap();
-        std::fs::File::open(&path)
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();
@@ -2465,7 +2467,9 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let old = "[URL Rewrite]\n/ad - reject\n[MITM]\nhostname = a.test\n";
         std::fs::write(&path, old).unwrap();
-        std::fs::File::open(&path)
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();
@@ -2480,7 +2484,9 @@ mod tests {
         config.rewrite.modules[0].url = format!("{base}/empty");
         let empty_path = dir.join(config.rewrite.modules[0].file_name());
         std::fs::write(&empty_path, old).unwrap();
-        std::fs::File::open(&empty_path)
+        std::fs::File::options()
+            .write(true)
+            .open(&empty_path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();
@@ -2526,7 +2532,9 @@ mod tests {
             "[Script]\nresponse if ${{url}} ~= /^https:\\/\\/a\\.test\\/ad/ then script(\"{v1_script_url}\")\n[MITM]\nhostname = a.test\n"
         );
         std::fs::write(&mod_path, &v1_module).unwrap();
-        std::fs::File::open(&mod_path)
+        std::fs::File::options()
+            .write(true)
+            .open(&mod_path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();
@@ -2594,7 +2602,9 @@ mod tests {
         );
         for (p, body) in [(&mod_a_path, &mod_a_v1), (&mod_b_path, &mod_b_v1)] {
             std::fs::write(p, body).unwrap();
-            std::fs::File::open(p)
+            std::fs::File::options()
+                .write(true)
+                .open(p)
                 .unwrap()
                 .set_modified(std::time::UNIX_EPOCH)
                 .unwrap();
@@ -2602,7 +2612,9 @@ mod tests {
         let shared_path = dir.join(clyntis_config::rewrite::cache_file(&shared_url));
         std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
         std::fs::write(&shared_path, "v1").unwrap();
-        std::fs::File::open(&shared_path)
+        std::fs::File::options()
+            .write(true)
+            .open(&shared_path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();

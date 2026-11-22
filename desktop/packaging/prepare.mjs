@@ -5,6 +5,7 @@ import {
   readFileSync,
   writeFileSync,
   existsSync,
+  rmSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -133,23 +134,28 @@ if (target.includes("windows")) {
     expected
   )
     throw new Error("Wintun archive checksum mismatch");
+  const extractDir = join(bin, "wintun-extract");
+  rmSync(extractDir, { recursive: true, force: true });
+  // Avoid Expand-Archive under Windows PowerShell 5.1 when PSModulePath resolves
+  // PowerShell 7's Microsoft.PowerShell.Archive, which calls a 3-arg .NET Core overload.
   const script =
-    "Expand-Archive -LiteralPath $env:CLYNTIS_WINTUN_ARCHIVE -DestinationPath $env:CLYNTIS_WINTUN_DEST -Force";
+    "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:CLYNTIS_WINTUN_ARCHIVE, $env:CLYNTIS_WINTUN_DEST)";
   run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
     env: {
       ...process.env,
       CLYNTIS_WINTUN_ARCHIVE: archive,
-      CLYNTIS_WINTUN_DEST: bin,
+      CLYNTIS_WINTUN_DEST: extractDir,
     },
   });
   copyFileSync(
-    join(bin, "wintun", "bin", "amd64", "wintun.dll"),
+    join(extractDir, "wintun", "bin", "amd64", "wintun.dll"),
     join(bin, "wintun.dll"),
   );
   copyFileSync(
-    join(bin, "wintun", "LICENSE.txt"),
+    join(extractDir, "wintun", "LICENSE.txt"),
     join(bin, "wintun-LICENSE.txt"),
   );
+  rmSync(extractDir, { recursive: true, force: true });
   copyFileSync(join(bin, "wintun.dll"), join(build, "wintun.dll"));
 }
 console.log(`Desktop sidecars ready: ${target}`);
