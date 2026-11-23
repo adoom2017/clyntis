@@ -140,7 +140,7 @@ impl Overrides {
                     Value::from("sniff"),
                     serde_yaml::from_str(
                         "HTTP: {ports: [80, 8080-8880], override-destination: true}\n\
-                         TLS: {ports: [443, 8443]}\n",
+                         TLS: {ports: [443, 8443], override-destination: true}\n",
                     )?,
                 );
             }
@@ -235,8 +235,9 @@ mod tests {
         assert!(config.adblock.enable);
         assert_eq!(config.adblock.lists[0].name, "AWAvenue-Ads");
         assert_eq!(config.adblock.allow, ["ok.test"]);
-        // The profile's own sniff rules are kept.
+        // The profile's own sniff rules are kept, and omitted override-destination defaults to true.
         assert_eq!(config.sniffer.sniff.keys().collect::<Vec<_>>(), ["TLS"]);
+        assert!(config.sniffer.sniff["TLS"].override_destination);
         // Nested `log.log-level` cannot win over the chosen level.
         let nested = "log:\n  log-level: debug\n";
         let config = crate::Config::parse(overrides.apply(nested).unwrap().as_bytes()).unwrap();
@@ -256,6 +257,12 @@ mod tests {
             config.sniffer.sniff.keys().collect::<Vec<_>>(),
             ["HTTP", "TLS"]
         );
+        assert!(config.sniffer.sniff["HTTP"].override_destination);
+        assert!(config.sniffer.sniff["TLS"].override_destination);
+
+        let explicit_false = "sniffer:\n  enable: true\n  sniff:\n    TLS: {ports: [443], override-destination: false}\n";
+        let config = crate::Config::parse(explicit_false.as_bytes()).unwrap();
+        assert!(!config.sniffer.sniff["TLS"].override_destination);
     }
 
     #[test]

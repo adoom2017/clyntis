@@ -663,4 +663,46 @@ pub(crate) mod tests {
         drop(client);
         assert!(core.sniff_target(&mut server, &stale).await.is_err());
     }
+
+    #[tokio::test]
+    async fn tls_sniff_overrides_destination_by_default() {
+        let hello = client_hello_with_alpn("grok.com", &[b"h2"]);
+        let poisoned = Target::new("157.240.2.14", 443).unwrap();
+
+        let default_yaml = "sniffer:\n  enable: true\n  sniff:\n    TLS: {ports: [443]}\n";
+        let default_cfg = clyntis_config::Config::parse(default_yaml.as_bytes()).unwrap();
+        let default_core = crate::Core::new(
+            default_cfg,
+            std::sync::Arc::new(clyntis_platform::DefaultHooks),
+        )
+        .unwrap();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &hello)
+            .await
+            .unwrap();
+        let (route, destination, _) = default_core
+            .sniff_target(&mut server, &poisoned)
+            .await
+            .unwrap();
+        assert_eq!(route.host, "grok.com");
+        assert_eq!(destination.host, "grok.com");
+
+        let keep_ip_yaml = "sniffer:\n  enable: true\n  sniff:\n    TLS: {ports: [443], override-destination: false}\n";
+        let keep_ip_cfg = clyntis_config::Config::parse(keep_ip_yaml.as_bytes()).unwrap();
+        let keep_ip_core = crate::Core::new(
+            keep_ip_cfg,
+            std::sync::Arc::new(clyntis_platform::DefaultHooks),
+        )
+        .unwrap();
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &hello)
+            .await
+            .unwrap();
+        let (route, destination, _) = keep_ip_core
+            .sniff_target(&mut server, &poisoned)
+            .await
+            .unwrap();
+        assert_eq!(route.host, "grok.com");
+        assert_eq!(destination.host, "157.240.2.14");
+    }
 }

@@ -122,11 +122,25 @@ impl PortRange {
         self.bounds().is_ok_and(|(a, b)| a <= n && n <= b)
     }
 }
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SniffProtocol {
     pub ports: Vec<PortRange>,
+    #[serde(default = "default_true")]
     pub override_destination: bool,
+}
+
+impl Default for SniffProtocol {
+    fn default() -> Self {
+        Self {
+            ports: Vec::new(),
+            override_destination: true,
+        }
+    }
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]

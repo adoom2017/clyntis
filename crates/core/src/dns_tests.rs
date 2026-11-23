@@ -624,3 +624,81 @@ async fn unanswered_aaaa_does_not_delay_an_ipv4_answer() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(1), "lookup took {took:?}");
 }
+
+#[tokio::test]
+async fn fake_ip_returns_nodata_for_https_and_svcb_without_upstream() {
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = udp.local_addr().unwrap().to_string();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_server = hits.clone();
+    let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+            hits_server.fetch_add(1, Ordering::SeqCst);
+            let mut reply = Message::from_vec(&buf[..n]).unwrap();
+            reply
+                .set_message_type(MessageType::Response)
+                .set_recursion_available(true)
+                .set_response_code(ResponseCode::NoError);
+            udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+        }
+    }));
+
+    async fn query_type(resolver: &Resolver, name: &str, kind: RecordType) -> Message {
+        let mut msg = Message::new();
+        msg.set_id(42)
+            .set_recursion_desired(true)
+            .add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
+        let bytes = msg.to_vec().unwrap();
+        Message::from_vec(&resolver.answer(&bytes).await.unwrap()).unwrap()
+    }
+
+    // 1. In fake-ip mode, HTTPS and SVCB return NODATA without hitting upstream.
+    let fake_resolver = Resolver::new(
+        Dns {
+            enhanced_mode: "fake-ip".into(),
+            nameserver: vec![upstream_addr.clone()],
+            fake_ip_filter: vec!["excluded.test".into()],
+            ..Dns::default()
+        },
+        Arc::new(clyntis_platform::DefaultHooks),
+    );
+    for kind in [RecordType::HTTPS, RecordType::SVCB] {
+        let reply = query_type(&fake_resolver, "pbs.twimg.com.", kind).await;
+        assert_eq!(reply.response_code(), ResponseCode::NoError);
+        assert!(reply.answers().is_empty());
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    // 2. Excluded hosts in fake-ip-filter still forward HTTPS to upstream.
+    let reply = query_type(&fake_resolver, "excluded.test.", RecordType::HTTPS).await;
+    assert_eq!(reply.response_code(), ResponseCode::NoError);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // 3. In redir-host mode, HTTPS forwards to upstream, except hosts-mapped names.
+    let mut hosts = std::collections::BTreeMap::new();
+    hosts.insert(
+        "pinned.test".into(),
+        clyntis_config::Strings::One("127.0.0.1".into()),
+    );
+    let redir_resolver = Resolver::new(
+        Dns {
+            enhanced_mode: "redir-host".into(),
+            nameserver: vec![upstream_addr],
+            ..Dns::default()
+        },
+        Arc::new(clyntis_platform::DefaultHooks),
+    );
+    redir_resolver
+        .configure(&hosts, None, &crate::resources::Resources::default())
+        .unwrap();
+    let reply = query_type(&redir_resolver, "pinned.test.", RecordType::HTTPS).await;
+    assert_eq!(reply.response_code(), ResponseCode::NoError);
+    assert!(reply.answers().is_empty());
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let reply = query_type(&redir_resolver, "pbs.twimg.com.", RecordType::HTTPS).await;
+    assert_eq!(reply.response_code(), ResponseCode::NoError);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}

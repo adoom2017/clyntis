@@ -1335,6 +1335,12 @@ impl Resolver {
             return Ok(response.to_vec()?);
         }
         if self.host_values(&host).is_some()
+            && query.query_class() == DNSClass::IN
+            && matches!(query.query_type(), RecordType::HTTPS | RecordType::SVCB)
+        {
+            return Ok(response.to_vec()?);
+        }
+        if self.host_values(&host).is_some()
             && matches!(query.query_type(), RecordType::A | RecordType::AAAA)
         {
             match self.lookup(&host, 0).await {
@@ -1362,33 +1368,40 @@ impl Resolver {
         }
         if self.config.enhanced_mode == "fake-ip"
             && query.query_class() == DNSClass::IN
-            && matches!(query.query_type(), RecordType::A | RecordType::AAAA)
             && !self.is_fake_ip_excluded(&host)
         {
-            if absolute_name(&host).is_err() {
-                response.set_response_code(ResponseCode::FormErr);
+            // Return NODATA for HTTPS/SVCB in fake-ip mode so clients do not
+            // receive upstream ipv4hint/ipv6hint (which may be poisoned and
+            // bypass Fake-IP) or CNAME chains that break domain-based routing.
+            if matches!(query.query_type(), RecordType::HTTPS | RecordType::SVCB) {
                 return Ok(response.to_vec()?);
             }
-            let ip = match self.fake_address(&host, query.query_type() == RecordType::AAAA) {
-                Ok(ip) => ip,
-                Err(_) => {
-                    response.set_response_code(ResponseCode::ServFail);
+            if matches!(query.query_type(), RecordType::A | RecordType::AAAA) {
+                if absolute_name(&host).is_err() {
+                    response.set_response_code(ResponseCode::FormErr);
                     return Ok(response.to_vec()?);
                 }
-            };
-            let data = match ip {
-                IpAddr::V4(ip) => RData::A(A(ip)),
-                IpAddr::V6(ip) => RData::AAAA(AAAA(ip)),
-            };
-            response.add_answer(Record::from_rdata(query.name().clone(), 60, data));
-        } else {
-            match self.cached_exchange(&request).await {
-                Ok(upstream) => {
-                    response = upstream;
-                }
-                Err(_) => {
-                    response.set_response_code(ResponseCode::ServFail);
-                }
+                let ip = match self.fake_address(&host, query.query_type() == RecordType::AAAA) {
+                    Ok(ip) => ip,
+                    Err(_) => {
+                        response.set_response_code(ResponseCode::ServFail);
+                        return Ok(response.to_vec()?);
+                    }
+                };
+                let data = match ip {
+                    IpAddr::V4(ip) => RData::A(A(ip)),
+                    IpAddr::V6(ip) => RData::AAAA(AAAA(ip)),
+                };
+                response.add_answer(Record::from_rdata(query.name().clone(), 60, data));
+                return Ok(response.to_vec()?);
+            }
+        }
+        match self.cached_exchange(&request).await {
+            Ok(upstream) => {
+                response = upstream;
+            }
+            Err(_) => {
+                response.set_response_code(ResponseCode::ServFail);
             }
         }
         Ok(response.to_vec()?)
