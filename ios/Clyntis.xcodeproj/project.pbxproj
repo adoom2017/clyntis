@@ -32,6 +32,7 @@
 		64E1E528262C415611A122DA /* AppOverrides.swift in Sources */ = {isa = PBXBuildFile; fileRef = 720A87D5DAE6CA0C8B875026 /* AppOverrides.swift */; };
 		6595D1D8F7B59AEBBCFAA8D8 /* RemoteConfigImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EF5B7AE790C96FE38085975 /* RemoteConfigImporter.swift */; };
 		6F3758ECF7571F9668C938E4 /* TunnelMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B4B2639FDBCD0D9EC6D5121 /* TunnelMessage.swift */; };
+		7179A110A8911D79EC5C2BDD /* QuickNodesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96679A561F11E44566910E02 /* QuickNodesView.swift */; };
 		73CA57E191453C5197FA9A33 /* MitmTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC27D7E530904CE47B30AD17 /* MitmTests.swift */; };
 		7618812A5D3C3DDBA68C8293 /* OverridesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 976049CA504E502DB4A52712 /* OverridesView.swift */; };
 		8110D1AB67EEF33506E470AC /* CustomRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = 600592D7EE14E85760521851 /* CustomRules.swift */; };
@@ -121,6 +122,7 @@
 		89B1506EAC515ABE8088FD09 /* EgressProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EgressProbe.swift; sourceTree = "<group>"; };
 		8D31DF756998FEC1803E949D /* Clyntis.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Clyntis.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9491005E6B8C53CB4BF4C139 /* ProfileServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileServer.swift; sourceTree = "<group>"; };
+		96679A561F11E44566910E02 /* QuickNodesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickNodesView.swift; sourceTree = "<group>"; };
 		976049CA504E502DB4A52712 /* OverridesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OverridesView.swift; sourceTree = "<group>"; };
 		9EEBA8384375CA66C51E77BE /* YAMLTextView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YAMLTextView.swift; sourceTree = "<group>"; };
 		9F7EAB0C1D2E264CCDE904DD /* RemoteConfigImportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteConfigImportTests.swift; sourceTree = "<group>"; };
@@ -192,6 +194,7 @@
 				976049CA504E502DB4A52712 /* OverridesView.swift */,
 				DC3C90397AC4E4D034C0E577 /* ProfileDetailView.swift */,
 				9491005E6B8C53CB4BF4C139 /* ProfileServer.swift */,
+				96679A561F11E44566910E02 /* QuickNodesView.swift */,
 				3EF5B7AE790C96FE38085975 /* RemoteConfigImporter.swift */,
 				4409D215D0A78072B9C08F80 /* RemoteImportView.swift */,
 				EF66560672CF24112FE39508 /* RequestsView.swift */,
@@ -435,6 +438,7 @@
 				E9CDAF3383A60304E5EEACA8 /* ProfileDetailView.swift in Sources */,
 				0E174E6CC2B7357B30FBAA04 /* ProfileServer.swift in Sources */,
 				61CF5ABEE28DB1C9D2079717 /* ProfileStore.swift in Sources */,
+				7179A110A8911D79EC5C2BDD /* QuickNodesView.swift in Sources */,
 				6595D1D8F7B59AEBBCFAA8D8 /* RemoteConfigImporter.swift in Sources */,
 				E06208BA706DCD951ED3081E /* RemoteImportView.swift in Sources */,
 				3D5115C3453FFB91F945C0C2 /* RequestsView.swift in Sources */,

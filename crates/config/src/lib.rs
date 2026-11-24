@@ -1,4 +1,5 @@
 pub mod adblock;
+pub mod auto;
 pub mod compat;
 pub mod crypto;
 pub mod custom;
@@ -6,6 +7,8 @@ pub mod mitm;
 pub mod network;
 pub mod overrides;
 pub mod rewrite;
+pub mod uri;
+pub use auto::AutoRouting;
 pub use compat::*;
 pub mod rule;
 pub mod syntax;
@@ -43,6 +46,9 @@ pub struct Config {
     pub proxies: Vec<Proxy>,
     pub proxy_groups: Vec<Group>,
     pub rules: Vec<String>,
+    /// Automatic GeoIP/GeoSite routing mode (`whitelist` or `blacklist`) when
+    /// a profile defines `proxies:` and omits `rules:`.
+    pub auto_routing: AutoRouting,
     pub dns: Dns,
     pub tun: Tun,
     pub external_controller: Option<String>,
@@ -99,6 +105,7 @@ impl Default for Config {
             proxies: vec![],
             proxy_groups: vec![],
             rules: vec!["MATCH,DIRECT".into()],
+            auto_routing: AutoRouting::Whitelist,
             dns: Dns::default(),
             tun: Tun::default(),
             external_controller: None,
@@ -536,6 +543,9 @@ impl Config {
             cfg.log.log_level.clone_from(&cfg.log_level);
         } else {
             cfg.log_level.clone_from(&cfg.log.log_level);
+        }
+        if let Some(mapping) = document.as_mapping() {
+            auto::apply_defaults(&mut cfg, mapping);
         }
         cfg.validate()?;
         Ok(cfg)

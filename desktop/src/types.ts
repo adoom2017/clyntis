@@ -250,6 +250,28 @@ export interface ImportResult {
   profile: ProfileSummary;
   warnings: { path: string; reason: string }[];
 }
+export type AutoRouting = "whitelist" | "blacklist";
+export interface NodeSummary {
+  name: string;
+  kind: string;
+  server: string;
+  port: number;
+}
+export interface SkippedLink {
+  line: number;
+  scheme: string;
+  reason: string;
+}
+export interface NodeImportResult {
+  profile: ProfileSummary;
+  nodes: NodeSummary[];
+  skipped: SkippedLink[];
+}
+export interface ProfileNodes {
+  isAuto: boolean;
+  autoRouting: AutoRouting | null;
+  nodes: NodeSummary[];
+}
 export interface Profile extends Omit<
   ProfileSummary,
   "pending" | "source" | "subscription" | "encrypted"

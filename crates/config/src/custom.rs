@@ -45,6 +45,11 @@ pub fn targets(yaml: &str) -> Result<Vec<String>> {
         .as_mapping()
         .context("the profile must be a YAML mapping")?;
     let mut names = vec!["DIRECT".to_owned(), "REJECT".to_owned()];
+    for name in crate::auto::auto_targets(map) {
+        if !names.iter().any(|n| n == &name) {
+            names.push(name);
+        }
+    }
     for key in ["proxy-groups", "proxies"] {
         for item in map
             .get(key)
@@ -121,6 +126,7 @@ pub fn apply(yaml: &str, rules: &[String]) -> Result<Applied> {
         kept.push(Value::from(rule));
     }
     if !kept.is_empty() {
+        crate::auto::materialize_for_custom_rules(map)?;
         let existing = map
             .remove(Value::from("rules"))
             .and_then(|v| match v {
@@ -204,6 +210,39 @@ mod tests {
                 .rules
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn custom_rules_preserve_auto_routing_and_targets() {
+        let minimal = "proxies:\n  - {name: Tokyo, type: vless, server: 1.2.3.4, port: 443, uuid: 11111111-1111-4111-8111-111111111111}\n  - {name: SG, type: hysteria2, server: 5.6.7.8, port: 443, password: pass}\n";
+        assert_eq!(
+            targets(minimal).unwrap(),
+            ["DIRECT", "REJECT", "Proxy", "Auto", "Tokyo", "SG"]
+        );
+        let applied = apply(minimal, &["DOMAIN-SUFFIX,example.com,Proxy".into()]).unwrap();
+        assert!(applied.skipped.is_empty());
+        let cfg = crate::Config::parse(applied.yaml.as_bytes()).unwrap();
+        assert_eq!(cfg.rules[0], "DOMAIN-SUFFIX,example.com,Proxy");
+        assert_eq!(cfg.rules.last().map(String::as_str), Some("MATCH,Proxy"));
+        assert_eq!(cfg.proxy_groups.len(), 2);
+        assert!(cfg.geodata_mode);
+        assert!(cfg.geo_auto_update);
+        assert!(cfg.dns.enable);
+        assert_eq!(cfg.dns.enhanced_mode, "fake-ip");
+        assert_eq!(cfg.dns.nameserver, ["223.5.5.5", "119.29.29.29"]);
+        assert_eq!(cfg.dns.fake_ip_range, "28.0.0.0/16".parse().unwrap());
+        assert!(cfg.sniffer.enable);
+        assert!(cfg.sniffer.sniff.contains_key("TLS"));
+        assert!(cfg.tun.auto_dns);
+
+        let empty_groups = "proxy-groups: []\nproxies:\n  - {name: Tokyo, type: vless, server: 1.2.3.4, port: 443, uuid: 11111111-1111-4111-8111-111111111111}\n";
+        let applied_empty =
+            apply(empty_groups, &["DOMAIN-SUFFIX,example.com,Tokyo".into()]).unwrap();
+        let cfg_empty = crate::Config::parse(applied_empty.yaml.as_bytes()).unwrap();
+        assert_eq!(
+            cfg_empty.rules.last().map(String::as_str),
+            Some("MATCH,Tokyo")
         );
     }
 }

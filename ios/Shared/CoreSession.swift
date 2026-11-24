@@ -81,6 +81,93 @@ final class CoreSession {
         })
     }
 
+    struct NodeSummary: Decodable, Hashable, Identifiable {
+        let name: String
+        let kind: String
+        let server: String
+        let port: UInt16
+        var id: String { name }
+    }
+
+    struct SkippedLink: Decodable, Hashable {
+        let line: Int
+        let scheme: String
+        let reason: String
+    }
+
+    struct NodesImportResult: Decodable {
+        let yaml: String
+        let nodes: [NodeSummary]
+        let skipped: [SkippedLink]
+        let autoRouting: String
+    }
+
+    struct ProfileNodes: Decodable {
+        let isAuto: Bool
+        let autoRouting: String?
+        let nodes: [NodeSummary]
+    }
+
+    static func importNodeLinks(_ text: String, mode: String) throws -> NodesImportResult {
+        let textData = Data(text.utf8)
+        let modeData = Data(mode.utf8)
+        let data = try textData.withUnsafeBytes { textPtr in
+            try modeData.withUnsafeBytes { modePtr in
+                try read(limit: 24 * 1024 * 1024) {
+                    meta_import_node_links_v1(
+                        textPtr.bindMemory(to: UInt8.self).baseAddress, textPtr.count,
+                        modePtr.bindMemory(to: UInt8.self).baseAddress, modePtr.count,
+                        $0, $1, $2)
+                }
+            }
+        }
+        return try JSONDecoder().decode(NodesImportResult.self, from: data)
+    }
+
+    static func profileNodes(configuration: Data) throws -> ProfileNodes {
+        let data = try configuration.withUnsafeBytes { configPtr in
+            try read(limit: 24 * 1024 * 1024) {
+                meta_profile_nodes_v1(
+                    configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
+                    $0, $1, $2)
+            }
+        }
+        return try JSONDecoder().decode(ProfileNodes.self, from: data)
+    }
+
+    static func addNodeLinks(_ text: String, to configuration: Data) throws -> NodesImportResult {
+        let textData = Data(text.utf8)
+        let data = try configuration.withUnsafeBytes { configPtr in
+            try textData.withUnsafeBytes { textPtr in
+                try read(limit: 24 * 1024 * 1024) {
+                    meta_profile_add_links_v1(
+                        configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
+                        textPtr.bindMemory(to: UInt8.self).baseAddress, textPtr.count,
+                        $0, $1, $2)
+                }
+            }
+        }
+        return try JSONDecoder().decode(NodesImportResult.self, from: data)
+    }
+
+    static func updateProfileNodes(in configuration: Data, removeNames: [String], autoRouting: String?) throws -> Data {
+        struct Request: Encodable {
+            let removeNames: [String]
+            let autoRouting: String?
+        }
+        let reqData = try JSONEncoder().encode(Request(removeNames: removeNames, autoRouting: autoRouting))
+        return try configuration.withUnsafeBytes { configPtr in
+            try reqData.withUnsafeBytes { reqPtr in
+                try read(limit: 24 * 1024 * 1024) {
+                    meta_profile_update_nodes_v1(
+                        configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
+                        reqPtr.bindMemory(to: UInt8.self).baseAddress, reqPtr.count,
+                        $0, $1, $2)
+                }
+            }
+        }
+    }
+
     /// Names usable as a rule target in this configuration (DIRECT, REJECT, groups, proxies).
     static func ruleTargets(configuration: Data) throws -> [String] {
         let data = try configuration.withUnsafeBytes { config in

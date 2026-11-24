@@ -406,6 +406,108 @@ pub unsafe extern "C" fn meta_validate_config_v1(config_ptr: *const u8, config_l
     })
 }
 
+/// Parse one or more node share links (`vless://`, `hysteria2://`, `hy2://`,
+/// or Base64) into a minimal auto-routed YAML configuration. Writes JSON
+/// `{"yaml","nodes":[{"name","kind","server","port"}],"skipped":[...],"autoRouting"}`.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_import_node_links_v1(
+    text: *const u8,
+    text_len: usize,
+    mode: *const u8,
+    mode_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let text = std::str::from_utf8(unsafe { input(text, text_len)? })?;
+        let mode_str = std::str::from_utf8(unsafe { input(mode, mode_len)? })?;
+        let routing = clyntis_config::AutoRouting::parse(mode_str)?;
+        let result = clyntis_config::uri::import_links(text, routing)?;
+        unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
+    })
+}
+
+/// Inspect a YAML profile's nodes and whether it uses automatic GeoIP/GeoSite routing.
+/// Writes JSON `{"isAuto":bool,"autoRouting":"whitelist"|"blacklist"|null,"nodes":[...]}`.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_profile_nodes_v1(
+    config: *const u8,
+    len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let info = clyntis_config::uri::inspect_profile(yaml)?;
+        unsafe { output(&serde_json::to_vec(&info)?, buffer, capacity, length) }
+    })
+}
+
+/// Append node share links to an existing YAML profile's `proxies:`. Writes JSON
+/// `{"yaml","nodes":[...],"skipped":[...],"autoRouting"}`.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_profile_add_links_v1(
+    config: *const u8,
+    len: usize,
+    text: *const u8,
+    text_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let text = std::str::from_utf8(unsafe { input(text, text_len)? })?;
+        let result = clyntis_config::uri::append_links(yaml, text)?;
+        unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateNodesRequest {
+    #[serde(default)]
+    remove_names: Vec<String>,
+    #[serde(default)]
+    auto_routing: Option<clyntis_config::AutoRouting>,
+}
+
+/// Remove named proxies and/or update `auto-routing` mode on a YAML profile.
+/// `request` is JSON `{"removeNames":[...],"autoRouting":"whitelist"|"blacklist"|null}`.
+/// Writes the updated YAML bytes.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_profile_update_nodes_v1(
+    config: *const u8,
+    len: usize,
+    request: *const u8,
+    request_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let req: UpdateNodesRequest =
+            serde_json::from_slice(unsafe { input(request, request_len)? })?;
+        let updated = clyntis_config::uri::update_nodes(yaml, &req.remove_names, req.auto_routing)?;
+        unsafe { output(updated.as_bytes(), buffer, capacity, length) }
+    })
+}
+
 /// The Tencent COS target behind `url` as JSON `{"bucket", "region", "key"}`,
 /// or `null` when it is not a COS object URL.
 ///

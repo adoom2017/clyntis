@@ -363,6 +363,51 @@ final class AppModel {
         if !active { selectedID = profile.id }
     }
 
+    func importNodeLinks(name: String, text: String, mode: String) async throws -> CoreSession.NodesImportResult {
+        guard !busy, let store else { throw ClientError.message(L("正在处理其他操作，请稍后再试。")) }
+        busy = true
+        defer { busy = false }
+        let result = try await Task.detached {
+            try CoreSession.importNodeLinks(text, mode: mode)
+        }.value
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawChosen = trimmed.isEmpty ? (result.nodes.first?.name ?? L("我的节点")) : trimmed
+        let chosenName = String(rawChosen.prefix(100))
+        try await add(name: chosenName, configuration: Data(result.yaml.utf8), in: store)
+        return result
+    }
+
+    func profileNodes(for profile: Profile) throws -> CoreSession.ProfileNodes {
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
+        return try CoreSession.profileNodes(configuration: store.configuration(for: profile.id))
+    }
+
+    func addNodeLinks(_ text: String, to profile: Profile) async throws -> CoreSession.NodesImportResult {
+        guard !busy, let store else { throw ClientError.message(L("正在处理其他操作，请稍后再试。")) }
+        busy = true
+        defer { busy = false }
+        let current = try store.configuration(for: profile.id)
+        let result = try await Task.detached {
+            try CoreSession.addNodeLinks(text, to: current)
+        }.value
+        try await saveConfiguration(result.yaml, for: profile)
+        return result
+    }
+
+    func updateProfileNodes(for profile: Profile, removeNames: [String], autoRouting: String?) async throws {
+        guard !busy, let store else { throw ClientError.message(L("正在处理其他操作，请稍后再试。")) }
+        busy = true
+        defer { busy = false }
+        let current = try store.configuration(for: profile.id)
+        let updated = try await Task.detached {
+            try CoreSession.updateProfileNodes(in: current, removeNames: removeNames, autoRouting: autoRouting)
+        }.value
+        guard let yaml = String(data: updated, encoding: .utf8) else {
+            throw ClientError.message(L("配置编码无效。"))
+        }
+        try await saveConfiguration(yaml, for: profile)
+    }
+
     // MARK: Custom rules
 
     func saveCustomRules(_ rules: [String]) throws {

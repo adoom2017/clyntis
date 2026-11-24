@@ -34,6 +34,7 @@ struct ProfileDetailView: View {
                     }
                 }
                 Section {
+                    NavigationLink(L("节点与自动分流")) { ProfileNodesView(model: model, profile: profile) }
                     NavigationLink(L("查看与编辑配置")) { ConfigEditorView(model: model, profile: profile) }
                     if profile.source != nil {
                         Button {

@@ -875,6 +875,73 @@ pub async fn save_profile(state: State<'_, Desktop>, id: Uuid, yaml: String) -> 
     Ok(())
 }
 #[tauri::command]
+pub async fn import_node_links(
+    state: State<'_, Desktop>,
+    name: String,
+    links: String,
+    auto_routing: String,
+) -> Reply<profiles::NodeImportResult> {
+    let mode = clyntis_config::AutoRouting::parse(&auto_routing).map_err(error)?;
+    let _guard = state.operation.lock().await;
+    let result = state
+        .store
+        .import_node_links(name, &links, mode)
+        .map_err(error)?;
+    if let Ok(profile) = state.store.get(result.profile.id) {
+        engine::spawn_prefetch(
+            state.app.clone(),
+            state.logs.clone(),
+            state.store.clone(),
+            profile,
+        );
+    }
+    if state.store.selected().map_err(error)?.is_none() {
+        state.store.select(Some(result.profile.id)).map_err(error)?;
+    }
+    state.notify();
+    Ok(result)
+}
+#[tauri::command]
+pub fn profile_nodes(
+    state: State<'_, Desktop>,
+    id: Uuid,
+) -> Reply<clyntis_config::uri::ProfileNodes> {
+    let profile = state.store.get(id).map_err(error)?;
+    let yaml = profile.pending.as_deref().unwrap_or(&profile.yaml);
+    clyntis_config::uri::inspect_profile(yaml).map_err(error)
+}
+#[tauri::command]
+pub async fn add_profile_links(
+    state: State<'_, Desktop>,
+    id: Uuid,
+    links: String,
+) -> Reply<profiles::NodeImportResult> {
+    let _guard = state.operation.lock().await;
+    let result = state.store.add_profile_links(id, &links).map_err(error)?;
+    state.notify();
+    Ok(result)
+}
+#[tauri::command]
+pub async fn update_profile_nodes(
+    state: State<'_, Desktop>,
+    id: Uuid,
+    remove_names: Vec<String>,
+    auto_routing: Option<String>,
+) -> Reply<profiles::ProfileSummary> {
+    let mode = auto_routing
+        .as_deref()
+        .map(clyntis_config::AutoRouting::parse)
+        .transpose()
+        .map_err(error)?;
+    let _guard = state.operation.lock().await;
+    let summary = state
+        .store
+        .update_profile_nodes(id, &remove_names, mode)
+        .map_err(error)?;
+    state.notify();
+    Ok(summary)
+}
+#[tauri::command]
 pub async fn select_profile(state: State<'_, Desktop>, id: Uuid) -> Reply<()> {
     let mut op = state.operation.lock().await;
     let previous = state.store.selected().map_err(error)?;

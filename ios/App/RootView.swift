@@ -159,6 +159,7 @@ private struct ProfilesView: View {
     @AppStorage(Localization.key, store: Localization.defaults) private var language = "system"
     @State private var importing = false
     @State private var importingLink = false
+    @State private var addingNodes = false
     @State private var exporting: Profile?
     @State private var publishing: Profile?
     @State private var detail: Profile?
@@ -244,7 +245,7 @@ private struct ProfilesView: View {
                 }
                 if model.profiles.isEmpty {
                     ContentUnavailableView(L("还没有配置"), systemImage: "doc.badge.plus",
-                                           description: Text(L("点右上角 + 导入 Clash YAML 文件或链接")))
+                                           description: Text(L("点右上角 + 粘贴节点链接自动分流，或导入 Clash YAML 文件 / 链接")))
                 }
                 ForEach(model.profiles) { profile in
                     HStack(spacing: 12) {
@@ -291,6 +292,7 @@ private struct ProfilesView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu(L("导入"), systemImage: "plus") {
+                        Button(L("快速添加节点"), systemImage: "plus.circle") { addingNodes = true }
                         Button(L("从文件导入"), systemImage: "doc") { importing = true }
                         Button(L("从链接导入"), systemImage: "link") { importingLink = true }
                     }.disabled(model.busy)
@@ -304,6 +306,7 @@ private struct ProfilesView: View {
                 case .failure(let error): model.error = error.localizedDescription
                 }
             }
+            .sheet(isPresented: $addingNodes) { QuickAddNodesView(model: model) }
             .sheet(isPresented: $importingLink) { RemoteImportView(model: model) }
             .sheet(item: $exporting) { EncryptedExportView(model: model, profile: $0) }
             .sheet(item: $publishing) { CosPublishView(model: model, profile: $0) }

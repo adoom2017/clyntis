@@ -89,6 +89,26 @@ int32_t meta_yaml_check_v1(const uint8_t *config, size_t length,
 /* Validate a YAML configuration without creating a core handle or runtime.
  * Returns META_OK when valid; on META_ERROR, meta_error_v1 describes the error. */
 int32_t meta_validate_config_v1(const uint8_t *config_ptr, size_t config_len);
+/* Parse node share links (vless://, hysteria2://, hy2://, or Base64) into a
+ * minimal auto-routed YAML profile. mode is "whitelist" (default when empty) or
+ * "blacklist". Writes JSON {"yaml","nodes":[...],"skipped":[...],"autoRouting"}. */
+int32_t meta_import_node_links_v1(const uint8_t *text, size_t text_len,
+    const uint8_t *mode, size_t mode_len,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Inspect a profile's nodes and whether automatic GeoIP/GeoSite routing is active.
+ * Writes JSON {"isAuto":bool,"autoRouting":"whitelist"|"blacklist"|null,"nodes":[...]}. */
+int32_t meta_profile_nodes_v1(const uint8_t *config, size_t length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Append node share links to an existing YAML profile's proxies. Writes JSON
+ * {"yaml","nodes":[...],"skipped":[...],"autoRouting"}. */
+int32_t meta_profile_add_links_v1(const uint8_t *config, size_t length,
+    const uint8_t *text, size_t text_len,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Remove named proxies and/or update auto-routing mode. request is JSON
+ * {"removeNames":[...],"autoRouting":"whitelist"|"blacklist"|null}. Writes YAML. */
+int32_t meta_profile_update_nodes_v1(const uint8_t *config, size_t length,
+    const uint8_t *request, size_t request_length,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
 /* The Tencent COS target behind a URL: writes JSON {"bucket","region","key"},
  * or null when url is not a COS object URL. Caller-buffer contract. */
 int32_t meta_cos_target_v1(const uint8_t *url, size_t length,

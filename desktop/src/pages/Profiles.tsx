@@ -21,8 +21,11 @@ import { Editor } from "../components/Editor";
 import { type Perform, Empty, Modal, Confirm } from "../components/common";
 import { locale, t } from "../i18n";
 import {
+  type AutoRouting,
   type ImportResult,
+  type NodeImportResult,
   type Profile,
+  type ProfileNodes,
   type ProfileSummary,
   type PublishTarget,
   type Snapshot,
@@ -109,7 +112,7 @@ export function PasswordForm({
     </Modal>
   );
 }
-/** Encrypts a profile and uploads it to Tencent COS, replacing the object. */
+
 export function PublishForm({
   profile,
   onClose,
@@ -247,6 +250,7 @@ export function PublishForm({
     </Modal>
   );
 }
+
 export function SubscriptionForm({
   onClose,
   onSubmit,
@@ -325,6 +329,306 @@ export function SubscriptionForm({
               <Link2 size={16} />
             )}
             {t("添加")}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+export function NodeLinksModal({
+  onClose,
+  onSubmit,
+}: {
+  onClose: () => void;
+  onSubmit: (
+    name: string,
+    links: string,
+    autoRouting: AutoRouting,
+  ) => Promise<boolean>;
+}) {
+  const [name, setName] = useState("");
+  const [links, setLinks] = useState("");
+  const [autoRouting, setAutoRouting] = useState<AutoRouting>("whitelist");
+  const [saving, setSaving] = useState(false);
+  const [failed, setFailed] = useState(false);
+  return (
+    <Modal title={t("添加节点")} onClose={onClose}>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          setSaving(true);
+          void onSubmit(name, links, autoRouting)
+            .then((ok) => setFailed(!ok))
+            .finally(() => setSaving(false));
+        }}
+      >
+        <label className="field">
+          {t("配置名称（可选）")}
+          <input
+            value={name}
+            maxLength={100}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={t("留空则使用首个节点名称")}
+          />
+        </label>
+        <label className="field">
+          {t("节点链接")}
+          <textarea
+            autoFocus
+            required
+            rows={5}
+            value={links}
+            onChange={(e) => setLinks(e.target.value)}
+            placeholder={t("粘贴 vless:// 或 hysteria2:// / hy2:// 链接，支持多行或 Base64")}
+            spellCheck={false}
+          />
+        </label>
+        <div className="field">
+          <span>{t("自动分流模式")}</span>
+          <div className="segmented" role="group" aria-label={t("自动分流模式")}>
+            <button
+              type="button"
+              className={autoRouting === "whitelist" ? "selected" : ""}
+              onClick={() => setAutoRouting("whitelist")}
+            >
+              {t("白名单（推荐）")}
+            </button>
+            <button
+              type="button"
+              className={autoRouting === "blacklist" ? "selected" : ""}
+              onClick={() => setAutoRouting("blacklist")}
+            >
+              {t("黑名单")}
+            </button>
+          </div>
+          <p className="small muted">
+            {autoRouting === "whitelist"
+              ? t("国内与局域网直连，其余流量全部走代理，无需手写规则。")
+              : t("仅海外站点列表走代理，其余流量默认直连，更省代理流量。")}
+          </p>
+        </div>
+        {failed && (
+          <p role="alert" className="inline-error">
+            {t("添加失败，关闭此窗口查看原因。")}
+          </p>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            {t("取消")}
+          </button>
+          <button
+            className="button primary"
+            disabled={saving || !links.trim()}
+          >
+            {saving ? (
+              <LoaderCircle className="spin" size={16} />
+            ) : (
+              <Plus size={16} />
+            )}
+            {t("导入并启用")}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+export function ManageNodesModal({
+  profile,
+  initial,
+  perform,
+  onClose,
+  onNotice,
+}: {
+  profile: ProfileSummary;
+  initial: ProfileNodes;
+  perform: Perform;
+  onClose: () => void;
+  onNotice: (msg: string) => void;
+}) {
+  const [info, setInfo] = useState<ProfileNodes>(initial);
+  const [autoRouting, setAutoRouting] = useState<AutoRouting>(
+    initial.autoRouting ?? "whitelist",
+  );
+  const [links, setLinks] = useState("");
+  const [working, setWorking] = useState(false);
+  const [modalError, setModalError] = useState<string | null>(null);
+
+  const reload = async () => {
+    const next = await invoke<ProfileNodes>("profile_nodes", { id: profile.id });
+    setInfo(next);
+    if (next.autoRouting) setAutoRouting(next.autoRouting);
+  };
+
+  const changeMode = async (nextMode: AutoRouting) => {
+    if (nextMode === autoRouting) return;
+    const prevMode = autoRouting;
+    setAutoRouting(nextMode);
+    setModalError(null);
+    setWorking(true);
+    try {
+      const ok = await perform(async () => {
+        try {
+          await invoke("update_profile_nodes", {
+            id: profile.id,
+            removeNames: [],
+            autoRouting: nextMode,
+          });
+        } catch (e) {
+          setModalError(String(e));
+          throw e;
+        }
+      }, t("分流模式已更新，待应用"));
+      if (ok) {
+        await reload();
+      } else {
+        setAutoRouting(info.autoRouting ?? prevMode);
+      }
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const removeNode = async (name: string) => {
+    setModalError(null);
+    setWorking(true);
+    try {
+      const ok = await perform(async () => {
+        try {
+          await invoke("update_profile_nodes", {
+            id: profile.id,
+            removeNames: [name],
+            autoRouting: null,
+          });
+        } catch (e) {
+          setModalError(String(e));
+          throw e;
+        }
+      }, t("节点已移除，待应用"));
+      if (ok) await reload();
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const addLinks = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!links.trim()) return;
+    setModalError(null);
+    setWorking(true);
+    try {
+      const ok = await perform(async () => {
+        try {
+          const res = await invoke<NodeImportResult>("add_profile_links", {
+            id: profile.id,
+            links,
+          });
+          setLinks("");
+          onNotice(
+            res.skipped.length
+              ? t("已添加 {count} 个节点，跳过 {skipped} 条", {
+                  count: res.nodes.length,
+                  skipped: res.skipped.length,
+                })
+              : t("已添加 {count} 个节点，待应用", { count: res.nodes.length }),
+          );
+        } catch (e) {
+          setModalError(String(e));
+          throw e;
+        }
+      });
+      if (ok) await reload();
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return (
+    <Modal title={t("节点管理「{name}」", { name: profile.name })} onClose={onClose}>
+      <div className="field">
+        <span>{t("自动分流模式")}</span>
+        <div className="segmented" role="group" aria-label={t("自动分流模式")}>
+          <button
+            type="button"
+            disabled={working || !info.isAuto}
+            className={info.isAuto && autoRouting === "whitelist" ? "selected" : ""}
+            onClick={() => void changeMode("whitelist")}
+          >
+            {t("白名单（推荐）")}
+          </button>
+          <button
+            type="button"
+            disabled={working || !info.isAuto}
+            className={info.isAuto && autoRouting === "blacklist" ? "selected" : ""}
+            onClick={() => void changeMode("blacklist")}
+          >
+            {t("黑名单")}
+          </button>
+        </div>
+        <p className="small muted">
+          {!info.isAuto
+            ? t("此配置已定义自定义 rules，自动分流模式不会生效。")
+            : autoRouting === "whitelist"
+              ? t("国内与局域网直连，其余流量全部走代理，无需手写规则。")
+              : t("仅海外站点列表走代理，其余流量默认直连，更省代理流量。")}
+        </p>
+      </div>
+      <div className="field">
+        <span>{t("节点列表 ({count})", { count: info.nodes.length })}</span>
+        <div className="warning-list">
+          {info.nodes.map((node, idx) => (
+            <div key={`${node.name}-${idx}`} className="warning-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <div>
+                <strong>{node.name}</strong>
+                <div className="small muted">
+                  {node.kind} · {node.server}:{node.port}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="icon-button danger"
+                disabled={working || (info.isAuto && info.nodes.length <= 1)}
+                title={t("移除节点")}
+                aria-label={t("移除节点 {name}", { name: node.name })}
+                onClick={() => void removeNode(node.name)}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+      <form onSubmit={(e) => void addLinks(e)}>
+        <label className="field">
+          {t("追加节点链接")}
+          <textarea
+            rows={3}
+            value={links}
+            onChange={(e) => setLinks(e.target.value)}
+            placeholder={t("粘贴 vless:// 或 hysteria2:// / hy2:// 链接，支持多行或 Base64")}
+            spellCheck={false}
+          />
+        </label>
+        {modalError && (
+          <p role="alert" className="inline-error">
+            {modalError}
+          </p>
+        )}
+        <div className="modal-actions">
+          <button type="button" className="button secondary" onClick={onClose}>
+            {t("完成")}
+          </button>
+          <button
+            className="button primary"
+            disabled={working || !links.trim()}
+          >
+            {working ? (
+              <LoaderCircle className="spin" size={16} />
+            ) : (
+              <Plus size={16} />
+            )}
+            {t("添加节点")}
           </button>
         </div>
       </form>
@@ -472,6 +776,33 @@ export function ProfilesPage({
         }}
       />,
     );
+  const addNodeLinks = () =>
+    setModal(
+      <NodeLinksModal
+        onClose={() => setModal(null)}
+        onSubmit={async (name, links, autoRouting) => {
+          const ok = await perform(async () => {
+            const res = await invoke<NodeImportResult>("import_node_links", {
+              name,
+              links,
+              autoRouting,
+            });
+            setModal(null);
+            setNotice(
+              res.skipped.length
+                ? t("已导入 {count} 个节点，跳过 {skipped} 条", {
+                    count: res.nodes.length,
+                    skipped: res.skipped.length,
+                  })
+                : t("已导入 {count} 个节点并启用自动分流", {
+                    count: res.nodes.length,
+                  }),
+            );
+          });
+          return ok;
+        }}
+      />,
+    );
   return (
     <>
       <div className="toolbar">
@@ -488,12 +819,20 @@ export function ProfilesPage({
             {t("导入文件")}
           </button>
           <button
-            className="button primary"
+            className="button secondary"
             disabled={disabled}
             onClick={addSubscription}
           >
-            <Plus size={16} />
+            <Link2 size={16} />
             {t("添加订阅")}
+          </button>
+          <button
+            className="button primary"
+            disabled={disabled}
+            onClick={addNodeLinks}
+          >
+            <Plus size={16} />
+            {t("添加节点")}
           </button>
         </div>
       </div>
@@ -501,7 +840,7 @@ export function ProfilesPage({
         <Empty
           icon={<Layers3 />}
           title={t("还没有配置")}
-          text={t("导入 YAML 文件或添加订阅链接。")}
+          text={t("粘贴节点链接即可自动分流，或导入 YAML 文件 / 订阅。")}
         />
       ) : (
         <div className="profile-list">
@@ -583,6 +922,30 @@ export function ProfilesPage({
                     {t("检查更新")}
                   </button>
                 )}
+                <button
+                  className="action-button"
+                  disabled={disabled}
+                  onClick={() =>
+                    void perform(async () => {
+                      const nodes = await invoke<ProfileNodes>(
+                        "profile_nodes",
+                        { id: profile.id },
+                      );
+                      setModal(
+                        <ManageNodesModal
+                          profile={profile}
+                          initial={nodes}
+                          perform={perform}
+                          onClose={() => setModal(null)}
+                          onNotice={setNotice}
+                        />,
+                      );
+                    })
+                  }
+                >
+                  <Layers3 size={14} />
+                  {t("节点管理")}
+                </button>
                 <button
                   className="action-button"
                   disabled={disabled}

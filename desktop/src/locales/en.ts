@@ -81,8 +81,6 @@ export const en: Record<string, string> = {
   导入文件: "Import file",
   添加订阅: "Add subscription",
   还没有配置: "No profiles yet",
-  "导入 YAML 文件或添加订阅链接。":
-    "Import a YAML file or add a subscription link.",
   加密订阅: "Encrypted subscription",
   "检查于 {time}": "checked {time}",
   待应用: "Pending",
@@ -629,4 +627,37 @@ export const en: Record<string, string> = {
     "Only high-traffic closed connections are kept; showing {shown} of {total}",
   "仅显示前 {shown} 个字符（共 {total} 个字符）":
     "Showing the first {shown} of {total} characters",
+  添加节点: "Add nodes",
+  "配置名称（可选）": "Profile name (optional)",
+  留空则使用首个节点名称: "Leave blank to use the first node name",
+  节点链接: "Node links",
+  "粘贴 vless:// 或 hysteria2:// / hy2:// 链接，支持多行或 Base64":
+    "Paste vless:// or hysteria2:// / hy2:// links (multi-line or Base64 supported)",
+  自动分流模式: "Auto-routing mode",
+  "白名单（推荐）": "Whitelist (Recommended)",
+  黑名单: "Blacklist",
+  "国内与局域网直连，其余流量全部走代理，无需手写规则。":
+    "Direct for China & LAN, proxy everything else automatically.",
+  "仅海外站点列表走代理，其余流量默认直连，更省代理流量。":
+    "Proxy only known overseas sites, direct by default to save proxy traffic.",
+  导入并启用: "Import & enable",
+  "已导入 {count} 个节点并启用自动分流":
+    "Imported {count} node(s) with auto-routing enabled",
+  "已导入 {count} 个节点，跳过 {skipped} 条":
+    "Imported {count} node(s), skipped {skipped}",
+  节点管理: "Nodes",
+  "节点管理「{name}」": "Nodes · {name}",
+  "节点列表 ({count})": "Nodes ({count})",
+  移除节点: "Remove node",
+  "移除节点 {name}": "Remove node {name}",
+  追加节点链接: "Append node links",
+  "分流模式已更新，待应用": "Routing mode updated, pending apply",
+  "节点已移除，待应用": "Node removed, pending apply",
+  "已添加 {count} 个节点，待应用": "Added {count} node(s), pending apply",
+  "已添加 {count} 个节点，跳过 {skipped} 条":
+    "Added {count} node(s), skipped {skipped}",
+  "粘贴节点链接即可自动分流，或导入 YAML 文件 / 订阅。":
+    "Paste node links for automatic routing, or import a YAML file / subscription.",
+  "此配置已定义自定义 rules，自动分流模式不会生效。":
+    "This profile defines custom rules, so auto-routing mode does not apply.",
 };

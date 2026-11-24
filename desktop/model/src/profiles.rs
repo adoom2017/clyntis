@@ -17,6 +17,14 @@ pub struct ImportResult {
     pub warnings: Vec<crate::import::ImportWarning>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeImportResult {
+    pub profile: ProfileSummary,
+    pub nodes: Vec<clyntis_config::uri::NodeSummary>,
+    pub skipped: Vec<clyntis_config::uri::SkippedLink>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -450,6 +458,75 @@ impl Store {
             profile: profile.summary(),
             warnings,
         })
+    }
+
+    pub fn import_node_links(
+        &self,
+        name: String,
+        links: &str,
+        mode: clyntis_config::AutoRouting,
+    ) -> Result<NodeImportResult> {
+        let imported = clyntis_config::uri::import_links(links, mode)?;
+        let trimmed = name.trim();
+        let chosen_name = if !trimmed.is_empty() {
+            trimmed.to_owned()
+        } else if let Some(first) = imported.nodes.first() {
+            truncate_utf8(&first.name, 256)
+        } else {
+            tr!("我的节点", "My nodes")
+        };
+        let profile = self.create(chosen_name, imported.yaml, None, None)?;
+        Ok(NodeImportResult {
+            profile: profile.summary(),
+            nodes: imported.nodes,
+            skipped: imported.skipped,
+        })
+    }
+
+    pub fn add_profile_links(&self, id: Uuid, links: &str) -> Result<NodeImportResult> {
+        let mut profile = self.get(id)?;
+        let base_yaml = profile.pending.as_deref().unwrap_or(&profile.yaml);
+        let appended = clyntis_config::uri::append_links(base_yaml, links)?;
+        profile.pending = Some(appended.yaml);
+        self.save(&profile)?;
+        Ok(NodeImportResult {
+            profile: profile.summary(),
+            nodes: appended.nodes,
+            skipped: appended.skipped,
+        })
+    }
+
+    pub fn update_profile_nodes(
+        &self,
+        id: Uuid,
+        remove_names: &[String],
+        auto_routing: Option<clyntis_config::AutoRouting>,
+    ) -> Result<ProfileSummary> {
+        let mut profile = self.get(id)?;
+        let base_yaml = profile.pending.as_deref().unwrap_or(&profile.yaml);
+        let updated = clyntis_config::uri::update_nodes(base_yaml, remove_names, auto_routing)?;
+        profile.pending = Some(updated);
+        self.save(&profile)?;
+        Ok(profile.summary())
+    }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let mut end = 0;
+    for (idx, ch) in s.char_indices() {
+        if idx + ch.len_utf8() > max_bytes {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    let out = s[..end].trim();
+    if out.is_empty() {
+        tr!("我的节点", "My nodes")
+    } else {
+        out.to_owned()
     }
 }
 

@@ -1227,3 +1227,90 @@ fn packet_io_does_not_clear_pending_output_and_records_errors() {
     meta_discard_pending_output_v1();
     assert_eq!(meta_destroy_v1(id), OK);
 }
+
+#[test]
+fn node_links_import_inspect_append_and_update_via_ffi() {
+    fn read_json(call: impl Fn(*mut u8, usize, *mut usize) -> i32) -> serde_json::Value {
+        let mut len = 0usize;
+        assert_eq!(call(std::ptr::null_mut(), 0, &mut len), BUFFER_TOO_SMALL);
+        let mut buf = vec![0u8; len];
+        assert_eq!(call(buf.as_mut_ptr(), buf.len(), &mut len), OK);
+        serde_json::from_slice(&buf[..len]).unwrap()
+    }
+
+    let links = b"vless://11111111-1111-4111-8111-111111111111@example.com:443?security=tls&sni=example.com#Node1";
+    let mode = b"whitelist";
+    let imported = read_json(|buf, cap, out| unsafe {
+        meta_import_node_links_v1(
+            links.as_ptr(),
+            links.len(),
+            mode.as_ptr(),
+            mode.len(),
+            buf,
+            cap,
+            out,
+        )
+    });
+    assert_eq!(imported["autoRouting"], "whitelist");
+    assert_eq!(imported["nodes"][0]["name"], "Node1");
+    let yaml1 = imported["yaml"].as_str().unwrap().as_bytes().to_vec();
+
+    let info = read_json(|buf, cap, out| unsafe {
+        meta_profile_nodes_v1(yaml1.as_ptr(), yaml1.len(), buf, cap, out)
+    });
+    assert_eq!(info["isAuto"], true);
+    assert_eq!(info["nodes"].as_array().unwrap().len(), 1);
+
+    let extra = b"hy2://secret@hy.example.com:443?sni=hy.example.com#Node2";
+    let appended = read_json(|buf, cap, out| unsafe {
+        meta_profile_add_links_v1(
+            yaml1.as_ptr(),
+            yaml1.len(),
+            extra.as_ptr(),
+            extra.len(),
+            buf,
+            cap,
+            out,
+        )
+    });
+    assert_eq!(appended["nodes"][0]["name"], "Node2");
+    let yaml2 = appended["yaml"].as_str().unwrap().as_bytes().to_vec();
+
+    let req = br#"{"removeNames":["Node1"],"autoRouting":"blacklist"}"#;
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe {
+            meta_profile_update_nodes_v1(
+                yaml2.as_ptr(),
+                yaml2.len(),
+                req.as_ptr(),
+                req.len(),
+                std::ptr::null_mut(),
+                0,
+                &mut len,
+            )
+        },
+        BUFFER_TOO_SMALL
+    );
+    let mut out = vec![0u8; len];
+    assert_eq!(
+        unsafe {
+            meta_profile_update_nodes_v1(
+                yaml2.as_ptr(),
+                yaml2.len(),
+                req.as_ptr(),
+                req.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                &mut len,
+            )
+        },
+        OK
+    );
+    let info2 = read_json(|buf, cap, out_len| unsafe {
+        meta_profile_nodes_v1(out.as_ptr(), len, buf, cap, out_len)
+    });
+    assert_eq!(info2["autoRouting"], "blacklist");
+    assert_eq!(info2["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(info2["nodes"][0]["name"], "Node2");
+}
