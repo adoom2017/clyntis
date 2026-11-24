@@ -3,17 +3,31 @@ import SwiftUI
 import UIKit
 #endif
 
+private func isV2EncryptedLinks(_ raw: String) -> Bool {
+    let compact = raw.filter { !$0.isWhitespace }
+    return compact.count >= 24 && !compact.contains("://") && compact.hasPrefix("Q0xZTlRJ")
+}
+
+private func needsPasswordField(_ raw: String) -> Bool {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !trimmed.isEmpty && !trimmed.contains("://")
+}
+
 /// Sheet for creating a new auto-routed profile from node share links (`vless://`,
-/// `hysteria2://`, `hy2://`, or Base64 subscription text).
+/// `hysteria2://`, `hy2://`, Base64 subscription text, or CLYNTISE encrypted links).
 struct QuickAddNodesView: View {
     @Bindable var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var links = ""
+    @State private var password = ""
     @State private var autoRouting = "whitelist"
     @State private var importing = false
     @State private var errorMessage: String?
     @State private var skippedMessage: String?
+
+    private var encryptedDetected: Bool { isV2EncryptedLinks(links) }
+    private var showPassword: Bool { needsPasswordField(links) }
 
     var body: some View {
         NavigationStack {
@@ -33,6 +47,17 @@ struct QuickAddNodesView: View {
                     }
                     .disabled(importing)
                     #endif
+                }
+                if showPassword {
+                    Section {
+                        SecureField(encryptedDetected ? L("解密密码") : L("解密密码（可选）"), text: $password)
+                            .textContentType(.password)
+                            .disabled(importing)
+                    } header: {
+                        Text(L("解密密码"))
+                    } footer: {
+                        Text(encryptedDetected ? L("检测到加密节点链接，请输入密码解密。") : L("未加密的 Base64 订阅可留空。"))
+                    }
                 }
                 Section(L("名称")) {
                     TextField(L("留空则使用首个节点名称"), text: $name)
@@ -67,7 +92,7 @@ struct QuickAddNodesView: View {
                     Button(L("导入")) {
                         Task { await submit() }
                     }
-                    .disabled(importing || model.busy || links.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(importing || model.busy || links.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (encryptedDetected && password.isEmpty))
                 }
             }
             .interactiveDismissDisabled(importing)
@@ -93,7 +118,8 @@ struct QuickAddNodesView: View {
         importing = true
         defer { importing = false }
         do {
-            let result = try await model.importNodeLinks(name: name, text: links, mode: autoRouting)
+            let pw = password.isEmpty ? nil : password
+            let result = try await model.importNodeLinks(name: name, text: links, mode: autoRouting, password: pw)
             if result.skipped.isEmpty {
                 dismiss()
             } else {
@@ -112,13 +138,20 @@ struct ProfileNodesView: View {
     @State private var info: CoreSession.ProfileNodes?
     @State private var autoRouting = "whitelist"
     @State private var addingLinks = false
+    @State private var exportingLinks = false
     @State private var newLinks = ""
+    @State private var appendPassword = ""
     @State private var working = false
     @State private var message: String?
     @State private var failure: String?
     @State private var appendError: String?
 
     private var inUse: Bool { model.active && model.selectedID == profile.id }
+    private var appendEncryptedDetected: Bool { isV2EncryptedLinks(newLinks) }
+    private var showAppendPassword: Bool { needsPasswordField(newLinks) }
+    private var hasExportableNodes: Bool {
+        info?.nodes.contains(where: { $0.kind == "vless" || $0.kind == "hysteria2" }) ?? false
+    }
 
     var body: some View {
         List {
@@ -167,9 +200,14 @@ struct ProfileNodesView: View {
                 Section {
                     Button(L("添加节点链接")) {
                         appendError = nil
+                        appendPassword = ""
                         addingLinks = true
                     }
                     .disabled(working || model.busy)
+                    if hasExportableNodes {
+                        Button(L("导出节点链接")) { exportingLinks = true }
+                            .disabled(working || model.busy)
+                    }
                 } footer: {
                     if inUse { Text(L("连接中修改的内容会在重新连接后生效")) }
                 }
@@ -199,6 +237,17 @@ struct ProfileNodesView: View {
                         .disabled(working)
                         #endif
                     }
+                    if showAppendPassword {
+                        Section {
+                            SecureField(appendEncryptedDetected ? L("解密密码") : L("解密密码（可选）"), text: $appendPassword)
+                                .textContentType(.password)
+                                .disabled(working)
+                        } header: {
+                            Text(L("解密密码"))
+                        } footer: {
+                            Text(appendEncryptedDetected ? L("检测到加密节点链接，请输入密码解密。") : L("未加密的 Base64 订阅可留空。"))
+                        }
+                    }
                     if let appendError {
                         Section { Text(appendError).foregroundStyle(.red) }
                     }
@@ -214,11 +263,14 @@ struct ProfileNodesView: View {
                         Button(L("添加")) {
                             Task { await appendLinks() }
                         }
-                        .disabled(working || model.busy || newLinks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(working || model.busy || newLinks.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (appendEncryptedDetected && appendPassword.isEmpty))
                     }
                 }
                 .interactiveDismissDisabled(working)
             }
+        }
+        .sheet(isPresented: $exportingLinks) {
+            ExportNodeLinksView(model: model, profile: profile)
         }
     }
 
@@ -268,8 +320,10 @@ struct ProfileNodesView: View {
         message = nil
         defer { working = false }
         do {
-            let res = try await model.addNodeLinks(newLinks, to: profile)
+            let pw = appendPassword.isEmpty ? nil : appendPassword
+            let res = try await model.addNodeLinks(newLinks, to: profile, password: pw)
             newLinks = ""
+            appendPassword = ""
             addingLinks = false
             load()
             message = res.skipped.isEmpty
@@ -277,6 +331,131 @@ struct ProfileNodesView: View {
                 : L("已添加 {count} 个节点，跳过 {skipped} 条", ["count": res.nodes.count, "skipped": res.skipped.count])
         } catch {
             appendError = error.localizedDescription
+        }
+    }
+}
+
+/// Exports VLESS/Hysteria2 node share links in plaintext or password-encrypted format.
+struct ExportNodeLinksView: View {
+    let model: AppModel
+    let profile: Profile
+    @Environment(\.dismiss) private var dismiss
+    @State private var useEncryption = false
+    @State private var password = ""
+    @State private var repeated = ""
+    @State private var exportedText = ""
+    @State private var exportedCount = 0
+    @State private var working = false
+    @State private var notice: String?
+    @State private var errorMessage: String?
+
+    private var mismatch: Bool { useEncryption && !repeated.isEmpty && repeated != password }
+    private var canEncryptExport: Bool { !password.isEmpty && repeated == password }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle(L("使用密码加密"), isOn: $useEncryption)
+                        .disabled(working)
+                        .onChange(of: useEncryption) { _, encrypted in
+                            notice = nil
+                            errorMessage = nil
+                            exportedText = ""
+                            if !encrypted {
+                                Task { await exportPlain() }
+                            }
+                        }
+                }
+                if useEncryption {
+                    Section {
+                        SecureField(L("密码"), text: $password)
+                            .textContentType(.newPassword)
+                            .disabled(working)
+                        SecureField(L("确认密码"), text: $repeated)
+                            .textContentType(.newPassword)
+                            .disabled(working)
+                    } footer: {
+                        Text(mismatch ? L("两次输入的密码不一致") : L("加密后的链接可直接粘贴到「快速添加节点」或「添加节点链接」中，输入密码即可解密导入。"))
+                            .foregroundStyle(mismatch ? Color.red : Color.secondary)
+                    }
+                    Section {
+                        Button {
+                            Task { await exportEncrypted() }
+                        } label: {
+                            HStack {
+                                Text(L("生成并复制加密链接"))
+                                if working { Spacer(); ProgressView() }
+                            }
+                        }
+                        .disabled(working || !canEncryptExport)
+                    }
+                }
+                if !exportedText.isEmpty {
+                    Section(L("节点链接")) {
+                        TextEditor(text: .constant(exportedText))
+                            .font(.footnote.monospaced())
+                            .frame(minHeight: 110)
+                        #if canImport(UIKit)
+                        Button(L("复制链接")) {
+                            UIPasteboard.general.string = exportedText
+                            notice = useEncryption ? L("已复制加密节点链接") : L("已复制 {count} 个节点链接", ["count": exportedCount])
+                        }
+                        #endif
+                        ShareLink(item: exportedText)
+                    }
+                }
+                if let notice {
+                    Section { Text(notice).foregroundStyle(.secondary) }
+                }
+                if let errorMessage {
+                    Section { Text(errorMessage).foregroundStyle(.red) }
+                }
+            }
+            .navigationTitle(L("导出节点链接"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L("完成")) { dismiss() }
+                        .disabled(working)
+                }
+            }
+            .task {
+                if !useEncryption && exportedText.isEmpty {
+                    await exportPlain()
+                }
+            }
+        }
+    }
+
+    private func exportPlain() async {
+        working = true
+        errorMessage = nil
+        defer { working = false }
+        do {
+            let res = try await model.exportNodeLinks(for: profile, password: nil)
+            exportedText = res.text
+            exportedCount = res.count
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func exportEncrypted() async {
+        working = true
+        errorMessage = nil
+        notice = nil
+        defer { working = false }
+        do {
+            let res = try await model.exportNodeLinks(for: profile, password: password)
+            exportedText = res.text
+            exportedCount = res.count
+            #if canImport(UIKit)
+            UIPasteboard.general.string = res.text
+            #endif
+            notice = L("已复制加密节点链接")
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 }

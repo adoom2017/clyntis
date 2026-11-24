@@ -40,6 +40,9 @@ pub struct Resources {
     matchers: HashMap<(String, String), Matcher>,
     /// Geo categories already confirmed absent from the current geo file on disk.
     missing_geo: HashSet<(String, String)>,
+    /// 64-bit content hash of each loaded geo category's raw protobuf entry,
+    /// so `geo-auto-update` can reuse unchanged `Arc<DomainSet>` / `Arc<IpSet>`.
+    geo_hashes: HashMap<(String, String), u64>,
     /// Shared MMDB reader for `Country.mmdb` so dynamic GeoIP rules do not reload it.
     mmdb: Option<Arc<maxminddb::Reader<Vec<u8>>>>,
     /// Ad blocking lists, when `adblock.enable`.
@@ -99,6 +102,7 @@ impl Resources {
             routing_incomplete: AtomicBool::new(self.routing_incomplete()),
             matchers: self.matchers.clone(),
             missing_geo: self.missing_geo.clone(),
+            geo_hashes: self.geo_hashes.clone(),
             mmdb: self.mmdb.clone(),
             adblock: self.adblock.clone(),
             rewrite: self.rewrite.clone(),
@@ -160,6 +164,11 @@ impl Resources {
         }
         out.matchers.extend(found);
         out.missing_geo.extend(missing);
+        for ((k, c), h) in &self.geo_hashes {
+            if k == kind {
+                out.geo_hashes.insert((k.clone(), c.clone()), *h);
+            }
+        }
         if kind == "geoip" {
             out.mmdb = self.mmdb.clone();
         }
@@ -507,7 +516,9 @@ fn same_matcher(a: &Matcher, b: &Matcher) -> bool {
         | (Matcher::GeoIp(a), Matcher::GeoIp(b))
         | (Matcher::GeoSite(a), Matcher::GeoSite(b))
         | (Matcher::RuleSet(a), Matcher::RuleSet(b)) => a == b,
-        (Matcher::Glob(a), Matcher::Glob(b)) => a == b,
+        (Matcher::Glob(a), Matcher::Glob(b)) | (Matcher::Wildcard(a), Matcher::Wildcard(b)) => {
+            a == b
+        }
         (Matcher::Regex(a), Matcher::Regex(b)) => a.as_str() == b.as_str(),
         (Matcher::Net(a), Matcher::Net(b)) => a == b,
         (Matcher::Port(a), Matcher::Port(b)) => a == b,
@@ -528,6 +539,13 @@ fn same_matcher(a: &Matcher, b: &Matcher) -> bool {
     }
 }
 
+fn geo_entry_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn populate_geoip(
     data: &Path,
     geodata_mode: bool,
@@ -537,38 +555,81 @@ fn populate_geoip(
     out: &mut Resources,
 ) -> Result<()> {
     if geodata_mode {
-        let wanted: HashSet<String> = ip_refs
-            .iter()
-            .map(|tag| tag.trim_start_matches('!').to_ascii_lowercase())
-            .collect();
-        // Keep entries as raw bytes and decode one CIDR at a time: decoding all
-        // wanted countries into `GeoIp` structs would allocate a heap `Vec<u8>`
-        // per CIDR alongside the resulting `IpSet`.
-        let mut entries: HashMap<String, Vec<u8>> = HashMap::new();
-        for bytes in wire::read_entries(data, |code| wanted.contains(&code.to_ascii_lowercase()))
-            .context("invalid geoip.dat")?
-        {
-            let mut code = String::new();
-            wire::each_field(&bytes, 1, |value| {
-                code = std::str::from_utf8(value)?.to_ascii_lowercase();
-                Ok(())
-            })
-            .context("invalid geoip.dat")?;
-            entries.entry(code).or_insert(bytes);
-        }
-        // Release each country's raw bytes once its last tag is built.
-        let mut remaining: HashMap<String, usize> = HashMap::new();
-        for tag in ip_refs {
+        let mut by_code: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, tag) in ip_refs.iter().enumerate() {
             let code = tag.trim_start_matches('!').to_ascii_lowercase();
-            *remaining.entry(code).or_default() += 1;
+            by_code.entry(code).or_default().push(idx);
         }
-        for tag in ip_refs {
-            let key_pair = ("geoip".to_owned(), tag.clone());
-            let (key, inverse) = tag
-                .strip_prefix('!')
-                .map_or((tag.as_str(), false), |s| (s, true));
-            let code = key.to_ascii_lowercase();
-            let Some(entry) = entries.get(&code) else {
+        let mut seen: HashSet<String> = HashSet::with_capacity(by_code.len());
+        wire::stream_entries(
+            data,
+            |code| by_code.contains_key(&code.to_ascii_lowercase()),
+            |code, entry| {
+                let code_lower = code.to_ascii_lowercase();
+                let Some(indices) = by_code.get(&code_lower) else {
+                    return Ok(());
+                };
+                if !seen.insert(code_lower.clone()) {
+                    return Ok(());
+                }
+                let hash = geo_entry_hash(entry);
+                let hash_key = ("geoip".to_owned(), code_lower);
+                let prev_unchanged = previous.geo_hashes.get(&hash_key) == Some(&hash);
+                out.geo_hashes.insert(hash_key, hash);
+
+                let mut decoded: Option<(Vec<ipnet::IpNet>, bool)> = None;
+                for &idx in indices {
+                    let tag = &ip_refs[idx];
+                    let key_pair = ("geoip".to_owned(), tag.clone());
+                    if prev_unchanged && let Some(prev_matcher) = previous.matchers.get(&key_pair) {
+                        out.missing_geo.remove(&key_pair);
+                        out.matchers.insert(key_pair, prev_matcher.clone());
+                        continue;
+                    }
+                    let (nets, entry_inverse) = match &decoded {
+                        Some(d) => d,
+                        None => {
+                            let mut nets = Vec::new();
+                            let mut entry_inverse = false;
+                            wire::each_raw_field(entry, |number, wire_type, value| {
+                                match number {
+                                    1 => ensure!(wire_type == 2, "invalid geoip.dat"),
+                                    2 => {
+                                        ensure!(wire_type == 2, "invalid geoip.dat");
+                                        nets.push(decode_geoip_cidr(value)?);
+                                    }
+                                    3 => {
+                                        ensure!(wire_type == 0, "invalid geoip.dat");
+                                        entry_inverse = wire::decode_varint(value)? != 0;
+                                    }
+                                    _ => {}
+                                }
+                                Ok(())
+                            })?;
+                            decoded.insert((nets, entry_inverse))
+                        }
+                    };
+                    let inverse = tag.starts_with('!');
+                    out.missing_geo.remove(&key_pair);
+                    out.matchers.insert(
+                        key_pair,
+                        Matcher::Nets(Arc::new(IpSet::new(
+                            nets.iter().copied(),
+                            *entry_inverse ^ inverse,
+                        ))),
+                    );
+                }
+                Ok(())
+            },
+        )
+        .context("invalid geoip.dat")?;
+
+        for (code, indices) in &by_code {
+            if seen.contains(code) {
+                continue;
+            }
+            for &idx in indices {
+                let tag = &ip_refs[idx];
                 if !out.partial {
                     bail!("GEOIP category missing from data");
                 }
@@ -577,41 +638,13 @@ fn populate_geoip(
                     tag = %tag,
                     "GEOIP category missing from data; retaining cached rules or skipping"
                 );
+                let key_pair = ("geoip".to_owned(), tag.clone());
                 if let Some(matcher) = previous.matchers.get(&key_pair) {
                     out.matchers.insert(key_pair, matcher.clone());
                 } else {
                     out.missing_geo.insert(key_pair);
                 }
-                continue;
-            };
-            let mut nets = Vec::new();
-            let mut entry_inverse = false;
-            wire::each_raw_field(entry, |number, wire_type, value| {
-                match number {
-                    1 => ensure!(wire_type == 2, "invalid geoip.dat"),
-                    2 => {
-                        ensure!(wire_type == 2, "invalid geoip.dat");
-                        nets.push(decode_geoip_cidr(value)?);
-                    }
-                    3 => {
-                        ensure!(wire_type == 0, "invalid geoip.dat");
-                        entry_inverse = wire::decode_varint(value)? != 0;
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })?;
-            if let Some(count) = remaining.get_mut(&code) {
-                *count -= 1;
-                if *count == 0 {
-                    entries.remove(&code);
-                }
             }
-            out.missing_geo.remove(&key_pair);
-            out.matchers.insert(
-                key_pair,
-                Matcher::Nets(Arc::new(IpSet::new(nets, entry_inverse ^ inverse))),
-            );
         }
     } else {
         let db = if reuse_db {
@@ -669,37 +702,103 @@ fn populate_geosite(
     previous: &Resources,
     out: &mut Resources,
 ) -> Result<()> {
-    let wanted: HashSet<String> = site_refs
-        .iter()
-        .map(|tag| tag.split('@').next().unwrap_or("").to_ascii_lowercase())
-        .collect();
-    // Keep entries as raw bytes and decode one domain at a time: large
-    // categories (cn, geolocation-!cn) would otherwise exist twice, as
-    // decoded structs and as the resulting domain set.
-    let mut entries = HashMap::new();
-    for bytes in wire::read_entries(data, |code| wanted.contains(&code.to_ascii_lowercase()))
-        .context("invalid geosite.dat")?
-    {
-        let mut code = String::new();
-        wire::each_field(&bytes, 1, |value| {
-            code = std::str::from_utf8(value)?.to_ascii_lowercase();
-            Ok(())
-        })
-        .context("invalid geosite.dat")?;
-        entries.insert(code, bytes);
-    }
-    // Release each category's raw bytes once its last tag is built,
-    // so large categories do not all stay in memory until the end.
-    let mut remaining: HashMap<String, usize> = HashMap::new();
-    for tag in site_refs {
+    let mut by_code: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, tag) in site_refs.iter().enumerate() {
         let code = tag.split('@').next().unwrap_or("").to_ascii_lowercase();
-        *remaining.entry(code).or_default() += 1;
+        by_code.entry(code).or_default().push(idx);
     }
-    for tag in site_refs {
-        let key_pair = ("geosite".to_owned(), tag.clone());
-        let parts: Vec<_> = tag.split('@').collect();
-        let code = parts[0].to_ascii_lowercase();
-        let Some(entry) = entries.get(&code) else {
+    let mut seen: HashSet<String> = HashSet::with_capacity(by_code.len());
+    wire::stream_entries(
+        data,
+        |code| by_code.contains_key(&code.to_ascii_lowercase()),
+        |code, entry| {
+            let code_lower = code.to_ascii_lowercase();
+            let Some(indices) = by_code.get(&code_lower) else {
+                return Ok(());
+            };
+            if !seen.insert(code_lower.clone()) {
+                return Ok(());
+            }
+            let hash = geo_entry_hash(entry);
+            let hash_key = ("geosite".to_owned(), code_lower);
+            let prev_unchanged = previous.geo_hashes.get(&hash_key) == Some(&hash);
+            out.geo_hashes.insert(hash_key, hash);
+
+            for &idx in indices {
+                let tag = &site_refs[idx];
+                let key_pair = ("geosite".to_owned(), tag.clone());
+                if prev_unchanged && let Some(prev_matcher) = previous.matchers.get(&key_pair) {
+                    out.missing_geo.remove(&key_pair);
+                    out.matchers.insert(key_pair, prev_matcher.clone());
+                    continue;
+                }
+                let mut parts = tag.split('@');
+                let _ = parts.next();
+                let attrs: Vec<_> = parts.collect();
+                let mut set = DomainSetBuilder::default();
+                if attrs.is_empty() {
+                    wire::each_field(entry, 2, |bytes| {
+                        let mut kind: i32 = 0;
+                        let mut value: &str = "";
+                        wire::each_raw_field(bytes, |number, wire_type, val| {
+                            match number {
+                                1 => {
+                                    ensure!(wire_type == 0, "invalid geosite.dat");
+                                    kind = i32::try_from(wire::decode_varint(val)?)?;
+                                }
+                                2 => {
+                                    ensure!(wire_type == 2, "invalid geosite.dat");
+                                    value =
+                                        std::str::from_utf8(val).context("invalid geosite.dat")?;
+                                }
+                                _ => {}
+                            }
+                            Ok(())
+                        })?;
+                        match kind {
+                            0 => set.keyword(value),
+                            1 => set.regex(value)?,
+                            2 => set.suffix(value),
+                            3 => set.exact(value),
+                            _ => bail!("invalid geosite domain type"),
+                        }
+                        Ok(())
+                    })?;
+                } else {
+                    wire::each_field(entry, 2, |bytes| {
+                        let d = Domain::decode(bytes).context("invalid geosite.dat")?;
+                        if !attrs.iter().all(|attr| {
+                            let (name, inverse) =
+                                attr.strip_prefix('!').map_or((*attr, false), |v| (v, true));
+                            d.attribute.iter().any(|a| a.key.eq_ignore_ascii_case(name)) ^ inverse
+                        }) {
+                            return Ok(());
+                        }
+                        match d.kind {
+                            0 => set.keyword(&d.value),
+                            1 => set.regex(&d.value)?,
+                            2 => set.suffix(&d.value),
+                            3 => set.exact(&d.value),
+                            _ => bail!("invalid geosite domain type"),
+                        }
+                        Ok(())
+                    })?;
+                }
+                out.missing_geo.remove(&key_pair);
+                out.matchers
+                    .insert(key_pair, Matcher::Domains(Arc::new(set.build())));
+            }
+            Ok(())
+        },
+    )
+    .context("invalid geosite.dat")?;
+
+    for (code, indices) in &by_code {
+        if seen.contains(code) {
+            continue;
+        }
+        for &idx in indices {
+            let tag = &site_refs[idx];
             if !out.partial {
                 bail!("GEOSITE category missing from data");
             }
@@ -708,40 +807,13 @@ fn populate_geosite(
                 tag = %tag,
                 "GEOSITE category missing from data; retaining cached rules or skipping"
             );
+            let key_pair = ("geosite".to_owned(), tag.clone());
             if let Some(matcher) = previous.matchers.get(&key_pair) {
                 out.matchers.insert(key_pair, matcher.clone());
             } else {
                 out.missing_geo.insert(key_pair);
             }
-            continue;
-        };
-        let mut set = DomainSetBuilder::default();
-        wire::each_field(entry, 2, |bytes| {
-            let d = Domain::decode(bytes).context("invalid geosite.dat")?;
-            if !parts[1..].iter().all(|attr| {
-                let (name, inverse) = attr.strip_prefix('!').map_or((*attr, false), |v| (v, true));
-                d.attribute.iter().any(|a| a.key.eq_ignore_ascii_case(name)) ^ inverse
-            }) {
-                return Ok(());
-            }
-            match d.kind {
-                0 => set.keyword(&d.value),
-                1 => set.regex(&d.value)?,
-                2 => set.suffix(&d.value),
-                3 => set.exact(&d.value),
-                _ => bail!("invalid geosite domain type"),
-            }
-            Ok(())
-        })?;
-        if let Some(count) = remaining.get_mut(&code) {
-            *count -= 1;
-            if *count == 0 {
-                entries.remove(&code);
-            }
         }
-        out.missing_geo.remove(&key_pair);
-        out.matchers
-            .insert(key_pair, Matcher::Domains(Arc::new(set.build())));
     }
     Ok(())
 }
@@ -845,13 +917,14 @@ async fn adblock(
     let mut lists = Vec::new();
     for (list, resolved) in settings.lists.iter().zip(resolved) {
         let loaded = resolved.data.and_then(|data| {
-            let bytes = read_limited(&data)?;
-            clyntis_config::adblock::parse_list(
-                &bytes,
+            let reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(&data)?);
+            clyntis_config::adblock::parse_list_reader(
+                reader,
                 &list.format,
                 &mut block,
                 &mut allow,
                 &mut addresses,
+                LIMIT,
             )
         });
         let info = match loaded {
@@ -1850,9 +1923,9 @@ mod wire {
     }
 
     /// Calls `each` with `(field_number, wire_type, raw_bytes)` for every field.
-    pub fn each_raw_field(
-        buf: &[u8],
-        mut each: impl FnMut(u64, u8, &[u8]) -> Result<()>,
+    pub fn each_raw_field<'a>(
+        buf: &'a [u8],
+        mut each: impl FnMut(u64, u8, &'a [u8]) -> Result<()>,
     ) -> Result<()> {
         let mut pos = 0;
         while pos < buf.len() {
@@ -1884,55 +1957,77 @@ mod wire {
         bail!("protobuf varint too long")
     }
 
-    /// Raw bytes of every top-level entry whose country code satisfies `wanted`.
-    /// Streams the file: only an entry's first bytes are read to find its code,
-    /// and unwanted entries are skipped with a seek.
-    pub fn read_entries(
+    /// Streams every top-level entry whose country code satisfies `wanted`,
+    /// reusing a single scratch buffer so only one entry is in memory at once.
+    pub fn stream_entries(
         path: &std::path::Path,
         wanted: impl Fn(&str) -> bool,
-    ) -> Result<Vec<Vec<u8>>> {
+        mut on_entry: impl FnMut(&str, &[u8]) -> Result<()>,
+    ) -> Result<()> {
         use std::io::Read;
         let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
-        let mut out = Vec::new();
+        let mut entry = Vec::new();
+        let mut code_buf = String::new();
         while let Some(key) = read_varint(&mut reader)? {
             ensure!(key & 7 == 2, "unexpected protobuf wire type in list");
             let len = usize::try_from(read_varint(&mut reader)?.unwrap_or(0))?;
             ensure!(len <= 128 * 1024 * 1024, "protobuf entry too large");
             // A country code is a few bytes; 256 covers it with room to spare.
-            let mut entry = vec![0; len.min(256)];
+            let prefix = len.min(256);
+            entry.clear();
+            entry.resize(prefix, 0);
             reader.read_exact(&mut entry)?;
             let mut pos = 0;
-            let code = loop {
+            code_buf.clear();
+            let mut has_code = false;
+            loop {
                 if pos >= entry.len() {
-                    break None;
+                    break;
                 }
                 match field(&entry, &mut pos) {
-                    Ok((1, 2, value)) => break Some(std::str::from_utf8(value)?.to_owned()),
+                    Ok((1, 2, value)) => {
+                        code_buf.push_str(std::str::from_utf8(value)?);
+                        has_code = true;
+                        break;
+                    }
                     Ok(_) => continue,
-                    Err(_) => break None, // field runs past the prefix
+                    Err(_) => break, // field runs past the prefix
                 }
-            };
-            let keep = key >> 3 == 1 && code.as_deref().is_none_or(&wanted);
+            }
+            let keep = key >> 3 == 1 && (!has_code || wanted(&code_buf));
             if keep {
-                let prefix = entry.len();
                 entry.resize(len, 0);
                 reader.read_exact(&mut entry[prefix..])?;
                 // Fall back to a full parse when the code was not in the prefix.
-                if code.is_none() {
-                    let mut matched = false;
+                if !has_code {
                     each_field(&entry, 1, |value| {
-                        matched |= wanted(std::str::from_utf8(value)?);
+                        code_buf.clear();
+                        code_buf.push_str(std::str::from_utf8(value)?);
+                        has_code = true;
                         Ok(())
                     })?;
-                    if !matched {
+                    if !has_code || !wanted(&code_buf) {
                         continue;
                     }
                 }
-                out.push(entry);
+                on_entry(&code_buf, &entry)?;
             } else {
-                reader.seek_relative(i64::try_from(len - entry.len())?)?;
+                reader.seek_relative(i64::try_from(len - prefix)?)?;
             }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn read_entries(
+        path: &std::path::Path,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        stream_entries(path, wanted, |_, entry| {
+            out.push(entry.to_vec());
+            Ok(())
+        })?;
         Ok(out)
     }
 }
@@ -2182,32 +2277,89 @@ fn load_provider_matcher(p: &RuleProvider, path: &Path) -> Result<Matcher> {
             Ok(builder.build())
         }
         "yaml" => {
-            let bytes = read_limited(path)?;
-            let payload = parse_payload(&bytes, &p.format)?;
-            drop(bytes);
-            provider_matcher(p, &payload)
+            ensure!(
+                std::fs::metadata(path)?.len() <= LIMIT as u64,
+                "resource exceeds size limit"
+            );
+            let reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+            let mut builder = ProviderMatcherBuilder::new(&p.behavior);
+            serde::de::DeserializeSeed::deserialize(
+                YamlPayloadSeed(&mut builder),
+                serde_yaml::Deserializer::from_reader(reader),
+            )?;
+            Ok(builder.build())
         }
         _ => bail!("unsupported rule provider format"),
     }
 }
 
-fn parse_payload(data: &[u8], format: &str) -> Result<Vec<String>> {
-    match format {
-        "yaml" => {
-            #[derive(serde::Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Payload {
-                payload: Vec<String>,
+struct YamlPayloadSeed<'a, 'b>(&'a mut ProviderMatcherBuilder<'b>);
+impl<'de> serde::de::DeserializeSeed<'de> for YamlPayloadSeed<'_, '_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for YamlPayloadSeed<'_, '_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a rule-provider mapping with a payload sequence")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "payload" {
+                if seen {
+                    return Err(serde::de::Error::duplicate_field("payload"));
+                }
+                seen = true;
+                map.next_value_seed(YamlPayloadSeqSeed(self.0))?;
+            } else {
+                return Err(serde::de::Error::unknown_field(&key, &["payload"]));
             }
-            Ok(serde_yaml::from_slice::<Payload>(data)?.payload)
         }
-        "text" => Ok(std::str::from_utf8(data)?
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.starts_with('#'))
-            .map(str::to_owned)
-            .collect()),
-        _ => bail!("unsupported rule provider format"),
+        if !seen {
+            return Err(serde::de::Error::missing_field("payload"));
+        }
+        Ok(())
+    }
+}
+
+struct YamlPayloadSeqSeed<'a, 'b>(&'a mut ProviderMatcherBuilder<'b>);
+impl<'de> serde::de::DeserializeSeed<'de> for YamlPayloadSeqSeed<'_, '_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for YamlPayloadSeqSeed<'_, '_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a sequence of rule strings")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq
+            .next_element_seed(YamlPayloadItemSeed(self.0))?
+            .is_some()
+        {}
+        Ok(())
+    }
+}
+
+struct YamlPayloadItemSeed<'a, 'b>(&'a mut ProviderMatcherBuilder<'b>);
+impl<'de> serde::de::DeserializeSeed<'de> for YamlPayloadItemSeed<'_, '_> {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for YamlPayloadItemSeed<'_, '_> {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a rule string")
+    }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<(), E> {
+        self.0.push(v).map_err(serde::de::Error::custom)
     }
 }
 
@@ -4257,6 +4409,58 @@ rules:
         assert_eq!(not_cn.evaluate("", Some(other), 0, "", false), Some(true));
         assert_eq!(inv.evaluate("", Some(priv_v4), 0, "", false), Some(false));
         assert_eq!(inv.evaluate("", Some(other), 0, "", false), Some(true));
+
+        // Re-populating from a new file where "CN" has identical bytes reuses the Arc<IpSet>.
+        let data2 = dir.join("geoip2.dat");
+        std::fs::copy(&data, &data2).unwrap();
+        let mut out2 = Resources::default();
+        populate_geoip(
+            &data2,
+            true,
+            &["cn".into(), "!cn".into(), "inv".into()],
+            &out,
+            false,
+            &mut out2,
+        )
+        .unwrap();
+        match (
+            out.matchers.get(&("geoip".into(), "cn".into())),
+            out2.matchers.get(&("geoip".into(), "cn".into())),
+        ) {
+            (Some(Matcher::Nets(a)), Some(Matcher::Nets(b))) => assert!(Arc::ptr_eq(a, b)),
+            _ => panic!("expected Matcher::Nets for cn"),
+        }
+
+        // Streaming YAML provider matcher handles payload sequence and rejects unknown fields.
+        let yaml_path = dir.join("provider.yaml");
+        std::fs::write(
+            &yaml_path,
+            "payload:\n  - '+.example.com'\n  - 'sub.test'\n",
+        )
+        .unwrap();
+        let p = RuleProvider {
+            kind: "file".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            path: yaml_path.to_string_lossy().into_owned(),
+            url: String::new(),
+            interval: 3600,
+            payload: vec![],
+        };
+        let m = load_provider_matcher(&p, &yaml_path).unwrap();
+        assert_eq!(
+            m.evaluate("a.example.com", None, 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(m.evaluate("sub.test", None, 443, "tcp", false), Some(true));
+        assert_eq!(
+            m.evaluate("other.test", None, 443, "tcp", false),
+            Some(false)
+        );
+
+        let bad_yaml = dir.join("bad.yaml");
+        std::fs::write(&bad_yaml, "payload:\n  - 'a.com'\nextra: 1\n").unwrap();
+        assert!(load_provider_matcher(&p, &bad_yaml).is_err());
 
         std::fs::remove_dir_all(dir).unwrap();
     }

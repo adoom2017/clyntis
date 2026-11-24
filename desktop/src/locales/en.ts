@@ -660,4 +660,16 @@ export const en: Record<string, string> = {
     "Paste node links for automatic routing, or import a YAML file / subscription.",
   "此配置已定义自定义 rules，自动分流模式不会生效。":
     "This profile defines custom rules, so auto-routing mode does not apply.",
+  解密密码: "Decryption password",
+  "检测到加密节点链接，请输入密码解密。":
+    "Encrypted node links detected; enter the password to decrypt.",
+  "未加密的 Base64 订阅可留空。":
+    "Leave blank for unencrypted Base64 subscriptions.",
+  导出节点链接: "Export node links",
+  明文链接: "Plain links",
+  使用密码加密: "Encrypt with password",
+  加密并复制: "Encrypt & copy",
+  复制节点链接: "Copy node links",
+  已生成并复制加密节点链接: "Encrypted node links generated and copied",
+  "已复制 {count} 个节点链接": "Copied {count} node link(s)",
 };

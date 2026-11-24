@@ -45,13 +45,17 @@ impl Salamander {
         hash.update(salt);
         hash.finalize().into()
     }
-    pub fn obfuscate(&self, packet: &[u8]) -> Vec<u8> {
-        let mut out = vec![0; SALT + packet.len()];
+    pub fn obfuscate_into(&self, packet: &[u8], out: &mut [u8]) {
+        debug_assert_eq!(out.len(), SALT + packet.len());
         rand::thread_rng().fill_bytes(&mut out[..SALT]);
         let key = self.key(&out[..SALT]);
         for (i, byte) in packet.iter().enumerate() {
             out[SALT + i] = byte ^ key[i % key.len()];
         }
+    }
+    pub fn obfuscate(&self, packet: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; SALT + packet.len()];
+        self.obfuscate_into(packet, &mut out);
         out
     }
     /// Unscrambles in place, moving the payload to the front; returns its length.
@@ -233,14 +237,28 @@ impl AsyncUdpSocket for Transport {
                 ..*transmit
             }),
             Some(obfs) => {
-                let packet = obfs.obfuscate(transmit.contents);
-                socket.try_send(&Transmit {
-                    destination,
-                    ecn: transmit.ecn,
-                    contents: &packet,
-                    segment_size: None,
-                    src_ip: transmit.src_ip,
-                })
+                const STACK_MTU: usize = 1536;
+                let total = SALT + transmit.contents.len();
+                if total <= STACK_MTU {
+                    let mut stack = [0u8; STACK_MTU];
+                    obfs.obfuscate_into(transmit.contents, &mut stack[..total]);
+                    socket.try_send(&Transmit {
+                        destination,
+                        ecn: transmit.ecn,
+                        contents: &stack[..total],
+                        segment_size: None,
+                        src_ip: transmit.src_ip,
+                    })
+                } else {
+                    let packet = obfs.obfuscate(transmit.contents);
+                    socket.try_send(&Transmit {
+                        destination,
+                        ecn: transmit.ecn,
+                        contents: &packet,
+                        segment_size: None,
+                        src_ip: transmit.src_ip,
+                    })
+                }
             }
         }
     }

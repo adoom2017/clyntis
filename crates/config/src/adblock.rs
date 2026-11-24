@@ -231,110 +231,149 @@ pub fn parse_list(
     allow: &mut DomainSetBuilder,
     addresses: &mut Vec<IpNet>,
 ) -> Result<usize> {
-    let text = String::from_utf8_lossy(data);
+    ensure!(
+        FORMATS.contains(&format),
+        "unsupported adblock list format {format}"
+    );
     let mut taken = 0;
-    match format {
-        "clash" => {
-            for line in text.lines() {
-                let line = line.trim();
-                // yaml `payload:` items and plain text lines alike.
-                let entry = line
-                    .strip_prefix("- ")
-                    .unwrap_or(line)
-                    .trim()
-                    .trim_matches(|c| c == '\'' || c == '"');
-                if entry.is_empty() || entry.starts_with('#') || entry == "payload:" {
-                    continue;
-                }
-                if let Some(rule) = entry.split_once(',') {
-                    // A classical line: DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD.
-                    let value = rule.1.split(',').next().unwrap_or("").trim();
-                    match rule.0.trim() {
-                        "DOMAIN" => block.exact(value),
-                        "DOMAIN-SUFFIX" => block.suffix(value),
-                        "DOMAIN-KEYWORD" => block.keyword(value),
-                        "IP-CIDR" | "IP-CIDR6" => match value.parse() {
-                            Ok(net) => addresses.push(net),
-                            Err(_) => continue,
-                        },
-                        _ => continue,
-                    }
-                } else if let Ok(net) = entry.parse::<IpNet>() {
-                    // An `ipcidr` rule provider: bare networks.
-                    addresses.push(net);
-                } else if block.pattern(entry).is_err() {
-                    continue;
-                }
-                taken += 1;
-            }
-        }
-        "hosts" => {
-            for line in text.lines() {
-                let line = line.split('#').next().unwrap_or("").trim();
-                let mut fields = line.split_whitespace();
-                let (Some(address), Some(_)) = (fields.next(), fields.clone().next()) else {
-                    continue;
-                };
-                if !matches!(address, "0.0.0.0" | "127.0.0.1" | "::" | "::1") {
-                    continue;
-                }
-                for domain in fields {
-                    if !matches!(
-                        domain,
-                        "localhost"
-                            | "localhost.localdomain"
-                            | "local"
-                            | "broadcasthost"
-                            | "0.0.0.0"
-                    ) && domain.contains('.')
-                    {
-                        block.exact(domain);
-                        taken += 1;
-                    }
-                }
-            }
-        }
-        "adguard" => {
-            for line in text.lines() {
-                let line = line.trim();
-                let (exception, rule) = match line.strip_prefix("@@") {
-                    Some(rest) => (true, rest),
-                    None => (false, line),
-                };
-                let Some(rule) = rule.strip_prefix("||") else {
-                    continue;
-                };
-                // `$important` keeps its meaning at DNS level; other modifiers
-                // (badfilter, client, dnstype…) cannot be honoured: skip.
-                let (domain, modifiers) = rule.split_once('$').unwrap_or((rule, ""));
-                if !modifiers.is_empty() && modifiers != "important" {
-                    continue;
-                }
-                let Some(domain) = domain.strip_suffix('^') else {
-                    continue;
-                };
-                if domain.is_empty()
-                    || domain.ends_with('.')
-                    || !domain
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'*')
-                {
-                    continue;
-                }
-                let target = if exception { &mut *allow } else { &mut *block };
-                if domain.contains('*') {
-                    if target.pattern(domain).is_err() {
-                        continue;
-                    }
-                } else {
-                    target.suffix(domain);
-                }
-                taken += 1;
-            }
-        }
-        other => bail!("unsupported adblock list format {other}"),
+    for raw_line in data.split(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(raw_line);
+        taken += parse_list_line(&line, format, block, allow, addresses);
     }
     Ok(taken)
+}
+
+/// Streaming variant of [`parse_list`] that reads line-by-line from `reader`
+/// into a single reusable line buffer without buffering the full file.
+pub fn parse_list_reader(
+    mut reader: impl std::io::BufRead,
+    format: &str,
+    block: &mut DomainSetBuilder,
+    allow: &mut DomainSetBuilder,
+    addresses: &mut Vec<IpNet>,
+    limit: usize,
+) -> Result<usize> {
+    ensure!(
+        FORMATS.contains(&format),
+        "unsupported adblock list format {format}"
+    );
+    let mut buf = Vec::with_capacity(256);
+    let mut read_bytes = 0usize;
+    let mut taken = 0usize;
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        read_bytes = read_bytes.saturating_add(n);
+        ensure!(read_bytes <= limit, "resource exceeds size limit");
+        let line = String::from_utf8_lossy(&buf);
+        taken += parse_list_line(&line, format, block, allow, addresses);
+    }
+    Ok(taken)
+}
+
+fn parse_list_line(
+    line: &str,
+    format: &str,
+    block: &mut DomainSetBuilder,
+    allow: &mut DomainSetBuilder,
+    addresses: &mut Vec<IpNet>,
+) -> usize {
+    match format {
+        "clash" => {
+            let line = line.trim();
+            // yaml `payload:` items and plain text lines alike.
+            let entry = line
+                .strip_prefix("- ")
+                .unwrap_or(line)
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            if entry.is_empty() || entry.starts_with('#') || entry == "payload:" {
+                return 0;
+            }
+            if let Some(rule) = entry.split_once(',') {
+                // A classical line: DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD.
+                let value = rule.1.split(',').next().unwrap_or("").trim();
+                match rule.0.trim() {
+                    "DOMAIN" => block.exact(value),
+                    "DOMAIN-SUFFIX" => block.suffix(value),
+                    "DOMAIN-KEYWORD" => block.keyword(value),
+                    "IP-CIDR" | "IP-CIDR6" => match value.parse() {
+                        Ok(net) => addresses.push(net),
+                        Err(_) => return 0,
+                    },
+                    _ => return 0,
+                }
+            } else if let Ok(net) = entry.parse::<IpNet>() {
+                // An `ipcidr` rule provider: bare networks.
+                addresses.push(net);
+            } else if block.pattern(entry).is_err() {
+                return 0;
+            }
+            1
+        }
+        "hosts" => {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let mut fields = line.split_whitespace();
+            let (Some(address), Some(_)) = (fields.next(), fields.clone().next()) else {
+                return 0;
+            };
+            if !matches!(address, "0.0.0.0" | "127.0.0.1" | "::" | "::1") {
+                return 0;
+            }
+            let mut taken = 0;
+            for domain in fields {
+                if !matches!(
+                    domain,
+                    "localhost" | "localhost.localdomain" | "local" | "broadcasthost" | "0.0.0.0"
+                ) && domain.contains('.')
+                {
+                    block.exact(domain);
+                    taken += 1;
+                }
+            }
+            taken
+        }
+        "adguard" => {
+            let line = line.trim();
+            let (exception, rule) = match line.strip_prefix("@@") {
+                Some(rest) => (true, rest),
+                None => (false, line),
+            };
+            let Some(rule) = rule.strip_prefix("||") else {
+                return 0;
+            };
+            // `$important` keeps its meaning at DNS level; other modifiers
+            // (badfilter, client, dnstype…) cannot be honoured: skip.
+            let (domain, modifiers) = rule.split_once('$').unwrap_or((rule, ""));
+            if !modifiers.is_empty() && modifiers != "important" {
+                return 0;
+            }
+            let Some(domain) = domain.strip_suffix('^') else {
+                return 0;
+            };
+            if domain.is_empty()
+                || domain.ends_with('.')
+                || !domain
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'*')
+            {
+                return 0;
+            }
+            let target = if exception { &mut *allow } else { &mut *block };
+            if domain.contains('*') {
+                if target.pattern(domain).is_err() {
+                    return 0;
+                }
+            } else {
+                target.suffix(domain);
+            }
+            1
+        }
+        _ => 0,
+    }
 }
 
 /// What the apps store: which presets are on, extra lists and the allowlist.

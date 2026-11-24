@@ -1127,6 +1127,14 @@ impl Core {
             "proxies": &self.config.proxies,
         })
     }
+    /// Current routing mode without constructing a `serde_json::Value` DOM.
+    pub fn current_mode(&self) -> Mode {
+        self.policy.read().unwrap().mode.clone()
+    }
+    /// Immutable proxy groups and proxies slices for one-time FFI fragment caching.
+    pub fn groups_and_proxies(&self) -> (&[clyntis_config::Group], &[clyntis_config::Proxy]) {
+        (&self.config.proxy_groups, &self.config.proxies)
+    }
     pub fn selections(&self) -> HashMap<String, String> {
         self.policy.read().unwrap().selection.clone()
     }

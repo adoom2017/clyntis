@@ -32,6 +32,7 @@ use tokio_util::sync::{CancellationToken, PollSender};
 pub const MTU: usize = 1280;
 const CHUNK: usize = 8192;
 const BUFFER: usize = 64 * 1024;
+const COMPACT_BUFFER: usize = 16 * 1024;
 const QUEUE: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Retry interval while packets wait for room in a full router queue.
@@ -282,10 +283,10 @@ impl Flow {
     }
 }
 
-fn tcp_socket() -> tcp::Socket<'static> {
+fn tcp_socket_with(buffer: usize) -> tcp::Socket<'static> {
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; BUFFER]),
-        tcp::SocketBuffer::new(vec![0; BUFFER]),
+        tcp::SocketBuffer::new(vec![0; buffer]),
+        tcp::SocketBuffer::new(vec![0; buffer]),
     );
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
@@ -294,12 +295,18 @@ fn tcp_socket() -> tcp::Socket<'static> {
     socket
 }
 
+#[cfg(test)]
+fn tcp_socket() -> tcp::Socket<'static> {
+    tcp_socket_with(BUFFER)
+}
+
 /// Keeps one listening socket per `serve` port once the node has addresses.
 fn sync_listeners(
     listeners: &mut BTreeMap<u16, SocketHandle>,
     sockets: &mut SocketSet<'static>,
     gate: &Gate,
     addressed: bool,
+    buffer: usize,
 ) {
     listeners.retain(|port, handle| {
         let keep = addressed && gate.ports.contains_key(port);
@@ -315,7 +322,7 @@ fn sync_listeners(
         if listeners.contains_key(&port) {
             continue;
         }
-        let mut socket = tcp_socket();
+        let mut socket = tcp_socket_with(buffer);
         match socket.listen(port) {
             Ok(()) => {
                 listeners.insert(port, sockets.add(socket));
@@ -363,14 +370,28 @@ pub struct Inbound {
 /// carries decrypted packets from peers, `outgoing` takes packets to encrypt.
 /// `open` lists the peer addresses with open connections, so the router
 /// keeps only their paths alive.
+#[allow(dead_code)]
 pub async fn run(
+    commands: mpsc::Receiver<Command>,
+    incoming: mpsc::Receiver<Vec<u8>>,
+    outgoing: mpsc::Sender<Vec<u8>>,
+    open: watch::Sender<Vec<IpAddr>>,
+    inbound: Inbound,
+    stop: CancellationToken,
+) {
+    run_with_compact(commands, incoming, outgoing, open, inbound, stop, false).await
+}
+
+pub(crate) async fn run_with_compact(
     mut commands: mpsc::Receiver<Command>,
     mut incoming: mpsc::Receiver<Vec<u8>>,
     outgoing: mpsc::Sender<Vec<u8>>,
     open: watch::Sender<Vec<IpAddr>>,
     inbound: Inbound,
     stop: CancellationToken,
+    compact: bool,
 ) {
+    let buffer = if compact { COMPACT_BUFFER } else { BUFFER };
     let Inbound {
         mut gate,
         accepted,
@@ -410,7 +431,7 @@ pub async fn run(
                 Ok(()) => {
                     current = gate.borrow_and_update().clone();
                     let addressed = !iface.ip_addrs().is_empty();
-                    sync_listeners(&mut listeners, &mut sockets, &current, addressed);
+                    sync_listeners(&mut listeners, &mut sockets, &current, addressed, buffer);
                 }
                 Err(_) => gate_open = false,
             },
@@ -433,7 +454,7 @@ pub async fn run(
                             IpAddr::V6(v6) => { let _ = routes.add_default_ipv6_route(v6); }
                         }
                     }
-                    sync_listeners(&mut listeners, &mut sockets, &current, !addresses.is_empty());
+                    sync_listeners(&mut listeners, &mut sockets, &current, !addresses.is_empty(), buffer);
                 }
                 Some(Command::Connect(remote, reply)) => {
                     let local = iface.ip_addrs().iter().map(|c| c.address()).find(|a| {
@@ -443,7 +464,7 @@ pub async fn run(
                         let _ = reply.send(Err(anyhow::anyhow!("this node has no tailnet address for {remote}")));
                         continue;
                     };
-                    let mut socket = tcp_socket();
+                    let mut socket = tcp_socket_with(buffer);
                     next_port = if next_port >= LAST_PORT { FIRST_PORT } else { next_port + 1 };
                     let endpoint = IpEndpoint::new(remote.ip().into(), remote.port());
                     if let Err(error) = socket.connect(iface.context(), endpoint, (local, next_port)) {
@@ -478,7 +499,7 @@ pub async fn run(
             let remote = socket
                 .remote_endpoint()
                 .map(|endpoint| IpAddr::from(endpoint.addr));
-            let mut fresh = tcp_socket();
+            let mut fresh = tcp_socket_with(buffer);
             if fresh.listen(port).is_err() {
                 continue;
             }

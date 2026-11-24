@@ -363,12 +363,12 @@ final class AppModel {
         if !active { selectedID = profile.id }
     }
 
-    func importNodeLinks(name: String, text: String, mode: String) async throws -> CoreSession.NodesImportResult {
+    func importNodeLinks(name: String, text: String, mode: String, password: String? = nil) async throws -> CoreSession.NodesImportResult {
         guard !busy, let store else { throw ClientError.message(L("正在处理其他操作，请稍后再试。")) }
         busy = true
         defer { busy = false }
         let result = try await Task.detached {
-            try CoreSession.importNodeLinks(text, mode: mode)
+            try CoreSession.importNodeLinks(text, mode: mode, password: password)
         }.value
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawChosen = trimmed.isEmpty ? (result.nodes.first?.name ?? L("我的节点")) : trimmed
@@ -382,16 +382,24 @@ final class AppModel {
         return try CoreSession.profileNodes(configuration: store.configuration(for: profile.id))
     }
 
-    func addNodeLinks(_ text: String, to profile: Profile) async throws -> CoreSession.NodesImportResult {
+    func addNodeLinks(_ text: String, to profile: Profile, password: String? = nil) async throws -> CoreSession.NodesImportResult {
         guard !busy, let store else { throw ClientError.message(L("正在处理其他操作，请稍后再试。")) }
         busy = true
         defer { busy = false }
         let current = try store.configuration(for: profile.id)
         let result = try await Task.detached {
-            try CoreSession.addNodeLinks(text, to: current)
+            try CoreSession.addNodeLinks(text, to: current, password: password)
         }.value
         try await saveConfiguration(result.yaml, for: profile)
         return result
+    }
+
+    func exportNodeLinks(for profile: Profile, password: String?) async throws -> CoreSession.NodesExportResult {
+        guard let store else { throw ClientError.message(L("配置存储不可用。")) }
+        let current = try store.configuration(for: profile.id)
+        return try await Task.detached {
+            try CoreSession.exportNodeLinks(from: current, password: password)
+        }.value
     }
 
     func updateProfileNodes(for profile: Profile, removeNames: [String], autoRouting: String?) async throws {
@@ -805,25 +813,33 @@ final class AppModel {
         }
         if let error = snapshot.error { throw ClientError.message(error) }
         if snapshot.stopped == true { throw ClientError.message(L("内核已停止，请重新连接。")) }
-        upload = snapshot.upload ?? 0
-        download = snapshot.download ?? 0
+        let newUpload = snapshot.upload ?? 0
+        if upload != newUpload { upload = newUpload }
+        let newDownload = snapshot.download ?? 0
+        if download != newDownload { download = newDownload }
         let decodedConnections = snapshot.connections ?? []
-        connectionCount = decodedConnections.count
-        connections = ConnectionInfo.sorted(decodedConnections)
-        adblock = snapshot.adblock
-        mitm = snapshot.mitm
-        rewrite = snapshot.rewrite
+        if connectionCount != decodedConnections.count { connectionCount = decodedConnections.count }
+        let sortedConnections = ConnectionInfo.sorted(decodedConnections)
+        if connections != sortedConnections { connections = sortedConnections }
+        if adblock != snapshot.adblock { adblock = snapshot.adblock }
+        if mitm != snapshot.mitm { mitm = snapshot.mitm }
+        if rewrite != snapshot.rewrite { rewrite = snapshot.rewrite }
         if let config = snapshot.config {
-            mode = config.mode ?? "rule"
+            let newMode = config.mode ?? "rule"
+            if mode != newMode { mode = newMode }
             let selections = snapshot.selections ?? [:]
-            groups = (config.proxyGroups ?? []).map { group in
+            let newGroups = (config.proxyGroups ?? []).map { group in
                 ProxyGroup(name: group.name, type: group.type ?? "", nodes: group.proxies,
                            selected: selections[group.name])
             }
-            proxies = (config.proxies ?? []).map(\.name)
+            if groups != newGroups { groups = newGroups }
+            let newProxies = (config.proxies ?? []).map(\.name)
+            if proxies != newProxies { proxies = newProxies }
         }
-        nodeStatus = snapshot.proxies ?? [:]
-        currentNetworks = snapshot.network?.defined == true ? (snapshot.network?.networks ?? []) : nil
+        let newNodeStatus = snapshot.proxies ?? [:]
+        if nodeStatus != newNodeStatus { nodeStatus = newNodeStatus }
+        let newNetworks = snapshot.network?.defined == true ? (snapshot.network?.networks ?? []) : nil
+        if currentNetworks != newNetworks { currentNetworks = newNetworks }
     }
 }
 
@@ -832,7 +848,7 @@ struct PendingImport {
     let data: Data
 }
 
-struct ProxyGroup: Identifiable {
+struct ProxyGroup: Identifiable, Equatable {
     var id: String { name }
     let name: String
     /// As written in the profile: select, url-test, fallback, load-balance.

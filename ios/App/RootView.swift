@@ -19,8 +19,8 @@ struct RootView: View {
         .alert("Clyntis", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
             Button(L("知道了")) { model.error = nil }
         } message: { Text(model.error ?? "") }
-        .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
+        .task(id: scenePhase == .active && model.connected) {
+            guard scenePhase == .active, model.connected else { return }
             while !Task.isCancelled {
                 await model.refreshSnapshot()
                 do { try await Task.sleep(for: .seconds(2)) } catch { break }

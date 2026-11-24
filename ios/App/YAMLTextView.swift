@@ -35,7 +35,7 @@ struct YAMLTextView: UIViewRepresentable {
     func updateUIView(_ view: UITextView, context: Context) {
         context.coordinator.text = $text
         if view.text != text { view.text = text }
-        mark(view)
+        mark(view, coordinator: context.coordinator)
         if revealRequest != context.coordinator.revealed {
             context.coordinator.revealed = revealRequest
             if let range = lineRange(in: view.text) {
@@ -50,7 +50,9 @@ struct YAMLTextView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
     /// Re-tints in place so the selection and scroll position stay put.
-    private func mark(_ view: UITextView) {
+    private func mark(_ view: UITextView, coordinator: Coordinator) {
+        guard errorLine != nil || coordinator.lastMarkedErrorLine != nil else { return }
+        coordinator.lastMarkedErrorLine = errorLine
         let storage = view.textStorage
         let whole = NSRange(location: 0, length: storage.length)
         storage.beginEditing()
@@ -79,6 +81,7 @@ struct YAMLTextView: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         var text: Binding<String>
         var revealed = 0
+        var lastMarkedErrorLine: Int?
         init(text: Binding<String>) { self.text = text }
         func textViewDidChange(_ view: UITextView) { text.wrappedValue = view.text }
     }

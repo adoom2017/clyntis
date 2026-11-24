@@ -14,7 +14,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -33,6 +33,7 @@ struct CacheEntry {
 }
 const CACHE_ENTRIES: usize = 4096;
 const CACHE_BYTES: usize = 1024 * 1024;
+const HOSTED_PROXY_CACHE_BYTES: usize = 128 * 1024;
 /// Per-entry allocator and table overhead beyond the key and response bytes.
 const CACHE_OVERHEAD: usize = 256;
 /// Fallback negative cache TTL (seconds) for NODATA/NXDOMAIN responses that
@@ -54,10 +55,34 @@ fn answered(response: &Message) -> bool {
     )
 }
 fn cache_key(request: &Message) -> Result<Vec<u8>> {
-    // Keep EDNS, DNSSEC, recursion flags and query class in the cache key.
-    let mut key_request = request.clone();
-    key_request.set_id(0);
-    Ok(key_request.to_vec()?)
+    // Keep EDNS, DNSSEC, recursion flags and query class in the cache key
+    // without cloning the Message or serializing a full DNS wire packet.
+    let mut key = Vec::with_capacity(64);
+    let flags = u8::from(request.op_code())
+        | (u8::from(request.message_type() == MessageType::Response) << 4)
+        | (u8::from(request.recursion_desired()) << 5)
+        | (u8::from(request.checking_disabled()) << 6)
+        | (u8::from(request.authentic_data()) << 7);
+    key.push(flags);
+    if let Some(edns) = request.extensions() {
+        key.push(1);
+        key.push(edns.version());
+        key.extend_from_slice(&edns.max_payload().to_be_bytes());
+        key.push(u8::from(edns.flags().dnssec_ok));
+    } else {
+        key.push(0);
+    }
+    key.extend_from_slice(&(request.queries().len() as u16).to_be_bytes());
+    for query in request.queries() {
+        for label in query.name().iter() {
+            key.push(label.len() as u8);
+            key.extend(label.iter().map(u8::to_ascii_lowercase));
+        }
+        key.push(0);
+        key.extend_from_slice(&u16::from(query.query_type()).to_be_bytes());
+        key.extend_from_slice(&u16::from(query.query_class()).to_be_bytes());
+    }
+    Ok(key)
 }
 fn cache_ttl(response: &Message) -> u32 {
     if !answered(response) || response.truncated() {
@@ -93,12 +118,43 @@ fn cache_ttl(response: &Message) -> u32 {
     };
     ttl.min(3600)
 }
-#[derive(Default)]
 struct Cache {
     entries: HashMap<Vec<u8>, CacheEntry>,
     total_bytes: usize,
+    max_bytes: usize,
+}
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new(CACHE_BYTES)
+    }
 }
 impl Cache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        if self.total_bytes > self.max_bytes {
+            self.prune_expired(Instant::now());
+        }
+        while self.total_bytes > self.max_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.size);
+            }
+        }
+    }
     fn get(&mut self, key: &[u8], id: u16) -> Option<Message> {
         let now = Instant::now();
         let expired = match self.entries.get(key) {
@@ -149,14 +205,14 @@ impl Cache {
         if let Some(prev) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(prev.size);
         }
-        if size > CACHE_BYTES {
+        if size > self.max_bytes {
             return;
         }
         let now = Instant::now();
-        if self.entries.len() >= CACHE_ENTRIES || self.total_bytes + size > CACHE_BYTES {
+        if self.entries.len() >= CACHE_ENTRIES || self.total_bytes + size > self.max_bytes {
             self.prune_expired(now);
         }
-        while self.entries.len() >= CACHE_ENTRIES || self.total_bytes + size > CACHE_BYTES {
+        while self.entries.len() >= CACHE_ENTRIES || self.total_bytes + size > self.max_bytes {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -268,7 +324,8 @@ impl FakeMap {
         *stamp = self.stamp;
         let ip = *ip;
         self.order.push_back((ip, self.stamp));
-        if self.order.len() > 2 * self.capacity.max(64) {
+        let cap = self.capacity.max(64);
+        if self.order.len() > cap + cap / 2 {
             self.compact();
         }
         Some(ip)
@@ -364,6 +421,7 @@ pub struct Resolver {
     clock: Arc<clyntis_protocol::tls::Clock>,
     cache: Mutex<Cache>,
     proxy_cache: Mutex<Cache>,
+    proxy_cache_bytes: AtomicUsize,
     inflight: Mutex<HashMap<(bool, Vec<u8>), InflightSlot>>,
     fake: Mutex<FakeMap>,
     policy: RwLock<DnsPolicy>,
@@ -447,6 +505,7 @@ impl Resolver {
             configured: AtomicBool::new(false),
             cache: Mutex::new(Cache::default()),
             proxy_cache: Mutex::new(Cache::default()),
+            proxy_cache_bytes: AtomicUsize::new(CACHE_BYTES),
             inflight: Mutex::new(HashMap::new()),
             fake: Mutex::new(FakeMap::new(FAKE_CAPACITY)),
         }
@@ -617,6 +676,14 @@ impl Resolver {
         while map.len() > map.capacity {
             map.evict();
         }
+        drop(map);
+        let proxy_bytes = if capacity < FAKE_CAPACITY {
+            HOSTED_PROXY_CACHE_BYTES
+        } else {
+            CACHE_BYTES
+        };
+        self.proxy_cache_bytes.store(proxy_bytes, Ordering::Relaxed);
+        self.proxy_cache.lock().unwrap().set_max_bytes(proxy_bytes);
     }
     /// Restores exported mappings, oldest first; past the capacity only the
     /// most recent are kept, while addresses still advance past all of them.
@@ -695,7 +762,8 @@ impl Resolver {
     }
     pub fn clear_cache(&self) {
         *self.cache.lock().unwrap() = Cache::default();
-        *self.proxy_cache.lock().unwrap() = Cache::default();
+        *self.proxy_cache.lock().unwrap() =
+            Cache::new(self.proxy_cache_bytes.load(Ordering::Relaxed));
         self.reachable.lock().unwrap().clear();
     }
     #[cfg(test)]
@@ -1805,5 +1873,38 @@ mod perf_tests {
         assert!(resolver.is_fake_ip_excluded("localhost"));
         assert!(resolver.is_fake_ip_excluded("printer.local"));
         assert!(!resolver.is_fake_ip_excluded("example.com"));
+    }
+
+    #[test]
+    fn hosted_proxy_cache_cap_and_cache_key() {
+        let resolver = Resolver::new(Dns::default(), Arc::new(clyntis_platform::DefaultHooks));
+        resolver.set_fake_capacity(8192);
+        assert_eq!(
+            resolver.proxy_cache.lock().unwrap().max_bytes,
+            HOSTED_PROXY_CACHE_BYTES
+        );
+        resolver.clear_cache();
+        assert_eq!(
+            resolver.proxy_cache.lock().unwrap().max_bytes,
+            HOSTED_PROXY_CACHE_BYTES
+        );
+
+        let mut msg_a = Message::new();
+        msg_a.set_id(1);
+        msg_a.add_query(Query::query(
+            Name::from_ascii("Example.COM.").unwrap(),
+            RecordType::A,
+        ));
+        let mut msg_b = Message::new();
+        msg_b.set_id(999);
+        msg_b.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        assert_eq!(cache_key(&msg_a).unwrap(), cache_key(&msg_b).unwrap());
+
+        let mut msg_aaaa = msg_b.clone();
+        msg_aaaa.queries_mut()[0].set_query_type(RecordType::AAAA);
+        assert_ne!(cache_key(&msg_a).unwrap(), cache_key(&msg_aaaa).unwrap());
     }
 }

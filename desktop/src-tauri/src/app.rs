@@ -880,13 +880,17 @@ pub async fn import_node_links(
     name: String,
     links: String,
     auto_routing: String,
+    password: Option<String>,
 ) -> Reply<profiles::NodeImportResult> {
     let mode = clyntis_config::AutoRouting::parse(&auto_routing).map_err(error)?;
     let _guard = state.operation.lock().await;
-    let result = state
-        .store
-        .import_node_links(name, &links, mode)
-        .map_err(error)?;
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.import_node_links(name, &links, mode, password.as_deref())
+    })
+    .await
+    .map_err(|e| error(anyhow::anyhow!(e)))?
+    .map_err(error)?;
     if let Ok(profile) = state.store.get(result.profile.id) {
         engine::spawn_prefetch(
             state.app.clone(),
@@ -915,11 +919,30 @@ pub async fn add_profile_links(
     state: State<'_, Desktop>,
     id: Uuid,
     links: String,
+    password: Option<String>,
 ) -> Reply<profiles::NodeImportResult> {
     let _guard = state.operation.lock().await;
-    let result = state.store.add_profile_links(id, &links).map_err(error)?;
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.add_profile_links(id, &links, password.as_deref())
+    })
+    .await
+    .map_err(|e| error(anyhow::anyhow!(e)))?
+    .map_err(error)?;
     state.notify();
     Ok(result)
+}
+#[tauri::command]
+pub async fn export_profile_links(
+    state: State<'_, Desktop>,
+    id: Uuid,
+    password: Option<String>,
+) -> Reply<clyntis_config::uri::NodesExport> {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || store.export_profile_links(id, password.as_deref()))
+        .await
+        .map_err(|e| error(anyhow::anyhow!(e)))?
+        .map_err(error)
 }
 #[tauri::command]
 pub async fn update_profile_nodes(

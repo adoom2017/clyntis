@@ -108,16 +108,26 @@ final class CoreSession {
         let nodes: [NodeSummary]
     }
 
-    static func importNodeLinks(_ text: String, mode: String) throws -> NodesImportResult {
+    struct NodesExportResult: Decodable {
+        let text: String
+        let count: Int
+        let encrypted: Bool
+    }
+
+    static func importNodeLinks(_ text: String, mode: String, password: String? = nil) throws -> NodesImportResult {
         let textData = Data(text.utf8)
         let modeData = Data(mode.utf8)
+        let pwData = Data((password ?? "").utf8)
         let data = try textData.withUnsafeBytes { textPtr in
             try modeData.withUnsafeBytes { modePtr in
-                try read(limit: 24 * 1024 * 1024) {
-                    meta_import_node_links_v1(
-                        textPtr.bindMemory(to: UInt8.self).baseAddress, textPtr.count,
-                        modePtr.bindMemory(to: UInt8.self).baseAddress, modePtr.count,
-                        $0, $1, $2)
+                try pwData.withUnsafeBytes { pwPtr in
+                    try read(limit: 24 * 1024 * 1024) {
+                        meta_import_node_links_v1(
+                            textPtr.bindMemory(to: UInt8.self).baseAddress, textPtr.count,
+                            modePtr.bindMemory(to: UInt8.self).baseAddress, modePtr.count,
+                            pwData.isEmpty ? nil : pwPtr.bindMemory(to: UInt8.self).baseAddress, pwData.count,
+                            $0, $1, $2)
+                    }
                 }
             }
         }
@@ -126,7 +136,7 @@ final class CoreSession {
 
     static func profileNodes(configuration: Data) throws -> ProfileNodes {
         let data = try configuration.withUnsafeBytes { configPtr in
-            try read(limit: 24 * 1024 * 1024) {
+            try read(initialCapacity: 8 * 1024, limit: 24 * 1024 * 1024) {
                 meta_profile_nodes_v1(
                     configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
                     $0, $1, $2)
@@ -135,19 +145,38 @@ final class CoreSession {
         return try JSONDecoder().decode(ProfileNodes.self, from: data)
     }
 
-    static func addNodeLinks(_ text: String, to configuration: Data) throws -> NodesImportResult {
+    static func addNodeLinks(_ text: String, to configuration: Data, password: String? = nil) throws -> NodesImportResult {
         let textData = Data(text.utf8)
+        let pwData = Data((password ?? "").utf8)
         let data = try configuration.withUnsafeBytes { configPtr in
             try textData.withUnsafeBytes { textPtr in
-                try read(limit: 24 * 1024 * 1024) {
-                    meta_profile_add_links_v1(
-                        configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
-                        textPtr.bindMemory(to: UInt8.self).baseAddress, textPtr.count,
-                        $0, $1, $2)
+                try pwData.withUnsafeBytes { pwPtr in
+                    try read(limit: 24 * 1024 * 1024) {
+                        meta_profile_add_links_v1(
+                            configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
+                            textPtr.bindMemory(to: UInt8.self).baseAddress, textPtr.count,
+                            pwData.isEmpty ? nil : pwPtr.bindMemory(to: UInt8.self).baseAddress, pwData.count,
+                            $0, $1, $2)
+                    }
                 }
             }
         }
         return try JSONDecoder().decode(NodesImportResult.self, from: data)
+    }
+
+    static func exportNodeLinks(from configuration: Data, password: String? = nil) throws -> NodesExportResult {
+        let pwData = Data((password ?? "").utf8)
+        let data = try configuration.withUnsafeBytes { configPtr in
+            try pwData.withUnsafeBytes { pwPtr in
+                try read(initialCapacity: 8 * 1024, limit: 24 * 1024 * 1024) {
+                    meta_export_node_links_v1(
+                        configPtr.bindMemory(to: UInt8.self).baseAddress, configPtr.count,
+                        pwData.isEmpty ? nil : pwPtr.bindMemory(to: UInt8.self).baseAddress, pwData.count,
+                        $0, $1, $2)
+                }
+            }
+        }
+        return try JSONDecoder().decode(NodesExportResult.self, from: data)
     }
 
     static func updateProfileNodes(in configuration: Data, removeNames: [String], autoRouting: String?) throws -> Data {
@@ -188,7 +217,7 @@ final class CoreSession {
     static func yamlProblem(in text: String) -> YAMLProblem? {
         let bytes = Data(text.utf8)
         guard let data = try? bytes.withUnsafeBytes({ config in
-            try read { meta_yaml_check_v1(config.bindMemory(to: UInt8.self).baseAddress, config.count, $0, $1, $2) }
+            try read(initialCapacity: 512) { meta_yaml_check_v1(config.bindMemory(to: UInt8.self).baseAddress, config.count, $0, $1, $2) }
         }) else { return nil }
         return try? JSONDecoder().decode(YAMLProblem?.self, from: data)
     }
@@ -261,7 +290,7 @@ final class CoreSession {
 
     /// Buffered core log lines of this process (newline-separated JSON), removed once read.
     static func drainLogs() throws -> Data {
-        try read { meta_drain_logs_v1($0, $1, $2) }
+        try read(initialCapacity: 8 * 1024) { meta_drain_logs_v1($0, $1, $2) }
     }
 
     /// Top-level `ipv6` of the running configuration; the tunnel routes IPv6
@@ -279,7 +308,7 @@ final class CoreSession {
     /// Whether the core stopped, its connection count and traffic: the cheap
     /// periodic check (the snapshot also serializes the configuration).
     func status() throws -> Data {
-        try Self.read { meta_status_v1(handle, $0, $1, $2) }
+        try Self.read(initialCapacity: 512) { meta_status_v1(handle, $0, $1, $2) }
     }
 
     /// Traffic breakdown by destination host and connection, optionally filtered
@@ -417,15 +446,25 @@ final class CoreSession {
         }
     }
 
-    private static func read(limit: Int = 1024 * 1024,
+    private static func read(initialCapacity: Int = 64 * 1024,
+                             limit: Int = 1024 * 1024,
                              _ operation: (UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>) -> Int32) throws -> Data {
-        var data = Data(count: 64 * 1024)
+        var data = Data(count: initialCapacity)
         for _ in 0..<3 {
             var length = 0
             let result = data.withUnsafeMutableBytes {
                 operation($0.bindMemory(to: UInt8.self).baseAddress, $0.count, &length)
             }
-            if result == META_OK { return data.prefix(length) }
+            if result == META_OK {
+                if length == 0 { return Data() }
+                // Avoid pinning a large backing buffer when the payload is much smaller.
+                if length < data.count / 2 && data.count > 4096 {
+                    return data.withUnsafeBytes { raw in
+                        Data(bytes: raw.baseAddress!, count: length)
+                    }
+                }
+                return data.prefix(length)
+            }
             guard result == META_BUFFER_TOO_SMALL, length > 0, length <= limit else {
                 meta_discard_pending_output_v1()
                 throw ClientError.message(L("无法读取内核结果。"))

@@ -89,20 +89,29 @@ int32_t meta_yaml_check_v1(const uint8_t *config, size_t length,
 /* Validate a YAML configuration without creating a core handle or runtime.
  * Returns META_OK when valid; on META_ERROR, meta_error_v1 describes the error. */
 int32_t meta_validate_config_v1(const uint8_t *config_ptr, size_t config_len);
-/* Parse node share links (vless://, hysteria2://, hy2://, or Base64) into a
- * minimal auto-routed YAML profile. mode is "whitelist" (default when empty) or
- * "blacklist". Writes JSON {"yaml","nodes":[...],"skipped":[...],"autoRouting"}. */
+/* Parse node share links (vless://, hysteria2://, hy2://, Base64, or CLYNTISE
+ * encrypted Base64) into a minimal auto-routed YAML profile. mode is
+ * "whitelist" (default when empty) or "blacklist"; password may be NULL when
+ * unencrypted. Writes JSON {"yaml","nodes":[...],"skipped":[...],"autoRouting"}. */
 int32_t meta_import_node_links_v1(const uint8_t *text, size_t text_len,
     const uint8_t *mode, size_t mode_len,
+    const uint8_t *password, size_t password_len,
     uint8_t *buffer, size_t capacity, size_t *output_length);
 /* Inspect a profile's nodes and whether automatic GeoIP/GeoSite routing is active.
  * Writes JSON {"isAuto":bool,"autoRouting":"whitelist"|"blacklist"|null,"nodes":[...]}. */
 int32_t meta_profile_nodes_v1(const uint8_t *config, size_t length,
     uint8_t *buffer, size_t capacity, size_t *output_length);
-/* Append node share links to an existing YAML profile's proxies. Writes JSON
+/* Append node share links (or encrypted links when password is provided) to an
+ * existing YAML profile's proxies. Writes JSON
  * {"yaml","nodes":[...],"skipped":[...],"autoRouting"}. */
 int32_t meta_profile_add_links_v1(const uint8_t *config, size_t length,
     const uint8_t *text, size_t text_len,
+    const uint8_t *password, size_t password_len,
+    uint8_t *buffer, size_t capacity, size_t *output_length);
+/* Export a profile's VLESS/Hysteria2 nodes as share links, optionally encrypted
+ * with password (when non-NULL/non-empty). Writes JSON {"text","count","encrypted"}. */
+int32_t meta_export_node_links_v1(const uint8_t *config, size_t length,
+    const uint8_t *password, size_t password_len,
     uint8_t *buffer, size_t capacity, size_t *output_length);
 /* Remove named proxies and/or update auto-routing mode. request is JSON
  * {"removeNames":[...],"autoRouting":"whitelist"|"blacklist"|null}. Writes YAML. */

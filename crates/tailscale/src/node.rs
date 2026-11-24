@@ -269,13 +269,15 @@ impl Node {
         let (routes, routes_rx) = watch::channel(Routes::default());
         let (ready, _) = watch::channel(None);
         let (commands, commands_rx) = mpsc::channel(64);
-        let (to_router, from_stack) = mpsc::channel(1024);
-        let (to_stack, from_router) = mpsc::channel(1024);
+        let compact = cfg!(target_os = "ios") || options.os.eq_ignore_ascii_case("ios");
+        let channel_cap = if compact { 256 } else { 1024 };
+        let (to_router, from_stack) = mpsc::channel(channel_cap);
+        let (to_stack, from_router) = mpsc::channel(channel_cap);
         let (open, open_rx) = watch::channel(Vec::new());
         let (gate, gate_rx) = watch::channel(netstack::Gate::default());
         let (accepted, accepted_rx) = mpsc::channel(64);
         let serve_stats = Arc::new(netstack::ServeStats::default());
-        tokio::spawn(netstack::run(
+        tokio::spawn(netstack::run_with_compact(
             commands_rx,
             from_router,
             to_router,
@@ -286,6 +288,7 @@ impl Node {
                 stats: serve_stats.clone(),
             },
             stop.clone(),
+            compact,
         ));
         // One disco key for the node's lifetime: peers learn it from the map.
         let disco = Private::generate();

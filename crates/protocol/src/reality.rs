@@ -126,19 +126,22 @@ extern "C" fn callback(
         plain[..3].copy_from_slice(&[1, 8, 2]);
         plain[4..8].copy_from_slice(&state.now.to_be_bytes());
         plain[8..].copy_from_slice(&state.short_id);
-        let mut aad = hello.to_vec();
+        let mut stack = [0u8; 2048];
+        let mut heap;
+        let aad: &mut [u8] = if hello.len() <= stack.len() {
+            let buf = &mut stack[..hello.len()];
+            buf.copy_from_slice(hello);
+            buf
+        } else {
+            heap = hello.to_vec();
+            &mut heap
+        };
         aad[SESSION_OFFSET..SESSION_OFFSET + SESSION_LEN].fill(0);
         let cipher = match Aes256Gcm::new_from_slice(key.as_ref()) {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let sealed = match cipher.encrypt(
-            (&hello[26..38]).into(),
-            Payload {
-                msg: &plain,
-                aad: &aad,
-            },
-        ) {
+        let sealed = match cipher.encrypt((&hello[26..38]).into(), Payload { msg: &plain, aad }) {
             Ok(v) if v.len() == SESSION_LEN => v,
             _ => return false,
         };

@@ -87,11 +87,55 @@ impl PlatformHooks for HostHooks {
         Ok(())
     }
 }
+const PACKET_POOL_CAP: usize = 256;
+const PACKET_BUF_DEFAULT_CAP: usize = 2048;
+const PACKET_BUF_MAX_CAP: usize = 4096;
+
+#[derive(Default)]
+pub(crate) struct PacketPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
+}
+
+impl PacketPool {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            buffers: Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn take(&self, min_len: usize) -> Vec<u8> {
+        let mut buf = self
+            .buffers
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(min_len.max(PACKET_BUF_DEFAULT_CAP)));
+        buf.clear();
+        if buf.capacity() < min_len {
+            buf.reserve(min_len);
+        }
+        buf
+    }
+
+    pub(crate) fn recycle(&self, mut buf: Vec<u8>) {
+        if buf.capacity() > PACKET_BUF_MAX_CAP {
+            return;
+        }
+        let mut pool = self.buffers.lock().unwrap();
+        if pool.len() < PACKET_POOL_CAP {
+            buf.clear();
+            pool.push(buf);
+        }
+    }
+}
+
 struct HostPackets {
     input: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     output: mpsc::Sender<Vec<u8>>,
     hooks: HostHooks,
     wake: Arc<PacketWake>,
+    inbound_pool: Arc<PacketPool>,
+    outbound_pool: Arc<PacketPool>,
 }
 
 /// Coalesces packet_ready: after one notification the host drains until
@@ -126,12 +170,22 @@ impl PacketIo for HostPackets {
             .recv()
             .await
             .context("host packet channel closed")?;
-        ensure!(bytes.len() <= packet.len(), "host packet buffer too small");
-        packet[..bytes.len()].copy_from_slice(&bytes);
-        Ok(bytes.len())
+        let len = bytes.len();
+        if len > packet.len() {
+            self.inbound_pool.recycle(bytes);
+            anyhow::bail!("host packet buffer too small");
+        }
+        packet[..len].copy_from_slice(&bytes);
+        self.inbound_pool.recycle(bytes);
+        Ok(len)
     }
     async fn send(&self, packet: &[u8]) -> Result<()> {
-        self.output.send(packet.to_vec()).await?;
+        let mut buf = self.outbound_pool.take(packet.len());
+        buf.extend_from_slice(packet);
+        if let Err(err) = self.output.send(buf).await {
+            self.outbound_pool.recycle(err.0);
+            anyhow::bail!("packet channel closed");
+        }
         if !self.wake.queued() {
             return Ok(());
         }
@@ -149,6 +203,7 @@ pub(crate) struct PacketsOut {
     pub(crate) receiver: mpsc::Receiver<Vec<u8>>,
     pub(crate) pending: Option<Vec<u8>>,
     pub(crate) wake: Arc<PacketWake>,
+    pub(crate) pool: Arc<PacketPool>,
 }
 impl PacketsOut {
     /// Makes `pending` the next packet; false when the queue is empty, which
@@ -207,9 +262,25 @@ pub(crate) struct Handle {
     network: tokio::sync::watch::Sender<u64>,
     worker: Mutex<Option<JoinHandle<()>>>,
     pub(crate) packet_input: Option<mpsc::Sender<Vec<u8>>>,
+    pub(crate) inbound_pool: Arc<PacketPool>,
     pub(crate) packet_output: Mutex<PacketsOut>,
     packet_queue_enabled: Arc<AtomicBool>,
+    pub(crate) cached_groups_json: String,
+    pub(crate) cached_proxies_json: String,
 }
+
+fn build_runtime(is_ios: bool) -> Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.worker_threads(2).enable_all();
+    if is_ios {
+        // Cap blocking-pool stack spikes in the ~50 MiB iOS PacketTunnel extension.
+        builder
+            .max_blocking_threads(8)
+            .thread_keep_alive(Duration::from_secs(5));
+    }
+    Ok(builder.build()?)
+}
+
 impl Handle {
     pub(crate) fn new(id: u64, config: clyntis_config::Config, hooks: HostHooks) -> Result<Self> {
         #[cfg(target_os = "android")]
@@ -218,10 +289,10 @@ impl Handle {
             "Android host must provide socket protection"
         );
         let core = Core::new(config, Arc::new(hooks.clone()))?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
+        let (groups, proxies) = core.groups_and_proxies();
+        let cached_groups_json = serde_json::to_string(groups)?;
+        let cached_proxies_json = serde_json::to_string(proxies)?;
+        let runtime = build_runtime(cfg!(target_os = "ios"))?;
         let (commands, mut receiver) = mpsc::channel::<Command>(4);
         // Network changes bypass the bounded command queue: a full queue or a
         // slow reply made the host treat a change as fatal. Changes made
@@ -229,6 +300,8 @@ impl Handle {
         let (network, mut network_changes) = tokio::sync::watch::channel(0u64);
         let (input_sender, input_receiver) = mpsc::channel(256);
         let (output_sender, output_receiver) = mpsc::channel(256);
+        let inbound_pool = PacketPool::new();
+        let outbound_pool = PacketPool::new();
         let wake = Arc::new(PacketWake::default());
         let packet_input = core.config.tun.enable.then_some(input_sender);
         let packet_queue_enabled = Arc::new(AtomicBool::new(core.config.tun.enable));
@@ -240,6 +313,8 @@ impl Handle {
                 output: output_sender,
                 hooks,
                 wake: wake.clone(),
+                inbound_pool: inbound_pool.clone(),
+                outbound_pool: outbound_pool.clone(),
             }) as Arc<dyn PacketIo>
         });
         let owner = core.clone();
@@ -330,12 +405,16 @@ impl Handle {
             network,
             worker: Mutex::new(Some(worker)),
             packet_input,
+            inbound_pool,
             packet_queue_enabled,
             packet_output: Mutex::new(PacketsOut {
                 receiver: output_receiver,
                 pending: None,
                 wake,
+                pool: outbound_pool,
             }),
+            cached_groups_json,
+            cached_proxies_json,
         })
     }
     pub(crate) fn start(&self) -> Result<()> {
@@ -467,6 +546,7 @@ mod wake_tests {
             receiver,
             pending: None,
             wake: wake.clone(),
+            pool: PacketPool::new(),
         };
         let (notify, notified) = std::sync::mpsc::channel::<()>();
         let (next, rounds) = std::sync::mpsc::channel::<()>();
@@ -505,5 +585,39 @@ mod wake_tests {
             notifications < ROUNDS * BURST,
             "{notifications} notifications"
         );
+    }
+
+    #[test]
+    fn packet_pool_recycles_and_bounds_buffers() {
+        let pool = PacketPool::new();
+        let buf = pool.take(128);
+        assert!(buf.capacity() >= PACKET_BUF_DEFAULT_CAP);
+        assert!(buf.is_empty());
+        let ptr = buf.as_ptr();
+        pool.recycle(buf);
+
+        let reused = pool.take(64);
+        assert_eq!(reused.as_ptr(), ptr);
+        pool.recycle(reused);
+
+        // Oversized buffers (> 4096 B) are dropped rather than retained.
+        let huge = Vec::with_capacity(PACKET_BUF_MAX_CAP + 1);
+        pool.recycle(huge);
+        assert_eq!(pool.buffers.lock().unwrap().len(), 1);
+
+        // Pool size is capped at PACKET_POOL_CAP (256).
+        for _ in 0..(PACKET_POOL_CAP + 32) {
+            pool.recycle(Vec::with_capacity(PACKET_BUF_DEFAULT_CAP));
+        }
+        assert_eq!(pool.buffers.lock().unwrap().len(), PACKET_POOL_CAP);
+    }
+
+    #[test]
+    fn runtime_builder_succeeds_for_ios_and_non_ios() {
+        for is_ios in [false, true] {
+            let rt = build_runtime(is_ios).unwrap();
+            let val = rt.block_on(async { tokio::task::spawn_blocking(|| 42).await.unwrap() });
+            assert_eq!(val, 42);
+        }
     }
 }

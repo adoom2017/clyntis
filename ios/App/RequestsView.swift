@@ -80,6 +80,14 @@ private struct Row: Identifiable, Equatable {
     let id: String
     let entry: RequestEntry
     let generation: Int
+    let searchText: String
+
+    init(id: String, entry: RequestEntry, generation: Int) {
+        self.id = id
+        self.entry = entry
+        self.generation = generation
+        self.searchText = "\(entry.host) \(entry.http?.url ?? "") \(entry.rule) \(entry.chain) \(entry.http?.contentType ?? "") \(entry.http?.rewrite ?? "")".lowercased()
+    }
 }
 
 private enum Filter: String, CaseIterable {
@@ -133,9 +141,7 @@ struct RequestsView: View {
         return rows.reversed().filter { row in
             guard filter.matches(row.entry) else { return false }
             guard !words.isEmpty else { return true }
-            let e = row.entry
-            let text = "\(e.host) \(e.http?.url ?? "") \(e.rule) \(e.chain) \(e.http?.contentType ?? "") \(e.http?.rewrite ?? "")".lowercased()
-            return words.allSatisfy(text.contains)
+            return words.allSatisfy(row.searchText.contains)
         }
     }
 

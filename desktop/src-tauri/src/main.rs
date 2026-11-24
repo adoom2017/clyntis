@@ -89,6 +89,7 @@ fn main() {
             app::import_node_links,
             app::profile_nodes,
             app::add_profile_links,
+            app::export_profile_links,
             app::update_profile_nodes,
             app::read_profile,
             app::save_profile,

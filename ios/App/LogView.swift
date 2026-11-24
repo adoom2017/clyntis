@@ -24,6 +24,7 @@ struct LogView: View {
     }
 
     @Environment(\.scenePhase) private var scenePhase
+    @State private var isVisible = false
     @State private var entries: [LogEntry] = []
     @State private var lastStamp: LogFile.Stamp?
     @State private var loaded = false
@@ -87,8 +88,10 @@ struct LogView: View {
                 }
             }
             .refreshable { await reload(force: true) }
-            .task(id: scenePhase == .active) {
-                guard scenePhase == .active else { return }
+            .onAppear { isVisible = true }
+            .onDisappear { isVisible = false }
+            .task(id: isVisible && scenePhase == .active) {
+                guard isVisible, scenePhase == .active else { return }
                 // Live view while the page is visible and app is active.
                 while !Task.isCancelled {
                     await reload(force: !loaded)

@@ -45,6 +45,14 @@ pub struct ProfileNodes {
     pub nodes: Vec<NodeSummary>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodesExport {
+    pub text: String,
+    pub count: usize,
+    pub encrypted: bool,
+}
+
 /// Decodes percent-encoded UTF-8 (`%XX` and `+` in query values).
 fn percent_decode(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
@@ -581,12 +589,257 @@ fn seed_reserved_names(used: &mut HashSet<String>) {
     used.insert("GLOBAL".into());
 }
 
+fn percent_encode(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn format_host(server: &str) -> String {
+    if server.contains(':') && !server.starts_with('[') {
+        format!("[{server}]")
+    } else {
+        server.to_owned()
+    }
+}
+
+fn proxy_to_uri(proxy: &Proxy) -> Result<Option<String>> {
+    match proxy.kind {
+        ProxyKind::Vless => {
+            let uuid = proxy.uuid.context("VLESS node missing uuid")?;
+            let network = if proxy.network.is_empty() {
+                "tcp"
+            } else {
+                proxy.network.as_str()
+            };
+            let mut query = vec![
+                "encryption=none".to_owned(),
+                format!("type={}", percent_encode(network)),
+            ];
+            if !proxy.flow.is_empty() && network == "tcp" {
+                query.push(format!("flow={}", percent_encode(&proxy.flow)));
+            }
+            if let Some(reality) = &proxy.reality_opts {
+                query.push("security=reality".to_owned());
+                query.push(format!("pbk={}", percent_encode(&reality.public_key)));
+                if !reality.short_id.is_empty() {
+                    query.push(format!("sid={}", percent_encode(&reality.short_id)));
+                }
+            } else if proxy.tls {
+                query.push("security=tls".to_owned());
+            } else {
+                query.push("security=none".to_owned());
+            }
+            if let Some(sni) = proxy
+                .servername
+                .as_deref()
+                .or(proxy.sni.as_deref())
+                .filter(|s| !s.is_empty())
+            {
+                query.push(format!("sni={}", percent_encode(sni)));
+            }
+            if let Some(fp) = proxy
+                .client_fingerprint
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                query.push(format!("fp={}", percent_encode(fp)));
+            }
+            if !proxy.alpn.is_empty() {
+                query.push(format!("alpn={}", percent_encode(&proxy.alpn.join(","))));
+            }
+            if proxy.skip_cert_verify {
+                query.push("allowInsecure=1".to_owned());
+            }
+            if network == "ws" {
+                query.push(format!("path={}", percent_encode(&proxy.ws_opts.path)));
+                if let Some(host) = proxy
+                    .ws_opts
+                    .headers
+                    .get("Host")
+                    .or_else(|| proxy.ws_opts.headers.get("host"))
+                    .filter(|s| !s.is_empty())
+                {
+                    query.push(format!("host={}", percent_encode(host)));
+                }
+            } else if network == "grpc" && !proxy.grpc_opts.grpc_service_name.is_empty() {
+                query.push(format!(
+                    "serviceName={}",
+                    percent_encode(&proxy.grpc_opts.grpc_service_name)
+                ));
+            }
+            if proxy.xudp
+                || proxy
+                    .packet_encoding
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("xudp"))
+            {
+                query.push("packetEncoding=xudp".to_owned());
+            }
+            Ok(Some(format!(
+                "vless://{uuid}@{}:{}?{}#{}",
+                format_host(&proxy.server),
+                proxy.port,
+                query.join("&"),
+                percent_encode(&proxy.name)
+            )))
+        }
+        ProxyKind::Hysteria2 => {
+            let pw = if !proxy.password.is_empty() {
+                &proxy.password
+            } else {
+                &proxy.auth_str
+            };
+            ensure!(!pw.is_empty(), "Hysteria2 node missing password");
+            let mut query = Vec::new();
+            if let Some(sni) = proxy
+                .sni
+                .as_deref()
+                .or(proxy.servername.as_deref())
+                .filter(|s| !s.is_empty())
+            {
+                query.push(format!("sni={}", percent_encode(sni)));
+            }
+            if proxy.skip_cert_verify {
+                query.push("insecure=1".to_owned());
+            }
+            if let Some(obfs) = proxy
+                .obfs
+                .as_deref()
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"))
+            {
+                query.push(format!("obfs={}", percent_encode(obfs)));
+                if !proxy.obfs_password.is_empty() {
+                    query.push(format!(
+                        "obfs-password={}",
+                        percent_encode(&proxy.obfs_password)
+                    ));
+                }
+            }
+            if let Some(ports) = proxy.ports.as_deref().filter(|s| !s.is_empty()) {
+                query.push(format!("mport={}", percent_encode(ports)));
+            }
+            if !proxy.alpn.is_empty() {
+                query.push(format!("alpn={}", percent_encode(&proxy.alpn.join(","))));
+            }
+            if let Some(up) = proxy.up.as_deref().filter(|s| !s.is_empty()) {
+                query.push(format!("upmbps={}", percent_encode(up)));
+            }
+            if let Some(down) = proxy.down.as_deref().filter(|s| !s.is_empty()) {
+                query.push(format!("downmbps={}", percent_encode(down)));
+            }
+            let qs = if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", query.join("&"))
+            };
+            Ok(Some(format!(
+                "hy2://{}@{}:{}{qs}#{}",
+                percent_encode(pw),
+                format_host(&proxy.server),
+                proxy.port,
+                percent_encode(&proxy.name)
+            )))
+        }
+        ProxyKind::Trojan | ProxyKind::Tailscale => Ok(None),
+    }
+}
+
+/// Exports VLESS and Hysteria2 nodes from a YAML configuration as share links,
+/// optionally encrypted in Clyntis v2 Base64 format when `password` is given.
+pub fn export_links(yaml: &str, password: Option<&str>) -> Result<NodesExport> {
+    let cfg = Config::parse(yaml.as_bytes())?;
+    let mut uris = Vec::new();
+    for proxy in &cfg.proxies {
+        if let Some(uri) = proxy_to_uri(proxy)? {
+            uris.push(uri);
+        }
+    }
+    ensure!(
+        !uris.is_empty(),
+        "no exportable VLESS or Hysteria2 nodes found"
+    );
+    let count = uris.len();
+    let plain = zeroize::Zeroizing::new(uris.join("\n"));
+    match password.filter(|p| !p.is_empty()) {
+        Some(pw) => {
+            let text = crate::crypto::encrypt(plain.as_bytes(), pw)?;
+            Ok(NodesExport {
+                text,
+                count,
+                encrypted: true,
+            })
+        }
+        None => Ok(NodesExport {
+            text: (*plain).clone(),
+            count,
+            encrypted: false,
+        }),
+    }
+}
+
+/// Returns true when `raw` looks like Clyntis v2 (`CLYNTISE`) encrypted Base64 text.
+pub fn is_encrypted_links(raw: &str) -> bool {
+    let compact: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    if compact.len() < 24 || compact.contains("://") {
+        return false;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&compact)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&compact))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&compact));
+    bytes.is_ok_and(|b| b.starts_with(b"CLYNTISE"))
+}
+
+fn decrypt_if_needed(raw: &str, password: Option<&str>) -> Result<zeroize::Zeroizing<String>> {
+    if let Some(pw) = password.filter(|p| !p.is_empty()) {
+        let compact = zeroize::Zeroizing::new(
+            raw.chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect::<String>(),
+        );
+        let bytes = crate::crypto::decrypt(compact.as_bytes(), pw)?;
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|_| anyhow::anyhow!("wrong password or corrupted encrypted node links"))?;
+        Ok(zeroize::Zeroizing::new(text))
+    } else if is_encrypted_links(raw) {
+        bail!("encrypted node links require a password");
+    } else {
+        Ok(zeroize::Zeroizing::new(raw.to_owned()))
+    }
+}
+
 /// Parses one or more share links (or Base64 subscription text) into a minimal
 /// auto-routed YAML configuration.
 pub fn import_links(text: &str, mode: AutoRouting) -> Result<NodesImport> {
+    import_links_with_password(text, mode, None)
+}
+
+/// Parses share links, Base64 subscriptions, or Clyntis-encrypted links into a
+/// minimal auto-routed YAML configuration.
+pub fn import_links_with_password(
+    text: &str,
+    mode: AutoRouting,
+    password: Option<&str>,
+) -> Result<NodesImport> {
+    let decrypted = decrypt_if_needed(text, password)?;
     let mut used = HashSet::new();
     seed_reserved_names(&mut used);
-    let (proxy_values, nodes, skipped) = parse_links_into(text, &mut used)?;
+    let (proxy_values, nodes, skipped) = parse_links_into(&decrypted, &mut used)?;
     let mut root = Mapping::new();
     root.insert(Value::from("auto-routing"), Value::from(mode.as_str()));
     root.insert(Value::from("proxies"), Value::Sequence(proxy_values));
@@ -618,6 +871,17 @@ pub fn inspect_profile(yaml: &str) -> Result<ProfileNodes> {
 
 /// Appends parsed share links to an existing YAML configuration's `proxies:`.
 pub fn append_links(existing_yaml: &str, text: &str) -> Result<NodesImport> {
+    append_links_with_password(existing_yaml, text, None)
+}
+
+/// Appends share links (or Clyntis-encrypted links when `password` is provided)
+/// to an existing YAML configuration's `proxies:`.
+pub fn append_links_with_password(
+    existing_yaml: &str,
+    text: &str,
+    password: Option<&str>,
+) -> Result<NodesImport> {
+    let decrypted = decrypt_if_needed(text, password)?;
     let cfg = Config::parse(existing_yaml.as_bytes())?;
     let mut doc: Value = serde_yaml::from_str(existing_yaml)?;
     let map = doc
@@ -625,7 +889,7 @@ pub fn append_links(existing_yaml: &str, text: &str) -> Result<NodesImport> {
         .context("configuration must be a YAML mapping")?;
     let mut used: HashSet<String> = cfg.proxies.iter().map(|p| p.name.clone()).collect();
     seed_reserved_names(&mut used);
-    let (new_values, nodes, skipped) = parse_links_into(text, &mut used)?;
+    let (new_values, nodes, skipped) = parse_links_into(&decrypted, &mut used)?;
 
     let existing_seq = map
         .entry(Value::from("proxies"))
@@ -783,5 +1047,57 @@ mod tests {
         assert_eq!(cfg.proxies[0].port, 443);
         assert_eq!(cfg.proxies[0].password, "pa/ss");
         assert_eq!(cfg.proxies[0].obfs.as_deref(), Some("salamander"));
+    }
+
+    #[test]
+    fn exports_plaintext_and_encrypted_links_with_lossless_roundtrip() {
+        let input = format!("{VLESS_REALITY}\n{VLESS_WS}\n{HY2_LINK}");
+        let imported = import_links(&input, AutoRouting::Whitelist).unwrap();
+
+        let plain = export_links(&imported.yaml, None).unwrap();
+        assert!(!plain.encrypted);
+        assert_eq!(plain.count, 3);
+        assert!(!is_encrypted_links(&plain.text));
+        let reimported = import_links(&plain.text, AutoRouting::Whitelist).unwrap();
+        assert_eq!(reimported.nodes, imported.nodes);
+
+        let enc = export_links(&imported.yaml, Some("node-secret-pw")).unwrap();
+        assert!(enc.encrypted);
+        assert_eq!(enc.count, 3);
+        assert!(is_encrypted_links(&enc.text));
+        assert!(!enc.text.contains("vless://"));
+        assert!(!enc.text.contains("hy2://"));
+        assert!(!enc.text.contains("example.com"));
+
+        // Missing or wrong password must fail cleanly.
+        assert!(
+            import_links_with_password(&enc.text, AutoRouting::Whitelist, None)
+                .unwrap_err()
+                .to_string()
+                .contains("password")
+        );
+        assert!(
+            import_links_with_password(&enc.text, AutoRouting::Whitelist, Some("wrong-pw"))
+                .is_err()
+        );
+
+        // Line-wrapped ciphertext decrypts cleanly in both import and append.
+        let wrapped = enc
+            .text
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let decrypted =
+            import_links_with_password(&wrapped, AutoRouting::Blacklist, Some("node-secret-pw"))
+                .unwrap();
+        assert_eq!(decrypted.nodes.len(), 3);
+        assert_eq!(decrypted.auto_routing, AutoRouting::Blacklist);
+
+        let single = import_links(VLESS_REALITY, AutoRouting::Whitelist).unwrap();
+        let appended =
+            append_links_with_password(&single.yaml, &wrapped, Some("node-secret-pw")).unwrap();
+        assert_eq!(appended.nodes.len(), 3);
     }
 }

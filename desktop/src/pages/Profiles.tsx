@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Check,
+  Copy,
   FileCode2,
   FileLock2,
   FolderOpen,
@@ -24,12 +25,27 @@ import {
   type AutoRouting,
   type ImportResult,
   type NodeImportResult,
+  type NodesExport,
   type Profile,
   type ProfileNodes,
   type ProfileSummary,
   type PublishTarget,
   type Snapshot,
 } from "../types";
+
+function isV2EncryptedLinks(raw: string): boolean {
+  const compact = raw.replace(/\s+/g, "");
+  return (
+    compact.length >= 24 &&
+    !compact.includes("://") &&
+    compact.startsWith("Q0xZTlRJ")
+  );
+}
+
+function needsPasswordInput(raw: string): boolean {
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && !trimmed.includes("://");
+}
 
 export function PasswordForm({
   title,
@@ -345,21 +361,26 @@ export function NodeLinksModal({
     name: string,
     links: string,
     autoRouting: AutoRouting,
-  ) => Promise<boolean>;
+    password: string | null,
+  ) => Promise<string | null>;
 }) {
   const [name, setName] = useState("");
   const [links, setLinks] = useState("");
+  const [password, setPassword] = useState("");
   const [autoRouting, setAutoRouting] = useState<AutoRouting>("whitelist");
   const [saving, setSaving] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const encryptedDetected = isV2EncryptedLinks(links);
+  const showPassword = needsPasswordInput(links);
   return (
     <Modal title={t("添加节点")} onClose={onClose}>
       <form
         onSubmit={(event) => {
           event.preventDefault();
           setSaving(true);
-          void onSubmit(name, links, autoRouting)
-            .then((ok) => setFailed(!ok))
+          setErrorMsg(null);
+          void onSubmit(name, links, autoRouting, password || null)
+            .then((err) => setErrorMsg(err))
             .finally(() => setSaving(false));
         }}
       >
@@ -384,6 +405,23 @@ export function NodeLinksModal({
             spellCheck={false}
           />
         </label>
+        {showPassword && (
+          <label className="field">
+            {encryptedDetected ? t("解密密码") : t("解密密码（可选）")}
+            <input
+              type="password"
+              required={encryptedDetected}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="off"
+            />
+            <span className="small muted">
+              {encryptedDetected
+                ? t("检测到加密节点链接，请输入密码解密。")
+                : t("未加密的 Base64 订阅可留空。")}
+            </span>
+          </label>
+        )}
         <div className="field">
           <span>{t("自动分流模式")}</span>
           <div className="segmented" role="group" aria-label={t("自动分流模式")}>
@@ -408,9 +446,9 @@ export function NodeLinksModal({
               : t("仅海外站点列表走代理，其余流量默认直连，更省代理流量。")}
           </p>
         </div>
-        {failed && (
+        {errorMsg && (
           <p role="alert" className="inline-error">
-            {t("添加失败，关闭此窗口查看原因。")}
+            {errorMsg}
           </p>
         )}
         <div className="modal-actions">
@@ -419,7 +457,9 @@ export function NodeLinksModal({
           </button>
           <button
             className="button primary"
-            disabled={saving || !links.trim()}
+            disabled={
+              saving || !links.trim() || (encryptedDetected && !password)
+            }
           >
             {saving ? (
               <LoaderCircle className="spin" size={16} />
@@ -452,8 +492,21 @@ export function ManageNodesModal({
     initial.autoRouting ?? "whitelist",
   );
   const [links, setLinks] = useState("");
+  const [addPassword, setAddPassword] = useState("");
+  const [exportEncrypted, setExportEncrypted] = useState(false);
+  const [exportPassword, setExportPassword] = useState("");
+  const [exportRepeat, setExportRepeat] = useState("");
+  const [exportedText, setExportedText] = useState("");
   const [working, setWorking] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
+
+  const addEncryptedDetected = isV2EncryptedLinks(links);
+  const showAddPassword = needsPasswordInput(links);
+  const hasExportable = info.nodes.some(
+    (n) => n.kind === "vless" || n.kind === "hysteria2",
+  );
+  const exportMismatch =
+    exportEncrypted && exportRepeat !== "" && exportRepeat !== exportPassword;
 
   const reload = async () => {
     const next = await invoke<ProfileNodes>("profile_nodes", { id: profile.id });
@@ -523,8 +576,10 @@ export function ManageNodesModal({
           const res = await invoke<NodeImportResult>("add_profile_links", {
             id: profile.id,
             links,
+            password: addPassword || null,
           });
           setLinks("");
+          setAddPassword("");
           onNotice(
             res.skipped.length
               ? t("已添加 {count} 个节点，跳过 {skipped} 条", {
@@ -539,6 +594,28 @@ export function ManageNodesModal({
         }
       });
       if (ok) await reload();
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const exportLinks = async () => {
+    setModalError(null);
+    setWorking(true);
+    try {
+      const res = await invoke<NodesExport>("export_profile_links", {
+        id: profile.id,
+        password: exportEncrypted ? exportPassword : null,
+      });
+      setExportedText(res.text);
+      void navigator.clipboard?.writeText(res.text).catch(() => {});
+      onNotice(
+        res.encrypted
+          ? t("已生成并复制加密节点链接")
+          : t("已复制 {count} 个节点链接", { count: res.count }),
+      );
+    } catch (e) {
+      setModalError(String(e));
     } finally {
       setWorking(false);
     }
@@ -599,6 +676,78 @@ export function ManageNodesModal({
           ))}
         </div>
       </div>
+      {hasExportable && (
+        <div className="field">
+          <span>{t("导出节点链接")}</span>
+          <div className="segmented" role="group" aria-label={t("导出节点链接")}>
+            <button
+              type="button"
+              disabled={working}
+              className={!exportEncrypted ? "selected" : ""}
+              onClick={() => {
+                setExportEncrypted(false);
+                setExportedText("");
+              }}
+            >
+              {t("明文链接")}
+            </button>
+            <button
+              type="button"
+              disabled={working}
+              className={exportEncrypted ? "selected" : ""}
+              onClick={() => {
+                setExportEncrypted(true);
+                setExportedText("");
+              }}
+            >
+              {t("使用密码加密")}
+            </button>
+          </div>
+          {exportEncrypted && (
+            <>
+              <label className="field">
+                {t("加密密码")}
+                <input
+                  type="password"
+                  value={exportPassword}
+                  onChange={(e) => setExportPassword(e.target.value)}
+                  autoComplete="new-password"
+                />
+              </label>
+              <label className="field">
+                {t("确认密码")}
+                <input
+                  type="password"
+                  value={exportRepeat}
+                  onChange={(e) => setExportRepeat(e.target.value)}
+                  autoComplete="new-password"
+                />
+              </label>
+              {exportMismatch && (
+                <p className="inline-error">{t("两次输入的密码不一致")}</p>
+              )}
+            </>
+          )}
+          <div>
+            <button
+              type="button"
+              className="button secondary"
+              disabled={
+                working ||
+                (exportEncrypted &&
+                  (!exportPassword || exportRepeat !== exportPassword))
+              }
+              onClick={() => void exportLinks()}
+            >
+              <Copy size={14} />
+              {exportEncrypted ? t("加密并复制") : t("复制节点链接")}
+            </button>
+          </div>
+          {exportedText && (
+            <textarea rows={3} readOnly value={exportedText} spellCheck={false} />
+          )}
+        </div>
+      )}
       <form onSubmit={(e) => void addLinks(e)}>
         <label className="field">
           {t("追加节点链接")}
@@ -610,6 +759,23 @@ export function ManageNodesModal({
             spellCheck={false}
           />
         </label>
+        {showAddPassword && (
+          <label className="field">
+            {addEncryptedDetected ? t("解密密码") : t("解密密码（可选）")}
+            <input
+              type="password"
+              required={addEncryptedDetected}
+              value={addPassword}
+              onChange={(e) => setAddPassword(e.target.value)}
+              autoComplete="off"
+            />
+            <span className="small muted">
+              {addEncryptedDetected
+                ? t("检测到加密节点链接，请输入密码解密。")
+                : t("未加密的 Base64 订阅可留空。")}
+            </span>
+          </label>
+        )}
         {modalError && (
           <p role="alert" className="inline-error">
             {modalError}
@@ -621,7 +787,11 @@ export function ManageNodesModal({
           </button>
           <button
             className="button primary"
-            disabled={working || !links.trim()}
+            disabled={
+              working ||
+              !links.trim() ||
+              (addEncryptedDetected && !addPassword)
+            }
           >
             {working ? (
               <LoaderCircle className="spin" size={16} />
@@ -780,26 +950,33 @@ export function ProfilesPage({
     setModal(
       <NodeLinksModal
         onClose={() => setModal(null)}
-        onSubmit={async (name, links, autoRouting) => {
-          const ok = await perform(async () => {
-            const res = await invoke<NodeImportResult>("import_node_links", {
-              name,
-              links,
-              autoRouting,
-            });
-            setModal(null);
-            setNotice(
-              res.skipped.length
-                ? t("已导入 {count} 个节点，跳过 {skipped} 条", {
-                    count: res.nodes.length,
-                    skipped: res.skipped.length,
-                  })
-                : t("已导入 {count} 个节点并启用自动分流", {
-                    count: res.nodes.length,
-                  }),
-            );
+        onSubmit={async (name, links, autoRouting, password) => {
+          let errMsg: string | null = null;
+          await perform(async () => {
+            try {
+              const res = await invoke<NodeImportResult>("import_node_links", {
+                name,
+                links,
+                autoRouting,
+                password,
+              });
+              setModal(null);
+              setNotice(
+                res.skipped.length
+                  ? t("已导入 {count} 个节点，跳过 {skipped} 条", {
+                      count: res.nodes.length,
+                      skipped: res.skipped.length,
+                    })
+                  : t("已导入 {count} 个节点并启用自动分流", {
+                      count: res.nodes.length,
+                    }),
+              );
+            } catch (e) {
+              errMsg = String(e);
+              throw e;
+            }
           });
-          return ok;
+          return errMsg;
         }}
       />,
     );

@@ -536,7 +536,7 @@ impl Defragger {
     }
 }
 
-type Inbox = mpsc::Sender<(Target, Vec<u8>)>;
+type Inbox = mpsc::Sender<(Target, Bytes)>;
 
 #[derive(Default)]
 struct Sessions {
@@ -571,7 +571,7 @@ impl Sessions {
             };
             // A full queue drops the packet, as a congested link would.
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                inbox.try_send((source, payload.to_vec()))
+                inbox.try_send((source, payload))
             {
                 crate::drops::HYSTERIA2_INBOX_FULL
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -586,7 +586,7 @@ pub struct UdpSession {
     sessions: Arc<Sessions>,
     id: u32,
     packet: AtomicU16,
-    receiver: tokio::sync::Mutex<mpsc::Receiver<(Target, Vec<u8>)>>,
+    receiver: tokio::sync::Mutex<mpsc::Receiver<(Target, Bytes)>>,
 }
 impl Drop for UdpSession {
     fn drop(&mut self) {
@@ -633,12 +633,14 @@ impl Datagram for UdpSession {
         Ok(())
     }
     async fn recv(&self) -> Result<(Target, Vec<u8>)> {
-        self.receiver
+        let (target, payload) = self
+            .receiver
             .lock()
             .await
             .recv()
             .await
-            .context("Hysteria2 connection closed")
+            .context("Hysteria2 connection closed")?;
+        Ok((target, payload.into()))
     }
 }
 

@@ -465,8 +465,9 @@ impl Store {
         name: String,
         links: &str,
         mode: clyntis_config::AutoRouting,
+        password: Option<&str>,
     ) -> Result<NodeImportResult> {
-        let imported = clyntis_config::uri::import_links(links, mode)?;
+        let imported = clyntis_config::uri::import_links_with_password(links, mode, password)?;
         let trimmed = name.trim();
         let chosen_name = if !trimmed.is_empty() {
             trimmed.to_owned()
@@ -483,10 +484,16 @@ impl Store {
         })
     }
 
-    pub fn add_profile_links(&self, id: Uuid, links: &str) -> Result<NodeImportResult> {
+    pub fn add_profile_links(
+        &self,
+        id: Uuid,
+        links: &str,
+        password: Option<&str>,
+    ) -> Result<NodeImportResult> {
         let mut profile = self.get(id)?;
         let base_yaml = profile.pending.as_deref().unwrap_or(&profile.yaml);
-        let appended = clyntis_config::uri::append_links(base_yaml, links)?;
+        let appended =
+            clyntis_config::uri::append_links_with_password(base_yaml, links, password)?;
         profile.pending = Some(appended.yaml);
         self.save(&profile)?;
         Ok(NodeImportResult {
@@ -494,6 +501,16 @@ impl Store {
             nodes: appended.nodes,
             skipped: appended.skipped,
         })
+    }
+
+    pub fn export_profile_links(
+        &self,
+        id: Uuid,
+        password: Option<&str>,
+    ) -> Result<clyntis_config::uri::NodesExport> {
+        let profile = self.get(id)?;
+        let base_yaml = profile.pending.as_deref().unwrap_or(&profile.yaml);
+        clyntis_config::uri::export_links(base_yaml, password)
     }
 
     pub fn update_profile_nodes(

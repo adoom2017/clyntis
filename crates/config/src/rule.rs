@@ -16,6 +16,9 @@ pub enum Matcher {
     Subdomain(String),
     /// Domain pattern with `*` wildcards within labels (never crossing `.`).
     Glob(Box<str>),
+    /// `DOMAIN-WILDCARD` pattern: `*` matches any run (including `.`) and `?`
+    /// matches any single character.
+    Wildcard(Box<str>),
     Keyword(String),
     Regex(regex::Regex),
     Net(ipnet::IpNet),
@@ -275,15 +278,15 @@ pub struct DomainSetBuilder {
 }
 impl DomainSetBuilder {
     pub fn exact(&mut self, domain: &str) {
-        self.exact.push(&normalize(domain));
+        with_normalized(domain, |d| self.exact.push(d));
     }
     /// The domain and its subdomains.
     pub fn suffix(&mut self, domain: &str) {
-        self.suffix.push(&normalize(domain));
+        with_normalized(domain, |d| self.suffix.push(d));
     }
     /// Subdomains only.
     pub fn subdomain(&mut self, domain: &str) {
-        self.subdomain.push(&normalize(domain));
+        with_normalized(domain, |d| self.subdomain.push(d));
     }
     pub fn keyword(&mut self, keyword: &str) {
         self.keywords.push(keyword.to_ascii_lowercase().into());
@@ -363,8 +366,21 @@ fn compile_regexes(regexes: Vec<regex::Regex>) -> Box<[regex::Regex]> {
     }
     regexes.into_boxed_slice()
 }
-fn normalize(domain: &str) -> String {
-    domain.trim().trim_matches('.').to_ascii_lowercase()
+fn with_normalized<R>(domain: &str, f: impl FnOnce(&str) -> R) -> R {
+    let trimmed = domain.trim().trim_matches('.');
+    if !trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        return f(trimmed);
+    }
+    if trimmed.len() <= 256 && trimmed.is_ascii() {
+        let mut buf = [0u8; 256];
+        let len = trimmed.len();
+        buf[..len].copy_from_slice(trimmed.as_bytes());
+        buf[..len].make_ascii_lowercase();
+        if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+            return f(s);
+        }
+    }
+    f(&trimmed.to_ascii_lowercase())
 }
 fn merge_ranges<T: Copy + Ord>(ranges: &mut Vec<(T, T)>, next: impl Fn(T) -> T) {
     ranges.sort_unstable();
@@ -506,7 +522,7 @@ impl Matcher {
             "DOMAIN-SUFFIX" => Self::Suffix(value.trim_matches('.').into()),
             "DOMAIN-KEYWORD" => Self::Keyword(value),
             "DOMAIN-REGEX" => Self::Regex(compile_regex(f[1])?),
-            "DOMAIN-WILDCARD" => Self::Regex(wildcard_regex(&value)?),
+            "DOMAIN-WILDCARD" => parse_wildcard(&value)?,
             "IP-CIDR" | "IP-CIDR6" => {
                 let n: ipnet::IpNet = value.parse()?;
                 ensure!(
@@ -605,6 +621,7 @@ impl Matcher {
                 .strip_suffix(d)
                 .is_some_and(|p| p.len() > 1 && p.ends_with('.')),
             Self::Glob(g) => glob_matches(g, host),
+            Self::Wildcard(w) => wildcard_matches(w, host),
             Self::Keyword(k) => host.contains(k),
             Self::Regex(r) => r.is_match(host),
             Self::Domains(s) => s.matches(host),
@@ -673,30 +690,77 @@ impl Rule {
         })
     }
     pub fn matches(&self, host: &str, ip: Option<IpAddr>, port: u16, network: &str) -> bool {
-        self.matcher.evaluate(
-            &host.trim_end_matches('.').to_ascii_lowercase(),
-            ip,
-            port,
-            network,
-            false,
-        ) == Some(true)
+        let trimmed = host.trim_end_matches('.');
+        if !trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self.matcher.evaluate(trimmed, ip, port, network, false) == Some(true);
+        }
+        if trimmed.len() <= 256 && trimmed.is_ascii() {
+            let mut buf = [0u8; 256];
+            let len = trimmed.len();
+            buf[..len].copy_from_slice(trimmed.as_bytes());
+            buf[..len].make_ascii_lowercase();
+            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                return self.matcher.evaluate(s, ip, port, network, false) == Some(true);
+            }
+        }
+        self.matcher
+            .evaluate(&trimmed.to_ascii_lowercase(), ip, port, network, false)
+            == Some(true)
     }
 }
 /// mihomo's DOMAIN-WILDCARD: `*` stands for any run of characters, dots
 /// included, and `?` for one character; the pattern covers the whole host.
-fn wildcard_regex(pattern: &str) -> Result<regex::Regex> {
+fn parse_wildcard(pattern: &str) -> Result<Matcher> {
     let p = pattern.trim().trim_end_matches('.');
     ensure!(!p.is_empty(), "empty wildcard pattern");
-    let mut re = String::from("^");
-    for c in p.chars() {
-        match c {
-            '*' => re.push_str(".*"),
-            '?' => re.push('.'),
-            c => re.push_str(&regex::escape(c.encode_utf8(&mut [0; 4]))),
+    Ok(Matcher::Wildcard(p.into()))
+}
+fn wildcard_matches(pattern: &str, host: &str) -> bool {
+    if pattern.is_ascii() && host.is_ascii() {
+        let (p_bytes, h_bytes) = (pattern.as_bytes(), host.as_bytes());
+        let (mut p, mut h) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while h < h_bytes.len() {
+            if p < p_bytes.len() && p_bytes[p] == b'*' {
+                star = Some((p, h));
+                p += 1;
+            } else if p < p_bytes.len()
+                && (p_bytes[p] == b'?' || p_bytes[p].eq_ignore_ascii_case(&h_bytes[h]))
+            {
+                p += 1;
+                h += 1;
+            } else if let Some((sp, sh)) = star {
+                p = sp + 1;
+                h = sh + 1;
+                star = Some((sp, sh + 1));
+            } else {
+                return false;
+            }
+        }
+        return p_bytes[p..].iter().all(|&b| b == b'*');
+    }
+    let p_chars: Vec<char> = pattern.chars().collect();
+    let h_chars: Vec<char> = host.chars().collect();
+    let (mut p, mut h) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while h < h_chars.len() {
+        if p < p_chars.len() && p_chars[p] == '*' {
+            star = Some((p, h));
+            p += 1;
+        } else if p < p_chars.len()
+            && (p_chars[p] == '?' || p_chars[p].eq_ignore_ascii_case(&h_chars[h]))
+        {
+            p += 1;
+            h += 1;
+        } else if let Some((sp, sh)) = star {
+            p = sp + 1;
+            h = sh + 1;
+            star = Some((sp, sh + 1));
+        } else {
+            return false;
         }
     }
-    re.push('$');
-    compile_regex(&re)
+    p_chars[p..].iter().all(|&c| c == '*')
 }
 pub fn domain_pattern(pattern: &str) -> Result<Matcher> {
     let p = pattern.trim().to_ascii_lowercase();
@@ -1200,5 +1264,18 @@ mod tests {
         assert!(combined.matches("alpha7.test"));
         assert!(combined.matches("BETA9.test"));
         assert!(!combined.matches("gamma1.test"));
+    }
+
+    #[test]
+    fn long_domains_fall_back_past_stack_buffer() {
+        let long_label = "A".repeat(260);
+        let long_host = format!("{long_label}.EXAMPLE.COM.");
+        let rule = Rule::parse("DOMAIN-SUFFIX,example.com,DIRECT").unwrap();
+        assert!(rule.matches(&long_host, None, 443, "tcp"));
+
+        let mut b = DomainSetBuilder::default();
+        b.exact(&long_host);
+        let set = b.build();
+        assert!(set.matches(&long_host.trim_end_matches('.').to_ascii_lowercase()));
     }
 }

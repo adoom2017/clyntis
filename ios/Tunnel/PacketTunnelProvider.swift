@@ -840,6 +840,9 @@ private final class TunnelWatchdog {
     private var answered = TunnelWatchdog.uptime()
     private var reported: TimeInterval?
     private var timer: DispatchSourceTimer?
+    private var lastHeartbeatWrite: TimeInterval = 0
+    private var lastHeartbeatOperation = ""
+    private var lastHeartbeatBlocked = -1
     private let heartbeat = ProfileStore.sharedContainer()?.appendingPathComponent("tunnel-heartbeat.json")
 
     /// Seconds of uptime, which stands still while the device sleeps. With
@@ -876,6 +879,9 @@ private final class TunnelWatchdog {
     func start(watching tunnelQueue: DispatchQueue) {
         queue.sync {
             timer?.cancel()
+            lastHeartbeatWrite = 0
+            lastHeartbeatOperation = ""
+            lastHeartbeatBlocked = -1
             lock.lock()
             answered = Self.uptime()
             reported = nil
@@ -918,11 +924,19 @@ private final class TunnelWatchdog {
             log.warning("tunnel queue blocked for \(Int(blocked)) s in \(operation) (\(Int(busy)) s) memory=\(footprint) MiB")
         }
         guard let heartbeat else { return }
+        let blockedSeconds = Int(blocked)
+        let changed = operation != lastHeartbeatOperation
+            || (blockedSeconds > 0) != (lastHeartbeatBlocked > 0)
+            || (blockedSeconds > 10 && blockedSeconds != lastHeartbeatBlocked)
+        guard changed || now - lastHeartbeatWrite >= 15 else { return }
+        lastHeartbeatWrite = now
+        lastHeartbeatOperation = operation
+        lastHeartbeatBlocked = blockedSeconds
         let beat: [String: Any] = [
             "time": Self.isoFormatter.string(from: Date()),
             "operation": operation,
             "memory": footprint,
-            "blocked": Int(blocked),
+            "blocked": blockedSeconds,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: beat) {
             try? data.write(to: heartbeat, options: .atomic)

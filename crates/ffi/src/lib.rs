@@ -412,12 +412,27 @@ pub unsafe extern "C" fn meta_validate_config_v1(config_ptr: *const u8, config_l
 ///
 /// # Safety
 /// Inputs must be readable; buffer and length output writable and nonoverlapping.
+unsafe fn optional_utf8<'a>(ptr: *const u8, len: usize) -> Result<Option<&'a str>> {
+    if ptr.is_null() || len == 0 {
+        return Ok(None);
+    }
+    Ok(Some(std::str::from_utf8(unsafe { input(ptr, len)? })?))
+}
+
+/// Parse node share links (`vless://`, `hysteria2://`, `hy2://`, Base64, or
+/// `CLYNTISE` encrypted Base64) into a minimal auto-routed YAML profile.
+///
+/// # Safety
+/// Inputs must be readable (`password` may be null when `password_len == 0`);
+/// buffer and length output must be writable and nonoverlapping.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn meta_import_node_links_v1(
     text: *const u8,
     text_len: usize,
     mode: *const u8,
     mode_len: usize,
+    password: *const u8,
+    password_len: usize,
     buffer: *mut u8,
     capacity: usize,
     length: *mut usize,
@@ -425,8 +440,9 @@ pub unsafe extern "C" fn meta_import_node_links_v1(
     boundary(|| {
         let text = std::str::from_utf8(unsafe { input(text, text_len)? })?;
         let mode_str = std::str::from_utf8(unsafe { input(mode, mode_len)? })?;
+        let password = unsafe { optional_utf8(password, password_len)? };
         let routing = clyntis_config::AutoRouting::parse(mode_str)?;
-        let result = clyntis_config::uri::import_links(text, routing)?;
+        let result = clyntis_config::uri::import_links_with_password(text, routing, password)?;
         unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
     })
 }
@@ -451,7 +467,8 @@ pub unsafe extern "C" fn meta_profile_nodes_v1(
     })
 }
 
-/// Append node share links to an existing YAML profile's `proxies:`. Writes JSON
+/// Append node share links (or encrypted links when `password` is provided) to an
+/// existing YAML profile's `proxies:`. Writes JSON
 /// `{"yaml","nodes":[...],"skipped":[...],"autoRouting"}`.
 ///
 /// # Safety
@@ -462,6 +479,8 @@ pub unsafe extern "C" fn meta_profile_add_links_v1(
     len: usize,
     text: *const u8,
     text_len: usize,
+    password: *const u8,
+    password_len: usize,
     buffer: *mut u8,
     capacity: usize,
     length: *mut usize,
@@ -469,8 +488,32 @@ pub unsafe extern "C" fn meta_profile_add_links_v1(
     boundary(|| {
         let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
         let text = std::str::from_utf8(unsafe { input(text, text_len)? })?;
-        let result = clyntis_config::uri::append_links(yaml, text)?;
+        let password = unsafe { optional_utf8(password, password_len)? };
+        let result = clyntis_config::uri::append_links_with_password(yaml, text, password)?;
         unsafe { output(&serde_json::to_vec(&result)?, buffer, capacity, length) }
+    })
+}
+
+/// Export a YAML profile's VLESS/Hysteria2 nodes as share links, optionally
+/// encrypted with `password`. Writes JSON `{"text","count","encrypted"}`.
+///
+/// # Safety
+/// Inputs must be readable; buffer and length output writable and nonoverlapping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_export_node_links_v1(
+    config: *const u8,
+    len: usize,
+    password: *const u8,
+    password_len: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> i32 {
+    boundary(|| {
+        let yaml = std::str::from_utf8(unsafe { input(config, len)? })?;
+        let password = unsafe { optional_utf8(password, password_len)? };
+        let exported = clyntis_config::uri::export_links(yaml, password)?;
+        unsafe { output(&serde_json::to_vec(&exported)?, buffer, capacity, length) }
     })
 }
 
@@ -576,13 +619,10 @@ pub unsafe extern "C" fn meta_drain_logs_v1(
     capacity: usize,
     length: *mut usize,
 ) -> i32 {
-    boundary(|| {
-        let mut status = OK;
-        logs::drain(|bytes| {
-            status = unsafe { output(bytes, buffer, capacity, length)? };
-            Ok(status == OK)
-        })?;
-        Ok(status)
+    boundary(|| unsafe {
+        cached_output((9, 0, 0, 0), LIMIT, buffer, capacity, length, || {
+            Ok(logs::drain_bytes())
+        })
     })
 }
 
@@ -831,8 +871,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
     length: *mut usize,
 ) -> i32 {
     #[derive(serde::Serialize)]
-    struct Snapshot {
-        config: serde_json::Value,
+    struct SnapshotRest {
         selections: std::collections::HashMap<String, String>,
         connections: Vec<clyntis_core::Connection>,
         proxies: serde_json::Map<String, serde_json::Value>,
@@ -854,19 +893,7 @@ pub unsafe extern "C" fn meta_snapshot_v1(
                 capacity,
                 length,
                 || {
-                    let mut config = handle.core.snapshot_config();
-                    if let Some(obj) = config.as_object_mut() {
-                        obj.insert(
-                            "log-level".into(),
-                            serde_json::Value::String(handle.core.config.log_level.clone()),
-                        );
-                        obj.insert(
-                            "mixed-port".into(),
-                            serde_json::Value::from(handle.core.config.mixed_port),
-                        );
-                    }
-                    let snapshot = Snapshot {
-                        config,
+                    let rest = SnapshotRest {
                         selections: handle.core.selections(),
                         connections: handle.core.connections(),
                         proxies: handle.core.proxy_status(),
@@ -878,7 +905,24 @@ pub unsafe extern "C" fn meta_snapshot_v1(
                         download: handle.core.download.load(Ordering::Relaxed),
                         stopped: handle.core.stop.is_cancelled(),
                     };
-                    Ok(serde_json::to_vec(&snapshot)?)
+                    let mut out = Vec::with_capacity(
+                        1024 + handle.cached_groups_json.len() + handle.cached_proxies_json.len(),
+                    );
+                    serde_json::to_writer(&mut out, &rest)?;
+                    debug_assert_eq!(out.last(), Some(&b'}'));
+                    out.pop();
+                    out.extend_from_slice(b",\"config\":{\"mode\":");
+                    serde_json::to_writer(&mut out, &handle.core.current_mode())?;
+                    out.extend_from_slice(b",\"proxy-groups\":");
+                    out.extend_from_slice(handle.cached_groups_json.as_bytes());
+                    out.extend_from_slice(b",\"proxies\":");
+                    out.extend_from_slice(handle.cached_proxies_json.as_bytes());
+                    out.extend_from_slice(b",\"log-level\":");
+                    serde_json::to_writer(&mut out, &handle.core.config.log_level)?;
+                    out.extend_from_slice(b",\"mixed-port\":");
+                    serde_json::to_writer(&mut out, &handle.core.config.mixed_port)?;
+                    out.extend_from_slice(b"}}");
+                    Ok(out)
                 },
             )
         }
@@ -1279,10 +1323,18 @@ pub unsafe extern "C" fn meta_write_packet_v1(id: u64, data: *const u8, len: usi
         ensure!(!handle.core.stop.is_cancelled(), "core is stopped");
         handle.check_packet_queue()?;
         let input = handle.packet_input.as_ref().context("TUN is disabled")?;
-        match input.try_send(packet.to_vec()) {
+        let mut buf = handle.inbound_pool.take(packet.len());
+        buf.extend_from_slice(packet);
+        match input.try_send(buf) {
             Ok(()) => Ok(OK),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(WOULD_BLOCK),
-            Err(_) => anyhow::bail!("packet channel closed"),
+            Err(mpsc::error::TrySendError::Full(buf)) => {
+                handle.inbound_pool.recycle(buf);
+                Ok(WOULD_BLOCK)
+            }
+            Err(mpsc::error::TrySendError::Closed(buf)) => {
+                handle.inbound_pool.recycle(buf);
+                anyhow::bail!("packet channel closed");
+            }
         }
     })
 }
@@ -1308,9 +1360,72 @@ pub unsafe extern "C" fn meta_read_packet_v1(
             return Ok(WOULD_BLOCK);
         }
         let status = unsafe { output(queue.pending.as_ref().unwrap(), buffer, capacity, length)? };
-        if status == OK {
-            queue.pending.take();
+        if status == OK
+            && let Some(buf) = queue.pending.take()
+        {
+            queue.pool.recycle(buf);
         }
         Ok(status)
     })
+}
+
+#[cfg(test)]
+mod opt_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_config_matches_legacy_dom_format() {
+        let yaml = b"mixed-port: 7890\nlog-level: info\nmode: rule\nproxies:\n  - {name: P1, type: vless, server: 1.2.3.4, port: 443, uuid: 11111111-1111-1111-1111-111111111111}\nproxy-groups:\n  - {name: Auto, type: select, proxies: [P1, DIRECT]}\nrules:\n  - MATCH,Auto\n";
+        let mut id = 0u64;
+        assert_eq!(
+            unsafe { meta_create_v1(yaml.as_ptr(), yaml.len(), std::ptr::null(), &mut id) },
+            OK
+        );
+        let mut length = 0usize;
+        assert_eq!(
+            unsafe { meta_snapshot_v1(id, std::ptr::null_mut(), 0, &mut length) },
+            BUFFER_TOO_SMALL
+        );
+        let mut buf = vec![0u8; length];
+        assert_eq!(
+            unsafe { meta_snapshot_v1(id, buf.as_mut_ptr(), buf.len(), &mut length) },
+            OK
+        );
+        let snap: serde_json::Value = serde_json::from_slice(&buf[..length]).unwrap();
+        let h = handle(id).unwrap();
+        let mut expected = h.core.snapshot_config();
+        expected.as_object_mut().unwrap().insert(
+            "log-level".into(),
+            serde_json::Value::String(h.core.config.log_level.clone()),
+        );
+        expected.as_object_mut().unwrap().insert(
+            "mixed-port".into(),
+            serde_json::Value::from(h.core.config.mixed_port),
+        );
+        assert_eq!(snap["config"], expected);
+        assert_eq!(meta_destroy_v1(id), OK);
+    }
+
+    #[test]
+    fn drain_logs_cached_output_avoids_double_drain_on_retry() {
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut length = 0usize;
+        let _ = unsafe { meta_drain_logs_v1(scratch.as_mut_ptr(), scratch.len(), &mut length) };
+        logs::record_for_test(r#"{"time":1.0,"type":"info","payload":"opt-ffi-retry-test"}"#);
+
+        let mut tiny = [0u8; 4];
+        assert_eq!(
+            unsafe { meta_drain_logs_v1(tiny.as_mut_ptr(), tiny.len(), &mut length) },
+            BUFFER_TOO_SMALL
+        );
+        assert!(length > tiny.len());
+
+        let mut exact = vec![0u8; length];
+        assert_eq!(
+            unsafe { meta_drain_logs_v1(exact.as_mut_ptr(), exact.len(), &mut length) },
+            OK
+        );
+        let text = std::str::from_utf8(&exact[..length]).unwrap();
+        assert!(text.contains("opt-ffi-retry-test"), "{text}");
+    }
 }

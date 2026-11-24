@@ -272,6 +272,11 @@ export interface ProfileNodes {
   autoRouting: AutoRouting | null;
   nodes: NodeSummary[];
 }
+export interface NodesExport {
+  text: string;
+  count: number;
+  encrypted: boolean;
+}
 export interface Profile extends Omit<
   ProfileSummary,
   "pending" | "source" | "subscription" | "encrypted"

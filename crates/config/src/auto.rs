@@ -7,9 +7,47 @@
 
 use crate::{Config, Group, GroupKind, Proxy, ProxyKind, SniffProtocol};
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_yaml::{Mapping, Value};
 use std::collections::HashSet;
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Presence {
+    pub log_level: Option<IgnoredAny>,
+    pub rules: Option<IgnoredAny>,
+    pub geodata_mode: Option<IgnoredAny>,
+    pub geo_auto_update: Option<IgnoredAny>,
+    pub proxy_groups: Option<IgnoredAny>,
+    pub dns: Option<DnsPresence>,
+    pub sniffer: Option<SnifferPresence>,
+    pub tun: Option<TunPresence>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct DnsPresence {
+    pub enable: Option<IgnoredAny>,
+    pub enhanced_mode: Option<IgnoredAny>,
+    pub fake_ip_range: Option<IgnoredAny>,
+    pub nameserver: Option<IgnoredAny>,
+    pub default_nameserver: Option<IgnoredAny>,
+    pub fake_ip_filter: Option<IgnoredAny>,
+    pub ipv6: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SnifferPresence {
+    pub enable: Option<IgnoredAny>,
+    pub sniff: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TunPresence {
+    pub auto_dns: Option<IgnoredAny>,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -225,15 +263,54 @@ pub fn apply_defaults(cfg: &mut Config, map: &Mapping) {
     if !should_auto_route(map, &cfg.proxies) {
         return;
     }
+    let key = |k: &str| map.contains_key(Value::from(k)).then_some(IgnoredAny);
+    let dns_map = map.get(Value::from("dns")).and_then(Value::as_mapping);
+    let sniffer_map = map.get(Value::from("sniffer")).and_then(Value::as_mapping);
+    let tun_map = map.get(Value::from("tun")).and_then(Value::as_mapping);
+    let presence = Presence {
+        log_level: key("log-level"),
+        rules: key("rules"),
+        geodata_mode: key("geodata-mode"),
+        geo_auto_update: key("geo-auto-update"),
+        proxy_groups: key("proxy-groups"),
+        dns: dns_map.map(|m| DnsPresence {
+            enable: has_key(Some(m), "enable").then_some(IgnoredAny),
+            enhanced_mode: has_key(Some(m), "enhanced-mode").then_some(IgnoredAny),
+            fake_ip_range: has_key(Some(m), "fake-ip-range").then_some(IgnoredAny),
+            nameserver: has_key(Some(m), "nameserver").then_some(IgnoredAny),
+            default_nameserver: has_key(Some(m), "default-nameserver").then_some(IgnoredAny),
+            fake_ip_filter: has_key(Some(m), "fake-ip-filter").then_some(IgnoredAny),
+            ipv6: has_key(Some(m), "ipv6").then_some(IgnoredAny),
+        }),
+        sniffer: sniffer_map.map(|m| SnifferPresence {
+            enable: has_key(Some(m), "enable").then_some(IgnoredAny),
+            sniff: has_key(Some(m), "sniff").then_some(IgnoredAny),
+        }),
+        tun: tun_map.map(|m| TunPresence {
+            auto_dns: has_key(Some(m), "auto-dns").then_some(IgnoredAny),
+        }),
+    };
+    apply_defaults_inner(cfg, &presence);
+}
 
-    if !map.contains_key(Value::from("geodata-mode")) {
+/// Fills automatic GeoIP/GeoSite groups, rules, DNS, sniffer, and TUN defaults
+/// from a lightweight key-presence pass without building a full YAML DOM.
+pub fn apply_defaults_from_presence(cfg: &mut Config, presence: &Presence) {
+    if presence.rules.is_some() || !cfg.proxies.iter().any(is_routable) {
+        return;
+    }
+    apply_defaults_inner(cfg, presence);
+}
+
+fn apply_defaults_inner(cfg: &mut Config, presence: &Presence) {
+    if presence.geodata_mode.is_none() {
         cfg.geodata_mode = true;
     }
-    if !map.contains_key(Value::from("geo-auto-update")) {
+    if presence.geo_auto_update.is_none() {
         cfg.geo_auto_update = true;
     }
 
-    let target = if !map.contains_key(Value::from("proxy-groups")) {
+    let target = if presence.proxy_groups.is_none() {
         let (groups, target) = build_groups(&cfg.proxies);
         cfg.proxy_groups = groups;
         target
@@ -243,39 +320,39 @@ pub fn apply_defaults(cfg: &mut Config, map: &Mapping) {
 
     cfg.rules = build_rules(cfg.auto_routing, &target);
 
-    let dns_map = map.get(Value::from("dns")).and_then(Value::as_mapping);
-    if !has_key(dns_map, "enable") {
+    let dns = presence.dns.as_ref();
+    if dns.is_none_or(|d| d.enable.is_none()) {
         cfg.dns.enable = true;
     }
-    if !has_key(dns_map, "enhanced-mode") {
+    if dns.is_none_or(|d| d.enhanced_mode.is_none()) {
         cfg.dns.enhanced_mode = "fake-ip".into();
     }
-    if !has_key(dns_map, "fake-ip-range") {
+    if dns.is_none_or(|d| d.fake_ip_range.is_none()) {
         cfg.dns.fake_ip_range = "28.0.0.0/16".parse().unwrap();
     }
-    if !has_key(dns_map, "nameserver") {
+    if dns.is_none_or(|d| d.nameserver.is_none()) {
         cfg.dns.nameserver = default_dns_nameservers();
     }
-    if !has_key(dns_map, "default-nameserver") {
+    if dns.is_none_or(|d| d.default_nameserver.is_none()) {
         cfg.dns.default_nameserver = default_dns_nameservers();
     }
-    if !has_key(dns_map, "fake-ip-filter") {
+    if dns.is_none_or(|d| d.fake_ip_filter.is_none()) {
         cfg.dns.fake_ip_filter = default_fake_ip_filter();
     }
-    if !has_key(dns_map, "ipv6") {
+    if dns.is_none_or(|d| d.ipv6.is_none()) {
         cfg.dns.ipv6 = cfg.ipv6;
     }
 
-    let sniffer_map = map.get(Value::from("sniffer")).and_then(Value::as_mapping);
-    if !has_key(sniffer_map, "enable") {
+    let sniffer = presence.sniffer.as_ref();
+    if sniffer.is_none_or(|s| s.enable.is_none()) {
         cfg.sniffer.enable = true;
     }
-    if !has_key(sniffer_map, "sniff") {
+    if sniffer.is_none_or(|s| s.sniff.is_none()) {
         cfg.sniffer.sniff = default_sniff_protocols();
     }
 
-    let tun_map = map.get(Value::from("tun")).and_then(Value::as_mapping);
-    if !has_key(tun_map, "auto-dns") {
+    let tun = presence.tun.as_ref();
+    if tun.is_none_or(|t| t.auto_dns.is_none()) {
         cfg.tun.auto_dns = true;
     }
 }
@@ -469,6 +546,25 @@ mod tests {
             cfg.rules.last().map(String::as_str),
             Some("MATCH,AutoProxy")
         );
+    }
+
+    #[test]
+    fn null_and_empty_sections_receive_auto_routing_defaults() {
+        let presence =
+            serde_yaml::from_slice::<Option<Presence>>(b"dns: null\nsniffer:\ntun: null\n")
+                .unwrap()
+                .unwrap_or_default();
+        assert!(presence.dns.is_none());
+        assert!(presence.sniffer.is_none());
+        assert!(presence.tun.is_none());
+
+        let yaml = format!("dns: {{}}\nsniffer: {{}}\ntun: {{}}\n{SINGLE_NODE}");
+        let cfg = Config::parse(yaml.as_bytes()).unwrap();
+        assert!(cfg.dns.enable);
+        assert_eq!(cfg.dns.enhanced_mode, "fake-ip");
+        assert!(cfg.sniffer.enable);
+        assert_eq!(cfg.sniffer.sniff.len(), 2);
+        assert!(cfg.tun.auto_dns);
     }
 
     #[test]

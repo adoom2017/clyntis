@@ -254,12 +254,11 @@ pub(crate) async fn read_first_bytes<S: tokio::io::AsyncRead + Unpin>(
     }
     match tokio::time::timeout(timeout, async {
         loop {
-            let mut buffer = [0u8; 4096];
-            let n = stream.read(&mut buffer).await?;
+            prefix.reserve(4096);
+            let n = stream.read_buf(prefix).await?;
             if n == 0 {
                 break;
             }
-            prefix.extend_from_slice(&buffer[..n]);
             if done(prefix) {
                 break;
             }
@@ -326,12 +325,11 @@ impl crate::Core {
         let s = &self.config.sniffer;
         let _ = tokio::time::timeout(Duration::from_millis(500), async {
             loop {
-                let mut buffer = [0u8; 4096];
-                let n = stream.read(&mut buffer).await?;
+                prefix.reserve(4096);
+                let n = stream.read_buf(&mut prefix).await?;
                 if n == 0 {
                     break;
                 }
-                prefix.extend_from_slice(&buffer[..n]);
                 if stale {
                     // The fake IP is meaningless: take any TLS/HTTP host and
                     // dial it, whatever the sniffer's ports or override setting.

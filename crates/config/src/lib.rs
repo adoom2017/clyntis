@@ -535,18 +535,13 @@ impl Config {
         cfg.dns.listen = listen(&cfg.dns.listen);
         // The top-level Clash option wins when explicitly present, including
         // `info`; otherwise the nested logging option remains supported.
-        let document: serde_yaml::Value = serde_yaml::from_slice(bytes)?;
-        if document
-            .as_mapping()
-            .is_some_and(|mapping| mapping.contains_key(serde_yaml::Value::from("log-level")))
-        {
+        let presence = serde_yaml::from_slice::<Option<auto::Presence>>(bytes)?.unwrap_or_default();
+        if presence.log_level.is_some() {
             cfg.log.log_level.clone_from(&cfg.log_level);
         } else {
             cfg.log_level.clone_from(&cfg.log.log_level);
         }
-        if let Some(mapping) = document.as_mapping() {
-            auto::apply_defaults(&mut cfg, mapping);
-        }
+        auto::apply_defaults_from_presence(&mut cfg, &presence);
         cfg.validate()?;
         Ok(cfg)
     }

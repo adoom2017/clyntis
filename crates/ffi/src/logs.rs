@@ -48,20 +48,24 @@ pub(crate) fn init(level: &str) {
     });
 }
 
-/// Calls `take` with the buffered lines (newline-separated JSON objects with
-/// `time`, `type` and `payload`); they are removed only when `take` reports
-/// that it consumed them, so a too-small caller buffer loses nothing.
-pub(crate) fn drain(take: impl FnOnce(&[u8]) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+#[derive(serde::Serialize)]
+struct LogEntry<'a> {
+    time: f64,
+    #[serde(rename = "type")]
+    kind: &'a str,
+    payload: &'a str,
+}
+
+/// Drains buffered lines into a pre-sized newline-separated byte buffer.
+pub(crate) fn drain_bytes() -> Vec<u8> {
     let mut buffer = BUFFER.lock().unwrap();
-    let mut joined = Vec::new();
-    for line in buffer.iter() {
+    let total: usize = buffer.iter().map(|line| line.len() + 1).sum();
+    let mut joined = Vec::with_capacity(total);
+    for line in buffer.drain(..) {
         joined.extend_from_slice(line.as_bytes());
         joined.push(b'\n');
     }
-    if take(&joined)? {
-        buffer.clear();
-    }
-    Ok(())
+    joined
 }
 
 fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
@@ -79,9 +83,13 @@ fn record_panic(info: &std::panic::PanicHookInfo<'_>) {
         if buffer.len() == CAPACITY {
             buffer.pop_front();
         }
-        buffer.push_back(
-            serde_json::json!({"time": time, "type": "error", "payload": message}).to_string(),
-        );
+        if let Ok(line) = serde_json::to_string(&LogEntry {
+            time,
+            kind: "error",
+            payload: &message,
+        }) {
+            buffer.push_back(line);
+        }
     }
     if let Ok(path) = PANIC_FILE.try_lock()
         && let Some(path) = path.as_ref()
@@ -123,18 +131,46 @@ impl<S: Subscriber> Layer<S> for BufferLayer {
     fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
         let mut fields = Fields::default();
         event.record(&mut fields);
-        let level = match *event.metadata().level() {
-            tracing::Level::WARN => "warning".to_owned(),
-            level => level.as_str().to_ascii_lowercase(),
+        let kind = match *event.metadata().level() {
+            tracing::Level::TRACE => "trace",
+            tracing::Level::DEBUG => "debug",
+            tracing::Level::INFO => "info",
+            tracing::Level::WARN => "warning",
+            tracing::Level::ERROR => "error",
         };
         let time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
-        push(serde_json::json!({"time": time, "type": level, "payload": fields.0}).to_string());
+        if let Ok(line) = serde_json::to_string(&LogEntry {
+            time,
+            kind,
+            payload: &fields.0,
+        }) {
+            push(line);
+        }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn record_for_test(line: &str) {
     push(line.to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_entry_serializes_expected_json_shape() {
+        let json = serde_json::to_string(&LogEntry {
+            time: 123.5,
+            kind: "warning",
+            payload: "hello \"world\"",
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["time"], 123.5);
+        assert_eq!(parsed["type"], "warning");
+        assert_eq!(parsed["payload"], "hello \"world\"");
+    }
 }

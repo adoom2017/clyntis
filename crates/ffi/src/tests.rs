@@ -1246,6 +1246,8 @@ fn node_links_import_inspect_append_and_update_via_ffi() {
             links.len(),
             mode.as_ptr(),
             mode.len(),
+            std::ptr::null(),
+            0,
             buf,
             cap,
             out,
@@ -1268,6 +1270,8 @@ fn node_links_import_inspect_append_and_update_via_ffi() {
             yaml1.len(),
             extra.as_ptr(),
             extra.len(),
+            std::ptr::null(),
+            0,
             buf,
             cap,
             out,
@@ -1275,6 +1279,66 @@ fn node_links_import_inspect_append_and_update_via_ffi() {
     });
     assert_eq!(appended["nodes"][0]["name"], "Node2");
     let yaml2 = appended["yaml"].as_str().unwrap().as_bytes().to_vec();
+
+    // Plaintext & encrypted export + encrypted re-import/append via FFI.
+    let plain_exp = read_json(|buf, cap, out| unsafe {
+        meta_export_node_links_v1(
+            yaml2.as_ptr(),
+            yaml2.len(),
+            std::ptr::null(),
+            0,
+            buf,
+            cap,
+            out,
+        )
+    });
+    assert_eq!(plain_exp["count"], 2);
+    assert_eq!(plain_exp["encrypted"], false);
+
+    let pw = b"ffi-pass";
+    let enc_exp = read_json(|buf, cap, out| unsafe {
+        meta_export_node_links_v1(
+            yaml2.as_ptr(),
+            yaml2.len(),
+            pw.as_ptr(),
+            pw.len(),
+            buf,
+            cap,
+            out,
+        )
+    });
+    assert_eq!(enc_exp["count"], 2);
+    assert_eq!(enc_exp["encrypted"], true);
+    let enc_text = enc_exp["text"].as_str().unwrap().as_bytes();
+    let reimported = read_json(|buf, cap, out| unsafe {
+        meta_import_node_links_v1(
+            enc_text.as_ptr(),
+            enc_text.len(),
+            mode.as_ptr(),
+            mode.len(),
+            pw.as_ptr(),
+            pw.len(),
+            buf,
+            cap,
+            out,
+        )
+    });
+    assert_eq!(reimported["nodes"].as_array().unwrap().len(), 2);
+
+    let reappended = read_json(|buf, cap, out| unsafe {
+        meta_profile_add_links_v1(
+            yaml1.as_ptr(),
+            yaml1.len(),
+            enc_text.as_ptr(),
+            enc_text.len(),
+            pw.as_ptr(),
+            pw.len(),
+            buf,
+            cap,
+            out,
+        )
+    });
+    assert_eq!(reappended["nodes"].as_array().unwrap().len(), 2);
 
     let req = br#"{"removeNames":["Node1"],"autoRouting":"blacklist"}"#;
     let mut len = 0usize;

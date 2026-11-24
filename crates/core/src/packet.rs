@@ -412,6 +412,7 @@ struct TcpFlow {
     pending: Option<(Vec<u8>, usize)>,
     eof: bool,
     created: Instant,
+    time_wait_since: Option<Instant>,
     task: tokio::task::AbortHandle,
 }
 struct Reply {
@@ -422,6 +423,43 @@ struct Reply {
 }
 /// How often the TUN logs its UDP drop counters, when they changed.
 const DROPS_LOG_EVERY: Duration = Duration::from_secs(30);
+
+const TX_POOL_MAX_BUFFERS: usize = 64;
+const TX_POOL_DEFAULT_CAP: usize = 2048;
+const TX_POOL_MAX_CAP: usize = 4096;
+
+struct TxPool(std::sync::Mutex<Vec<Vec<u8>>>);
+
+static TX_POOL: TxPool = TxPool::new();
+
+impl TxPool {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut buf = self
+            .0
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(len.max(TX_POOL_DEFAULT_CAP)));
+        buf.clear();
+        buf.resize(len, 0);
+        buf
+    }
+
+    fn put(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > TX_POOL_MAX_CAP {
+            return;
+        }
+        buf.clear();
+        let mut pool = self.0.lock().unwrap();
+        if pool.len() < TX_POOL_MAX_BUFFERS {
+            pool.push(buf);
+        }
+    }
+}
 
 pub(crate) struct PacketDevice {
     pub(crate) incoming: VecDeque<Vec<u8>>,
@@ -464,14 +502,20 @@ impl RxToken for Receive {
 }
 impl TxToken for Transmit {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut bytes = vec![0; len];
+        let mut bytes = TX_POOL.take(len);
         let result = f(&mut bytes);
         match self {
             Self::Reserved(permit) => {
                 let _ = permit.send(bytes);
             }
             Self::BestEffort(sender) => {
-                let _ = sender.try_send(bytes);
+                if let Err(
+                    mpsc::error::TrySendError::Full(bytes)
+                    | mpsc::error::TrySendError::Closed(bytes),
+                ) = sender.try_send(bytes)
+                {
+                    TX_POOL.put(bytes);
+                }
             }
         }
         result
@@ -942,6 +986,13 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut writer = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut ident = uuid::Uuid::new_v4().as_u128() as u32;
         while let Some(packet) = outgoing.recv().await {
+            if packet.len() <= mtu || packet.first().is_none_or(|b| b >> 4 != 6) {
+                let res =
+                    tokio::time::timeout(Duration::from_secs(5), writer_io.send(&packet)).await;
+                TX_POOL.put(packet);
+                res??;
+                continue;
+            }
             ident = ident.wrapping_add(1);
             let frames = match ipv6::fragment(packet, mtu, ident) {
                 Ok(frames) => frames,
@@ -1015,12 +1066,14 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut refused: HashMap<Flow, Instant> = HashMap::new();
     let mut guard = Guard::new(budget);
     let dns_hijack = DnsHijack::parse(&core.config.tun.dns_hijack);
+    let hosted = budget.max_tcp == Budget::HOSTED.max_tcp;
+    let incoming_cap = if hosted { 64 } else { 256 };
     loop {
         tokio::select! {
             biased;
             _ = core.stop.cancelled() => break,
             result = &mut writer => { result??; break; },
-            result = io.recv(&mut packet), if device.incoming.len() < 256 => {
+            result = io.recv(&mut packet), if device.incoming.len() < incoming_cap => {
                 let n = result?;
                 ensure!(n <= packet.len(), "PacketIo returned invalid length");
                 if n == 0 { continue; }
@@ -1061,7 +1114,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                         let core = core.clone();
                         let dns = dns_hijack.matches(flow.target, true);
                         let task = tasks.spawn(async move { (flow, 0, tcp_session(core, flow, dns, stream).await) });
-                        tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), task });
+                        tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), time_wait_since: None, task });
                     } else if !flow.tcp && !udp.ports.contains_key(&flow.target) {
                         let dns = dns_hijack.matches(flow.target, false);
                         let socket = || {
@@ -1202,6 +1255,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             }
         }
         let mut retired = vec![];
+        let tcp_pressure = hosted && (tcp_flows.len() >= budget.max_tcp * 3 / 4 || guard.shedding);
         tcp_flows.retain(|_, state| {
             let socket = sockets.get_mut::<tcp::Socket>(state.handle);
             // Keepalive ACKs count as liveness in smoltcp. Do not impose a
@@ -1210,6 +1264,23 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 && state.created.elapsed() > Duration::from_secs(30)
             {
                 socket.abort();
+            }
+            if hosted {
+                if matches!(
+                    socket.state(),
+                    tcp::State::Closing
+                        | tcp::State::TimeWait
+                        | tcp::State::LastAck
+                        | tcp::State::Closed
+                ) {
+                    state.pending = None;
+                }
+                if socket.state() == tcp::State::TimeWait {
+                    let since = *state.time_wait_since.get_or_insert_with(Instant::now);
+                    if tcp_pressure || since.elapsed() >= Duration::from_secs(3) {
+                        socket.abort();
+                    }
+                }
             }
             while socket.can_recv() {
                 let Some(input) = &state.input else {
@@ -1771,5 +1842,27 @@ mod budget_tests {
         tcp[16..18].copy_from_slice(&0xdead_u16.to_be_bytes());
         pkt.extend_from_slice(&tcp);
         assert!(sniff(&pkt).is_none());
+    }
+
+    #[test]
+    fn tx_pool_recycles_bounded_buffers_and_drops_oversized() {
+        let pool = TxPool::new();
+        let buf = pool.take(64);
+        assert_eq!(buf.len(), 64);
+        assert!(buf.capacity() >= TX_POOL_DEFAULT_CAP);
+        pool.put(buf);
+        let reused = pool.take(128);
+        assert_eq!(reused.len(), 128);
+        assert!(reused.capacity() >= TX_POOL_DEFAULT_CAP);
+
+        // Oversized (> 4096) buffers are dropped rather than pooled.
+        pool.put(Vec::with_capacity(TX_POOL_MAX_CAP + 1));
+        assert!(pool.0.lock().unwrap().is_empty());
+
+        // Pool capacity is bounded at TX_POOL_MAX_BUFFERS.
+        for _ in 0..(TX_POOL_MAX_BUFFERS + 10) {
+            pool.put(Vec::with_capacity(TX_POOL_DEFAULT_CAP));
+        }
+        assert_eq!(pool.0.lock().unwrap().len(), TX_POOL_MAX_BUFFERS);
     }
 }
