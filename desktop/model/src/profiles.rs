@@ -492,8 +492,7 @@ impl Store {
     ) -> Result<NodeImportResult> {
         let mut profile = self.get(id)?;
         let base_yaml = profile.pending.as_deref().unwrap_or(&profile.yaml);
-        let appended =
-            clyntis_config::uri::append_links_with_password(base_yaml, links, password)?;
+        let appended = clyntis_config::uri::append_links_with_password(base_yaml, links, password)?;
         profile.pending = Some(appended.yaml);
         self.save(&profile)?;
         Ok(NodeImportResult {
