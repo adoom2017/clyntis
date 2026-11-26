@@ -21,9 +21,10 @@ struct RootView: View {
         } message: { Text(model.error ?? "") }
         .task(id: scenePhase == .active && model.connected) {
             guard scenePhase == .active, model.connected else { return }
+            await model.refreshSnapshot()
             while !Task.isCancelled {
-                await model.refreshSnapshot()
                 do { try await Task.sleep(for: .seconds(2)) } catch { break }
+                await model.refreshStatus()
             }
         }
     }
@@ -363,6 +364,10 @@ private struct NodesView: View {
                 }
             }
             .navigationDestination(for: String.self) { NodeDetailView(model: model, name: $0) }
+            .task(id: model.connected) {
+                if model.connected { await model.refreshSnapshot() }
+            }
+            .refreshable { await model.refreshSnapshot() }
         }
     }
 

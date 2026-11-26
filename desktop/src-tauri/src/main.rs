@@ -107,6 +107,7 @@ fn main() {
             app::dns_leak_test,
             app::proxies,
             app::adblock_status,
+            app::allow_adblock_domain,
             app::rewrite_status,
             app::network_status,
             app::select_proxy,

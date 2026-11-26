@@ -39,7 +39,7 @@ use udp_table::{Drops, UdpTable};
 
 const CHUNK: usize = 8192;
 /// How often the memory guard samples the footprint.
-const GUARD_EVERY: Duration = Duration::from_millis(250);
+const GUARD_EVERY: Duration = Duration::from_millis(75);
 /// Longest the packet loop sleeps with nothing due: the period of its
 /// housekeeping (fragment and UDP expiry, refusal cleanup, summaries).
 const IDLE_WAKE: Duration = Duration::from_secs(1);
@@ -459,6 +459,16 @@ impl TxPool {
             pool.push(buf);
         }
     }
+
+    fn clear(&self) {
+        let mut pool = self.0.lock().unwrap();
+        pool.clear();
+        pool.shrink_to_fit();
+    }
+}
+
+pub(crate) fn relieve_memory() {
+    TX_POOL.clear();
 }
 
 pub(crate) struct PacketDevice {
@@ -1061,6 +1071,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut ipv6_dropped: u64 = 0;
     let mut fragments = ipv6::Reassembly::default();
     let mut last_expiry = Instant::now();
+    let mut pending_relief: Option<Instant> = None;
     // UDP flows the route rejected: their next datagrams get an ICMP error at
     // once instead of a new session (and log line) each.
     let mut refused: HashMap<Flow, Instant> = HashMap::new();
@@ -1223,13 +1234,25 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 reply = None;
                 finished = None;
                 while tasks.try_join_next().is_some() {}
-                let released = memory::relieve();
+                TX_POOL.clear();
+                pending_relief = Some(Instant::now() + Duration::from_millis(150));
                 tracing::warn!(
                     udp_sessions,
                     udp_ports,
                     tcp_flows = tcp_count,
-                    released_kib = released / 1024,
                     "memory critical; released the TUN's flows"
+                );
+            }
+        }
+        if pending_relief.is_some_and(|at| Instant::now() >= at) {
+            pending_relief = None;
+            while tasks.try_join_next().is_some() {}
+            TX_POOL.clear();
+            let released = memory::relieve();
+            if released >= MIB {
+                tracing::info!(
+                    released_kib = released / 1024,
+                    "memory critical; deferred relief reclaimed free pages"
                 );
             }
         }
@@ -1456,6 +1479,9 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
         let mut deadline = Instant::now() + delay;
         if let Some(due) = guard.next_due() {
             deadline = deadline.min(due);
+        }
+        if let Some(relief_due) = pending_relief {
+            deadline = deadline.min(relief_due);
         }
         // Re-arming the timer on every pass cost a busy loop ~8% of its
         // throughput; an earlier wake than needed is only an extra pass.

@@ -975,7 +975,7 @@ impl Core {
         let mut looked_up = false;
         let host = target.host.trim_end_matches('.').to_ascii_lowercase();
         for (index, rule) in rules.iter().enumerate() {
-            let matched = rule.matcher.evaluate(
+            let mut matched = rule.matcher.evaluate(
                 &host,
                 ip,
                 target.port,
@@ -991,10 +991,11 @@ impl Core {
                     .and_then(|v| v.first().map(SocketAddr::ip));
                 resolved = true;
                 looked_up = true;
+                matched = rule
+                    .matcher
+                    .evaluate(&host, ip, target.port, network, false);
             }
-            if matched == Some(true)
-                || (matched.is_none() && rule.matches(&host, ip, target.port, network))
-            {
+            if matched == Some(true) {
                 let mut trace = Trace::new(
                     self.leaf(&rule.target)?,
                     rule.target.clone(),
@@ -1804,14 +1805,22 @@ impl Core {
     /// Replaces the user's allowlist without restarting; validated like the
     /// configuration's `adblock.allow`.
     pub fn set_adblock_allow(&self, allow: Vec<String>) -> Result<()> {
+        let mut seen: std::collections::HashSet<String> =
+            self.config.adblock.allow.iter().cloned().collect();
+        let mut merged = self.config.adblock.allow.clone();
+        for entry in allow {
+            if seen.insert(entry.clone()) {
+                merged.push(entry);
+            }
+        }
         clyntis_config::adblock::Adblock {
-            allow: allow.clone(),
+            allow: merged.clone(),
             ..Default::default()
         }
         .validate()?;
-        *self.adblock_allow.write().unwrap() = allow.clone();
+        *self.adblock_allow.write().unwrap() = merged.clone();
         if let Some(filter) = self.resolver.adblock() {
-            filter.set_allow(&allow);
+            filter.set_allow(&merged);
         }
         Ok(())
     }
@@ -1929,6 +1938,7 @@ impl Core {
             self.resolver.clear_cache();
             clyntis_protocol::tls::clear_caches();
         }
+        packet::relieve_memory();
         memory::relieve()
     }
     /// Drops reconstructible inspection caches under rising memory pressure

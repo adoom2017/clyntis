@@ -1369,6 +1369,143 @@ pub unsafe extern "C" fn meta_read_packet_v1(
     })
 }
 
+const MAX_PACKET_BATCH: usize = 64;
+
+/// Writes a batch of `[u16_le len][bytes]...` framed IP packets to the core.
+///
+/// # Safety
+/// `data` must be readable for `len` bytes (or null when `len == 0`), and
+/// `written` must be a valid, writable, non-null pointer. All packet bytes are
+/// copied before return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_write_packets_v1(
+    id: u64,
+    data: *const u8,
+    len: usize,
+    written: *mut usize,
+) -> i32 {
+    packet_boundary(|| {
+        ensure!(!written.is_null(), "written count is required");
+        unsafe {
+            *written = 0;
+        }
+        let framed = unsafe { input(data, len)? };
+        let handle = handle(id)?;
+        ensure!(!handle.core.stop.is_cancelled(), "core is stopped");
+        handle.check_packet_queue()?;
+        let input = handle.packet_input.as_ref().context("TUN is disabled")?;
+        let mut offset = 0usize;
+        let mut count = 0usize;
+        while offset < framed.len() {
+            ensure!(offset + 2 <= framed.len(), "truncated packet frame header");
+            let pkt_len = u16::from_le_bytes([framed[offset], framed[offset + 1]]) as usize;
+            offset += 2;
+            ensure!(
+                offset + pkt_len <= framed.len(),
+                "truncated packet frame payload"
+            );
+            let packet = &framed[offset..offset + pkt_len];
+            offset += pkt_len;
+            ensure!((20..=65535).contains(&pkt_len), "invalid IP packet length");
+            ensure!(matches!(packet[0] >> 4, 4 | 6), "invalid IP version");
+            let mut buf = handle.inbound_pool.take(pkt_len);
+            buf.extend_from_slice(packet);
+            match input.try_send(buf) {
+                Ok(()) => count += 1,
+                Err(mpsc::error::TrySendError::Full(buf)) => {
+                    handle.inbound_pool.recycle(buf);
+                    unsafe {
+                        *written = count;
+                    }
+                    return Ok(WOULD_BLOCK);
+                }
+                Err(mpsc::error::TrySendError::Closed(buf)) => {
+                    handle.inbound_pool.recycle(buf);
+                    anyhow::bail!("packet channel closed");
+                }
+            }
+        }
+        unsafe {
+            *written = count;
+        }
+        Ok(OK)
+    })
+}
+
+/// Reads up to `max_packets` (clamped to 64) queued IP packets into `buffer`
+/// using `[u16_le len][bytes]...` framing.
+///
+/// # Safety
+/// `length` and `count` must be writable, non-null, nonoverlapping pointers.
+/// `buffer` must be writable for `capacity` bytes (or null when `capacity == 0`).
+/// No Rust allocation is transferred to the host.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_read_packets_v1(
+    id: u64,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+    count: *mut usize,
+    max_packets: usize,
+) -> i32 {
+    packet_boundary(|| {
+        ensure!(!length.is_null(), "output length is required");
+        ensure!(!count.is_null(), "packet count is required");
+        unsafe {
+            *length = 0;
+            *count = 0;
+        }
+        let handle = handle(id)?;
+        handle.check_packet_queue()?;
+        let max = max_packets.min(MAX_PACKET_BATCH);
+        if max == 0 {
+            return Ok(OK);
+        }
+        let mut queue = handle.packet_output.lock().unwrap();
+        let mut offset = 0usize;
+        let mut packets_read = 0usize;
+        while packets_read < max {
+            if !queue.fill()? {
+                break;
+            }
+            let pkt = queue.pending.as_ref().unwrap();
+            let pkt_len = u16::try_from(pkt.len()).context("IP packet exceeds u16 frame")?;
+            let framed_len = 2 + pkt.len();
+            if offset + framed_len > capacity {
+                if packets_read == 0 {
+                    unsafe {
+                        *length = framed_len;
+                    }
+                    return Ok(BUFFER_TOO_SMALL);
+                }
+                break;
+            }
+            ensure!(!buffer.is_null(), "invalid output buffer");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pkt_len.to_le_bytes().as_ptr(),
+                    buffer.add(offset),
+                    2,
+                );
+                std::ptr::copy_nonoverlapping(pkt.as_ptr(), buffer.add(offset + 2), pkt.len());
+            }
+            offset += framed_len;
+            packets_read += 1;
+            if let Some(buf) = queue.pending.take() {
+                queue.pool.recycle(buf);
+            }
+        }
+        if packets_read == 0 {
+            return Ok(WOULD_BLOCK);
+        }
+        unsafe {
+            *length = offset;
+            *count = packets_read;
+        }
+        Ok(OK)
+    })
+}
+
 #[cfg(test)]
 mod opt_tests {
     use super::*;

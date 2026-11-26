@@ -22,7 +22,7 @@ const MAX_FRAME: usize = 4 * 1024 * 1024;
 const WRITE_CHUNK: usize = 16 * 1024;
 /// Buffers grown past this by an unusually large frame are released once
 /// drained instead of being kept for the life of the stream.
-const KEEP_CAPACITY: usize = 32 * 1024;
+const KEEP_CAPACITY: usize = 16 * 1024;
 
 fn release_if_large(buffer: &mut Vec<u8>) {
     if buffer.is_empty() && buffer.capacity() > KEEP_CAPACITY {

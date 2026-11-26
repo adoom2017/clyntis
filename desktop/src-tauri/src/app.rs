@@ -40,6 +40,7 @@ pub struct Snapshot {
 struct Operation {
     engine: Option<Engine>,
     active: Option<(Profile, Settings)>,
+    yaml_adblock_allow: Option<Vec<String>>,
 }
 pub struct Desktop {
     app: tauri::AppHandle,
@@ -84,6 +85,7 @@ impl Desktop {
             operation: tokio::sync::Mutex::new(Operation {
                 engine: None,
                 active: None,
+                yaml_adblock_allow: None,
             }),
             view: Mutex::new(Snapshot {
                 status: "stopped".into(),
@@ -104,18 +106,23 @@ impl Desktop {
         })
     }
     fn snapshot_with_logs(&self, include_logs: bool) -> Result<Snapshot> {
-        let mut view = self.view.lock().unwrap().clone();
-        view.profiles = self.store.list()?;
-        view.settings = self.store.settings()?;
-        view.selected = self.store.selected()?;
-        if let Some(id) = view.selected {
-            view.mode = self.store.mode(id)?;
-        }
-        view.logs = if include_logs {
+        let profiles = self.store.list()?;
+        let settings = self.store.settings()?;
+        let selected = self.store.selected()?;
+        let mode = selected.map(|id| self.store.mode(id)).transpose()?;
+        let logs = if include_logs {
             self.logs.lock().unwrap().iter().cloned().collect()
         } else {
             Vec::new()
         };
+        let mut view = self.view.lock().unwrap().clone();
+        view.profiles = profiles;
+        view.settings = settings;
+        view.selected = selected;
+        if let Some(mode) = mode {
+            view.mode = mode;
+        }
+        view.logs = logs;
         Ok(view)
     }
     fn notify(&self) {
@@ -190,6 +197,7 @@ impl Desktop {
         // The core starts from local resources and fetches missing data after
         // the proxy is up; prefetch must never hold up connecting.
         let previous = operation.active.clone();
+        operation.yaml_adblock_allow = None;
         if let Some(mut engine) = operation.engine.take() {
             self.status("stopping", None);
             if let Err(error) = engine.stop().await {
@@ -279,6 +287,7 @@ impl Desktop {
         self.stop_locked(&mut op).await
     }
     async fn stop_locked(&self, op: &mut Operation) -> Result<()> {
+        op.yaml_adblock_allow = None;
         if let Some(mut engine) = op.engine.take() {
             self.status("stopping", None);
             let result = engine.stop().await;
@@ -416,6 +425,52 @@ impl Desktop {
         }
         self.notify();
         result
+    }
+    /// Adds `domain` to the adblock allowlist without clobbering YAML `lists`
+    /// when `settings.overrides.adblock` is unset.
+    async fn allow_adblock_domain(&self, domain: &str) -> Result<()> {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        ensure!(
+            !domain.is_empty(),
+            "{}",
+            tr!("域名不能为空", "Domain cannot be empty")
+        );
+        let mut settings = self.store.settings()?;
+        if let Some(adblock) = settings.overrides.adblock.as_mut() {
+            if adblock
+                .allow
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(&domain))
+            {
+                return Ok(());
+            }
+            adblock.allow.push(domain);
+            return self.settings(settings).await;
+        }
+        let mut op = self.operation.lock().await;
+        let engine = op
+            .engine
+            .as_ref()
+            .with_context(|| tr!("内核未运行", "The core is not running"))?;
+        let mut allow = if let Some(allow) = &op.yaml_adblock_allow {
+            allow.clone()
+        } else if let Some((profile, _)) = &op.active {
+            profiles::validate(&profile.yaml)?.adblock.allow
+        } else {
+            Vec::new()
+        };
+        if !allow.iter().any(|d| d.eq_ignore_ascii_case(&domain)) {
+            allow.push(domain);
+            engine
+                .request(
+                    reqwest::Method::PATCH,
+                    &["configs"],
+                    Some(json!({ "adblock-allow": allow })),
+                )
+                .await?;
+            op.yaml_adblock_allow = Some(allow);
+        }
+        Ok(())
     }
     /// The running core's decryption settings, with the CA.
     fn mitm_patch(&self, settings: &Settings) -> Result<Value> {
@@ -1029,27 +1084,34 @@ async fn controller(state: &Desktop) -> Reply<engine::Controller> {
         .map_err(error)
 }
 #[tauri::command]
-pub async fn adblock_status(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn adblock_status(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["adblock"], None)
+        .request_raw(reqwest::Method::GET, &["adblock"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn rewrite_status(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn allow_adblock_domain(state: State<'_, Desktop>, domain: String) -> Reply<()> {
+    state.allow_adblock_domain(&domain).await.map_err(error)
+}
+#[tauri::command]
+pub async fn rewrite_status(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["rewrite"], None)
+        .request_raw(reqwest::Method::GET, &["rewrite"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn network_status(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn network_status(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["network"], None)
+        .request_raw(reqwest::Method::GET, &["network"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
@@ -1057,39 +1119,43 @@ pub async fn test_route(
     state: State<'_, Desktop>,
     target: String,
     network: String,
-) -> Reply<Value> {
+) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(
+        .request_raw(
             reqwest::Method::POST,
             &["rules", "test"],
             Some(json!({"target":target,"network":network})),
         )
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn dns_leak_audit(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn dns_leak_audit(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["dns", "leak"], None)
+        .request_raw(reqwest::Method::GET, &["dns", "leak"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn dns_leak_test(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn dns_leak_test(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::POST, &["dns", "leak", "test"], None)
+        .request_raw(reqwest::Method::POST, &["dns", "leak", "test"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn proxies(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn proxies(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["proxies"], None)
+        .request_raw(reqwest::Method::GET, &["proxies"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
@@ -1109,23 +1175,28 @@ pub async fn select_proxy(state: State<'_, Desktop>, group: String, name: String
     Ok(())
 }
 #[tauri::command]
-pub async fn probe_proxy(state: State<'_, Desktop>, name: String) -> Reply<Value> {
+pub async fn probe_proxy(state: State<'_, Desktop>, name: String) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["proxies", &name, "delay"], None)
+        .request_raw(reqwest::Method::GET, &["proxies", &name, "delay"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn connections(state: State<'_, Desktop>) -> Reply<Value> {
+pub async fn connections(state: State<'_, Desktop>) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["connections"], None)
+        .request_raw(reqwest::Method::GET, &["connections"], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn traffic_details(state: State<'_, Desktop>, host: Option<String>) -> Reply<Value> {
+pub async fn traffic_details(
+    state: State<'_, Desktop>,
+    host: Option<String>,
+) -> Reply<tauri::ipc::Response> {
     let query: Vec<(&str, String)> = host
         .into_iter()
         .filter(|h| !h.trim().is_empty())
@@ -1133,8 +1204,9 @@ pub async fn traffic_details(state: State<'_, Desktop>, host: Option<String>) ->
         .collect();
     controller(&state)
         .await?
-        .request_query(reqwest::Method::GET, &["traffic", "details"], &query, None)
+        .request_query_raw(reqwest::Method::GET, &["traffic", "details"], &query, None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
@@ -1155,24 +1227,26 @@ pub async fn close_connection(state: State<'_, Desktop>, id: Option<String>) -> 
 }
 /// Recorded requests newer than `after` (see the core's `/requests`).
 #[tauri::command]
-pub async fn requests(state: State<'_, Desktop>, after: u64) -> Reply<Value> {
+pub async fn requests(state: State<'_, Desktop>, after: u64) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request_query(
+        .request_query_raw(
             reqwest::Method::GET,
             &["requests"],
             &[("after", after.to_string())],
             None,
         )
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 #[tauri::command]
-pub async fn request_detail(state: State<'_, Desktop>, id: u64) -> Reply<Value> {
+pub async fn request_detail(state: State<'_, Desktop>, id: u64) -> Reply<tauri::ipc::Response> {
     controller(&state)
         .await?
-        .request(reqwest::Method::GET, &["requests", &id.to_string()], None)
+        .request_raw(reqwest::Method::GET, &["requests", &id.to_string()], None)
         .await
+        .map(tauri::ipc::Response::new)
         .map_err(error)
 }
 /// Saves the request log to `path`: CSV (every entry) for a `.csv` path,

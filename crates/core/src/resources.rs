@@ -18,6 +18,7 @@ use std::{
 
 const MODULE_LIMIT: usize = 2 << 20;
 const HOSTED_MOCK_LIMIT: usize = 2 << 20;
+const HOSTED_LIMIT: usize = 16 * 1024 * 1024;
 const LIMIT: usize = 128 * 1024 * 1024;
 
 const fn rewrite_mock_limit(hosted: bool) -> usize {
@@ -54,7 +55,17 @@ pub struct Resources {
     /// parsing again while the active snapshot still holds the old copy.
     providers: HashMap<String, (ProviderSource, Matcher)>,
     adblock_sources: Vec<ListSource>,
+    adblock_cache: HashMap<(String, String, Stamp), CachedAdblockList>,
     rewrite_sources: Option<RewriteSource>,
+}
+/// Parsed adblock list cached by `(url, format, stamp)` so partial refreshes
+/// or unrelated config changes do not re-parse unchanged lists.
+#[derive(Clone)]
+struct CachedAdblockList {
+    block: clyntis_config::rule::DomainSetBuilder,
+    allow: clyntis_config::rule::DomainSetBuilder,
+    addresses: Vec<ipnet::IpNet>,
+    entries: usize,
 }
 /// What the rewrite modules were compiled from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +78,7 @@ struct RewriteSource {
 
 /// A file's length and SHA-256: unchanged contents, whatever the mtime (a
 /// periodic download of the same list replaces the file).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Stamp {
     len: u64,
     digest: [u8; 32],
@@ -108,6 +119,7 @@ impl Resources {
             rewrite: self.rewrite.clone(),
             providers: self.providers.clone(),
             adblock_sources: self.adblock_sources.clone(),
+            adblock_cache: self.adblock_cache.clone(),
             rewrite_sources: self.rewrite_sources.clone(),
         }
     }
@@ -339,8 +351,13 @@ impl Resources {
             crate::rewrite::clean_stale_files(&config.directory);
         }
         let proxy = via.and_then(|core| core.resource_proxy().map(|name| (core, name)));
+        let limit = if config.internal_host_packet_io {
+            HOSTED_LIMIT
+        } else {
+            LIMIT
+        };
         let fetch = Fetch {
-            limit: LIMIT,
+            limit,
             resolver,
             hooks,
             proxy: proxy.as_ref().map(|(core, name)| (*core, name.as_str())),
@@ -500,7 +517,8 @@ impl Resources {
             }
         }
         out.rules(&config.rules)?;
-        (out.adblock, out.adblock_sources) = adblock(config, refresh, &fetch, previous).await;
+        (out.adblock, out.adblock_sources, out.adblock_cache) =
+            adblock(config, refresh, &fetch, previous).await;
         (out.rewrite, out.rewrite_sources) = rewrite(config, refresh, &fetch, previous).await;
         Ok(out)
     }
@@ -828,14 +846,19 @@ async fn adblock(
     refresh: bool,
     fetch: &Fetch<'_>,
     previous: &Resources,
-) -> (Option<Arc<crate::adblock::Filter>>, Vec<ListSource>) {
+) -> (
+    Option<Arc<crate::adblock::Filter>>,
+    Vec<ListSource>,
+    HashMap<(String, String, Stamp), CachedAdblockList>,
+) {
     let settings = &config.adblock;
     // Without lists the built-in endpoints and QUIC fallback still apply.
     if !settings.enable {
-        return (None, vec![]);
+        return (None, vec![], HashMap::new());
     }
     struct Resolved {
         data: Result<PathBuf>,
+        stamp: Option<Stamp>,
         updated: Option<u64>,
     }
     let mut resolved = Vec::new();
@@ -876,12 +899,14 @@ async fn adblock(
             staged.commit()?;
             Ok((path, stamp))
         });
+        let stamp = committed.as_ref().ok().map(|(_, stamp)| *stamp);
         sources.push(ListSource {
             list: list.clone(),
-            stamp: committed.as_ref().ok().map(|(_, stamp)| *stamp),
+            stamp,
         });
         resolved.push(Resolved {
             data: committed.map(|(path, _)| path),
+            stamp,
             updated,
         });
     }
@@ -909,24 +934,63 @@ async fn adblock(
             })
             .collect();
         tracing::debug!("ad blocking lists unchanged; reusing them");
-        return (Some(Arc::new(active.with_lists(settings, lists))), sources);
+        return (
+            Some(Arc::new(active.with_lists(settings, lists))),
+            sources,
+            previous.adblock_cache.clone(),
+        );
     }
     let mut block = clyntis_config::rule::DomainSetBuilder::default();
     let mut allow = clyntis_config::rule::DomainSetBuilder::default();
     let mut addresses = Vec::new();
     let mut lists = Vec::new();
+    let mut next_cache = HashMap::new();
     for (list, resolved) in settings.lists.iter().zip(resolved) {
-        let loaded = resolved.data.and_then(|data| {
-            let reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(&data)?);
-            clyntis_config::adblock::parse_list_reader(
-                reader,
-                &list.format,
-                &mut block,
-                &mut allow,
-                &mut addresses,
-                LIMIT,
-            )
-        });
+        let key = resolved
+            .stamp
+            .map(|stamp| (list.url.clone(), list.format.clone(), stamp));
+        let loaded = match (resolved.data, key.as_ref()) {
+            (Ok(_), Some(cache_key)) if previous.adblock_cache.contains_key(cache_key) => {
+                let cached = previous.adblock_cache.get(cache_key).unwrap().clone();
+                block.extend(&cached.block);
+                allow.extend(&cached.allow);
+                addresses.extend_from_slice(&cached.addresses);
+                let entries = cached.entries;
+                next_cache.insert(cache_key.clone(), cached);
+                Ok(entries)
+            }
+            (Ok(data), _) => (|| {
+                let reader =
+                    std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(&data)?);
+                let mut list_block = clyntis_config::rule::DomainSetBuilder::default();
+                let mut list_allow = clyntis_config::rule::DomainSetBuilder::default();
+                let mut list_addresses = Vec::new();
+                let entries = clyntis_config::adblock::parse_list_reader(
+                    reader,
+                    &list.format,
+                    &mut list_block,
+                    &mut list_allow,
+                    &mut list_addresses,
+                    fetch.limit,
+                )?;
+                block.extend(&list_block);
+                allow.extend(&list_allow);
+                addresses.extend_from_slice(&list_addresses);
+                if let Some(cache_key) = key {
+                    next_cache.insert(
+                        cache_key,
+                        CachedAdblockList {
+                            block: list_block,
+                            allow: list_allow,
+                            addresses: list_addresses,
+                            entries,
+                        },
+                    );
+                }
+                Ok(entries)
+            })(),
+            (Err(error), _) => Err(error),
+        };
         let info = match loaded {
             Ok(entries) => crate::adblock::ListInfo {
                 name: list.name.clone(),
@@ -953,7 +1017,7 @@ async fn adblock(
         lists = filter.lists.len(),
         "ad blocking enabled"
     );
-    (Some(Arc::new(filter)), sources)
+    (Some(Arc::new(filter)), sources, next_cache)
 }
 /// Loads the rewrite modules and downloads their scripts and response
 /// files. Like ad blocking lists, a module that cannot be loaded is reported
@@ -1151,7 +1215,7 @@ async fn rewrite(
             });
             (url, result)
         }))
-        .buffered(6)
+        .buffered(2)
         .collect()
         .await;
     let mut files = std::collections::HashMap::new();

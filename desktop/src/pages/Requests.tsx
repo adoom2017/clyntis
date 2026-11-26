@@ -37,6 +37,7 @@ import {
 
 /** Rows the page keeps; the core keeps its own, larger log. */
 const ROWS = 5000;
+const RENDER_LIMIT = 500;
 const POLL_MS = 1500;
 const PRETTY_AUTO_LIMIT = 256 * 1024;
 const PREVIEW_CHAR_LIMIT = 100_000;
@@ -290,7 +291,7 @@ export function RequestsPage({
                 </tr>
               </thead>
               <tbody>
-                {visible.slice(0, 1000).map((row) => (
+                {visible.slice(0, RENDER_LIMIT).map((row) => (
                   <RequestRow key={row.key} row={row} onOpen={setSelected} />
                 ))}
               </tbody>
@@ -302,8 +303,8 @@ export function RequestsPage({
             )}
           </div>
           <p className="small muted table-note">
-            {visible.length > 1000
-              ? t("显示最近 1000 条，共 {count} 条", { count: visible.length })
+            {visible.length > RENDER_LIMIT
+              ? t("显示最近 500 条，共 {count} 条", { count: visible.length })
               : t("{count} 条记录", { count: visible.length })}
           </p>
         </>

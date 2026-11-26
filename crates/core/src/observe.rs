@@ -326,7 +326,11 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                     continue;
                 }
                 if needs_body && body_source.permit.is_none() {
-                    body_source.permit = context.core.mitm.try_rewrite();
+                    body_source.permit = context
+                        .core
+                        .mitm
+                        .acquire_rewrite(std::time::Duration::from_millis(100))
+                        .await;
                     if body_source.permit.is_none() {
                         tracing::debug!(
                             module = %rule.module,
@@ -765,7 +769,10 @@ where
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             path.clone()
         } else {
-            let authority = find(&headers, "host").unwrap_or(&context.authority);
+            let authority = normalize_authority(
+                find(&headers, "host").unwrap_or(&context.authority),
+                context.scheme,
+            );
             if method == "CONNECT" {
                 format!("{}://{path}", context.scheme)
             } else {
@@ -1399,6 +1406,22 @@ fn header_list(headers: &[httparse::Header<'_>]) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+fn normalize_authority<'a>(authority: &'a str, scheme: &str) -> &'a str {
+    let default_port = match scheme {
+        "https" => "443",
+        "http" => "80",
+        _ => return authority,
+    };
+    authority
+        .strip_suffix(default_port)
+        .and_then(|rest| rest.strip_suffix(':'))
+        .filter(|host| {
+            !host.is_empty()
+                && ((host.starts_with('[') && host.ends_with(']')) || !host.contains(':'))
+        })
+        .unwrap_or(authority)
 }
 
 fn find<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -2093,10 +2116,14 @@ ans = type=http-request,pattern=^http://ads\.test/local$,requires-body=0,script-
                 .await
                 .unwrap();
 
-            while core.requests.captured_bytes() < body_len {
+            while core
+                .requests
+                .reserve_body_budget(crate::requests::HOSTED_CAPTURE_BYTES - body_len + 1)
+                .is_ok()
+            {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            assert_eq!(core.requests.captured_bytes(), body_len);
+            assert_eq!(core.requests.captured_bytes(), 0);
             assert!(
                 core.mitm.try_rewrite().is_some(),
                 "requires-body=0 local answer must not occupy rewrite_slot"
@@ -2105,7 +2132,7 @@ ans = type=http-request,pattern=^http://ads\.test/local$,requires-body=0,script-
                 core.requests
                     .reserve_body_budget(crate::requests::HOSTED_CAPTURE_BYTES - body_len + 1)
                     .is_err(),
-                "local answer must share Requests::capture_budget"
+                "local answer must reserve from Requests::rewrite_budget"
             );
 
             server

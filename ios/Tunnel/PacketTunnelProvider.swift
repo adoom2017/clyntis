@@ -26,7 +26,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// before a new start replaces it.
     private var packetWake: PacketWake?
     /// Reused by every drain on `queue`; each packet is copied out of it.
-    private var packetBuffer = [UInt8](repeating: 0, count: 65_535)
+    private var packetBuffer = [UInt8](repeating: 0, count: 131_072)
+    /// Reused by every submit on `queue` to frame up to `packetBatch` packets.
+    private var writeBuffer: [UInt8] = []
     private var drainScheduled = false
     private var monitor: NWPathMonitor?
     private var receivedInitialPath = false
@@ -233,22 +235,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         defer { watchdog.end() }
         let finished: Bool = autoreleasepool {
             var index = index
+            var nextIndices: [Int] = []
+            nextIndices.reserveCapacity(Self.packetBatch)
             while index < packets.count {
-                let packet = packets[index]
-                index += 1
-                // One malformed packet must not end the VPN: the core refuses it
-                // with the same error as a stopped core, so drop it here.
-                guard (20...65_535).contains(packet.count),
-                      [4, 6].contains(packet[packet.startIndex] >> 4) else {
-                    dropped("malformed packet from the system (\(packet.count) bytes)")
-                    continue
+                let batchStart = index
+                writeBuffer.removeAll(keepingCapacity: true)
+                nextIndices.removeAll(keepingCapacity: true)
+                while index < packets.count && nextIndices.count < Self.packetBatch {
+                    let packet = packets[index]
+                    index += 1
+                    // One malformed packet must not end the VPN: the core refuses it
+                    // with the same error as a stopped core, so drop it here.
+                    guard (20...65_535).contains(packet.count),
+                          [4, 6].contains(packet[packet.startIndex] >> 4) else {
+                        dropped("malformed packet from the system (\(packet.count) bytes)")
+                        continue
+                    }
+                    let len = UInt16(packet.count)
+                    writeBuffer.append(UInt8(truncatingIfNeeded: len))
+                    writeBuffer.append(UInt8(truncatingIfNeeded: len >> 8))
+                    writeBuffer.append(contentsOf: packet)
+                    nextIndices.append(index)
                 }
-                let result = packet.withUnsafeBytes {
-                    meta_write_packet_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+                if nextIndices.isEmpty { continue }
+                var written = 0
+                let result = writeBuffer.withUnsafeBytes {
+                    meta_write_packets_v1(core.handle, $0.bindMemory(to: UInt8.self).baseAddress, $0.count, &written)
                 }
                 if result == META_WOULD_BLOCK {
                     // Keep unread packets rather than silently dropping a saturated batch.
-                    let retry = index - 1, total = waited + delay
+                    let retry = written > 0 ? nextIndices[min(written, nextIndices.count) - 1] : batchStart
+                    let total = waited + delay
                     if waited < 5_000, total >= 5_000 {
                         log.warning("core packet input full for 5 s; still retrying memory=\(memory())")
                     }
@@ -299,41 +316,46 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             var packets: [Data] = [], protocols: [NSNumber] = []
             packets.reserveCapacity(Self.packetBatch)
             protocols.reserveCapacity(Self.packetBatch)
-            var emptied = false
-            for _ in 0..<Self.packetBatch {
-                var length = 0
-                var packet = Data()
-                let result = packetBuffer.withUnsafeMutableBytes { buffer -> Int32 in
-                    let result = meta_read_packet_v1(core.handle, buffer.bindMemory(to: UInt8.self).baseAddress,
-                                                     buffer.count, &length)
-                    // Copied out: the next read reuses the buffer.
-                    if result == META_OK, length > 0, let base = buffer.baseAddress {
-                        packet = Data(bytes: base, count: length)
+            var length = 0
+            var count = 0
+            let result = packetBuffer.withUnsafeMutableBytes { buffer -> Int32 in
+                let status = meta_read_packets_v1(core.handle, buffer.bindMemory(to: UInt8.self).baseAddress,
+                                                  buffer.count, &length, &count, Self.packetBatch)
+                guard status == META_OK, count > 0, let base = buffer.baseAddress else {
+                    return status
+                }
+                var offset = 0
+                for _ in 0..<count {
+                    guard offset + 2 <= length else { break }
+                    let pktLen = Int(base.loadUnaligned(fromByteOffset: offset, as: UInt16.self).littleEndian)
+                    offset += 2
+                    guard offset + pktLen <= length else { break }
+                    if pktLen > 0 {
+                        let packet = Data(bytes: base.advanced(by: offset), count: pktLen)
+                        let version = packet[packet.startIndex] >> 4
+                        if version == 4 || version == 6 {
+                            packets.append(packet)
+                            protocols.append(version == 4 ? Self.inetProtocol : Self.inet6Protocol)
+                        } else {
+                            dropped("invalid packet from the core (version \(version))")
+                        }
                     }
-                    return result
+                    offset += pktLen
                 }
-                if result == META_WOULD_BLOCK {
-                    emptied = true
-                    break
-                }
-                guard result == META_OK else {
-                    fail(ClientError.message(L("无法读取内核 IP 数据包。")))
-                    return false
-                }
-                guard length > 0 else { continue }
-                let version = packet[packet.startIndex] >> 4
-                guard version == 4 || version == 6 else {
-                    dropped("invalid packet from the core (version \(version))")
-                    continue
-                }
-                packets.append(packet)
-                protocols.append(version == 4 ? Self.inetProtocol : Self.inet6Protocol)
+                return status
+            }
+            if result == META_WOULD_BLOCK {
+                return false
+            }
+            guard result == META_OK else {
+                fail(ClientError.message(L("无法读取内核 IP 数据包。")))
+                return false
             }
             if !packets.isEmpty, !packetFlow.writePackets(packets, withProtocols: protocols) {
                 // The flow refuses while it is being torn down; stopTunnel follows.
                 dropped("the system refused \(packets.count) packet(s)")
             }
-            return !emptied
+            return true
         }
         if shouldContinue { scheduleDrain(epoch: epoch) }
     }
@@ -634,6 +656,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 defer { self.watchdog.end() }
                 switch message.command {
                 case "snapshot": break
+                case "status":
+                    completionHandler?(try core.status())
+                    return
                 case "traffic-details":
                     completionHandler?(try core.trafficDetails(host: message.host))
                     return

@@ -34,17 +34,9 @@ export function AdblockPanel({
     return () => window.clearInterval(timer);
   }, [visible]);
   const allow = (domain: string) => {
-    const adblock = settings.overrides.adblock ?? defaultAdblock;
-    if (adblock.allow.includes(domain)) return;
-    const next: Settings = {
-      ...settings,
-      overrides: {
-        ...settings.overrides,
-        adblock: { ...adblock, allow: [...adblock.allow, domain] },
-      },
-    };
+    if (settings.overrides.adblock?.allow.includes(domain)) return;
     void perform(
-      () => invoke("save_settings", { settings: next }),
+      () => invoke("allow_adblock_domain", { domain }),
       t("已放行 {domain}", { domain }),
     );
   };

@@ -242,6 +242,21 @@ int32_t meta_dns_leak_v1(meta_handle handle, uint32_t online,
     uint8_t *buffer, size_t capacity, size_t *output_length);
 int32_t meta_write_packet_v1(meta_handle handle, const uint8_t *packet, size_t length);
 int32_t meta_read_packet_v1(meta_handle handle, uint8_t *buffer, size_t capacity, size_t *length);
+/* Write a batch of framed IP packets ([u16_le length][bytes]...) to the core.
+ * Packets are validated and enqueued in order. *written receives the number
+ * of packets accepted before returning. Returns META_OK when every packet in
+ * buffer was accepted, META_WOULD_BLOCK when the core's input queue is full
+ * (with *written set to the partial count accepted), or META_ERROR on invalid
+ * framing, invalid IP packet, or stopped/invalid handle. */
+int32_t meta_write_packets_v1(meta_handle handle, const uint8_t *buffer, size_t length, size_t *written);
+/* Read up to max_packets (clamped to 64) queued IP packets into buffer using
+ * [u16_le length][bytes]... framing. Sets *length to bytes written and *count
+ * to packets written. Returns META_OK if at least one packet was read (or
+ * max_packets == 0), META_WOULD_BLOCK if no packet is queued (re-arming
+ * packet_ready), or META_BUFFER_TOO_SMALL if the first packet's frame
+ * (2 + packet.len()) exceeds capacity (leaving it queued, *length = frame size). */
+int32_t meta_read_packets_v1(meta_handle handle, uint8_t *buffer, size_t capacity,
+    size_t *length, size_t *count, size_t max_packets);
 #ifdef __cplusplus
 }
 #endif

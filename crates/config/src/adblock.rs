@@ -48,10 +48,10 @@ pub const DNS_ANSWERS: [&str; 2] = ["nxdomain", "null"];
 
 /// Ports on which the HTTPDNS addresses below serve lookups: HTTP, HTTPS and
 /// DNS over TLS / QUIC. Port 53 stays open: plain DNS reaches the core anyway.
-pub const HTTPDNS_PORTS: [u16; 3] = [80, 443, 853];
+pub const HTTPDNS_PORTS: [u16; 6] = [80, 443, 853, 4433, 8080, 8443];
 /// Addresses that answer lookups over HTTP(S) or TLS for apps that bypass the
 /// system resolver: Chinese HTTPDNS services and public DoH/DoT resolvers.
-pub const HTTPDNS_ADDRESSES: [&str; 17] = [
+pub const HTTPDNS_ADDRESSES: [&str; 28] = [
     // Alibaba Cloud HTTPDNS.
     "203.107.1.0/24",
     // Tencent Cloud HTTPDNS and DNSPod (HTTP `/d`, DoH, DoT): Xiaohongshu
@@ -76,10 +76,22 @@ pub const HTTPDNS_ADDRESSES: [&str; 17] = [
     "8.8.4.4/32",
     "9.9.9.9/32",
     "149.112.112.112/32",
+    // IPv6 DoH / DoT / HTTPDNS endpoints.
+    "2400:3200::1/128",
+    "2400:3200:baba::1/128",
+    "2402:4e00::/128",
+    "2402:4e00:1::/128",
+    "2400:da00::6666/128",
+    "2606:4700:4700::1111/128",
+    "2606:4700:4700::1001/128",
+    "2001:4860:4860::8888/128",
+    "2001:4860:4860::8844/128",
+    "2620:fe::fe/128",
+    "2620:fe::9/128",
 ];
 /// Names of the same kind of endpoints, refused at DNS and on connection.
 /// Each covers its subdomains.
-pub const HTTPDNS_DOMAINS: [&str; 18] = [
+pub const HTTPDNS_DOMAINS: [&str; 28] = [
     "httpdns.aliyuncs.com",
     "httpdns-api.aliyuncs.com",
     "httpdns.alicdn.com",
@@ -87,6 +99,16 @@ pub const HTTPDNS_DOMAINS: [&str; 18] = [
     "doh.pub",
     "dot.pub",
     "doh.360.cn",
+    "httpdns.n.netease.com",
+    "hdns.ksyun.com",
+    "dig.bdurl.net",
+    "dns.jd.com",
+    "httpdns.bilivideo.com",
+    "httpdns.baidubce.com",
+    "httpsdns.baidu.com",
+    "httpdns.push.heytapmobi.com",
+    "dns.weixin.qq.com",
+    "dns.weixin.qq.com.cn",
     "dns.google",
     "dns.google.com",
     "cloudflare-dns.com",
@@ -235,6 +257,16 @@ pub fn parse_list(
         FORMATS.contains(&format),
         "unsupported adblock list format {format}"
     );
+    if format == "adguard" {
+        let mut entries = Vec::new();
+        for raw_line in data.split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(raw_line);
+            if let Some(entry) = parse_adguard_line(&line) {
+                entries.push(entry);
+            }
+        }
+        return Ok(apply_adguard_entries(entries, block, allow));
+    }
     let mut taken = 0;
     for raw_line in data.split(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(raw_line);
@@ -260,6 +292,7 @@ pub fn parse_list_reader(
     let mut buf = Vec::with_capacity(256);
     let mut read_bytes = 0usize;
     let mut taken = 0usize;
+    let mut adguard_entries = (format == "adguard").then(Vec::new);
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
@@ -269,9 +302,125 @@ pub fn parse_list_reader(
         read_bytes = read_bytes.saturating_add(n);
         ensure!(read_bytes <= limit, "resource exceeds size limit");
         let line = String::from_utf8_lossy(&buf);
-        taken += parse_list_line(&line, format, block, allow, addresses);
+        if let Some(entries) = adguard_entries.as_mut() {
+            if let Some(entry) = parse_adguard_line(&line) {
+                entries.push(entry);
+            }
+        } else {
+            taken += parse_list_line(&line, format, block, allow, addresses);
+        }
+    }
+    if let Some(entries) = adguard_entries {
+        taken += apply_adguard_entries(entries, block, allow);
     }
     Ok(taken)
+}
+
+struct AdguardEntry {
+    domain: String,
+    is_pattern: bool,
+    exception: bool,
+    important: bool,
+    badfilter: bool,
+}
+
+fn parse_adguard_line(line: &str) -> Option<AdguardEntry> {
+    let line = line.trim();
+    let (exception, rule) = match line.strip_prefix("@@") {
+        Some(rest) => (true, rest),
+        None => (false, line),
+    };
+    let rule = rule.strip_prefix("||")?;
+    let (domain, modifiers) = rule.split_once('$').unwrap_or((rule, ""));
+    let mut important = false;
+    let mut badfilter = false;
+    if !modifiers.is_empty() {
+        for modifier in modifiers.split(',') {
+            match modifier.trim() {
+                "important" => important = true,
+                "badfilter" => badfilter = true,
+                _ => return None,
+            }
+        }
+    }
+    let domain = domain.strip_suffix('^')?;
+    if domain.is_empty()
+        || domain.ends_with('.')
+        || !domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'*')
+    {
+        return None;
+    }
+    Some(AdguardEntry {
+        domain: domain.to_ascii_lowercase(),
+        is_pattern: domain.contains('*'),
+        exception,
+        important,
+        badfilter,
+    })
+}
+
+fn apply_adguard_entries(
+    entries: Vec<AdguardEntry>,
+    block: &mut DomainSetBuilder,
+    allow: &mut DomainSetBuilder,
+) -> usize {
+    use std::collections::HashSet;
+
+    let badfilters: HashSet<(bool, String)> = entries
+        .iter()
+        .filter(|e| e.badfilter)
+        .map(|e| (e.exception, e.domain.clone()))
+        .collect();
+    let important_blocks: HashSet<String> = entries
+        .iter()
+        .filter(|e| {
+            !e.exception
+                && e.important
+                && !e.badfilter
+                && !badfilters.contains(&(false, e.domain.clone()))
+        })
+        .map(|e| e.domain.clone())
+        .collect();
+    let important_allows: HashSet<String> = entries
+        .iter()
+        .filter(|e| {
+            e.exception
+                && e.important
+                && !e.badfilter
+                && !badfilters.contains(&(true, e.domain.clone()))
+        })
+        .map(|e| e.domain.clone())
+        .collect();
+
+    let mut taken = 0;
+    for entry in entries {
+        if entry.badfilter || badfilters.contains(&(entry.exception, entry.domain.clone())) {
+            continue;
+        }
+        if entry.exception
+            && !entry.important
+            && important_blocks.contains(&entry.domain)
+            && !important_allows.contains(&entry.domain)
+        {
+            continue;
+        }
+        let target = if entry.exception {
+            &mut *allow
+        } else {
+            &mut *block
+        };
+        if entry.is_pattern {
+            if target.pattern(&entry.domain).is_err() {
+                continue;
+            }
+        } else {
+            target.suffix(&entry.domain);
+        }
+        taken += 1;
+    }
+    taken
 }
 
 fn parse_list_line(
@@ -530,6 +679,16 @@ mod tests {
             block.matches("x.ads.test") && block.matches("imp.test") && !block.matches("bad.test")
         );
         assert!(allow.matches("ok.ads.test"));
+
+        // `$badfilter` disables matching rules and `$important` overrides non-important `@@`.
+        let (block2, allow2, taken2) = parse(
+            "||cancelled.test^\n||cancelled.test^$badfilter\n||forced.test^$important\n@@||forced.test^\n||overridden.test^$important\n@@||overridden.test^$important\n",
+            "adguard",
+        );
+        assert_eq!(taken2, 3);
+        assert!(!block2.matches("cancelled.test"));
+        assert!(block2.matches("forced.test") && !allow2.matches("forced.test"));
+        assert!(block2.matches("overridden.test") && allow2.matches("overridden.test"));
     }
 
     #[test]

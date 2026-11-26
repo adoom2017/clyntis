@@ -1378,3 +1378,272 @@ fn node_links_import_inspect_append_and_update_via_ffi() {
     assert_eq!(info2["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(info2["nodes"][0]["name"], "Node2");
 }
+
+fn make_icmp_echo(seq_no: u16, payload: &[u8]) -> Vec<u8> {
+    let icmp = Icmpv4Repr::EchoRequest {
+        ident: 9,
+        seq_no,
+        data: payload,
+    };
+    let ip = Ipv4Repr {
+        src_addr: "10.0.0.2".parse().unwrap(),
+        dst_addr: "198.18.0.1".parse().unwrap(),
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut packet = vec![0; ip.buffer_len() + icmp.buffer_len()];
+    let mut frame = Ipv4Packet::new_unchecked(&mut packet);
+    ip.emit(&mut frame, &ChecksumCapabilities::default());
+    icmp.emit(
+        &mut Icmpv4Packet::new_unchecked(frame.payload_mut()),
+        &ChecksumCapabilities::default(),
+    );
+    packet
+}
+
+fn frame_packets(packets: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for pkt in packets {
+        out.extend_from_slice(&(pkt.len() as u16).to_le_bytes());
+        out.extend_from_slice(pkt);
+    }
+    out
+}
+
+#[test]
+fn batched_packet_io_roundtrips_multiple_packets_and_rearms_wake() {
+    let context = Box::new(Callbacks {
+        id: AtomicU64::new(0),
+        notifications: AtomicUsize::new(0),
+    });
+    let hooks = MetaPlatformV1 {
+        size: std::mem::size_of::<MetaPlatformV1>() as u32,
+        version: 1,
+        context: (&*context as *const Callbacks).cast_mut().cast(),
+        protect_socket: None,
+        packet_ready: Some(ready),
+    };
+    let id = create(b"tun: {enable: true}\n", &hooks);
+    context.id.store(id, Ordering::Relaxed);
+    assert_eq!(meta_start_v1(id), OK);
+
+    let batch: Vec<Vec<u8>> = (0..10u16).map(|i| make_icmp_echo(i, b"batch")).collect();
+    let framed = frame_packets(&batch);
+    let mut written = 0usize;
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, framed.as_ptr(), framed.len(), &mut written) },
+        OK
+    );
+    assert_eq!(written, 10);
+
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut read_buf = vec![0u8; 64 * 1024];
+    let mut replies = Vec::new();
+    while replies.len() < 10 {
+        assert!(
+            Instant::now() < until,
+            "timed out waiting for batched replies"
+        );
+        let mut length = 0usize;
+        let mut count = 0usize;
+        match unsafe {
+            meta_read_packets_v1(
+                id,
+                read_buf.as_mut_ptr(),
+                read_buf.len(),
+                &mut length,
+                &mut count,
+                64,
+            )
+        } {
+            OK => {
+                assert!(count > 0);
+                let mut offset = 0usize;
+                for _ in 0..count {
+                    let pkt_len =
+                        u16::from_le_bytes([read_buf[offset], read_buf[offset + 1]]) as usize;
+                    offset += 2;
+                    let pkt = &read_buf[offset..offset + pkt_len];
+                    offset += pkt_len;
+                    let frame = Ipv4Packet::new_checked(pkt).unwrap();
+                    let icmp = Icmpv4Repr::parse(
+                        &Icmpv4Packet::new_checked(frame.payload()).unwrap(),
+                        &ChecksumCapabilities::default(),
+                    )
+                    .unwrap();
+                    if let Icmpv4Repr::EchoReply { seq_no, data, .. } = icmp {
+                        assert_eq!(data, b"batch");
+                        replies.push(seq_no);
+                    }
+                }
+                assert_eq!(offset, length);
+            }
+            WOULD_BLOCK => std::thread::sleep(Duration::from_millis(1)),
+            status => panic!("unexpected read status: {status}"),
+        }
+    }
+    replies.sort_unstable();
+    assert_eq!(replies, (0..10).collect::<Vec<_>>());
+
+    let mut length = 0usize;
+    let mut count = 0usize;
+    assert_eq!(
+        unsafe {
+            meta_read_packets_v1(
+                id,
+                read_buf.as_mut_ptr(),
+                read_buf.len(),
+                &mut length,
+                &mut count,
+                64,
+            )
+        },
+        WOULD_BLOCK
+    );
+    assert_eq!(length, 0);
+    assert_eq!(count, 0);
+    assert_eq!(meta_destroy_v1(id), OK);
+}
+
+#[test]
+fn batched_packet_io_handles_buffer_too_small_and_partial_capacity() {
+    let context = Box::new(Callbacks {
+        id: AtomicU64::new(0),
+        notifications: AtomicUsize::new(0),
+    });
+    let hooks = MetaPlatformV1 {
+        size: std::mem::size_of::<MetaPlatformV1>() as u32,
+        version: 1,
+        context: (&*context as *const Callbacks).cast_mut().cast(),
+        protect_socket: None,
+        packet_ready: Some(ready),
+    };
+    let id = create(b"tun: {enable: true}\n", &hooks);
+    context.id.store(id, Ordering::Relaxed);
+    assert_eq!(meta_start_v1(id), OK);
+
+    let p1 = make_icmp_echo(1, b"one");
+    let p2 = make_icmp_echo(2, b"two");
+    let framed = frame_packets(&[p1.clone(), p2.clone()]);
+    let mut written = 0usize;
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, framed.as_ptr(), framed.len(), &mut written) },
+        OK
+    );
+    assert_eq!(written, 2);
+
+    let until = Instant::now() + Duration::from_secs(3);
+    while context.notifications.load(Ordering::Relaxed) == 0 {
+        assert!(Instant::now() < until);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Wait briefly for both replies to land in output queue.
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Too small for even 1 packet -> BUFFER_TOO_SMALL, leaves packet queued.
+    let mut length = 0usize;
+    let mut count = 0usize;
+    let mut tiny = [0u8; 4];
+    assert_eq!(
+        unsafe {
+            meta_read_packets_v1(
+                id,
+                tiny.as_mut_ptr(),
+                tiny.len(),
+                &mut length,
+                &mut count,
+                64,
+            )
+        },
+        BUFFER_TOO_SMALL
+    );
+    assert_eq!(length, 2 + p1.len());
+    assert_eq!(count, 0);
+
+    // Exact capacity for 1 packet -> reads 1, leaves second queued.
+    let mut one_buf = vec![0u8; length];
+    assert_eq!(
+        unsafe {
+            meta_read_packets_v1(
+                id,
+                one_buf.as_mut_ptr(),
+                one_buf.len(),
+                &mut length,
+                &mut count,
+                64,
+            )
+        },
+        OK
+    );
+    assert_eq!(count, 1);
+    assert_eq!(length, one_buf.len());
+
+    // Read remaining packet.
+    let mut rem_buf = vec![0u8; 2048];
+    assert_eq!(
+        unsafe {
+            meta_read_packets_v1(
+                id,
+                rem_buf.as_mut_ptr(),
+                rem_buf.len(),
+                &mut length,
+                &mut count,
+                64,
+            )
+        },
+        OK
+    );
+    assert_eq!(count, 1);
+    assert_eq!(meta_destroy_v1(id), OK);
+}
+
+#[test]
+fn batched_packet_io_rejects_malformed_framing_and_reports_would_block() {
+    let hooks = MetaPlatformV1 {
+        size: std::mem::size_of::<MetaPlatformV1>() as u32,
+        version: 1,
+        context: std::ptr::null_mut(),
+        protect_socket: None,
+        packet_ready: None,
+    };
+    let id = create(b"tun: {enable: true}\n", &hooks);
+    // Do NOT start core so input queue (capacity 256) fills deterministically.
+    let mut written = 0usize;
+    // Truncated header (1 byte)
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, [0x10].as_ptr(), 1, &mut written) },
+        ERROR
+    );
+    // Truncated payload
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, [20, 0, 0x45].as_ptr(), 3, &mut written) },
+        ERROR
+    );
+    // Invalid IP version (version 3)
+    let mut bad_ip = [0u8; 22];
+    bad_ip[0..2].copy_from_slice(&20u16.to_le_bytes());
+    bad_ip[2] = 0x30;
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, bad_ip.as_ptr(), bad_ip.len(), &mut written) },
+        ERROR
+    );
+
+    // Fill 250 packets, then 20 packets -> partial WOULD_BLOCK with written == 6.
+    let pkt = make_icmp_echo(1, b"fill");
+    let batch250 = frame_packets(&vec![pkt.clone(); 250]);
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, batch250.as_ptr(), batch250.len(), &mut written) },
+        OK
+    );
+    assert_eq!(written, 250);
+
+    let batch20 = frame_packets(&vec![pkt; 20]);
+    assert_eq!(
+        unsafe { meta_write_packets_v1(id, batch20.as_ptr(), batch20.len(), &mut written) },
+        WOULD_BLOCK
+    );
+    assert_eq!(written, 6);
+
+    assert_eq!(meta_destroy_v1(id), OK);
+}

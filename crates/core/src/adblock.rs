@@ -387,6 +387,14 @@ mod tests {
         // HTTPDNS endpoint blocked on HTTPDNS ports, not on unrelated ports.
         assert_eq!(filter.refuses("1.1.1.1", 443, "tcp"), Some(Block::Endpoint));
         assert_eq!(
+            filter.refuses("1.1.1.1", 8443, "tcp"),
+            Some(Block::Endpoint)
+        );
+        assert_eq!(
+            filter.refuses("[2606:4700:4700::1111]", 443, "tcp"),
+            Some(Block::Endpoint)
+        );
+        assert_eq!(
             filter.refuses("203.107.1.42", 80, "tcp"),
             Some(Block::Endpoint)
         );
@@ -396,5 +404,6 @@ mod tests {
             filter.refuses("198.51.100.1", 443, "udp"),
             Some(Block::Quic)
         );
+        assert_eq!(filter.refuses("example.cn", 443, "tcp"), None);
     }
 }

@@ -346,7 +346,7 @@ fn client_config(
     }));
     // Hysteria's client defaults; a fraction of them when memory is tight.
     let (stream, connection, datagrams) = if options.compact {
-        (1 << 20, 4 << 20, 1 << 20)
+        (512 << 10, 4 << 20, 1 << 20)
     } else {
         (8 << 20, 20 << 20, 4 << 20)
     };

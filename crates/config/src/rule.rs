@@ -94,7 +94,7 @@ impl DomainList {
         self.hashes.is_empty()
     }
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ListBuilder {
     hashes: Vec<u64>,
 }
@@ -265,7 +265,7 @@ impl std::fmt::Debug for DomainSet {
 }
 
 /// Collects domain conditions, then packs them into a [`DomainSet`].
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DomainSetBuilder {
     exact: ListBuilder,
     suffix: ListBuilder,
@@ -298,6 +298,25 @@ impl DomainSetBuilder {
         }
         self.regex.push(compile_regex(source)?);
         Ok(())
+    }
+    /// Merges all domain conditions from `other` into `self`.
+    pub fn extend(&mut self, other: &Self) {
+        self.exact.hashes.extend_from_slice(&other.exact.hashes);
+        self.suffix.hashes.extend_from_slice(&other.suffix.hashes);
+        self.subdomain
+            .hashes
+            .extend_from_slice(&other.subdomain.hashes);
+        self.globs.extend(other.globs.iter().cloned());
+        self.keywords.extend(other.keywords.iter().cloned());
+        for r in &other.regex {
+            if !self
+                .regex
+                .iter()
+                .any(|existing| existing.as_str() == r.as_str())
+            {
+                self.regex.push(r.clone());
+            }
+        }
     }
     /// Adds a Clash-style pattern: `+.x` (x and subdomains), `.x` (subdomains),
     /// `*` within labels (never across a dot), or a plain domain.

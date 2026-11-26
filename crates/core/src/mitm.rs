@@ -55,6 +55,8 @@ const BYPASS: usize = 2048;
 const BYPASS_TTL_SECS: i64 = 24 * 60 * 60;
 /// How long non-persisted session bypass entries live.
 const SESSION_BYPASS_TTL_SECS: i64 = 60 * 60;
+/// How long HTTP/2-only ALPN bypass entries suppress QUIC fallback.
+const ALPN_BYPASS_TTL_SECS: i64 = 60;
 /// Maximum size accepted when loading the persisted bypass cache.
 const MAX_BYPASS_FILE_BYTES: u64 = 1024 * 1024;
 const BYPASS_FILE_NAME: &str = ".mitm-bypass.json";
@@ -532,8 +534,8 @@ pub(crate) struct Interceptor {
     /// verification failure, or protocol incompatibility.
     bypass: Mutex<HashMap<String, BypassEntry>>,
     /// Hosts that had HTTP/2-only (non-HTTP/1.1 ALPN) connections passed
-    /// through without decryption or rewrite.
-    alpn_bypass: Mutex<HashSet<String>>,
+    /// through without decryption or rewrite, mapped to their expiry timestamp.
+    alpn_bypass: Mutex<HashMap<String, i64>>,
     storage_path: Option<PathBuf>,
     persist_lock: Mutex<()>,
     /// Tests talk to servers with their own certificates.
@@ -827,6 +829,7 @@ impl Interceptor {
         let slot = self.inspection_slots.clone().try_acquire_owned().ok()?;
         (!self.memory_limited()).then_some(slot)
     }
+    #[cfg(test)]
     pub(crate) fn try_rewrite(&self) -> Option<Arc<OwnedSemaphorePermit>> {
         if self.memory_limited() {
             return None;
@@ -837,6 +840,19 @@ impl Interceptor {
             .ok()
             .map(Arc::new)
     }
+    pub(crate) async fn acquire_rewrite(
+        &self,
+        timeout: Duration,
+    ) -> Option<Arc<OwnedSemaphorePermit>> {
+        if self.memory_limited() {
+            return None;
+        }
+        let permit = tokio::time::timeout(timeout, self.rewrite_slot.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()?;
+        (!self.memory_limited()).then(|| Arc::new(permit))
+    }
     /// Whether UDP 443 (QUIC) to `host` should be rejected to induce TCP fallback.
     pub(crate) fn blocks_quic(&self, host: &str) -> bool {
         if !self.can_inspect() || !self.settings.read().unwrap().quic_fallback {
@@ -846,7 +862,10 @@ impl Interceptor {
             return false;
         }
         let key = normalize_host(host);
-        !self.alpn_bypass.lock().unwrap().contains(&key)
+        let now = unix_now();
+        let mut skipped = self.alpn_bypass.lock().unwrap();
+        skipped.retain(|_, expires_at| *expires_at > now);
+        !skipped.contains_key(&key)
     }
     /// Listed by the user or a module; the user's exclusions win.
     fn listed(&self, host: &str) -> bool {
@@ -883,10 +902,17 @@ impl Interceptor {
     pub(crate) fn bypassed_module_hosts(&self) -> Vec<String> {
         self.filter_module_hosts(self.current_bypass_hosts())
     }
+    fn current_alpn_bypass_hosts(&self) -> Vec<String> {
+        let now = unix_now();
+        let mut skipped = self.alpn_bypass.lock().unwrap();
+        skipped.retain(|_, expires_at| *expires_at > now);
+        let mut out: Vec<String> = skipped.keys().cloned().collect();
+        out.sort();
+        out
+    }
     /// Hosts from rewrite modules that had HTTP/2-only connections passed through.
     pub(crate) fn skipped_alpn_module_hosts(&self) -> Vec<String> {
-        let hosts: Vec<String> = self.alpn_bypass.lock().unwrap().iter().cloned().collect();
-        self.filter_module_hosts(hosts)
+        self.filter_module_hosts(self.current_alpn_bypass_hosts())
     }
     fn record_bypass(&self, host: &str, reason: BypassReason, ttl_secs: i64, persisted: bool) {
         let key = normalize_host(host);
@@ -941,11 +967,17 @@ impl Interceptor {
         if key.is_empty() {
             return;
         }
+        let now = unix_now();
         let mut skipped = self.alpn_bypass.lock().unwrap();
-        if (skipped.len() < BYPASS || skipped.contains(&key)) && skipped.insert(key) {
+        skipped.retain(|_, expires_at| *expires_at > now);
+        let is_new = !skipped.contains_key(&key);
+        if is_new && skipped.len() < BYPASS {
+            skipped.insert(key, now + ALPN_BYPASS_TTL_SECS);
             tracing::warn!(
                 "[MITM] {host}: client ALPN does not offer http/1.1 (e.g. HTTP/2 or gRPC); passing connection through without decryption or rewrite"
             );
+        } else if !is_new {
+            skipped.insert(key, now + ALPN_BYPASS_TTL_SECS);
         }
     }
     pub(crate) fn clear_bypass(&self) {
@@ -973,8 +1005,7 @@ impl Interceptor {
             .or_else(|| X509::from_pem(settings.ca_cert.as_bytes()).ok());
         let ca = cert.map(|cert| describe(&cert));
         let bypassed = self.current_bypass_hosts();
-        let mut skipped_alpn: Vec<_> = self.alpn_bypass.lock().unwrap().iter().cloned().collect();
-        skipped_alpn.sort();
+        let skipped_alpn = self.current_alpn_bypass_hosts();
         json!({
             "enable": settings.enable,
             "hostname": settings.hostname,

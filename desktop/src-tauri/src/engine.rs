@@ -54,6 +54,14 @@ impl Controller {
     ) -> Result<serde_json::Value> {
         self.request_query(method, path, &[], body).await
     }
+    pub async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        path: &[&str],
+        body: Option<serde_json::Value>,
+    ) -> Result<String> {
+        self.request_query_raw(method, path, &[], body).await
+    }
     /// A GET whose response is a file rather than JSON.
     pub async fn download(&self, path: &[&str], query: &[(&str, String)]) -> Result<Vec<u8>> {
         let mut url = reqwest::Url::parse(&format!("http://{}/", self.address))?;
@@ -73,13 +81,13 @@ impl Controller {
         );
         Ok(response.bytes().await?.to_vec())
     }
-    pub async fn request_query(
+    pub async fn request_query_raw(
         &self,
         method: reqwest::Method,
         path: &[&str],
         query: &[(&str, String)],
         body: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<String> {
         let mut url = reqwest::Url::parse(&format!("http://{}/", self.address))?;
         url.path_segments_mut().unwrap().clear().extend(path);
         if !query.is_empty() {
@@ -94,16 +102,25 @@ impl Controller {
             .await
             .with_context(|| tr!("内核控制接口无法连接", "Cannot reach the core controller"))?;
         let status = response.status();
-        let value: serde_json::Value = response.json().await?;
-        ensure!(
-            status.is_success(),
-            "{}",
-            value["message"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| tr!("内核请求失败", "The core request failed"))
-        );
-        Ok(value)
+        let text = response.text().await?;
+        if !status.is_success() {
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| value["message"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| tr!("内核请求失败", "The core request failed"));
+            anyhow::bail!("{message}");
+        }
+        Ok(text)
+    }
+    pub async fn request_query(
+        &self,
+        method: reqwest::Method,
+        path: &[&str],
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let text = self.request_query_raw(method, path, query, body).await?;
+        Ok(serde_json::from_str(&text)?)
     }
 }
 /// Download missing routing resources into the profile's runtime directory as

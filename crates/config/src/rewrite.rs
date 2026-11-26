@@ -590,12 +590,39 @@ fn substitute_arguments<'a>(
     out.into()
 }
 
+fn strip_mitm_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            let after = &host[end + 1..];
+            if let Some(port) = after.strip_prefix(':')
+                && !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+            {
+                return &host[..=end];
+            }
+        }
+        return host;
+    }
+    if let Some((name, port)) = host.rsplit_once(':')
+        && !name.is_empty()
+        && !name.contains(':')
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+    {
+        return name;
+    }
+    host
+}
+
 fn push_mitm_host(item: &str, hosts: &mut Vec<String>) {
     let host = item
         .trim()
         .trim_start_matches("%APPEND%")
         .trim_start_matches("%INSERT%")
         .trim();
+    let host = strip_mitm_port(host);
     if !host.is_empty()
         && host.len() <= 253
         && !host.starts_with('%')
@@ -890,15 +917,34 @@ fn keyword_action(
                 rest.to_vec(),
             )?),
         ),
-        "response-body-replace-regex" | "request-body-replace-regex" | "response-body" => {
-            // Quantumult X: `response-body regex response-body replacement`.
+        "request-header" | "response-header" => {
+            // Quantumult X: `request-header regex request-header replacement`.
+            let (pattern_tokens, rep_tokens) =
+                if let Some(pos) = rest.iter().position(|t| t == word) {
+                    (&rest[..pos], &rest[pos + 1..])
+                } else if rest.len() >= 2 {
+                    (&rest[..1], &rest[1..])
+                } else {
+                    return Err(());
+                };
+            (
+                phase,
+                Action::Header(qx_header_op(pattern_tokens, rep_tokens)?),
+            )
+        }
+        "response-body-replace-regex"
+        | "request-body-replace-regex"
+        | "response-body"
+        | "request-body" => {
+            // Quantumult X: `response-body regex response-body replacement`
+            // and `request-body regex request-body replacement`.
             let rest: Vec<String> = rest
                 .iter()
-                .filter(|t| *t != "response-body")
+                .filter(|t| *t != "response-body" && *t != "request-body")
                 .cloned()
                 .collect();
             (
-                if word == "request-body-replace-regex" {
+                if word.starts_with("request-body") {
                     Phase::Request
                 } else {
                     Phase::Response
@@ -951,21 +997,30 @@ fn keyword_action(
         | "script-request-header"
         | "script-echo-response" => {
             let url = first()?;
+            let opts = options(&rest[1..]);
             let phase = if word.contains("response") && word != "script-echo-response" {
                 Phase::Response
             } else {
                 Phase::Request
             };
+            let number_option =
+                |key| option(&opts, key).and_then(|v: &str| v.trim().parse::<u64>().ok());
+            let name = option(&opts, "tag")
+                .filter(|t| !t.is_empty())
+                .map_or_else(|| script_name(&url, number), str::to_owned);
             (
                 phase,
                 Action::Script(Script {
-                    name: script_name(&url, number),
+                    name,
                     url: remote(url)?,
-                    requires_body: word.ends_with("-body"),
-                    binary: false,
-                    max_size: None,
-                    timeout: None,
-                    argument: ScriptArgument::default(),
+                    requires_body: word.ends_with("-body")
+                        || truthy(option(&opts, "requires-body")),
+                    binary: truthy(option(&opts, "binary-body-mode")),
+                    max_size: number_option("max-size").filter(|s| *s > 0),
+                    timeout: number_option("timeout").filter(|t| *t > 0),
+                    argument: ScriptArgument::Text(
+                        option(&opts, "argument").unwrap_or("").to_owned(),
+                    ),
                 }),
             )
         }
@@ -987,6 +1042,49 @@ fn pairs(rest: Vec<String>) -> Result<Vec<(String, String)>, ()> {
         .chunks(2)
         .map(|p| (p[0].clone(), p[1].clone()))
         .collect())
+}
+
+fn qx_strip_header_framing(text: &str) -> &str {
+    text.trim_start_matches(r"(\r\n)")
+        .trim_start_matches(r"\r\n")
+        .trim_start_matches('^')
+        .trim_end_matches(r"(\r\n)")
+        .trim_end_matches(r"\r\n")
+        .trim_end_matches('$')
+}
+
+fn qx_header_op(pattern_tokens: &[String], rep_tokens: &[String]) -> Result<HeaderOp, ()> {
+    if pattern_tokens.is_empty() {
+        return Err(());
+    }
+    let pattern_joined = pattern_tokens.join(" ");
+    let pattern = qx_strip_header_framing(&pattern_joined);
+    let (name, val_regex) = pattern.split_once(':').ok_or(())?;
+    let name = name.trim();
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return Err(());
+    }
+    let val_regex = val_regex.trim_start_matches(r"\s*").trim_start();
+    let val_regex = if val_regex.is_empty() {
+        ".*"
+    } else {
+        val_regex
+    };
+    let rep_joined = rep_tokens.join(" ");
+    let rep = qx_strip_header_framing(&rep_joined);
+    if rep.is_empty() {
+        return Ok(HeaderOp::Delete(name.to_owned()));
+    }
+    if let Some((rep_name, rep_val)) = rep.split_once(':')
+        && rep_name.trim().eq_ignore_ascii_case(name)
+    {
+        return Ok(HeaderOp::ReplaceRegex(
+            name.to_owned(),
+            val_regex.to_owned(),
+            rep_val.trim_start().to_owned(),
+        ));
+    }
+    Err(())
 }
 
 fn header_op(op: &str, mut args: Vec<String>) -> Result<HeaderOp, ()> {
@@ -1176,40 +1274,45 @@ fn build_script(
 /// Loon: `http-response pattern script-path=…, requires-body=true, tag=name`.
 /// Other script types (cron, generic, dns…) are skipped quietly.
 fn script_line(line: &str, number: usize) -> Result<Option<Rule>, ()> {
-    let lower = line.to_ascii_lowercase();
-    let (phase, pattern, options) =
-        if lower.starts_with("http-request") || lower.starts_with("http-response") {
-            let (head, rest) = line.split_once(char::is_whitespace).ok_or(())?;
-            let rest = rest.trim_start();
-            // The pattern runs to the first whitespace; options follow,
-            // separated by commas.
-            let (pattern, options) = rest.split_once(char::is_whitespace).ok_or(())?;
-            let options = split_outside_quotes(options, ',')
-                .into_iter()
-                .filter_map(|o| {
-                    o.split_once('=')
-                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v).to_owned()))
-                })
-                .collect::<Vec<_>>();
-            let phase = phase_prefix(head).ok_or(())?.0;
-            (phase, pattern.to_owned(), options)
-        } else {
-            let (name, rest) = line.split_once('=').ok_or(())?;
-            let mut options: Vec<(String, String)> = split_outside_quotes(rest, ',')
-                .into_iter()
-                .filter_map(|o| {
-                    o.split_once('=')
-                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v).to_owned()))
-                })
-                .collect();
-            let kind = option(&options, "type").unwrap_or("").to_ascii_lowercase();
-            let Some((phase, false)) = phase_prefix(&kind) else {
-                return Ok(None);
-            };
-            let pattern = option(&options, "pattern").ok_or(())?.to_owned();
-            options.push(("tag".into(), name.trim().to_owned()));
-            (phase, pattern, options)
+    let is_loon = line
+        .split_once(char::is_whitespace)
+        .is_some_and(|(head, rest)| {
+            (head.eq_ignore_ascii_case("http-request")
+                || head.eq_ignore_ascii_case("http-response"))
+                && !rest.trim_start().starts_with('=')
+        });
+    let (phase, pattern, options) = if is_loon {
+        let (head, rest) = line.split_once(char::is_whitespace).ok_or(())?;
+        let rest = rest.trim_start();
+        // The pattern runs to the first whitespace; options follow,
+        // separated by commas.
+        let (pattern, options) = rest.split_once(char::is_whitespace).ok_or(())?;
+        let options = split_outside_quotes(options, ',')
+            .into_iter()
+            .filter_map(|o| {
+                o.split_once('=')
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v).to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let phase = phase_prefix(head).ok_or(())?.0;
+        (phase, pattern.to_owned(), options)
+    } else {
+        let (name, rest) = line.split_once('=').ok_or(())?;
+        let mut options: Vec<(String, String)> = split_outside_quotes(rest, ',')
+            .into_iter()
+            .filter_map(|o| {
+                o.split_once('=')
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), unquote(v).to_owned()))
+            })
+            .collect();
+        let kind = option(&options, "type").unwrap_or("").to_ascii_lowercase();
+        let Some((phase, false)) = phase_prefix(&kind) else {
+            return Ok(None);
         };
+        let pattern = option(&options, "pattern").ok_or(())?.to_owned();
+        options.push(("tag".into(), name.trim().to_owned()));
+        (phase, pattern, options)
+    };
     let url = option(&options, "script-path").ok_or(())?.to_owned();
     build_script(phase, pattern, Vec::new(), url, &options, None, number)
 }
@@ -2713,5 +2816,62 @@ hostname = a.test, first.test.comhostname = second.test.com, -skip.test.com
         );
         assert_eq!(script.timeout, Some(10));
         assert!(script.requires_body && script.binary);
+    }
+
+    #[test]
+    fn parses_mitm_ports_qx_body_header_and_surge_http_prefixed_script() {
+        let module = parse_module(
+            r#"[Rewrite]
+^https://a\.test/req url request-body "a":1 request-body "a":0
+^https://a\.test/hdr url request-header (\r\n)User-Agent:.* request-header (\r\n)User-Agent: Custom
+^https://a\.test/del url response-header (\r\n)X-Ad:.* response-header
+^https://a\.test/js url script-response-body https://cdn.test/b.js binary-body-mode=true timeout=15 max-size=65536
+[Script]
+http-request-rewrite = type=http-response,pattern=^https://a\.test/s,requires-body=1,script-path=https://cdn.test/s.js
+[MITM]
+hostname = %APPEND% api.test:443, *.img.test:8443, zero.test:0, [2001:db8::1]:443, 2001:db8::2
+"#,
+        );
+        assert!(module.skipped.is_empty(), "{:?}", module.skipped);
+        assert_eq!(
+            module.hostnames,
+            [
+                "api.test",
+                "*.img.test",
+                "zero.test",
+                "[2001:db8::1]",
+                "2001:db8::2"
+            ]
+        );
+        assert_eq!(module.rules[0].phase, Phase::Request);
+        assert_eq!(
+            module.rules[0].action,
+            Action::BodyReplace(vec![("\"a\":1".into(), "\"a\":0".into())])
+        );
+        assert_eq!(module.rules[1].phase, Phase::Request);
+        assert_eq!(
+            module.rules[1].action,
+            Action::Header(HeaderOp::ReplaceRegex(
+                "User-Agent".into(),
+                ".*".into(),
+                "Custom".into()
+            ))
+        );
+        assert_eq!(module.rules[2].phase, Phase::Response);
+        assert_eq!(
+            module.rules[2].action,
+            Action::Header(HeaderOp::Delete("X-Ad".into()))
+        );
+        let Action::Script(qx_script) = &module.rules[3].action else {
+            panic!()
+        };
+        assert!(qx_script.binary && qx_script.requires_body);
+        assert_eq!(qx_script.timeout, Some(15));
+        assert_eq!(qx_script.max_size, Some(65536));
+        assert_eq!(module.rules[4].phase, Phase::Response);
+        let Action::Script(surge_script) = &module.rules[4].action else {
+            panic!()
+        };
+        assert_eq!(surge_script.name, "http-request-rewrite");
     }
 }

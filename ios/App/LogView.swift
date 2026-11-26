@@ -31,35 +31,54 @@ struct LogView: View {
     @State private var level = Level.all
     @State private var query = ""
 
-    private var visible: [LogEntry] {
-        entries.reversed().filter { entry in
-            level.includes(entry.level)
+    private static let renderLimit = 500
+
+    private var visibleResult: (rows: [LogEntry], total: Int) {
+        var rows: [LogEntry] = []
+        rows.reserveCapacity(Self.renderLimit)
+        var total = 0
+        for entry in entries.reversed() {
+            guard level.includes(entry.level)
                 && (query.isEmpty || entry.message.localizedCaseInsensitiveContains(query)
-                    || entry.source.localizedCaseInsensitiveContains(query))
+                    || entry.source.localizedCaseInsensitiveContains(query)) else {
+                continue
+            }
+            total += 1
+            if rows.count < Self.renderLimit {
+                rows.append(entry)
+            }
         }
+        return (rows, total)
     }
 
     var body: some View {
-        let visible = self.visible
+        let result = self.visibleResult
         NavigationStack {
-            List(visible) { entry in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text(entry.date.dropFirst(11)).monospacedDigit()
-                        Text(entry.source)
-                        Spacer()
-                        Text(entry.level.uppercased()).foregroundStyle(color(entry.level))
+            List {
+                ForEach(result.rows) { entry in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text(entry.date.dropFirst(11)).monospacedDigit()
+                            Text(entry.source)
+                            Spacer()
+                            Text(entry.level.uppercased()).foregroundStyle(color(entry.level))
+                        }
+                        .font(.caption2).foregroundStyle(.secondary)
+                        Text(entry.message)
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
                     }
-                    .font(.caption2).foregroundStyle(.secondary)
-                    Text(entry.message)
-                        .font(.system(.footnote, design: .monospaced))
-                        .textSelection(.enabled)
+                    .padding(.vertical, 2)
                 }
-                .padding(.vertical, 2)
+                if result.total > Self.renderLimit {
+                    Text(L("显示最近 500 条，共 {count} 条", ["count": result.total]))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .listStyle(.plain)
             .overlay {
-                if visible.isEmpty {
+                if result.rows.isEmpty {
                     ContentUnavailableView(entries.isEmpty ? L("暂无日志") : L("无匹配日志"),
                                            systemImage: "doc.text.magnifyingglass")
                 }

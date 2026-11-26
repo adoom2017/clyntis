@@ -733,6 +733,11 @@ pub(crate) struct State {
     created: Instant,
     /// Milliseconds after `created` when bytes last moved either way.
     active: AtomicU64,
+    /// Chunk counter to avoid calling `Instant::now()` on every chunk.
+    chunks: AtomicU32,
+    /// `total_bytes()` at the last `touch()`, so `idle_expired` only refreshes
+    /// `active` for bytes that arrived after the last `touch()`.
+    touched_bytes: AtomicU64,
     /// One side of a TCP relay reached EOF; `ended` wakes [`idle_expired`].
     half_closed: AtomicBool,
     ended: Notify,
@@ -761,6 +766,17 @@ impl State {
             .elapsed()
             .saturating_sub(Duration::from_millis(self.active.load(Ordering::Relaxed)))
     }
+    fn total_bytes(&self) -> u64 {
+        self.upload
+            .load(Ordering::Relaxed)
+            .saturating_add(self.download.load(Ordering::Relaxed))
+    }
+    fn touch(&self) {
+        self.touched_bytes
+            .store(self.total_bytes(), Ordering::Relaxed);
+        self.active
+            .store(self.created.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
     fn mark_eof(&self) {
         if !self.half_closed.swap(true, Ordering::Relaxed) {
             self.ended.notify_one();
@@ -782,6 +798,7 @@ impl State {
 pub(crate) struct Tracker {
     core: Arc<Core>,
     pub(crate) state: Arc<State>,
+    pending: AtomicBool,
 }
 impl Tracker {
     pub(crate) fn new(
@@ -813,6 +830,8 @@ impl Tracker {
             started_unix,
             created: Instant::now(),
             active: AtomicU64::new(0),
+            chunks: AtomicU32::new(0),
+            touched_bytes: AtomicU64::new(0),
             half_closed: AtomicBool::new(false),
             ended: Notify::new(),
             reason: Mutex::new(None),
@@ -820,10 +839,17 @@ impl Tracker {
             log: core.requests.clone(),
         });
         core.traffic.lock().unwrap().insert_active(state.clone())?;
-        Ok(Self { core, state })
+        Ok(Self {
+            core,
+            state,
+            pending: AtomicBool::new(true),
+        })
     }
     pub(crate) fn cancel(&self) -> tokio_util::sync::CancellationToken {
         self.state.info.cancel.clone()
+    }
+    fn mark_pending(&self) {
+        self.pending.store(true, Ordering::Relaxed);
     }
     fn record(&self, upload: bool, n: usize) {
         if n == 0 {
@@ -836,10 +862,11 @@ impl Tracker {
         };
         local.fetch_add(n as u64, Ordering::Relaxed);
         total.fetch_add(n as u64, Ordering::Relaxed);
-        self.state.active.store(
-            self.state.created.elapsed().as_millis() as u64,
-            Ordering::Relaxed,
-        );
+        if self.pending.swap(false, Ordering::Relaxed)
+            || self.state.chunks.fetch_add(1, Ordering::Relaxed) & 63 == 0
+        {
+            self.state.touch();
+        }
     }
 }
 impl Drop for Tracker {
@@ -866,7 +893,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Stream<S> {
         let room = buf.remaining() > 0;
         let result = Pin::new(&mut this.inner).poll_read(cx, buf);
         let n = buf.filled().len() - before;
-        this.tracker.record(false, n);
+        if result.is_pending() {
+            this.tracker.mark_pending();
+        } else {
+            this.tracker.record(false, n);
+        }
         if room && n == 0 && matches!(result, Poll::Ready(Ok(()))) {
             this.tracker.state.mark_eof();
         }
@@ -931,6 +962,10 @@ pub(crate) async fn idle_expired(state: &State, limits: RelayLimits) -> &'static
         };
         let quiet = state.quiet();
         if quiet >= limit {
+            if state.total_bytes() != state.touched_bytes.load(Ordering::Relaxed) {
+                state.touch();
+                continue;
+            }
             return reason;
         }
         tokio::select! {
@@ -947,8 +982,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Stream<S> {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(cx, bytes);
-        if let Poll::Ready(Ok(n)) = result {
-            this.tracker.record(true, n);
+        match &result {
+            Poll::Pending => this.tracker.mark_pending(),
+            Poll::Ready(Ok(n)) => this.tracker.record(true, *n),
+            Poll::Ready(Err(_)) => {}
         }
         result
     }
@@ -1020,6 +1057,8 @@ mod tests {
             started_unix,
             created: Instant::now(),
             active: AtomicU64::new(0),
+            chunks: AtomicU32::new(0),
+            touched_bytes: AtomicU64::new(0),
             half_closed: AtomicBool::new(false),
             ended: Notify::new(),
             reason: Mutex::new(None),

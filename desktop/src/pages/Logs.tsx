@@ -6,6 +6,8 @@ import { locale, t } from "../i18n";
 import { type Log } from "../types";
 import { type Perform } from "../components/common";
 
+const RENDER_LIMIT = 500;
+
 /** Quiet the parts of a log line the eye skips (network tags, local
  * addresses, arrows) so destinations and rules stand out. */
 const quietLogPart =
@@ -139,7 +141,7 @@ export function LogPage({
       </div>
       <div className="panel logs-panel" role="log" aria-live="off">
         {visible.length ? (
-          visible.map((log, i) => (
+          visible.slice(0, RENDER_LIMIT).map((log, i) => (
             <LogRow
               key={log.id ?? `${log.time}-${visible.length - i}`}
               log={log}
@@ -150,7 +152,9 @@ export function LogPage({
         )}
       </div>
       <p className="small muted table-note">
-        {t("保留最近 2000 条，URL、UUID 和凭据已脱敏。")}
+        {visible.length > RENDER_LIMIT
+          ? `${t("显示最近 500 条，共 {count} 条", { count: visible.length })} · ${t("保留最近 2000 条，URL、UUID 和凭据已脱敏。")}`
+          : t("保留最近 2000 条，URL、UUID 和凭据已脱敏。")}
       </p>
     </>
   );

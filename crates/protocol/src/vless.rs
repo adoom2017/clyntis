@@ -343,9 +343,19 @@ impl Datagram for UdpSession {
         ensure!(writer.1, "VLESS UDP writer interrupted or closed");
         writer.1 = false;
         let w = &mut writer.0;
-        w.write_u16(bytes.len() as u16).await?;
-        w.write_all(bytes).await?;
-        w.flush().await?;
+        let len_bytes = (bytes.len() as u16).to_be_bytes();
+        let total = 2 + bytes.len();
+        if total <= 2048 {
+            let mut buf = [0u8; 2048];
+            buf[..2].copy_from_slice(&len_bytes);
+            buf[2..total].copy_from_slice(bytes);
+            w.write_all(&buf[..total]).await?;
+        } else {
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(&len_bytes);
+            buf.extend_from_slice(bytes);
+            w.write_all(&buf).await?;
+        }
         writer.1 = true;
         Ok(())
     }

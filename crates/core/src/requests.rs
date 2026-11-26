@@ -219,6 +219,7 @@ pub struct Requests {
     log: Mutex<Log>,
     limits: Limits,
     capture_budget: Option<Arc<Semaphore>>,
+    rewrite_budget: Option<Arc<Semaphore>>,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -233,6 +234,7 @@ impl Requests {
             log: Mutex::default(),
             limits: if hosted { HOSTED } else { DESKTOP },
             capture_budget: hosted.then(|| Arc::new(Semaphore::new(HOSTED_CAPTURE_BYTES))),
+            rewrite_budget: hosted.then(|| Arc::new(Semaphore::new(HOSTED_CAPTURE_BYTES))),
         }
     }
     pub(crate) fn body_cap(&self, content_type: Option<&str>) -> usize {
@@ -255,15 +257,15 @@ impl Requests {
             HOSTED_CAPTURE_BYTES.saturating_sub(budget.available_permits())
         })
     }
-    /// Reserves `bytes` from the hosted body-memory budget shared with
-    /// captured request/response log bodies. Returns `Ok(None)` when
+    /// Reserves `bytes` from the hosted rewrite body-memory budget, independent
+    /// of captured request/response log bodies. Returns `Ok(None)` when
     /// unbudgeted (desktop) or `bytes == 0`, `Ok(Some(permit))` on success,
-    /// or `Err(())` when the hosted budget cannot cover `bytes`.
+    /// or `Err(())` when the hosted rewrite budget cannot cover `bytes`.
     pub(crate) fn reserve_body_budget(
         &self,
         bytes: usize,
     ) -> Result<Option<OwnedSemaphorePermit>, ()> {
-        let Some(budget) = &self.capture_budget else {
+        let Some(budget) = &self.rewrite_budget else {
             return Ok(None);
         };
         if bytes == 0 {
@@ -1342,7 +1344,9 @@ fn decode_with(encoding: &str, bytes: &[u8], cap: u64) -> Option<Vec<u8>> {
             "zstd" => Box::new(zstd::stream::read::Decoder::new(data.as_ref()).ok()?),
             _ => return None,
         };
-        let _ = reader.take(cap).read_to_end(&mut out);
+        if reader.take(cap).read_to_end(&mut out).is_err() {
+            return None;
+        }
         if out.is_empty() && !data.is_empty() {
             return None;
         }
@@ -1390,6 +1394,7 @@ mod tests {
                 decoded_cap: DECODED_CAP,
             },
             capture_budget: None,
+            rewrite_budget: None,
         };
         for n in 0..5 {
             requests.push(summary(&format!("{n}.test")), None);
@@ -1569,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_body_budget_shares_hosted_budget_and_restores_on_drop() {
+    fn reserve_body_budget_is_independent_of_capture_budget() {
         let desktop = Requests::new(false);
         assert_eq!(desktop.captured_bytes(), 0);
         assert!(desktop.reserve_body_budget(0).unwrap().is_none());
@@ -1583,42 +1588,40 @@ mod tests {
         assert_eq!(hosted.captured_bytes(), 0);
 
         let mut captured = Body::default();
-        let captured_chunk = vec![b'a'; 1024];
+        let captured_chunk = vec![b'a'; HOSTED_CAPTURE_BYTES];
         hosted.capture(&mut captured, &captured_chunk, captured_chunk.len());
-        assert_eq!(captured.bytes.len(), 1024);
-        assert_eq!(hosted.captured_bytes(), 1024);
-
-        let remaining = HOSTED_CAPTURE_BYTES - 1024;
-        assert!(hosted.reserve_body_budget(remaining + 1).is_err());
-        assert!(hosted.reserve_body_budget(usize::MAX).is_err());
-        assert_eq!(hosted.captured_bytes(), 1024);
-
-        let reserved = hosted
-            .reserve_body_budget(remaining)
-            .expect("exact remaining budget should succeed")
-            .expect("nonzero hosted reservation should hold a permit");
+        assert_eq!(captured.bytes.len(), HOSTED_CAPTURE_BYTES);
         assert_eq!(hosted.captured_bytes(), HOSTED_CAPTURE_BYTES);
+
+        // Full capture budget must not block rewrite body reservation.
+        let reserved = hosted
+            .reserve_body_budget(HOSTED_CAPTURE_BYTES)
+            .expect("rewrite budget should be independent of capture budget")
+            .expect("nonzero hosted reservation should hold a permit");
         assert!(hosted.reserve_body_budget(1).is_err());
         assert!(hosted.reserve_body_budget(0).unwrap().is_none());
 
-        let mut starved = Body::default();
-        hosted.capture(&mut starved, b"blocked", 64);
-        assert!(starved.bytes.is_empty());
-        assert_eq!(starved.size, 7);
-
         drop(reserved);
-        assert_eq!(hosted.captured_bytes(), 1024);
-
-        drop(captured);
-        assert_eq!(hosted.captured_bytes(), 0);
-
         let full = hosted
             .reserve_body_budget(HOSTED_CAPTURE_BYTES)
-            .expect("full budget should be restored after drop")
+            .expect("full rewrite budget should be restored after drop")
             .expect("full hosted reservation should hold a permit");
-        assert_eq!(hosted.captured_bytes(), HOSTED_CAPTURE_BYTES);
         drop(full);
+        drop(captured);
         assert_eq!(hosted.captured_bytes(), 0);
+    }
+
+    #[test]
+    fn decode_limited_rejects_truncated_gzip() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hello world from clyntis").unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert_eq!(
+            decode_limited("gzip", &compressed, 1024).as_deref(),
+            Some(b"hello world from clyntis".as_slice())
+        );
+        let truncated = &compressed[..compressed.len() - 4];
+        assert_eq!(decode_limited("gzip", truncated, 1024), None);
     }
 
     #[allow(clippy::too_many_arguments)]

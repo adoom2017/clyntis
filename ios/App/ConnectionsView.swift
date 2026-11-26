@@ -103,6 +103,7 @@ struct TrafficDetails: Decodable, Equatable {
 /// Open connections, like the desktop's connection page.
 struct ConnectionsView: View {
     @Bindable var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
     @State private var query = ""
     @State private var confirmCloseAll = false
 
@@ -152,6 +153,14 @@ struct ConnectionsView: View {
         }
         .confirmationDialog(L("关闭全部 {count} 个连接？", ["count": model.connections.count]), isPresented: $confirmCloseAll, titleVisibility: .visible) {
             Button(L("全部关闭"), role: .destructive) { Task { await model.closeConnection(nil) } }
+        }
+        .refreshable { await model.refreshSnapshot() }
+        .task(id: scenePhase == .active && model.connected) {
+            guard scenePhase == .active, model.connected else { return }
+            while !Task.isCancelled {
+                await model.refreshSnapshot()
+                do { try await Task.sleep(for: .seconds(2)) } catch { break }
+            }
         }
     }
 

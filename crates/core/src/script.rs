@@ -431,6 +431,10 @@ mod imp {
         job: &mut Job,
         state: &Rc<RefCell<State>>,
     ) -> Result<()> {
+        let original_body = match job.phase {
+            Phase::Request => job.request_body.clone(),
+            Phase::Response => job.response.as_ref().and_then(|r| r.body.clone()),
+        };
         let globals = ctx.globals();
         let native = Object::new(ctx.clone())?;
         {
@@ -440,7 +444,8 @@ mod imp {
                 Function::new(ctx.clone(), move |value: Value| {
                     let mut state = state.borrow_mut();
                     if state.done.is_none() {
-                        state.done = Some(outcome(&value));
+                        state.done =
+                            Some(outcome(&value, original_body.as_deref().map(Vec::as_slice)));
                     }
                 })?,
             )?;
@@ -648,12 +653,32 @@ mod imp {
         code.parse().ok().filter(|s| (100..=599).contains(s))
     }
 
-    fn body_field(object: &Object<'_>) -> Option<Vec<u8>> {
-        let bytes: Value = object.get("bodyBytes").ok()?;
-        bytes_of(&bytes).or_else(|| bytes_of(&object.get::<_, Value>("body").ok()?))
+    fn body_field(object: &Object<'_>, original: Option<&[u8]>) -> Option<Vec<u8>> {
+        let bytes_val = object
+            .get::<_, Value>("bodyBytes")
+            .ok()
+            .and_then(|v| bytes_of(&v));
+        let body_raw = object.get::<_, Value>("body").ok();
+        let body_is_string = body_raw.as_ref().is_some_and(|v| v.is_string());
+        let body_val = body_raw.as_ref().and_then(bytes_of);
+        match (bytes_val, body_val) {
+            (Some(bb), Some(b)) => {
+                if let Some(orig) = original {
+                    if bb.as_slice() == orig && b.as_slice() != orig {
+                        return Some(b);
+                    }
+                } else if body_is_string {
+                    return Some(b);
+                }
+                Some(bb)
+            }
+            (Some(bb), None) => Some(bb),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
 
-    fn outcome(value: &Value<'_>) -> Outcome {
+    fn outcome(value: &Value<'_>, original_body: Option<&[u8]>) -> Outcome {
         let Some(object) = value.as_object() else {
             return Outcome::default();
         };
@@ -667,7 +692,7 @@ mod imp {
             url: get("url").and_then(|v| v.as_string()?.to_string().ok()),
             status: get("status").and_then(|v| status_of(&v)),
             headers: get("headers").map(|v| header_list(&v)),
-            body: body_field(object),
+            body: body_field(object, original_body),
             abort: get("abort").and_then(|v| v.as_bool()).unwrap_or(false),
             response: None,
         };
@@ -683,7 +708,7 @@ mod imp {
                     .get::<_, Value>("headers")
                     .map(|v| header_list(&v))
                     .unwrap_or_default(),
-                body: body_field(&response).unwrap_or_default(),
+                body: body_field(&response, original_body).unwrap_or_default(),
                 file: None,
             });
         }
@@ -1056,6 +1081,44 @@ response if ${url} ~= /^https:\/\/a\.test\/x$/ then script("https://cdn.test/obj
             .await
             .unwrap();
         assert_eq!(outcome.body.as_deref(), Some(&b"persisted-value"[..]));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn binary_body_mode_respects_modified_response_body() {
+        let directory = std::env::temp_dir().join("clyntis-script-binary-body-edit");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = clyntis_config::Config::parse(b"rules:\n- MATCH,DIRECT\n").unwrap();
+        config.directory = directory.clone();
+        let core = crate::Core::new(config, Arc::new(clyntis_platform::DefaultHooks)).unwrap();
+
+        let path = directory.join("edit_body.js");
+        std::fs::write(
+            &path,
+            r#"$response.body = "rewritten-text"; $done($response);"#,
+        )
+        .unwrap();
+        let job = Job {
+            name: "edit_body".into(),
+            phase: Phase::Response,
+            url: "https://example.test/api".into(),
+            method: "GET".into(),
+            request_headers: vec![],
+            request_body: None,
+            response: Some(ResponseInput {
+                status: 200,
+                headers: vec![],
+                body: Some(Arc::new(b"original-bytes".to_vec())),
+            }),
+            path,
+            binary: true,
+            timeout: DEFAULT_TIMEOUT,
+            argument: clyntis_config::rewrite::ScriptArgument::default(),
+        };
+        let outcome = run(&core, job).await.unwrap();
+        assert_eq!(outcome.body.as_deref(), Some(&b"rewritten-text"[..]));
 
         let _ = std::fs::remove_dir_all(&directory);
     }

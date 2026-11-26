@@ -28,6 +28,8 @@ final class AppModel {
     var connections: [ConnectionInfo] = []
     /// Ad blocking state and counters from the snapshot.
     var adblock: AdblockStatus?
+    /// Runtime allowlist when adblock is enabled via profile YAML rather than overrides.
+    var runtimeAdblockAllow: [String] = []
     /// The running core's decryption status from the snapshot.
     var mitm: MitmStatus?
     var rewrite: RewriteStatus?
@@ -106,7 +108,7 @@ final class AppModel {
                         if !self.active {
                             self.upload = 0; self.download = 0; self.connectionCount = 0; self.groups = []
                             self.proxies = []; self.nodeStatus = [:]; self.connections = []
-                            self.adblock = nil; self.currentNetworks = nil; self.mitm = nil; self.rewrite = nil
+                            self.adblock = nil; self.runtimeAdblockAllow = []; self.currentNetworks = nil; self.mitm = nil; self.rewrite = nil
                         }
                     }
                 }
@@ -438,7 +440,7 @@ final class AppModel {
             return true
         }
         if previous?.allow != value?.allow, connected {
-            try applySnapshot(await send(TunnelMessage(command: "adblock-allow", allow: value?.allow ?? [])))
+            try await applySnapshot(await send(TunnelMessage(command: "adblock-allow", allow: value?.allow ?? [])))
         }
         return false
     }
@@ -459,14 +461,22 @@ final class AppModel {
     }
 
     /// Adds `domain` to the allowlist (from the statistics), live.
-    /// Adds `domain` to the app's allowlist and applies it to the running core.
+    /// Updates `overrides.adblock` when configured via overrides, or `runtimeAdblockAllow`
+    /// when adblock is enabled by the profile YAML so YAML lists are not clobbered.
     func allowAdblock(_ domain: String) async throws {
-        guard var settings = overrides.adblock else {
-            throw ClientError.message(L("去广告由配置文件开启，请在配置的 adblock.allow 中放行，或在本页开启去广告后再放行。"))
+        let domain = domain.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !domain.isEmpty else { return }
+        if var settings = overrides.adblock {
+            guard !settings.allow.contains(domain) else { return }
+            settings.allow.append(domain)
+            _ = try await saveAdblock(settings)
+            return
         }
-        guard !settings.allow.contains(domain) else { return }
-        settings.allow.append(domain)
-        _ = try await saveAdblock(settings)
+        guard !runtimeAdblockAllow.contains(domain) else { return }
+        runtimeAdblockAllow.append(domain)
+        if connected {
+            try await applySnapshot(await send(TunnelMessage(command: "adblock-allow", allow: runtimeAdblockAllow)))
+        }
     }
 
     /// Saves the rewrite modules; they apply on the next connection.
@@ -488,7 +498,7 @@ final class AppModel {
         next.mitm = value
         try saveOverrides(next)
         if connected {
-            try applySnapshot(await send(TunnelMessage(command: "mitm", mitm: value)))
+            try await applySnapshot(await send(TunnelMessage(command: "mitm", mitm: value)))
         }
     }
 
@@ -496,32 +506,24 @@ final class AppModel {
     func generateAuthority() async throws -> MitmAuthority {
         let authority = try await Task.detached { try MitmAuthority.generate() }.value
         if connected, let settings = overrides.mitm {
-            try applySnapshot(await send(TunnelMessage(command: "mitm", mitm: settings)))
+            try await applySnapshot(await send(TunnelMessage(command: "mitm", mitm: settings)))
         }
         return authority
     }
 
     func clearMitmBypass() async throws {
-        try applySnapshot(await send(TunnelMessage(command: "mitm-bypass-clear")))
+        try await applySnapshot(await send(TunnelMessage(command: "mitm-bypass-clear")))
     }
 
     /// Request log entries after `after` (see RequestsView).
     func fetchRequests(after: UInt64) async throws -> RequestPage {
         let data = try await send(TunnelMessage(command: "requests", after: after))
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let error = object["error"] as? String {
-            throw ClientError.message(error)
-        }
-        return try JSONDecoder().decode(RequestPage.self, from: data)
+        return try await Self.decodeResponse(RequestPage.self, from: data)
     }
 
     func requestDetail(_ id: UInt64) async throws -> RequestDetail {
         let data = try await send(TunnelMessage(command: "request-detail", request: id))
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let error = object["error"] as? String {
-            throw ClientError.message(error)
-        }
-        return try JSONDecoder().decode(RequestDetail.self, from: data)
+        return try await Self.decodeResponse(RequestDetail.self, from: data)
     }
 
     /// The tunnel's request log as a HAR or CSV file.
@@ -537,7 +539,7 @@ final class AppModel {
     }
 
     func clearRequests() async throws {
-        try applySnapshot(await send(TunnelMessage(command: "clear-requests")))
+        try await applySnapshot(await send(TunnelMessage(command: "clear-requests")))
     }
 
     /// Adds a REJECT rule for `host` ahead of the others; it applies on the
@@ -635,9 +637,32 @@ final class AppModel {
         defer { requestInFlight = false }
         do {
             let data = try await send(TunnelMessage(command: "snapshot"))
-            try applySnapshot(data)
+            try await applySnapshot(data)
         } catch {
             Diagnostics.app.error("snapshot: \(Diagnostics.describe(error))")
+            if connected { self.error = error.localizedDescription }
+        }
+    }
+
+    func refreshStatus() async {
+        guard connected, !requestInFlight else { return }
+        requestInFlight = true
+        defer { requestInFlight = false }
+        do {
+            let data = try await send(TunnelMessage(command: "status"))
+            let status: CoreStatus = try await Task.detached(priority: .userInitiated) {
+                try JSONDecoder().decode(CoreStatus.self, from: data)
+            }.value
+            if let error = status.error { throw ClientError.message(error) }
+            if status.stopped == true { throw ClientError.message(L("内核已停止，请重新连接。")) }
+            let newUpload = status.upload ?? 0
+            if upload != newUpload { upload = newUpload }
+            let newDownload = status.download ?? 0
+            if download != newDownload { download = newDownload }
+            let newCount = status.connections ?? 0
+            if connectionCount != newCount { connectionCount = newCount }
+        } catch {
+            Diagnostics.app.error("status: \(Diagnostics.describe(error))")
             if connected { self.error = error.localizedDescription }
         }
     }
@@ -646,7 +671,7 @@ final class AppModel {
         guard connected, !busy else { return }
         busy = true
         defer { busy = false }
-        do { try applySnapshot(await send(TunnelMessage(command: "mode", mode: value))) }
+        do { try await applySnapshot(await send(TunnelMessage(command: "mode", mode: value))) }
         catch { self.error = error.localizedDescription }
     }
 
@@ -654,14 +679,14 @@ final class AppModel {
         guard connected, !busy else { return }
         busy = true
         defer { busy = false }
-        do { try applySnapshot(await send(TunnelMessage(command: "select", group: group, node: node))) }
+        do { try await applySnapshot(await send(TunnelMessage(command: "select", group: group, node: node))) }
         catch { self.error = error.localizedDescription }
     }
 
     /// Closes one connection, or all of them when `id` is nil.
     func closeConnection(_ id: String?) async {
         guard connected else { return }
-        do { try applySnapshot(await send(TunnelMessage(command: "close", id: id))) }
+        do { try await applySnapshot(await send(TunnelMessage(command: "close", id: id))) }
         catch { self.error = error.localizedDescription }
     }
 
@@ -670,7 +695,7 @@ final class AppModel {
         guard connected, nodeStatus[node]?.probeable == true, !probing.contains(node) else { return }
         probing.insert(node)
         defer { probing.remove(node) }
-        do { try applySnapshot(await send(TunnelMessage(command: "probe", node: node), timeout: 15)) }
+        do { try await applySnapshot(await send(TunnelMessage(command: "probe", node: node), timeout: 15)) }
         catch { Diagnostics.app.warning("probe \(node): \(Diagnostics.describe(error))") }
     }
 
@@ -695,22 +720,14 @@ final class AppModel {
     func testRoute(_ target: String, network: String) async throws -> RouteTest {
         guard connected else { throw ClientError.message(L("VPN 未连接。")) }
         let data = try await send(TunnelMessage(command: "test-route", target: target, network: network), timeout: 15)
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let error = object["error"] as? String {
-            throw ClientError.message(error)
-        }
-        return try JSONDecoder().decode(RouteTest.self, from: data)
+        return try await Self.decodeResponse(RouteTest.self, from: data)
     }
 
     /// Online DNS leak test, or cached config review when `online` is false.
     func dnsLeak(online: Bool) async throws -> DnsLeakResult {
         guard connected else { throw ClientError.message(L("VPN 未连接。")) }
         let data = try await send(TunnelMessage(command: "dns-leak", online: online), timeout: online ? 45 : 5)
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let error = object["error"] as? String {
-            throw ClientError.message(error)
-        }
-        return try JSONDecoder().decode(DnsLeakResult.self, from: data)
+        return try await Self.decodeResponse(DnsLeakResult.self, from: data)
     }
 
     /// On-demand traffic breakdown by host and connection, filtered to `host`
@@ -718,11 +735,17 @@ final class AppModel {
     func fetchTrafficDetails(host: String? = nil) async throws -> TrafficDetails {
         guard connected else { throw ClientError.message(L("VPN 未连接。")) }
         let data = try await send(TunnelMessage(command: "traffic-details", host: host))
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let error = object["error"] as? String {
-            throw ClientError.message(error)
-        }
-        return try JSONDecoder().decode(TrafficDetails.self, from: data)
+        return try await Self.decodeResponse(TrafficDetails.self, from: data)
+    }
+
+    nonisolated private static func decodeResponse<T: Decodable & Sendable>(_ type: T.Type, from data: Data) async throws -> T {
+        try await Task.detached(priority: .userInitiated) {
+            if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let error = object["error"] as? String {
+                throw ClientError.message(error)
+            }
+            return try JSONDecoder().decode(T.self, from: data)
+        }.value
     }
 
     private func send(_ message: TunnelMessage, timeout: Double = 5) async throws -> Data {
@@ -744,7 +767,15 @@ final class AppModel {
         }
     }
 
-    private struct CoreSnapshot: Decodable {
+    private struct CoreStatus: Decodable, Sendable {
+        let error: String?
+        let stopped: Bool?
+        let connections: Int?
+        let upload: UInt64?
+        let download: UInt64?
+    }
+
+    private struct CoreSnapshot: Decodable, Sendable {
         struct Config: Decodable {
             struct Group: Decodable {
                 let name: String
@@ -804,23 +835,26 @@ final class AppModel {
         }
     }
 
-    private func applySnapshot(_ data: Data) throws {
-        let snapshot: CoreSnapshot
+    private func applySnapshot(_ data: Data) async throws {
+        let decoded: (snapshot: CoreSnapshot, sortedConnections: [ConnectionInfo])
         do {
-            snapshot = try JSONDecoder().decode(CoreSnapshot.self, from: data)
+            decoded = try await Task.detached(priority: .userInitiated) {
+                let snapshot = try JSONDecoder().decode(CoreSnapshot.self, from: data)
+                let sorted = ConnectionInfo.sorted(snapshot.connections ?? [])
+                return (snapshot, sorted)
+            }.value
         } catch {
             throw ClientError.message(L("无效的内核状态。"))
         }
+        let snapshot = decoded.snapshot
         if let error = snapshot.error { throw ClientError.message(error) }
         if snapshot.stopped == true { throw ClientError.message(L("内核已停止，请重新连接。")) }
         let newUpload = snapshot.upload ?? 0
         if upload != newUpload { upload = newUpload }
         let newDownload = snapshot.download ?? 0
         if download != newDownload { download = newDownload }
-        let decodedConnections = snapshot.connections ?? []
-        if connectionCount != decodedConnections.count { connectionCount = decodedConnections.count }
-        let sortedConnections = ConnectionInfo.sorted(decodedConnections)
-        if connections != sortedConnections { connections = sortedConnections }
+        if connectionCount != decoded.sortedConnections.count { connectionCount = decoded.sortedConnections.count }
+        if connections != decoded.sortedConnections { connections = decoded.sortedConnections }
         if adblock != snapshot.adblock { adblock = snapshot.adblock }
         if mitm != snapshot.mitm { mitm = snapshot.mitm }
         if rewrite != snapshot.rewrite { rewrite = snapshot.rewrite }

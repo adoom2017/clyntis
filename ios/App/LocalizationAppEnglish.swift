@@ -63,7 +63,6 @@ let appEnglishText: [String: String] = [
     "已拦截 {value} 次": "{value} blocked",
     "重新连接后生效": "Applies after a reconnect",
     "未开启": "Off",
-    "去广告由配置文件开启，请在配置的 adblock.allow 中放行，或在本页开启去广告后再放行。": "Ad blocking is turned on by the profile; allow it in the profile's adblock.allow, or turn on ad blocking on this page and allow it here.",
     "此配置不是从链接导入的。": "This profile was not imported from a link.",
     "VPN 会话不可用。": "The VPN session is unavailable.",
     "VPN 无响应。": "The VPN does not respond.",

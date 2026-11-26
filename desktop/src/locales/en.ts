@@ -465,7 +465,7 @@ export const en: Record<string, string> = {
   大小: "Size",
   耗时: "Duration",
   暂无请求: "No requests yet",
-  "显示最近 1000 条，共 {count} 条": "Showing the latest 1000 of {count}",
+  "显示最近 500 条，共 {count} 条": "Showing the latest 500 of {count}",
   "{count} 条记录": "{count} entries",
   失败: "Failed",
   "{count} 个请求": "{count} requests",
