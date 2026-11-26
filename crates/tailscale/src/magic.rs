@@ -47,6 +47,8 @@ const IDLE_TICK: Duration = Duration::from_secs(5);
 const DERP_RETRY: Duration = Duration::from_secs(5);
 const DERP_RETRY_MAX: Duration = Duration::from_secs(60);
 const MAX_ENDPOINTS: usize = 8;
+const PONG_RATE_WINDOW: Duration = Duration::from_secs(1);
+const MAX_PONGS_PER_WINDOW: u32 = 10;
 /// DERP-relayed pongs report this as the source (tailcfg.DerpMagicIP).
 const DERP_MAGIC_IP: Ipv4Addr = Ipv4Addr::new(127, 3, 3, 40);
 
@@ -111,6 +113,7 @@ struct PeerState {
     last_discovery: Option<Instant>,
     last_heartbeat: Option<Instant>,
     last_send: Option<Instant>,
+    pong_window: Option<(Instant, u32)>,
 }
 impl PeerState {
     fn trusted(&self, now: Instant) -> Option<SocketAddr> {
@@ -118,6 +121,35 @@ impl PeerState {
             .as_ref()
             .filter(|path| path.trusted_until > now)
             .map(|path| path.addr)
+    }
+
+    fn allow_pong(&mut self, now: Instant) -> bool {
+        match &mut self.pong_window {
+            Some((start, count)) if now.duration_since(*start) < PONG_RATE_WINDOW => {
+                if *count >= MAX_PONGS_PER_WINDOW {
+                    return false;
+                }
+                *count += 1;
+                true
+            }
+            slot => {
+                *slot = Some((now, 1));
+                true
+            }
+        }
+    }
+}
+
+fn is_valid_ping_target(ip: IpAddr, allow_loopback: bool) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && (allow_loopback || !v4.is_loopback())
+                && !v4.is_multicast()
+                && !v4.is_broadcast()
+                && !v4.is_link_local()
+        }
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -158,6 +190,7 @@ struct Router {
     paths: Paths,
     ticks: u32,
     buf: Vec<u8>,
+    allow_loopback: bool,
 }
 
 impl Router {
@@ -257,7 +290,10 @@ impl Router {
     }
 
     fn ping(&mut self, peer: &Peer, addr: SocketAddr) {
-        if self.udp.is_none() || addr.is_ipv6() || addr.ip().is_unspecified() {
+        if self.udp.is_none()
+            || addr.is_ipv6()
+            || !is_valid_ping_target(addr.ip(), self.allow_loopback)
+        {
             return;
         }
         let tx: [u8; 12] = rand::random();
@@ -330,7 +366,9 @@ impl Router {
                         SocketAddr::new(DERP_MAGIC_IP.into(), self.routes.borrow().home as u16)
                     }
                 };
-                self.send_disco(&peer, via, &Message::Pong { tx, src });
+                if self.states.entry(peer.key).or_default().allow_pong(now) {
+                    self.send_disco(&peer, via, &Message::Pong { tx, src });
+                }
                 if let Via::Udp(addr) = via {
                     self.by_addr.insert(addr, peer.key);
                     let state = self.states.entry(peer.key).or_default();
@@ -374,9 +412,13 @@ impl Router {
                 }
             }
             Message::CallMeMaybe(endpoints) => {
+                let allow_loopback = self.allow_loopback;
                 let state = self.states.entry(peer.key).or_default();
                 for addr in &endpoints {
-                    if !state.learned.contains(addr) {
+                    if !addr.is_ipv6()
+                        && is_valid_ping_target(addr.ip(), allow_loopback)
+                        && !state.learned.contains(addr)
+                    {
                         state.learned.push(*addr);
                     }
                 }
@@ -810,12 +852,34 @@ pub async fn run(
     dialer: Arc<dyn Dialer>,
     routes: watch::Receiver<Routes>,
     open: watch::Receiver<Vec<IpAddr>>,
+    from_stack: mpsc::Receiver<Vec<u8>>,
+    to_stack: mpsc::Sender<Vec<u8>>,
+    endpoints: watch::Sender<Endpoints>,
+    paths: Paths,
+    network: watch::Receiver<u64>,
+    stop: CancellationToken,
+) {
+    run_inner(
+        key, disco, dialer, routes, open, from_stack, to_stack, endpoints, paths, network, stop,
+        false,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner(
+    key: Private,
+    disco: Private,
+    dialer: Arc<dyn Dialer>,
+    routes: watch::Receiver<Routes>,
+    open: watch::Receiver<Vec<IpAddr>>,
     mut from_stack: mpsc::Receiver<Vec<u8>>,
     to_stack: mpsc::Sender<Vec<u8>>,
     endpoints: watch::Sender<Endpoints>,
     paths: Paths,
     mut network: watch::Receiver<u64>,
     stop: CancellationToken,
+    allow_loopback: bool,
 ) {
     let (derp_in, mut derp_rx) = mpsc::channel(1024);
     let (links, mut links_rx) = mpsc::channel(16);
@@ -848,6 +912,7 @@ pub async fn run(
         paths,
         ticks: 0,
         buf: vec![0; BUFFER],
+        allow_loopback,
     };
     router.publish();
     let mut routes = routes;
@@ -1009,7 +1074,7 @@ mod tests {
         let (to_stack, _from_router) = mpsc::channel(16);
         let (endpoints, _) = watch::channel(Vec::new());
         let stop = CancellationToken::new();
-        tokio::spawn(run(
+        tokio::spawn(run_inner(
             ours.clone(),
             our_disco.clone(),
             Arc::new(Loopback),
@@ -1021,6 +1086,7 @@ mod tests {
             Default::default(),
             watch::channel(0).1,
             stop.clone(),
+            true,
         ));
         let packet = ip_packet(b"direct");
         to_router.send(packet.clone()).await.unwrap();
@@ -1077,5 +1143,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filters_unsafe_ping_targets() {
+        assert!(!is_valid_ping_target(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false
+        ));
+        assert!(!is_valid_ping_target(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            false
+        ));
+        assert!(!is_valid_ping_target(
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            false
+        ));
+        assert!(!is_valid_ping_target(
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            false
+        ));
+        assert!(!is_valid_ping_target(
+            IpAddr::V4(Ipv4Addr::new(169, 254, 10, 20)),
+            false
+        ));
+        assert!(!is_valid_ping_target(
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            false
+        ));
+        assert!(is_valid_ping_target(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            false
+        ));
+    }
+
+    #[test]
+    fn rate_limits_pongs_per_peer() {
+        let mut state = PeerState::default();
+        let start = Instant::now();
+        for _ in 0..MAX_PONGS_PER_WINDOW {
+            assert!(state.allow_pong(start));
+        }
+        assert!(!state.allow_pong(start));
+        assert!(state.allow_pong(start + PONG_RATE_WINDOW));
     }
 }

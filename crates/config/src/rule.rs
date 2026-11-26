@@ -202,6 +202,37 @@ fn label_matches(pattern: &[u8], label: &[u8]) -> bool {
     pattern[p..].iter().all(|&c| c == b'*')
 }
 
+/// Precomputed label-suffix hashes for a lowercased, dot-trimmed host,
+/// amortized across multiple [`DomainSet`] lookups on a single route miss.
+#[derive(Clone, Copy, Debug)]
+pub struct HostMatchCtx<'a> {
+    pub host: &'a str,
+    suffix_hashes: [u64; 8],
+    label_count: usize,
+}
+impl<'a> HostMatchCtx<'a> {
+    pub fn new(host: &'a str) -> Self {
+        let mut suffix_hashes = [0u64; 8];
+        let mut label_count = 0usize;
+        let mut label = host;
+        loop {
+            if label_count < suffix_hashes.len() {
+                suffix_hashes[label_count] = domain_hash(label);
+            }
+            label_count += 1;
+            match label.split_once('.') {
+                Some((_, rest)) => label = rest,
+                None => break,
+            }
+        }
+        Self {
+            host,
+            suffix_hashes,
+            label_count,
+        }
+    }
+}
+
 /// Immutable set of domain conditions, built with [`DomainSetBuilder`].
 #[derive(Clone, Default)]
 pub struct DomainSet {
@@ -214,15 +245,36 @@ pub struct DomainSet {
 }
 impl DomainSet {
     pub fn matches(&self, host: &str) -> bool {
+        let labels = if !self.globs.anchored.is_empty() {
+            host.split('.').count()
+        } else {
+            0
+        };
+        self.matches_with_hashes(host, labels, |_, label| domain_hash(label))
+    }
+    pub fn matches_prehashed(&self, ctx: &HostMatchCtx<'_>) -> bool {
+        self.matches_with_hashes(ctx.host, ctx.label_count, |idx, label| {
+            ctx.suffix_hashes
+                .get(idx)
+                .copied()
+                .unwrap_or_else(|| domain_hash(label))
+        })
+    }
+    fn matches_with_hashes(
+        &self,
+        host: &str,
+        labels: usize,
+        mut hash_at: impl FnMut(usize, &str) -> u64,
+    ) -> bool {
         let lists = !(self.exact.is_empty() && self.suffix.is_empty() && self.subdomain.is_empty());
         let globs = !self.globs.anchored.is_empty();
         if lists || globs {
             // One hash per label serves every list and the glob index.
-            let labels = if globs { host.split('.').count() } else { 0 };
             let mut label = host;
-            let mut first = true;
+            let mut idx = 0;
             loop {
-                let hash = domain_hash(label);
+                let hash = hash_at(idx, label);
+                let first = idx == 0;
                 if lists
                     && ((first && self.exact.contains(hash))
                         || self.suffix.contains(hash)
@@ -238,7 +290,7 @@ impl DomainSet {
                     Some((_, rest)) => label = rest,
                     None => break,
                 }
-                first = false;
+                idx += 1;
             }
         }
         self.globs.loose_matches(host)
@@ -633,6 +685,29 @@ impl Matcher {
         network: &str,
         can_resolve: bool,
     ) -> Option<bool> {
+        self.evaluate_inner(host, None, ip, port, network, can_resolve)
+    }
+    /// Like [`Matcher::evaluate`], but reuses precomputed [`HostMatchCtx`]
+    /// label-suffix hashes for [`Matcher::Domains`].
+    pub fn evaluate_with_ctx(
+        &self,
+        ctx: &HostMatchCtx<'_>,
+        ip: Option<IpAddr>,
+        port: u16,
+        network: &str,
+        can_resolve: bool,
+    ) -> Option<bool> {
+        self.evaluate_inner(ctx.host, Some(ctx), ip, port, network, can_resolve)
+    }
+    fn evaluate_inner(
+        &self,
+        host: &str,
+        ctx: Option<&HostMatchCtx<'_>>,
+        ip: Option<IpAddr>,
+        port: u16,
+        network: &str,
+        can_resolve: bool,
+    ) -> Option<bool> {
         Some(match self {
             Self::Domain(d) => host == d,
             Self::Suffix(d) => host == d || host.strip_suffix(d).is_some_and(|p| p.ends_with('.')),
@@ -643,7 +718,10 @@ impl Matcher {
             Self::Wildcard(w) => wildcard_matches(w, host),
             Self::Keyword(k) => host.contains(k),
             Self::Regex(r) => r.is_match(host),
-            Self::Domains(s) => s.matches(host),
+            Self::Domains(s) => match ctx {
+                Some(ctx) => s.matches_prehashed(ctx),
+                None => s.matches(host),
+            },
             Self::Net(n) => match ip {
                 Some(ip) => n.contains(&ip),
                 None if can_resolve => return None,
@@ -664,13 +742,17 @@ impl Matcher {
             Self::Network(n) => n == network,
             Self::OnNetwork(n) => n.get(),
             Self::All => true,
-            Self::Not(m) => return m.evaluate(host, ip, port, network, can_resolve).map(|v| !v),
-            Self::NoResolve(m) => return m.evaluate(host, ip, port, network, false),
+            Self::Not(m) => {
+                return m
+                    .evaluate_inner(host, ctx, ip, port, network, can_resolve)
+                    .map(|v| !v);
+            }
+            Self::NoResolve(m) => return m.evaluate_inner(host, ctx, ip, port, network, false),
             Self::And(nodes) | Self::Or(nodes) => {
                 let and = matches!(self, Self::And(_));
                 let mut unknown = false;
                 for m in nodes.iter() {
-                    match m.evaluate(host, ip, port, network, can_resolve) {
+                    match m.evaluate_inner(host, ctx, ip, port, network, can_resolve) {
                         Some(v) if v != and => return Some(v),
                         None => unknown = true,
                         _ => {}
@@ -724,6 +806,17 @@ impl Rule {
         }
         self.matcher
             .evaluate(&trimmed.to_ascii_lowercase(), ip, port, network, false)
+            == Some(true)
+    }
+    pub fn matches_with_ctx(
+        &self,
+        ctx: &HostMatchCtx<'_>,
+        ip: Option<IpAddr>,
+        port: u16,
+        network: &str,
+    ) -> bool {
+        self.matcher
+            .evaluate_with_ctx(ctx, ip, port, network, false)
             == Some(true)
     }
 }
@@ -1296,5 +1389,97 @@ mod tests {
         b.exact(&long_host);
         let set = b.build();
         assert!(set.matches(&long_host.trim_end_matches('.').to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn domain_set_matches_prehashed_matches_identically_across_edge_cases() {
+        let mut b = DomainSetBuilder::default();
+        b.exact("localhost");
+        b.exact("exact.example.com");
+        b.exact("l1.l2.l3.l4.l5.l6.l7.l8.l9.l10");
+        b.suffix("sfx.test");
+        b.suffix("l8.l9.tail");
+        b.suffix("single-sfx");
+        b.subdomain("sub.test");
+        b.subdomain("l9.deep");
+        assert!(b.absorb(domain_pattern("*.glob.test").unwrap()).is_none());
+        assert!(
+            b.absorb(domain_pattern("a.*.c.d.e.f.g.h.i.j").unwrap())
+                .is_none()
+        );
+        assert!(b.absorb(domain_pattern("loose.*").unwrap()).is_none());
+        b.keyword("kwmatch");
+        b.regex("^re-[0-9]+\\.example\\.org$").unwrap();
+        let set = b.build();
+
+        let hosts = [
+            // Empty and single-label
+            "",
+            ".",
+            "localhost",
+            "single-sfx",
+            "sub.test",
+            "kwmatch",
+            "unknown-single",
+            // Trailing dots
+            "exact.example.com.",
+            "a.sfx.test.",
+            "localhost.",
+            "a.sub.test.",
+            "x.glob.test.",
+            "re-42.example.org.",
+            // Standard multi-label (<= 8 labels)
+            "exact.example.com",
+            "sfx.test",
+            "a.sfx.test",
+            "a.b.sub.test",
+            "x.glob.test",
+            "x.y.glob.test",
+            "loose.tld",
+            "has-kwmatch-inside.net",
+            "re-42.example.org",
+            "miss.example.com",
+            // > 8 labels (10+ labels)
+            "l1.l2.l3.l4.l5.l6.l7.l8.l9.l10",
+            "l1.l2.l3.l4.l5.l6.l7.l8.l9.tail",
+            "a.b.c.d.e.f.g.h.l9.deep",
+            "a.b.c.d.e.f.g.h.i.j",
+            "a.x.c.d.e.f.g.h.i.j",
+            "x.a.b.c.d.e.f.g.h.i.j",
+            "l1.l2.l3.l4.l5.l6.l7.l8.l9.miss",
+        ];
+
+        for host in hosts {
+            let ctx = HostMatchCtx::new(host);
+            assert_eq!(
+                set.matches_prehashed(&ctx),
+                set.matches(host),
+                "mismatch for host {host:?}"
+            );
+        }
+
+        // Verify Matcher::evaluate_with_ctx and Rule::matches_with_ctx agree with evaluate/matches.
+        let matcher =
+            Matcher::And(vec![Matcher::Domains(Arc::new(set)), Matcher::Port(443)].into());
+        let rule = Rule {
+            matcher: matcher.clone(),
+            target: "PROXY".into(),
+            no_resolve: false,
+        };
+        for host in hosts {
+            let ctx = HostMatchCtx::new(host);
+            assert_eq!(
+                matcher.evaluate_with_ctx(&ctx, None, 443, "tcp", false),
+                matcher.evaluate(host, None, 443, "tcp", false),
+                "matcher mismatch for {host:?}"
+            );
+            let trimmed = host.trim_end_matches('.');
+            let trimmed_ctx = HostMatchCtx::new(trimmed);
+            assert_eq!(
+                rule.matches_with_ctx(&trimmed_ctx, None, 443, "tcp"),
+                rule.matches(host, None, 443, "tcp"),
+                "rule mismatch for {host:?}"
+            );
+        }
     }
 }

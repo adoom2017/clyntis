@@ -125,6 +125,23 @@ pub enum CertificateCompression {
     Zstd,
 }
 
+const MAX_CERT_CHAIN_BYTES: u64 = 256 * 1024;
+
+fn decompress_bounded<R: std::io::Read, W: std::io::Write>(
+    reader: R,
+    output: &mut W,
+) -> std::io::Result<()> {
+    let mut limited = reader.take(MAX_CERT_CHAIN_BYTES + 1);
+    let written = std::io::copy(&mut limited, output)?;
+    if written > MAX_CERT_CHAIN_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed TLS certificate chain exceeds limit",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct ZlibCertificateDecompressor;
 impl CertificateCompressor for ZlibCertificateDecompressor {
@@ -132,9 +149,7 @@ impl CertificateCompressor for ZlibCertificateDecompressor {
     const CAN_COMPRESS: bool = false;
     const CAN_DECOMPRESS: bool = true;
     fn decompress<W: std::io::Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
-        let mut decoder = flate2::read::ZlibDecoder::new(input);
-        std::io::copy(&mut decoder, output)?;
-        Ok(())
+        decompress_bounded(flate2::read::ZlibDecoder::new(input), output)
     }
 }
 
@@ -145,9 +160,7 @@ impl CertificateCompressor for BrotliCertificateDecompressor {
     const CAN_COMPRESS: bool = false;
     const CAN_DECOMPRESS: bool = true;
     fn decompress<W: std::io::Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
-        let mut decoder = brotli::Decompressor::new(input, 4096);
-        std::io::copy(&mut decoder, output)?;
-        Ok(())
+        decompress_bounded(brotli::Decompressor::new(input, 4096), output)
     }
 }
 
@@ -162,9 +175,7 @@ impl CertificateCompressor for ZstdCertificateDecompressor {
     const CAN_COMPRESS: bool = false;
     const CAN_DECOMPRESS: bool = true;
     fn decompress<W: std::io::Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
-        let mut decoder = zstd::stream::read::Decoder::new(input)?;
-        std::io::copy(&mut decoder, output)?;
-        Ok(())
+        decompress_bounded(zstd::stream::read::Decoder::new(input)?, output)
     }
 }
 
@@ -676,6 +687,13 @@ fn configure_ssl(
     configure_ssl_with(config, clock, true)
 }
 
+fn normalize_server_name(name: &str) -> &str {
+    name.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .filter(|s| s.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or(name)
+}
+
 /// `check_name: false` verifies the chain without the server name.
 fn configure_ssl_with(
     config: &TlsConnectConfig,
@@ -684,8 +702,13 @@ fn configure_ssl_with(
 ) -> Result<(boring::ssl::Ssl, BrowserProfile)> {
     let (connector, profile, alpn, session_key) = connector(config, check_name)?;
     let mut configured = connector.configure()?;
-    configured.set_verify_hostname(check_name && config.verify_cert && config.reality.is_none());
-    let mut ssl = configured.into_ssl(&config.server_name)?;
+    let verify_name = check_name && config.verify_cert && config.reality.is_none();
+    configured.set_verify_hostname(verify_name);
+    let server_name = normalize_server_name(&config.server_name);
+    let mut ssl = configured.into_ssl(server_name)?;
+    if verify_name && let Ok(ip) = server_name.parse::<std::net::IpAddr>() {
+        ssl.verify_param_mut().set_ip(ip)?;
+    }
     if let Some(key) = session_key.as_ref() {
         ssl.set_ex_data(session_server_name_index(), key.server_name.clone());
         if let Some(session) = take_session(key) {
@@ -857,7 +880,11 @@ pub(crate) fn quic_ssl(
     let connector = build_connector(&profile, alpn, verify, false, None)?;
     let mut configured = connector.configure()?;
     configured.set_verify_hostname(verify);
+    let server_name = normalize_server_name(server_name);
     let mut ssl = configured.into_ssl(server_name)?;
+    if verify && let Ok(ip) = server_name.parse::<std::net::IpAddr>() {
+        ssl.verify_param_mut().set_ip(ip)?;
+    }
     ssl.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     ssl.set_max_proto_version(Some(SslVersion::TLS1_3))?;
     if let Some(now) = clock.unix_seconds() {
@@ -2080,5 +2107,54 @@ mod tests {
         let sid1 = run_reality_hello(&reality_config).await;
         let sid2 = run_reality_hello(&reality_config).await;
         assert_ne!(sid1, sid2);
+    }
+
+    #[test]
+    fn certificate_decompressor_rejects_oversized_payload() {
+        use std::io::Write as _;
+        let over = vec![0x41u8; MAX_CERT_CHAIN_BYTES as usize + 1];
+        let exact = vec![0x41u8; MAX_CERT_CHAIN_BYTES as usize];
+
+        let mut zlib_over =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        zlib_over.write_all(&over).unwrap();
+        let zlib_over = zlib_over.finish().unwrap();
+        let err = ZlibCertificateDecompressor
+            .decompress(&zlib_over, &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut zlib_exact =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        zlib_exact.write_all(&exact).unwrap();
+        let zlib_exact = zlib_exact.finish().unwrap();
+        let mut out = Vec::new();
+        ZlibCertificateDecompressor
+            .decompress(&zlib_exact, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), exact.len());
+
+        let mut brotli_over = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut brotli_over, 4096, 1, 20);
+            w.write_all(&over).unwrap();
+        }
+        let err = BrotliCertificateDecompressor
+            .decompress(&brotli_over, &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let zstd_over = zstd::stream::encode_all(over.as_slice(), 1).unwrap();
+        let err = ZstdCertificateDecompressor
+            .decompress(&zstd_over, &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn normalize_server_name_strips_ipv6_brackets() {
+        assert_eq!(normalize_server_name("[::1]"), "::1");
+        assert_eq!(normalize_server_name("1.2.3.4"), "1.2.3.4");
+        assert_eq!(normalize_server_name("example.com"), "example.com");
     }
 }

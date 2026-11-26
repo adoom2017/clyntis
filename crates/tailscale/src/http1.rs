@@ -2,7 +2,52 @@
 //! either read to the end or upgraded to another protocol.
 use anyhow::{Context, Result, bail, ensure};
 use clyntis_protocol::BoxStream;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const IO_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn has_crlf_or_nul(s: &str) -> bool {
+    s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
+fn validate_request_head(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<()> {
+    ensure!(
+        !method.is_empty()
+            && !has_crlf_or_nul(method)
+            && !method.contains(':')
+            && !method.chars().any(|c| c.is_ascii_whitespace()),
+        "invalid HTTP method"
+    );
+    ensure!(
+        !host.is_empty()
+            && !has_crlf_or_nul(host)
+            && !host.chars().any(|c| c.is_ascii_whitespace()),
+        "invalid HTTP Host header"
+    );
+    ensure!(
+        !path.is_empty()
+            && !has_crlf_or_nul(path)
+            && !path.chars().any(|c| c.is_ascii_whitespace()),
+        "invalid HTTP request path"
+    );
+    for (key, value) in headers {
+        ensure!(
+            !key.is_empty()
+                && !has_crlf_or_nul(key)
+                && !key.contains(':')
+                && !key.chars().any(|c| c.is_ascii_whitespace()),
+            "invalid HTTP header name"
+        );
+        ensure!(!has_crlf_or_nul(value), "invalid HTTP header value");
+    }
+    Ok(())
+}
 
 pub struct Response {
     pub status: u16,
@@ -27,17 +72,24 @@ pub async fn request(
     path: &str,
     headers: &[(&str, &str)],
 ) -> Result<Response> {
+    validate_request_head(method, host, path, headers)?;
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Clyntis\r\n");
     for (key, value) in headers {
         head.push_str(&format!("{key}: {value}\r\n"));
     }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await?;
-    stream.flush().await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(head.as_bytes()))
+        .await
+        .context("HTTP/1.1 write timed out")??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush())
+        .await
+        .context("HTTP/1.1 flush timed out")??;
     let mut buf = Vec::with_capacity(4096);
     loop {
         let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
+        let n = tokio::time::timeout(IO_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .context("HTTP/1.1 read timed out")??;
         ensure!(n > 0, "connection closed before the HTTP response");
         buf.extend_from_slice(&chunk[..n]);
         let mut parsed = [httparse::EMPTY_HEADER; 64];
@@ -85,7 +137,9 @@ pub async fn body(stream: &mut BoxStream, response: Response, limit: usize) -> R
             return Ok(body);
         }
         ensure!(data.len() <= limit, "HTTP body too large");
-        let n = stream.read(&mut chunk).await?;
+        let n = tokio::time::timeout(IO_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .context("HTTP/1.1 body read timed out")??;
         if n == 0 {
             if length.is_none() && !chunked {
                 return Ok(data);
@@ -132,5 +186,69 @@ mod tests {
             b"Wikipedia"
         );
         assert!(dechunk(b"4\r\nWiki\r\n5\r\nped").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn request_rejects_crlf_and_invalid_tokens() {
+        let (client, _server) = tokio::io::duplex(1024);
+        let mut stream: BoxStream = Box::new(client);
+
+        assert!(
+            request(&mut stream, "GET\r\n", "example.com", "/", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(&mut stream, "GET /", "example.com", "/", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(&mut stream, "GET:X", "example.com", "/", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(&mut stream, "GET", "example.com\r\nX: 1", "/", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(&mut stream, "GET", "example.com", "/\nHost: evil", &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(
+                &mut stream,
+                "GET",
+                "example.com",
+                "/",
+                &[("X-Bad\r\n", "1")]
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            request(&mut stream, "GET", "example.com", "/", &[("X Bad", "1")])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(&mut stream, "GET", "example.com", "/", &[("X:Bad", "1")])
+                .await
+                .is_err()
+        );
+        assert!(
+            request(
+                &mut stream,
+                "GET",
+                "example.com",
+                "/",
+                &[("X-Ok", "val\r\nInjected: 1")]
+            )
+            .await
+            .is_err()
+        );
     }
 }

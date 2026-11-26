@@ -58,15 +58,11 @@ pub struct Resources {
     adblock_cache: HashMap<(String, String, Stamp), CachedAdblockList>,
     rewrite_sources: Option<RewriteSource>,
 }
-/// Parsed adblock list cached by `(url, format, stamp)` so partial refreshes
-/// or unrelated config changes do not re-parse unchanged lists.
-#[derive(Clone)]
-struct CachedAdblockList {
-    block: clyntis_config::rule::DomainSetBuilder,
-    allow: clyntis_config::rule::DomainSetBuilder,
-    addresses: Vec<ipnet::IpNet>,
-    entries: usize,
-}
+/// Lightweight marker for an adblock list cached by `(url, format, stamp)`
+/// so partial refreshes reuse the on-disk binary cache without pinning
+/// duplicate `DomainSetBuilder` / `Vec<IpNet>` copies in memory.
+#[derive(Clone, Copy)]
+struct CachedAdblockList;
 /// What the rewrite modules were compiled from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RewriteSource {
@@ -392,14 +388,15 @@ impl Resources {
                         &mut staged,
                     )
                     .await?;
+                    let stamp = Stamp::of(&data)?;
                     let source = ProviderSource {
                         behavior: p.behavior.clone(),
                         format: p.format.clone(),
-                        stamp: Stamp::of(&data)?,
+                        stamp,
                     };
                     let matcher = match previous.providers.get(name) {
                         Some((built, matcher)) if *built == source => matcher.clone(),
-                        _ => load_provider_matcher(p, &data)?,
+                        _ => load_provider_matcher_cached(p, &data, Some((&path, stamp)))?,
                     };
                     staged.commit()?;
                     out.providers
@@ -949,46 +946,49 @@ async fn adblock(
         let key = resolved
             .stamp
             .map(|stamp| (list.url.clone(), list.format.clone(), stamp));
-        let loaded = match (resolved.data, key.as_ref()) {
-            (Ok(_), Some(cache_key)) if previous.adblock_cache.contains_key(cache_key) => {
-                let cached = previous.adblock_cache.get(cache_key).unwrap().clone();
-                block.extend(&cached.block);
-                allow.extend(&cached.allow);
-                addresses.extend_from_slice(&cached.addresses);
-                let entries = cached.entries;
-                next_cache.insert(cache_key.clone(), cached);
-                Ok(entries)
-            }
-            (Ok(data), _) => (|| {
-                let reader =
-                    std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(&data)?);
-                let mut list_block = clyntis_config::rule::DomainSetBuilder::default();
-                let mut list_allow = clyntis_config::rule::DomainSetBuilder::default();
-                let mut list_addresses = Vec::new();
-                let entries = clyntis_config::adblock::parse_list_reader(
-                    reader,
+        let path = config.directory.join(list.file_name());
+        let cache_path = rule_cache::cache_path(&path);
+        let config_hash = rule_cache::hash_strs(&[list.format.as_str()]);
+        let loaded = match (
+            resolved.data,
+            key.as_ref()
+                .and_then(|k| previous.adblock_cache.get(k).map(|c| (k, c))),
+        ) {
+            (Ok(data), Some((cache_key, _cached))) => {
+                let res = load_or_parse_adblock_list(
+                    &data,
+                    &cache_path,
+                    resolved.stamp,
+                    config_hash,
                     &list.format,
-                    &mut list_block,
-                    &mut list_allow,
-                    &mut list_addresses,
                     fetch.limit,
-                )?;
-                block.extend(&list_block);
-                allow.extend(&list_allow);
-                addresses.extend_from_slice(&list_addresses);
-                if let Some(cache_key) = key {
-                    next_cache.insert(
-                        cache_key,
-                        CachedAdblockList {
-                            block: list_block,
-                            allow: list_allow,
-                            addresses: list_addresses,
-                            entries,
-                        },
-                    );
+                    &mut block,
+                    &mut allow,
+                    &mut addresses,
+                );
+                if let Ok(entries) = res {
+                    let _ = entries;
+                    next_cache.insert(cache_key.clone(), CachedAdblockList);
                 }
-                Ok(entries)
-            })(),
+                res
+            }
+            (Ok(data), None) => {
+                let res = load_or_parse_adblock_list(
+                    &data,
+                    &cache_path,
+                    resolved.stamp,
+                    config_hash,
+                    &list.format,
+                    fetch.limit,
+                    &mut block,
+                    &mut allow,
+                    &mut addresses,
+                );
+                if let (Ok(_), Some(cache_key)) = (&res, key) {
+                    next_cache.insert(cache_key, CachedAdblockList);
+                }
+                res
+            }
             (Err(error), _) => Err(error),
         };
         let info = match loaded {
@@ -1019,6 +1019,52 @@ async fn adblock(
     );
     (Some(Arc::new(filter)), sources, next_cache)
 }
+#[allow(clippy::too_many_arguments)]
+fn load_or_parse_adblock_list(
+    data: &Path,
+    cache_path: &Path,
+    stamp: Option<Stamp>,
+    config_hash: u64,
+    format: &str,
+    limit: usize,
+    block: &mut DomainSetBuilder,
+    allow: &mut DomainSetBuilder,
+    addresses: &mut Vec<ipnet::IpNet>,
+) -> Result<usize> {
+    if let Some(stamp) = stamp
+        && let Some(entries) =
+            rule_cache::load_adblock(cache_path, stamp, config_hash, block, allow, addresses)
+    {
+        return Ok(entries);
+    }
+    let prev_addrs = addresses.len();
+    let buf = std::cell::RefCell::new(Vec::new());
+    let mut block_rec = rule_cache::AdblockDomainRecorder {
+        target: block,
+        allow: false,
+        buf: &buf,
+    };
+    let mut allow_rec = rule_cache::AdblockDomainRecorder {
+        target: allow,
+        allow: true,
+        buf: &buf,
+    };
+    let entries = clyntis_config::adblock::parse_list_file_into(
+        data,
+        format,
+        &mut block_rec,
+        &mut allow_rec,
+        addresses,
+        limit,
+    )?;
+    if let Some(stamp) = stamp {
+        let mut buf = buf.into_inner();
+        rule_cache::append_ips(&mut buf, &addresses[prev_addrs..]);
+        let _ = rule_cache::write_adblock(cache_path, stamp, config_hash, entries, &buf);
+    }
+    Ok(entries)
+}
+
 /// Loads the rewrite modules and downloads their scripts and response
 /// files. Like ad blocking lists, a module that cannot be loaded is reported
 /// and left out.
@@ -1776,6 +1822,39 @@ fn exceeds_limit(meta: &std::fs::Metadata, limit: usize) -> bool {
     meta.len() > limit as u64
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct HttpCacheMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_modified: Option<String>,
+}
+
+enum DownloadOutcome {
+    NotModified,
+    Downloaded { bytes: usize, meta: HttpCacheMeta },
+}
+
+fn http_meta_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta", path.display()))
+}
+
+fn read_http_meta(path: &Path) -> Option<HttpCacheMeta> {
+    let bytes = std::fs::read(http_meta_path(path)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_http_meta(path: &Path, meta: &HttpCacheMeta) {
+    let meta_path = http_meta_path(path);
+    if meta.etag.is_none() && meta.last_modified.is_none() {
+        let _ = std::fs::remove_file(meta_path);
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(meta) {
+        let _ = atomic_write(&meta_path, &bytes);
+    }
+}
+
 async fn asset(
     path: &Path,
     url: &str,
@@ -1799,16 +1878,22 @@ async fn asset(
         fetch.download,
         "routing resource is not cached; download deferred until connected"
     );
+    let condition = if meta.is_some() && !oversized {
+        read_http_meta(path)
+    } else {
+        None
+    };
     let (temp, mut file) = pending.create(path)?;
     // Resource hosts (jsDelivr, GitHub) are often unreachable directly from
     // the networks that need the proxy in the first place: use it first.
-    let mut result = download_with(
+    let mut result = download_conditional(
         url,
         fetch.resolver,
         fetch.hooks,
         fetch.proxy,
         TIMEOUTS,
         fetch.limit,
+        condition.as_ref(),
         &mut file,
     )
     .await;
@@ -1821,28 +1906,51 @@ async fn asset(
         use std::io::Seek;
         file.set_len(0)?;
         file.rewind()?;
-        result = download_with(
+        result = download_conditional(
             url,
             fetch.resolver,
             fetch.hooks,
             None,
             TIMEOUTS,
             fetch.limit,
+            condition.as_ref(),
             &mut file,
         )
         .await;
     }
-    let result = result.and_then(|_| Ok(file.sync_all()?)).with_context(|| {
-        format!(
-            "routing resource download failed ({})",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        )
-    });
+    let result = result
+        .and_then(|outcome| {
+            if matches!(outcome, DownloadOutcome::Downloaded { .. }) {
+                file.sync_all()?;
+            }
+            Ok(outcome)
+        })
+        .with_context(|| {
+            format!(
+                "routing resource download failed ({})",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )
+        });
     match result {
-        Ok(()) => {
+        Ok(DownloadOutcome::NotModified) => {
+            pending.discard(&temp);
+            if let Ok(existing) = std::fs::OpenOptions::new().write(true).open(path) {
+                let _ = existing.set_modified(std::time::SystemTime::now());
+            }
+            tracing::debug!(
+                file = %path.file_name().unwrap_or_default().to_string_lossy(),
+                "routing resource not modified (304)"
+            );
+            Ok(path.into())
+        }
+        Ok(DownloadOutcome::Downloaded {
+            bytes,
+            meta: http_meta,
+        }) => {
+            write_http_meta(path, &http_meta);
             tracing::info!(
                 file = %path.file_name().unwrap_or_default().to_string_lossy(),
-                bytes = file.metadata().map(|m| m.len()).unwrap_or(0),
+                bytes,
                 had_cached_file = meta.is_some(),
                 "routing resource downloaded"
             );
@@ -2117,6 +2225,7 @@ const TIMEOUTS: Timeouts = Timeouts {
 /// link, so only lack of progress fails a download, not its total duration.
 /// Writes the body to `sink` as it arrives and returns its length.
 /// Connects directly, or through the named proxy or group when `via` is set.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn download_with(
     url: &str,
     resolver: &crate::dns::Resolver,
@@ -2126,6 +2235,23 @@ async fn download_with(
     limit: usize,
     sink: &mut (dyn std::io::Write + Send),
 ) -> Result<usize> {
+    match download_conditional(url, resolver, hooks, via, timeouts, limit, None, sink).await? {
+        DownloadOutcome::Downloaded { bytes, .. } => Ok(bytes),
+        DownloadOutcome::NotModified => bail!("unexpected 304 without conditional headers"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_conditional(
+    url: &str,
+    resolver: &crate::dns::Resolver,
+    hooks: &clyntis_platform::Hooks,
+    via: Option<(&crate::Core, &str)>,
+    timeouts: Timeouts,
+    limit: usize,
+    condition: Option<&HttpCacheMeta>,
+    sink: &mut (dyn std::io::Write + Send),
+) -> Result<DownloadOutcome> {
     tokio::time::timeout(timeouts.total, async {
         use http_body_util::{BodyExt, Empty};
         let mut url = url.to_owned();
@@ -2215,15 +2341,25 @@ async fn download_with(
                     hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
                         .await?;
                 let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
-                let request = http::Request::get(uri.path_and_query().map_or("/", |v| v.as_str()))
-                    .header(
-                        http::header::HOST,
-                        uri.authority()
-                            .context("missing resource authority")?
-                            .as_str(),
-                    )
-                    .header(http::header::USER_AGENT, "clyntis")
-                    .body(Empty::<bytes::Bytes>::new())?;
+                let mut builder =
+                    http::Request::get(uri.path_and_query().map_or("/", |v| v.as_str()))
+                        .header(
+                            http::header::HOST,
+                            uri.authority()
+                                .context("missing resource authority")?
+                                .as_str(),
+                        )
+                        .header(http::header::USER_AGENT, "clyntis");
+                if let Some(cond) = condition {
+                    if let Some(etag) = &cond.etag {
+                        builder = builder.header(http::header::IF_NONE_MATCH, etag.as_str());
+                    }
+                    if let Some(last_modified) = &cond.last_modified {
+                        builder =
+                            builder.header(http::header::IF_MODIFIED_SINCE, last_modified.as_str());
+                    }
+                }
+                let request = builder.body(Empty::<bytes::Bytes>::new())?;
                 anyhow::Ok((sender.send_request(request).await?, driver))
             })
             .await
@@ -2233,6 +2369,10 @@ async fn download_with(
                     timeouts.response.as_secs()
                 )
             })??;
+            if response.status() == http::StatusCode::NOT_MODIFIED {
+                drop(driver);
+                return Ok(DownloadOutcome::NotModified);
+            }
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -2254,6 +2394,18 @@ async fn download_with(
                 response.status().is_success(),
                 "resource HTTP request failed"
             );
+            let meta = HttpCacheMeta {
+                etag: response
+                    .headers()
+                    .get(http::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+                last_modified: response
+                    .headers()
+                    .get(http::header::LAST_MODIFIED)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned),
+            };
             let mut body = response.into_body();
             let mut received = 0usize;
             loop {
@@ -2278,7 +2430,10 @@ async fn download_with(
                 }
             }
             drop(driver);
-            return Ok(received);
+            return Ok(DownloadOutcome::Downloaded {
+                bytes: received,
+                meta,
+            });
         }
         bail!("too many resource redirects")
     })
@@ -2312,7 +2467,28 @@ fn decode_geoip_cidr(bytes: &[u8]) -> Result<ipnet::IpNet> {
     Ok(ipnet::IpNet::new(ip, u8::try_from(prefix)?)?)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn load_provider_matcher(p: &RuleProvider, path: &Path) -> Result<Matcher> {
+    load_provider_matcher_cached(p, path, None)
+}
+
+fn load_provider_matcher_cached(
+    p: &RuleProvider,
+    path: &Path,
+    cache: Option<(&Path, Stamp)>,
+) -> Result<Matcher> {
+    let config_hash = rule_cache::hash_strs(&[p.behavior.as_str(), p.format.as_str()]);
+    if let Some((final_path, stamp)) = cache {
+        let cache_path = rule_cache::cache_path(final_path);
+        if let Some(matcher) = rule_cache::load_provider(&cache_path, stamp, config_hash) {
+            return Ok(matcher);
+        }
+    }
+    let mut builder = if cache.is_some() {
+        ProviderMatcherBuilder::with_cache(&p.behavior)
+    } else {
+        ProviderMatcherBuilder::new(&p.behavior)
+    };
     match p.format.as_str() {
         "text" => {
             use std::io::{BufRead, BufReader};
@@ -2321,7 +2497,6 @@ fn load_provider_matcher(p: &RuleProvider, path: &Path) -> Result<Matcher> {
                 "resource exceeds size limit"
             );
             let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
-            let mut builder = ProviderMatcherBuilder::new(&p.behavior);
             let mut line = String::new();
             let mut read_bytes = 0usize;
             loop {
@@ -2338,7 +2513,6 @@ fn load_provider_matcher(p: &RuleProvider, path: &Path) -> Result<Matcher> {
                 }
                 builder.push(value)?;
             }
-            Ok(builder.build())
         }
         "yaml" => {
             ensure!(
@@ -2346,15 +2520,23 @@ fn load_provider_matcher(p: &RuleProvider, path: &Path) -> Result<Matcher> {
                 "resource exceeds size limit"
             );
             let reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
-            let mut builder = ProviderMatcherBuilder::new(&p.behavior);
             serde::de::DeserializeSeed::deserialize(
                 YamlPayloadSeed(&mut builder),
                 serde_yaml::Deserializer::from_reader(reader),
             )?;
-            Ok(builder.build())
         }
         _ => bail!("unsupported rule provider format"),
     }
+    let (matcher, cache_buf) = builder.build_with_cache();
+    if let (Some((final_path, stamp)), Some(buf)) = (cache, cache_buf) {
+        let _ = rule_cache::write_provider(
+            &rule_cache::cache_path(final_path),
+            stamp,
+            config_hash,
+            &buf,
+        );
+    }
+    Ok(matcher)
 }
 
 struct YamlPayloadSeed<'a, 'b>(&'a mut ProviderMatcherBuilder<'b>);
@@ -2433,6 +2615,7 @@ struct ProviderMatcherBuilder<'a> {
     domains: DomainSetBuilder,
     nets: Vec<ipnet::IpNet>,
     nodes: Vec<Matcher>,
+    cache_buf: Option<Vec<u8>>,
 }
 
 impl<'a> ProviderMatcherBuilder<'a> {
@@ -2443,6 +2626,14 @@ impl<'a> ProviderMatcherBuilder<'a> {
             domains: DomainSetBuilder::default(),
             nets: Vec::new(),
             nodes: Vec::new(),
+            cache_buf: None,
+        }
+    }
+
+    fn with_cache(behavior: &'a str) -> Self {
+        Self {
+            cache_buf: Some(Vec::new()),
+            ..Self::new(behavior)
         }
     }
 
@@ -2450,8 +2641,19 @@ impl<'a> ProviderMatcherBuilder<'a> {
         self.count += 1;
         ensure!(self.count <= 2_000_000, "too many provider rules");
         match self.behavior {
-            "domain" => self.domains.pattern(value)?,
-            "ipcidr" => self.nets.push(value.parse()?),
+            "domain" => {
+                self.domains.pattern(value)?;
+                if let Some(buf) = &mut self.cache_buf {
+                    rule_cache::push_str(buf, rule_cache::TAG_BLOCK_PATTERN, value);
+                }
+            }
+            "ipcidr" => {
+                let net: ipnet::IpNet = value.parse()?;
+                self.nets.push(net);
+                if let Some(buf) = &mut self.cache_buf {
+                    rule_cache::push_ip(buf, net);
+                }
+            }
             "classical" => {
                 let m = Matcher::parse_condition(value)?;
                 let mut refs = vec![];
@@ -2461,8 +2663,18 @@ impl<'a> ProviderMatcherBuilder<'a> {
                     "nested RULE-SET is not permitted in classical providers"
                 );
                 match m {
-                    Matcher::Net(net) => self.nets.push(net),
-                    m => self.nodes.extend(self.domains.absorb(m)),
+                    Matcher::Net(net) => {
+                        self.nets.push(net);
+                        if let Some(buf) = &mut self.cache_buf {
+                            rule_cache::push_ip(buf, net);
+                        }
+                    }
+                    m => {
+                        if let Some(buf) = &mut self.cache_buf {
+                            rule_cache::record_matcher(buf, &m, value);
+                        }
+                        self.nodes.extend(self.domains.absorb(m));
+                    }
                 }
             }
             _ => bail!("unsupported provider behavior"),
@@ -2470,7 +2682,11 @@ impl<'a> ProviderMatcherBuilder<'a> {
         Ok(())
     }
 
-    fn build(mut self) -> Matcher {
+    fn build(self) -> Matcher {
+        self.build_with_cache().0
+    }
+
+    fn build_with_cache(mut self) -> (Matcher, Option<Vec<u8>>) {
         let domains = self.domains.build();
         if !domains.is_empty() {
             self.nodes.insert(0, Matcher::Domains(Arc::new(domains)));
@@ -2479,7 +2695,369 @@ impl<'a> ProviderMatcherBuilder<'a> {
             self.nodes
                 .insert(0, Matcher::Nets(Arc::new(IpSet::new(self.nets, false))));
         }
-        Matcher::Or(self.nodes.into())
+        (Matcher::Or(self.nodes.into()), self.cache_buf)
+    }
+}
+
+/// Versioned binary rule cache (SRS-like) on disk for compiled `ProviderMatcher`
+/// and `adblock` domain+IP sets so cold starts deserialize without re-parsing
+/// text, YAML, or AdGuard lists.
+mod rule_cache {
+    use super::{Stamp, atomic_write};
+    use anyhow::{Result, bail, ensure};
+    use clyntis_config::{
+        adblock::DomainTarget,
+        rule::{DomainSetBuilder, IpSet, Matcher},
+    };
+    use std::{
+        io::{BufReader, Read},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    const MAGIC: &[u8; 4] = b"CLRS";
+    const VERSION: u16 = 1;
+    const KIND_PROVIDER: u8 = 1;
+    const KIND_ADBLOCK: u8 = 2;
+
+    pub const TAG_BLOCK_EXACT: u8 = 1;
+    pub const TAG_BLOCK_SUFFIX: u8 = 2;
+    pub const TAG_BLOCK_SUBDOMAIN: u8 = 3;
+    pub const TAG_BLOCK_GLOB: u8 = 4;
+    pub const TAG_BLOCK_KEYWORD: u8 = 5;
+    pub const TAG_BLOCK_PATTERN: u8 = 6;
+    pub const TAG_BLOCK_REGEX: u8 = 7;
+    pub const TAG_ALLOW_EXACT: u8 = 8;
+    pub const TAG_ALLOW_SUFFIX: u8 = 9;
+    pub const TAG_ALLOW_SUBDOMAIN: u8 = 10;
+    pub const TAG_ALLOW_KEYWORD: u8 = 11;
+    pub const TAG_ALLOW_PATTERN: u8 = 12;
+    pub const TAG_IPV4: u8 = 13;
+    pub const TAG_IPV6: u8 = 14;
+    pub const TAG_OTHER_RULE: u8 = 15;
+
+    pub fn cache_path(path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.rcache", path.display()))
+    }
+
+    pub fn hash_strs(parts: &[&str]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for part in parts {
+            for &b in part.as_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= 0xff;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    pub fn push_str(buf: &mut Vec<u8>, tag: u8, s: &str) {
+        let Ok(len) = u32::try_from(s.len()) else {
+            return;
+        };
+        buf.push(tag);
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    pub fn push_ip(buf: &mut Vec<u8>, net: ipnet::IpNet) {
+        match net {
+            ipnet::IpNet::V4(v4) => {
+                buf.push(TAG_IPV4);
+                buf.extend_from_slice(&v4.addr().octets());
+                buf.push(v4.prefix_len());
+            }
+            ipnet::IpNet::V6(v6) => {
+                buf.push(TAG_IPV6);
+                buf.extend_from_slice(&v6.addr().octets());
+                buf.push(v6.prefix_len());
+            }
+        }
+    }
+
+    pub fn append_ips(buf: &mut Vec<u8>, nets: &[ipnet::IpNet]) {
+        for &net in nets {
+            push_ip(buf, net);
+        }
+    }
+
+    pub fn record_matcher(buf: &mut Vec<u8>, m: &Matcher, raw: &str) {
+        match m {
+            Matcher::Domain(d) => push_str(buf, TAG_BLOCK_EXACT, d),
+            Matcher::Suffix(d) => push_str(buf, TAG_BLOCK_SUFFIX, d),
+            Matcher::Subdomain(d) => push_str(buf, TAG_BLOCK_SUBDOMAIN, d),
+            Matcher::Glob(g) => push_str(buf, TAG_BLOCK_GLOB, g),
+            Matcher::Keyword(k) => push_str(buf, TAG_BLOCK_KEYWORD, k),
+            Matcher::Regex(r) => push_str(buf, TAG_BLOCK_REGEX, r.as_str()),
+            _ => push_str(buf, TAG_OTHER_RULE, raw),
+        }
+    }
+
+    pub struct AdblockDomainRecorder<'a> {
+        pub target: &'a mut DomainSetBuilder,
+        pub allow: bool,
+        pub buf: &'a std::cell::RefCell<Vec<u8>>,
+    }
+
+    impl DomainTarget for AdblockDomainRecorder<'_> {
+        fn exact(&mut self, domain: &str) {
+            self.target.exact(domain);
+            push_str(
+                &mut self.buf.borrow_mut(),
+                if self.allow {
+                    TAG_ALLOW_EXACT
+                } else {
+                    TAG_BLOCK_EXACT
+                },
+                domain,
+            );
+        }
+        fn suffix(&mut self, domain: &str) {
+            self.target.suffix(domain);
+            push_str(
+                &mut self.buf.borrow_mut(),
+                if self.allow {
+                    TAG_ALLOW_SUFFIX
+                } else {
+                    TAG_BLOCK_SUFFIX
+                },
+                domain,
+            );
+        }
+        fn subdomain(&mut self, domain: &str) {
+            self.target.subdomain(domain);
+            push_str(
+                &mut self.buf.borrow_mut(),
+                if self.allow {
+                    TAG_ALLOW_SUBDOMAIN
+                } else {
+                    TAG_BLOCK_SUBDOMAIN
+                },
+                domain,
+            );
+        }
+        fn keyword(&mut self, keyword: &str) {
+            self.target.keyword(keyword);
+            push_str(
+                &mut self.buf.borrow_mut(),
+                if self.allow {
+                    TAG_ALLOW_KEYWORD
+                } else {
+                    TAG_BLOCK_KEYWORD
+                },
+                keyword,
+            );
+        }
+        fn pattern(&mut self, pattern: &str) -> Result<()> {
+            self.target.pattern(pattern)?;
+            push_str(
+                &mut self.buf.borrow_mut(),
+                if self.allow {
+                    TAG_ALLOW_PATTERN
+                } else {
+                    TAG_BLOCK_PATTERN
+                },
+                pattern,
+            );
+            Ok(())
+        }
+    }
+
+    fn write_header(
+        out: &mut Vec<u8>,
+        kind: u8,
+        stamp: Stamp,
+        config_hash: u64,
+        entries: Option<u64>,
+    ) {
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&stamp.len.to_le_bytes());
+        out.extend_from_slice(&stamp.digest);
+        out.extend_from_slice(&config_hash.to_le_bytes());
+        out.push(kind);
+        if let Some(entries) = entries {
+            out.extend_from_slice(&entries.to_le_bytes());
+        }
+    }
+
+    pub fn write_provider(path: &Path, stamp: Stamp, config_hash: u64, body: &[u8]) -> Result<()> {
+        let mut out = Vec::with_capacity(55 + body.len());
+        write_header(&mut out, KIND_PROVIDER, stamp, config_hash, None);
+        out.extend_from_slice(body);
+        atomic_write(path, &out)
+    }
+
+    pub fn write_adblock(
+        path: &Path,
+        stamp: Stamp,
+        config_hash: u64,
+        entries: usize,
+        body: &[u8],
+    ) -> Result<()> {
+        let mut out = Vec::with_capacity(63 + body.len());
+        write_header(
+            &mut out,
+            KIND_ADBLOCK,
+            stamp,
+            config_hash,
+            Some(u64::try_from(entries)?),
+        );
+        out.extend_from_slice(body);
+        atomic_write(path, &out)
+    }
+
+    fn read_header(
+        reader: &mut impl Read,
+        expected_kind: u8,
+        stamp: Stamp,
+        config_hash: u64,
+    ) -> Result<Option<usize>> {
+        let mut hdr = [0u8; 55];
+        reader.read_exact(&mut hdr)?;
+        ensure!(&hdr[0..4] == MAGIC, "bad rule cache magic");
+        let version = u16::from_le_bytes([hdr[4], hdr[5]]);
+        ensure!(version == VERSION, "unsupported rule cache version");
+        let len = u64::from_le_bytes(hdr[6..14].try_into().unwrap());
+        ensure!(len == stamp.len, "rule cache stamp length mismatch");
+        ensure!(hdr[14..46] == stamp.digest, "rule cache stamp mismatch");
+        let hash = u64::from_le_bytes(hdr[46..54].try_into().unwrap());
+        ensure!(hash == config_hash, "rule cache config mismatch");
+        ensure!(hdr[54] == expected_kind, "rule cache kind mismatch");
+        if expected_kind == KIND_ADBLOCK {
+            let mut entries_buf = [0u8; 8];
+            reader.read_exact(&mut entries_buf)?;
+            Ok(Some(usize::try_from(u64::from_le_bytes(entries_buf))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_str<'a>(reader: &mut impl Read, scratch: &'a mut Vec<u8>) -> Result<&'a str> {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let len = usize::try_from(u32::from_le_bytes(len_buf))?;
+        ensure!(len <= 65536, "rule cache string too long");
+        scratch.resize(len, 0);
+        reader.read_exact(scratch)?;
+        Ok(std::str::from_utf8(scratch)?)
+    }
+
+    fn read_tag(reader: &mut impl Read) -> Result<Option<u8>> {
+        let mut tag = [0u8];
+        match reader.read(&mut tag)? {
+            0 => Ok(None),
+            1 => Ok(Some(tag[0])),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn load_provider(path: &Path, stamp: Stamp, config_hash: u64) -> Option<Matcher> {
+        load_provider_inner(path, stamp, config_hash).ok()
+    }
+
+    fn load_provider_inner(path: &Path, stamp: Stamp, config_hash: u64) -> Result<Matcher> {
+        let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+        read_header(&mut reader, KIND_PROVIDER, stamp, config_hash)?;
+        let mut domains = DomainSetBuilder::default();
+        let mut nets = Vec::new();
+        let mut nodes = Vec::new();
+        let mut scratch = Vec::with_capacity(256);
+        while let Some(tag) = read_tag(&mut reader)? {
+            match tag {
+                TAG_BLOCK_EXACT => domains.exact(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_SUFFIX => domains.suffix(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_SUBDOMAIN => domains.subdomain(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_GLOB => {
+                    let s = read_str(&mut reader, &mut scratch)?;
+                    let _ = domains.absorb(Matcher::Glob(s.into()));
+                }
+                TAG_BLOCK_KEYWORD => domains.keyword(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_PATTERN => domains.pattern(read_str(&mut reader, &mut scratch)?)?,
+                TAG_BLOCK_REGEX => domains.regex(read_str(&mut reader, &mut scratch)?)?,
+                TAG_IPV4 => {
+                    let mut buf = [0u8; 5];
+                    reader.read_exact(&mut buf)?;
+                    let addr = Ipv4Addr::from(<[u8; 4]>::try_from(&buf[..4]).unwrap());
+                    nets.push(ipnet::IpNet::new(IpAddr::V4(addr), buf[4])?);
+                }
+                TAG_IPV6 => {
+                    let mut buf = [0u8; 17];
+                    reader.read_exact(&mut buf)?;
+                    let addr = Ipv6Addr::from(<[u8; 16]>::try_from(&buf[..16]).unwrap());
+                    nets.push(ipnet::IpNet::new(IpAddr::V6(addr), buf[16])?);
+                }
+                TAG_OTHER_RULE => {
+                    let raw = read_str(&mut reader, &mut scratch)?;
+                    nodes.push(Matcher::parse_condition(raw)?);
+                }
+                _ => bail!("unknown rule cache tag {tag}"),
+            }
+        }
+        let domains = domains.build();
+        if !domains.is_empty() {
+            nodes.insert(0, Matcher::Domains(Arc::new(domains)));
+        }
+        if !nets.is_empty() {
+            nodes.insert(0, Matcher::Nets(Arc::new(IpSet::new(nets, false))));
+        }
+        Ok(Matcher::Or(nodes.into()))
+    }
+
+    pub fn load_adblock(
+        path: &Path,
+        stamp: Stamp,
+        config_hash: u64,
+        block: &mut DomainSetBuilder,
+        allow: &mut DomainSetBuilder,
+        addresses: &mut Vec<ipnet::IpNet>,
+    ) -> Option<usize> {
+        load_adblock_inner(path, stamp, config_hash, block, allow, addresses).ok()
+    }
+
+    fn load_adblock_inner(
+        path: &Path,
+        stamp: Stamp,
+        config_hash: u64,
+        block: &mut DomainSetBuilder,
+        allow: &mut DomainSetBuilder,
+        addresses: &mut Vec<ipnet::IpNet>,
+    ) -> Result<usize> {
+        let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+        let entries =
+            read_header(&mut reader, KIND_ADBLOCK, stamp, config_hash)?.unwrap_or_default();
+        let mut scratch = Vec::with_capacity(256);
+        while let Some(tag) = read_tag(&mut reader)? {
+            match tag {
+                TAG_BLOCK_EXACT => block.exact(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_SUFFIX => block.suffix(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_SUBDOMAIN => block.subdomain(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_KEYWORD => block.keyword(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_PATTERN => block.pattern(read_str(&mut reader, &mut scratch)?)?,
+                TAG_ALLOW_EXACT => allow.exact(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_SUFFIX => allow.suffix(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_SUBDOMAIN => allow.subdomain(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_KEYWORD => allow.keyword(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_PATTERN => allow.pattern(read_str(&mut reader, &mut scratch)?)?,
+                TAG_IPV4 => {
+                    let mut buf = [0u8; 5];
+                    reader.read_exact(&mut buf)?;
+                    let addr = Ipv4Addr::from(<[u8; 4]>::try_from(&buf[..4]).unwrap());
+                    addresses.push(ipnet::IpNet::new(IpAddr::V4(addr), buf[4])?);
+                }
+                TAG_IPV6 => {
+                    let mut buf = [0u8; 17];
+                    reader.read_exact(&mut buf)?;
+                    let addr = Ipv6Addr::from(<[u8; 16]>::try_from(&buf[..16]).unwrap());
+                    addresses.push(ipnet::IpNet::new(IpAddr::V6(addr), buf[16])?);
+                }
+                _ => bail!("unknown adblock cache tag {tag}"),
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -4525,6 +5103,231 @@ rules:
         let bad_yaml = dir.join("bad.yaml");
         std::fs::write(&bad_yaml, "payload:\n  - 'a.com'\nextra: 1\n").unwrap();
         assert!(load_provider_matcher(&p, &bad_yaml).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn binary_rule_cache_roundtrips_providers_and_adblock() {
+        let dir = std::env::temp_dir().join(format!("meta-rcache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Classical YAML provider with domains, regex, CIDRs, and port matcher.
+        let yaml_path = dir.join("classical.yaml");
+        std::fs::write(
+            &yaml_path,
+            "payload:\n  - DOMAIN,exact.test\n  - DOMAIN-SUFFIX,sfx.test\n  - DOMAIN-KEYWORD,kw\n  - IP-CIDR,192.0.2.0/24\n  - IP-CIDR6,2001:db8::/32\n  - DST-PORT,8443\n",
+        )
+        .unwrap();
+        let p = RuleProvider {
+            kind: "file".into(),
+            behavior: "classical".into(),
+            format: "yaml".into(),
+            path: yaml_path.to_string_lossy().into_owned(),
+            url: String::new(),
+            interval: 3600,
+            payload: vec![],
+        };
+        let stamp = Stamp::of(&yaml_path).unwrap();
+        let m1 = load_provider_matcher_cached(&p, &yaml_path, Some((&yaml_path, stamp))).unwrap();
+        assert_eq!(
+            m1.evaluate("exact.test", None, 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m1.evaluate("a.sfx.test", None, 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(m1.evaluate("mykw.org", None, 443, "tcp", false), Some(true));
+        assert_eq!(
+            m1.evaluate("", Some("192.0.2.5".parse().unwrap()), 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m1.evaluate("", Some("2001:db8::1".parse().unwrap()), 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m1.evaluate("other.test", None, 8443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m1.evaluate("other.test", None, 80, "tcp", false),
+            Some(false)
+        );
+
+        // Corrupt the YAML source without changing its stamp? We can verify the binary cache
+        // actually serves the second load by overwriting the YAML file with invalid YAML while
+        // passing the original stamp directly to `rule_cache::load_provider`.
+        let cache_file = rule_cache::cache_path(&yaml_path);
+        assert!(cache_file.exists());
+        let config_hash = rule_cache::hash_strs(&[p.behavior.as_str(), p.format.as_str()]);
+        let m2 = rule_cache::load_provider(&cache_file, stamp, config_hash).unwrap();
+        assert_eq!(
+            m2.evaluate("exact.test", None, 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m2.evaluate("a.sfx.test", None, 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m2.evaluate("", Some("192.0.2.5".parse().unwrap()), 443, "tcp", false),
+            Some(true)
+        );
+        assert_eq!(
+            m2.evaluate("other.test", None, 8443, "tcp", false),
+            Some(true)
+        );
+        // Wrong config hash or stamp misses the cache cleanly.
+        assert!(rule_cache::load_provider(&cache_file, stamp, config_hash ^ 1).is_none());
+
+        // Adblock binary cache roundtrip (domains + allow + IPv4/IPv6).
+        let ad_path = dir.join("ads.list");
+        let ad_cache = rule_cache::cache_path(&ad_path);
+        let ad_stamp = Stamp {
+            len: 42,
+            digest: [7u8; 32],
+        };
+        let ad_hash = rule_cache::hash_strs(&["clash"]);
+        let mut block = DomainSetBuilder::default();
+        let mut allow = DomainSetBuilder::default();
+        let mut addrs = Vec::new();
+        let buf = std::cell::RefCell::new(Vec::new());
+        {
+            let mut br = rule_cache::AdblockDomainRecorder {
+                target: &mut block,
+                allow: false,
+                buf: &buf,
+            };
+            clyntis_config::adblock::DomainTarget::suffix(&mut br, "ad.example");
+        }
+        {
+            let mut ar = rule_cache::AdblockDomainRecorder {
+                target: &mut allow,
+                allow: true,
+                buf: &buf,
+            };
+            clyntis_config::adblock::DomainTarget::suffix(&mut ar, "ok.ad.example");
+        }
+        let mut buf = buf.into_inner();
+        addrs.push("203.0.113.0/24".parse().unwrap());
+        rule_cache::append_ips(&mut buf, &addrs);
+        rule_cache::write_adblock(&ad_cache, ad_stamp, ad_hash, 3, &buf).unwrap();
+
+        let mut b2 = DomainSetBuilder::default();
+        let mut a2 = DomainSetBuilder::default();
+        let mut ips2 = Vec::new();
+        let entries =
+            rule_cache::load_adblock(&ad_cache, ad_stamp, ad_hash, &mut b2, &mut a2, &mut ips2)
+                .unwrap();
+        assert_eq!(entries, 3);
+        let (b2, a2) = (b2.build(), a2.build());
+        assert!(b2.matches("x.ad.example") && a2.matches("ok.ad.example"));
+        assert_eq!(
+            ips2,
+            vec!["203.0.113.0/24".parse::<ipnet::IpNet>().unwrap()]
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn conditional_download_sends_etag_and_handles_304() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let req_log = requests.clone();
+        let server = tokio::spawn(async move {
+            for idx in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                req_log.lock().unwrap().push(req.clone());
+                if idx == 0 {
+                    let body = b"cached-payload";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(resp.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                } else {
+                    let resp =
+                        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n";
+                    stream.write_all(resp.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("meta-304-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("list.txt");
+        let url = format!("http://{addr}/list.txt");
+        let resolver =
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
+        let fetch = Fetch {
+            resolver: &resolver,
+            hooks: &hooks,
+            proxy: None,
+            download: true,
+            limit: LIMIT,
+        };
+
+        // First fetch: 200 OK writes temp file and `.meta` sidecar.
+        let mut staged1 = Staged::default();
+        let p1 = asset(&target, &url, Some(3600), true, &fetch, &mut staged1)
+            .await
+            .unwrap();
+        assert_ne!(p1, target);
+        staged1.commit().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"cached-payload");
+        let saved_meta = read_http_meta(&target).unwrap();
+        assert_eq!(saved_meta.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(
+            saved_meta.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+
+        // Backdate mtime so `asset()` treats it as expired and revalidates.
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        // Second fetch: sends If-None-Match & If-Modified-Since, receives 304, updates mtime, keeps file.
+        let mut staged2 = Staged::default();
+        let p2 = asset(&target, &url, Some(3600), true, &fetch, &mut staged2)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let logged = requests.lock().unwrap();
+        assert_eq!(logged.len(), 2, "requests: {logged:?}");
+        let second_lower = logged[1].to_ascii_lowercase();
+        assert!(
+            second_lower.contains("if-none-match: \"v1\""),
+            "{}",
+            logged[1]
+        );
+        assert!(
+            second_lower.contains("if-modified-since: wed, 21 oct 2015 07:28:00 gmt"),
+            "{}",
+            logged[1]
+        );
+        assert_eq!(p2, target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"cached-payload");
+        let new_mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        assert!(
+            new_mtime > old_time,
+            "expected mtime to advance: old={old_time:?}, new={new_mtime:?}"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

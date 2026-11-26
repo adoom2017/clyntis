@@ -157,7 +157,7 @@ pub fn request(id: uuid::Uuid, target: &Target, command: u8, flow: &str) -> Resu
     if flow.is_empty() {
         out.push(0);
     } else {
-        ensure!(flow.len() <= 127, "VLESS flow too long");
+        ensure!(flow.len() <= 125, "VLESS flow too long");
         out.extend_from_slice(&[(flow.len() + 2) as u8, 0x0a, flow.len() as u8]);
         out.extend_from_slice(flow.as_bytes());
     }

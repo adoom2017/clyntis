@@ -93,7 +93,7 @@ struct Pending {
     method: String,
     url: String,
     /// As sent on, after rewrites.
-    headers: Vec<(String, String)>,
+    headers: Arc<Vec<(String, String)>>,
     body: Arc<Mutex<Body>>,
     /// Answered by a rewrite rule instead of the server.
     answer: Option<Box<Answer>>,
@@ -191,7 +191,7 @@ where
 struct Message {
     url: String,
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: Arc<Vec<(String, String)>>,
     /// The whole body, decoded; `None` when the rules do not need it or it
     /// could not be read whole.
     body: Option<Arc<Vec<u8>>>,
@@ -234,9 +234,7 @@ impl<'a, R: AsyncBufRead + Unpin> BodySource<'a, R> {
                 .await
                 .map_err(|_| io::ErrorKind::BrokenPipe)?;
             self.sent_continue = true;
-            message
-                .headers
-                .retain(|(k, _)| !k.eq_ignore_ascii_case("expect"));
+            Arc::make_mut(&mut message.headers).retain(|(k, _)| !k.eq_ignore_ascii_case("expect"));
             message.head_changed = true;
         }
         let framing = self.buffered.remaining.take().unwrap_or(Framing::Length(0));
@@ -428,7 +426,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                 if rewrite::apply_header_with(
                     &rewrites.rewriter,
                     index,
-                    &mut message.headers,
+                    Arc::make_mut(&mut message.headers),
                     allow_compile,
                     group_runtimes.as_ref(),
                 ) {
@@ -505,7 +503,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                     url: request_url.to_owned(),
                     method: method.to_owned(),
                     request_headers: if phase == Phase::Request {
-                        message.headers.clone()
+                        (*message.headers).clone()
                     } else {
                         request_headers.to_vec()
                     },
@@ -516,7 +514,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                     },
                     response: (phase == Phase::Response).then(|| script::ResponseInput {
                         status: message.status,
-                        headers: message.headers.clone(),
+                        headers: (*message.headers).clone(),
                         body,
                     }),
                 };
@@ -564,7 +562,7 @@ async fn apply_rules<R: AsyncBufRead + Unpin>(
                                         .filter(|(k, _)| rewrite::is_framing(k))
                                         .cloned(),
                                 );
-                                message.headers = headers;
+                                message.headers = Arc::new(headers);
                                 message.head_changed = true;
                             }
                             if let Some(body) = outcome.body
@@ -704,9 +702,21 @@ async fn read_body<R: AsyncBufRead + Unpin>(
 }
 
 fn encode_head(start: &str, headers: &[(String, String)]) -> Vec<u8> {
-    let mut out = format!("{start}\r\n").into_bytes();
+    let cap = start.len()
+        + 2
+        + headers
+            .iter()
+            .map(|(name, value)| name.len() + 2 + value.len() + 2)
+            .sum::<usize>()
+        + 2;
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(start.as_bytes());
+    out.extend_from_slice(b"\r\n");
     for (name, value) in headers {
-        out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
     out
@@ -765,7 +775,7 @@ where
         let method = request.method.unwrap_or_default().to_owned();
         let path = request.path.unwrap_or_default().to_owned();
         let minor = request.version.unwrap_or(1);
-        let headers = header_list(request.headers);
+        let headers = Arc::new(header_list(request.headers));
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             path.clone()
         } else {
@@ -980,8 +990,7 @@ where
                             .send(RequestEvent::Continue)
                             .await
                             .map_err(|_| io::ErrorKind::BrokenPipe)?;
-                        message
-                            .headers
+                        Arc::make_mut(&mut message.headers)
                             .retain(|(k, _)| !k.eq_ignore_ascii_case("expect"));
                     }
                     buffered
@@ -1001,7 +1010,11 @@ where
                     .iter()
                     .any(|(name, _)| rewrite::is_framing(name))
             {
-                set_body_headers(&mut message.headers, send.len(), message.body_changed);
+                set_body_headers(
+                    Arc::make_mut(&mut message.headers),
+                    send.len(),
+                    message.body_changed,
+                );
             }
             capture(context, &mut body.lock().unwrap(), &send, cap);
             pending.headers = message.headers.clone();
@@ -1127,7 +1140,7 @@ where
             }
             writer.flush().await?;
             let status = answer.status;
-            let headers = std::mem::take(&mut answer.headers);
+            let headers = Arc::new(std::mem::take(&mut answer.headers));
             drop(answer);
             drop(answer_budget);
             record(context, request, Some((status, headers)), body, None, true);
@@ -1188,7 +1201,7 @@ where
             }
             let version = response.version.unwrap_or(1);
             let reason = response.reason.unwrap_or_default().to_owned();
-            let headers = header_list(response.headers);
+            let headers = Arc::new(header_list(response.headers));
             break (head, code, version, reason, headers);
         };
         // After a switch the bytes that follow belong to another protocol.
@@ -1275,8 +1288,7 @@ where
                     let start = format!("HTTP/1.{minor} {} {reason}", message.status);
                     if request.method == "HEAD" || matches!(message.status, 204 | 304) {
                         if message.status == 204 || !bodiless {
-                            message
-                                .headers
+                            Arc::make_mut(&mut message.headers)
                                 .retain(|(name, _)| !rewrite::is_framing(name));
                         }
                         writer
@@ -1298,7 +1310,11 @@ where
                             Arc::new(buffered.bytes)
                         };
                         message.body = None;
-                        set_body_headers(&mut message.headers, send.len(), message.body_changed);
+                        set_body_headers(
+                            Arc::make_mut(&mut message.headers),
+                            send.len(),
+                            message.body_changed,
+                        );
                         capture(context, &mut body, &send, cap);
                         writer
                             .write_all(&encode_head(&start, &message.headers))
@@ -1356,17 +1372,19 @@ fn capture(context: &Context, body: &mut Body, bytes: &[u8], cap: usize) {
     context.core.requests.capture(body, bytes, cap);
 }
 
+type ResponseHead = (u16, Arc<Vec<(String, String)>>);
+
 fn record(
     context: &Context,
     request: Pending,
-    response: Option<(u16, Vec<(String, String)>)>,
+    response: Option<ResponseHead>,
     response_body: Body,
     error: Option<String>,
     answered: bool,
 ) {
     let request_body = std::mem::take(&mut *request.body.lock().unwrap());
     let (status, response_headers) = match response {
-        Some((code, headers)) => (Some(code), headers),
+        Some((code, headers)) => (Some(code), Arc::unwrap_or_clone(headers)),
         None => (None, vec![]),
     };
     let (labels, rewrite_actions): (Vec<String>, Vec<String>) = request.applied.into_iter().unzip();
@@ -1388,7 +1406,7 @@ fn record(
         request.started,
         summary,
         HttpDetail {
-            request_headers: request.headers,
+            request_headers: Arc::unwrap_or_clone(request.headers),
             response_headers,
             request_body,
             response_body,

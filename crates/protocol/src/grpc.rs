@@ -20,6 +20,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 const WRITE_CHUNK: usize = 16 * 1024;
 const KEEP_CAPACITY: usize = 16 * 1024;
+const INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024;
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn release_if_large(buffer: &mut Vec<u8>) {
     if buffer.is_empty() && buffer.capacity() > KEEP_CAPACITY {
@@ -125,7 +128,7 @@ fn reuse_least_loaded(
 
 fn pooled(key: &str, options: &clyntis_config::GrpcOptions) -> Option<Physical> {
     let pool = POOL.get_or_init(Default::default);
-    let map = pool.lock().unwrap();
+    let map = pool.lock().unwrap_or_else(|e| e.into_inner());
     let list = map.get(key)?;
     let least = list
         .iter()
@@ -145,12 +148,15 @@ fn ping_timeout(interval: Duration) -> Duration {
 /// last stream ends.
 pub fn reset_pool() {
     if let Some(pool) = POOL.get() {
-        pool.lock().unwrap().clear();
+        pool.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
 fn remove_physical(key: &str, id: u64) {
-    let mut map = POOL.get_or_init(Default::default).lock().unwrap();
+    let mut map = POOL
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let remove_key = if let Some(list) = map.get_mut(key) {
         list.retain(|physical| physical.id != id);
         list.is_empty()
@@ -217,12 +223,20 @@ pub async fn connect(
         let mut stream = incoming
             .take()
             .expect("gRPC transport stream consumed once");
-        if let Some((config, clock)) = tls.as_ref() {
-            stream = crate::tls::SecureConnector::new(clock.clone())
-                .connect(stream, config)
-                .await?;
-        }
-        let (sender, mut connection) = h2::client::handshake(stream).await?;
+        let (sender, mut connection) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            if let Some((config, clock)) = tls.as_ref() {
+                stream = crate::tls::SecureConnector::new(clock.clone())
+                    .connect(stream, config)
+                    .await?;
+            }
+            let mut builder = h2::client::Builder::new();
+            builder
+                .initial_window_size(INITIAL_STREAM_WINDOW_SIZE)
+                .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE);
+            Ok::<_, anyhow::Error>(builder.handshake(stream).await?)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("gRPC handshake timed out"))??;
         let active = Arc::new(AtomicUsize::new(0));
         let id = NEXT_PHYSICAL_ID.fetch_add(1, Ordering::Relaxed);
         POOL.get_or_init(Default::default)
@@ -318,6 +332,7 @@ pub async fn connect(
         payload_at: 0,
         unreleased_incoming: 0,
         unreleased_payload: 0,
+        data_ended: false,
         closed: false,
         active: lease.transfer(),
     }))
@@ -332,6 +347,7 @@ pub struct GrpcStream {
     payload_at: usize,
     unreleased_incoming: usize,
     unreleased_payload: usize,
+    data_ended: bool,
     closed: bool,
     active: Arc<AtomicUsize>,
 }
@@ -466,31 +482,56 @@ impl AsyncRead for GrpcStream {
                 self.recv = Some(response.into_body());
                 self.response = None;
             }
-            let next = {
-                let this = self.as_mut().get_mut();
-                let recv = this.recv.as_mut().expect("gRPC response body initialized");
-                match Pin::new(&mut *recv).poll_data(cx) {
-                    Poll::Ready(item) => item,
-                    Poll::Pending => {
-                        // We need more bytes to finish an incomplete frame
-                        // (already validated <= MAX_FRAME); release held
-                        // capacity for those buffered bytes so frames larger
-                        // than the HTTP/2 receive window cannot stall.
-                        if this.unreleased_incoming > 0 {
-                            let release = std::mem::take(&mut this.unreleased_incoming);
-                            let _ = recv.flow_control().release_capacity(release);
+            if !self.data_ended {
+                let next = {
+                    let this = self.as_mut().get_mut();
+                    let recv = this.recv.as_mut().expect("gRPC response body initialized");
+                    match Pin::new(&mut *recv).poll_data(cx) {
+                        Poll::Ready(item) => item,
+                        Poll::Pending => {
+                            // We need more bytes to finish an incomplete frame
+                            // (already validated <= MAX_FRAME); release held
+                            // capacity for those buffered bytes so frames larger
+                            // than the HTTP/2 receive window cannot stall.
+                            if this.unreleased_incoming > 0 {
+                                let release = std::mem::take(&mut this.unreleased_incoming);
+                                let _ = recv.flow_control().release_capacity(release);
+                            }
+                            return Poll::Pending;
                         }
-                        return Poll::Pending;
                     }
+                };
+                match next {
+                    Some(Ok(data)) => {
+                        self.incoming.extend_from_slice(&data);
+                        self.unreleased_incoming += data.len();
+                        continue;
+                    }
+                    Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
+                    None => self.data_ended = true,
                 }
-            };
-            match next {
-                Some(Ok(data)) => {
-                    self.incoming.extend_from_slice(&data);
-                    self.unreleased_incoming += data.len();
+            }
+            if self.data_ended {
+                let recv = self.recv.as_mut().expect("gRPC response body initialized");
+                match ready!(Pin::new(recv).poll_trailers(cx)) {
+                    Ok(Some(trailers)) => {
+                        if let Some(status) =
+                            trailers.get("grpc-status").and_then(|v| v.to_str().ok())
+                            && status != "0"
+                        {
+                            let msg = trailers
+                                .get("grpc-message")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "gRPC stream failed with status {status}: {msg}"
+                            ))));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Poll::Ready(Err(io::Error::other(error))),
                 }
-                Some(Err(error)) => return Poll::Ready(Err(io::Error::other(error))),
-                None => self.closed = true,
+                self.closed = true;
             }
         }
     }

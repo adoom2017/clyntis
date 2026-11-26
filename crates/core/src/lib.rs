@@ -34,15 +34,21 @@ pub use traffic::{ConnectionTraffic, HostTraffic, TrafficDetails};
 
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use clyntis_config::{Config, GroupKind, Mode, ProxyKind, rule::Rule};
+use clyntis_config::{
+    Config, GroupKind, Mode, ProxyKind,
+    rule::{HostMatchCtx, Rule},
+};
 use clyntis_platform::Hooks;
 use clyntis_protocol::{BoxStream, Datagram, Target};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex, RwLock, Weak, atomic::AtomicU64},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, task::JoinSet};
@@ -51,7 +57,20 @@ use tokio_util::sync::CancellationToken;
 /// Fake-IP names kept by the iOS tunnel; apps query again within seconds
 /// (answers have a one-second TTL), so evicted names come back at once.
 const HOSTED_FAKE_CAPACITY: usize = 8192;
-type Hysteria2Slot = Arc<tokio::sync::Mutex<Option<Arc<clyntis_protocol::hysteria2::Client>>>>;
+/// How long an idle cached Hysteria2 client with 0 active streams is kept.
+const HYSTERIA2_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long without dials before UrlTest background probing pauses.
+const URL_TEST_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Maximum entries in the policy-epoch-guarded route decision LRU cache.
+const ROUTE_CACHE_CAPACITY: usize = 128;
+
+struct CachedHysteria2 {
+    client: Arc<clyntis_protocol::hysteria2::Client>,
+    epoch: u64,
+    last_used: Instant,
+    active: Arc<AtomicUsize>,
+}
+type Hysteria2Slot = Arc<tokio::sync::Mutex<Option<CachedHysteria2>>>;
 /// How often the info log summarizes ad blocks.
 const ADBLOCK_SUMMARY_EVERY: Duration = Duration::from_secs(60);
 /// Retrying resources that were missing at start: first wait, then doubling.
@@ -97,6 +116,14 @@ pub struct Core {
     /// Scripts of rewrite modules: the store and the runs at once.
     scripts: script::Engine,
     rewrite_stats: rewrite::Stats,
+    /// Monotonic epoch bumped whenever routing policy, selection, or network rules change.
+    policy_epoch: AtomicU64,
+    /// Small LRU cache of rule-mode route decisions guarded by `policy_epoch`.
+    route_cache: Mutex<RouteCache>,
+    /// Epoch-anchored monotonic clock and last dial timestamp (ms) for UrlTest idle_timeout.
+    started_at: Instant,
+    last_dial_ms: AtomicU64,
+    url_test_wake: tokio::sync::Notify,
 }
 struct Policy {
     mode: Mode,
@@ -158,6 +185,7 @@ pub(crate) struct RouteDecision {
 
 /// A route decision with what led to it: the address IP rules saw and the
 /// index of the matching rule.
+#[derive(Clone)]
 pub(crate) struct Trace {
     pub(crate) decision: RouteDecision,
     pub(crate) ip: Option<std::net::IpAddr>,
@@ -182,6 +210,188 @@ impl Trace {
             index: None,
             looked_up: false,
         }
+    }
+}
+
+struct RouteCacheEntry {
+    host: String,
+    port: u16,
+    network: String,
+    address: Option<std::net::IpAddr>,
+    trace: Trace,
+}
+
+#[derive(Default)]
+struct RouteCache {
+    epoch: u64,
+    entries: VecDeque<RouteCacheEntry>,
+}
+
+impl RouteCache {
+    fn get(
+        &mut self,
+        epoch: u64,
+        host: &str,
+        port: u16,
+        network: &str,
+        address: Option<std::net::IpAddr>,
+    ) -> Option<Trace> {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.entries.clear();
+            return None;
+        }
+        let pos = self.entries.iter().position(|e| {
+            e.port == port && e.address == address && e.network == network && e.host == host
+        })?;
+        let entry = self.entries.remove(pos)?;
+        let trace = entry.trace.clone();
+        self.entries.push_front(entry);
+        Some(trace)
+    }
+
+    fn insert(
+        &mut self,
+        epoch: u64,
+        host: &str,
+        port: u16,
+        network: &str,
+        address: Option<std::net::IpAddr>,
+        trace: Trace,
+    ) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.entries.clear();
+        }
+        if let Some(pos) = self.entries.iter().position(|e| {
+            e.port == port && e.address == address && e.network == network && e.host == host
+        }) {
+            self.entries.remove(pos);
+        } else if self.entries.len() >= ROUTE_CACHE_CAPACITY {
+            self.entries.pop_back();
+        }
+        self.entries.push_front(RouteCacheEntry {
+            host: host.to_owned(),
+            port,
+            network: network.to_owned(),
+            address,
+            trace,
+        });
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum LowerHost<'a> {
+    Borrowed(&'a str),
+    Stack([u8; 256], usize),
+    Heap(String),
+}
+
+impl<'a> LowerHost<'a> {
+    fn new(host: &'a str) -> Self {
+        let trimmed = host.trim_end_matches('.');
+        if !trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Self::Borrowed(trimmed);
+        }
+        let bytes = trimmed.as_bytes();
+        if bytes.len() <= 256 {
+            let mut buf = [0u8; 256];
+            for (dst, &src) in buf[..bytes.len()].iter_mut().zip(bytes) {
+                *dst = src.to_ascii_lowercase();
+            }
+            return Self::Stack(buf, bytes.len());
+        }
+        Self::Heap(trimmed.to_ascii_lowercase())
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Stack(buf, len) => std::str::from_utf8(&buf[..*len]).unwrap_or(""),
+            Self::Heap(s) => s.as_str(),
+        }
+    }
+}
+
+fn interleave_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut v6 = addresses.iter().copied().filter(SocketAddr::is_ipv6);
+    let mut v4 = addresses.iter().copied().filter(SocketAddr::is_ipv4);
+    let mut out = Vec::with_capacity(addresses.len());
+    loop {
+        match (v6.next(), v4.next()) {
+            (Some(a), Some(b)) => {
+                out.push(a);
+                out.push(b);
+            }
+            (Some(a), None) => {
+                out.push(a);
+                out.extend(v6);
+                break;
+            }
+            (None, Some(b)) => {
+                out.push(b);
+                out.extend(v4);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    out
+}
+
+struct ActiveGuard(Arc<AtomicUsize>);
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct TrackedStream {
+    inner: BoxStream,
+    _guard: ActiveGuard,
+}
+impl tokio::io::AsyncRead for TrackedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for TrackedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+struct TrackedDatagram<D> {
+    inner: D,
+    _guard: ActiveGuard,
+}
+#[async_trait]
+impl<D: Datagram + 'static> Datagram for TrackedDatagram<D> {
+    async fn send(&self, target: &Target, bytes: &[u8]) -> Result<()> {
+        self.inner.send(target, bytes).await
+    }
+    async fn recv(&self) -> Result<(Target, Vec<u8>)> {
+        self.inner.recv().await
     }
 }
 
@@ -428,6 +638,11 @@ impl Core {
             tailscale: Default::default(),
             network_epoch: tokio::sync::watch::channel(0).0,
             network: Default::default(),
+            policy_epoch: AtomicU64::new(0),
+            route_cache: Default::default(),
+            started_at: Instant::now(),
+            last_dial_ms: AtomicU64::new(0),
+            url_test_wake: tokio::sync::Notify::new(),
         }))
     }
     pub async fn start(self: &Arc<Self>) -> Result<Running> {
@@ -665,20 +880,38 @@ impl Core {
                 let mut interval = tokio::time::interval(Duration::from_secs(group.interval));
                 let mut network = core.network_epoch.subscribe();
                 loop {
-                    tokio::select! {
-                        _ = core.stop.cancelled() => break,
-                        _ = interval.tick() => {}
-                        // A new network can change which member works (a LAN
-                        // check URL reachable only at home): re-test once it
-                        // has settled instead of waiting for the interval.
-                        changed = network.changed() => {
-                            if changed.is_err() { break }
-                            tokio::select! {
-                                _ = core.stop.cancelled() => break,
-                                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                    if core.dial_idle_elapsed() >= URL_TEST_IDLE_TIMEOUT {
+                        tokio::select! {
+                            _ = core.stop.cancelled() => break,
+                            _ = core.url_test_wake.notified() => {
+                                interval.reset();
                             }
-                            network.mark_unchanged();
-                            interval.reset();
+                            changed = network.changed() => {
+                                if changed.is_err() { break }
+                                network.mark_unchanged();
+                                continue;
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = core.stop.cancelled() => break,
+                            _ = interval.tick() => {
+                                if core.dial_idle_elapsed() >= URL_TEST_IDLE_TIMEOUT {
+                                    continue;
+                                }
+                            }
+                            // A new network can change which member works (a LAN
+                            // check URL reachable only at home): re-test once it
+                            // has settled instead of waiting for the interval.
+                            changed = network.changed() => {
+                                if changed.is_err() { break }
+                                tokio::select! {
+                                    _ = core.stop.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                                }
+                                network.mark_unchanged();
+                                interval.reset();
+                            }
                         }
                     }
                     let results = futures_util::future::join_all(group.proxies.iter().map(|target| {
@@ -690,14 +923,42 @@ impl Core {
                         }
                     }))
                     .await;
-                    let mut policy = core.policy.write().unwrap();
-                    let current = policy.selection.get(&group.name).cloned();
-                    if let Some(next) = url_test_choice(current.as_deref(), &results, group.tolerance) {
-                        if current.as_deref() != Some(next.as_str()) {
-                            tracing::info!(group = %group.name, from = ?current, to = %next, "url-test group switched");
+                    let switched = {
+                        let mut policy = core.policy.write().unwrap();
+                        let current = policy.selection.get(&group.name).cloned();
+                        if let Some(next) = url_test_choice(current.as_deref(), &results, group.tolerance) {
+                            let changed = current.as_deref() != Some(next.as_str());
+                            if changed {
+                                tracing::info!(group = %group.name, from = ?current, to = %next, "url-test group switched");
+                            }
+                            policy.selection.insert(group.name.clone(), next);
+                            changed
+                        } else {
+                            false
                         }
-                        policy.selection.insert(group.name.clone(), next);
+                    };
+                    if switched {
+                        core.bump_policy_epoch();
+                        core.traffic.lock().unwrap().cancel_by_chain(&group.name);
                     }
+                }
+            });
+        }
+        {
+            let core = self.clone();
+            tasks.spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                let mut network = core.network_epoch.subscribe();
+                loop {
+                    tokio::select! {
+                        _ = core.stop.cancelled() => break,
+                        _ = interval.tick() => {}
+                        changed = network.changed() => {
+                            if changed.is_err() { break }
+                            network.mark_unchanged();
+                        }
+                    }
+                    core.evict_idle_hysteria2();
                 }
             });
         }
@@ -905,6 +1166,7 @@ impl Core {
         self.mark_networks(&rules);
         policy.rules = Arc::from(rules);
         *resources = next_with_geo;
+        self.bump_policy_epoch();
         Ok(())
     }
     pub(crate) async fn route_decision(
@@ -970,13 +1232,25 @@ impl Core {
                 None,
             ));
         }
-        let mut ip = target.ip().or(address);
+        let initial_ip = target.ip().or(address);
+        let mut ip = initial_ip;
         let mut resolved = ip.is_some();
         let mut looked_up = false;
-        let host = target.host.trim_end_matches('.').to_ascii_lowercase();
+        let lower_host = LowerHost::new(&target.host);
+        let host = lower_host.as_str();
+        let epoch = self.policy_epoch.load(Ordering::Acquire);
+        if let Some(cached) =
+            self.route_cache
+                .lock()
+                .unwrap()
+                .get(epoch, host, target.port, network, initial_ip)
+        {
+            return Ok(cached);
+        }
+        let host_ctx = HostMatchCtx::new(host);
         for (index, rule) in rules.iter().enumerate() {
-            let mut matched = rule.matcher.evaluate(
-                &host,
+            let mut matched = rule.matcher.evaluate_with_ctx(
+                &host_ctx,
                 ip,
                 target.port,
                 network,
@@ -991,9 +1265,9 @@ impl Core {
                     .and_then(|v| v.first().map(SocketAddr::ip));
                 resolved = true;
                 looked_up = true;
-                matched = rule
-                    .matcher
-                    .evaluate(&host, ip, target.port, network, false);
+                matched =
+                    rule.matcher
+                        .evaluate_with_ctx(&host_ctx, ip, target.port, network, false);
             }
             if matched == Some(true) {
                 let mut trace = Trace::new(
@@ -1007,11 +1281,31 @@ impl Core {
                 );
                 trace.index = Some(index);
                 trace.looked_up = looked_up;
+                if self.policy_epoch.load(Ordering::Acquire) == epoch {
+                    self.route_cache.lock().unwrap().insert(
+                        epoch,
+                        host,
+                        target.port,
+                        network,
+                        initial_ip,
+                        trace.clone(),
+                    );
+                }
                 return Ok(trace);
             }
         }
         let mut trace = Trace::new("DIRECT", "DIRECT", "Fallback", ip);
         trace.looked_up = looked_up;
+        if self.policy_epoch.load(Ordering::Acquire) == epoch {
+            self.route_cache.lock().unwrap().insert(
+                epoch,
+                host,
+                target.port,
+                network,
+                initial_ip,
+                trace.clone(),
+            );
+        }
         Ok(trace)
     }
     #[cfg(test)]
@@ -1036,12 +1330,48 @@ impl Core {
         }
         let mut chain = vec![name];
         for _ in 0..=self.config.proxy_groups.len() {
-            match policy.selection.get(chain.last().unwrap()) {
+            let Some(current) = chain.last() else {
+                return Ok(chain);
+            };
+            match policy.selection.get(current) {
                 Some(selected) => chain.push(selected.clone()),
                 None => return Ok(chain),
             }
         }
         bail!("group cycle")
+    }
+    fn bump_policy_epoch(&self) {
+        self.policy_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+    fn note_dial(&self) {
+        let now_ms = self.started_at.elapsed().as_millis() as u64;
+        let prev_ms = self.last_dial_ms.swap(now_ms, Ordering::Relaxed);
+        if now_ms.saturating_sub(prev_ms) >= URL_TEST_IDLE_TIMEOUT.as_millis() as u64 {
+            self.url_test_wake.notify_waiters();
+        }
+    }
+    fn dial_idle_elapsed(&self) -> Duration {
+        let now_ms = self.started_at.elapsed().as_millis() as u64;
+        let last_ms = self.last_dial_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+    fn evict_idle_hysteria2(&self) {
+        let epoch = *self.network_epoch.borrow();
+        let slots: Vec<Hysteria2Slot> = self.hysteria2.lock().unwrap().values().cloned().collect();
+        for slot in slots {
+            if let Ok(mut guard) = slot.try_lock()
+                && let Some(entry) = guard.as_ref()
+            {
+                let stale = entry.epoch != epoch || !entry.client.is_alive();
+                let idle = entry.active.load(Ordering::Acquire) == 0
+                    && entry.last_used.elapsed() >= HYSTERIA2_IDLE_TIMEOUT;
+                if (stale || idle)
+                    && let Some(removed) = guard.take()
+                {
+                    removed.client.close();
+                }
+            }
+        }
     }
     pub fn select(&self, group: &str, name: &str) -> Result<()> {
         let config = self
@@ -1054,16 +1384,22 @@ impl Core {
             config.proxies.iter().any(|p| p == name),
             "node not in group"
         );
-        self.policy
+        let previous = self
+            .policy
             .write()
             .unwrap()
             .selection
             .insert(group.into(), name.into());
+        if previous.as_deref() != Some(name) {
+            self.bump_policy_epoch();
+            self.traffic.lock().unwrap().cancel_by_chain(group);
+        }
         self.save_profile()?;
         Ok(())
     }
     pub fn set_mode(&self, mode: Mode) {
         self.policy.write().unwrap().mode = mode;
+        self.bump_policy_epoch();
     }
     pub fn replace_rules(&self, rules: impl AsRef<[String]>) -> Result<()> {
         self.update_policy(None, Some(rules.as_ref().to_vec()))
@@ -1109,13 +1445,14 @@ impl Core {
         if let Some(mode) = mode {
             policy.mode = mode;
         }
+        self.bump_policy_epoch();
         Ok(())
     }
     pub fn configuration(&self) -> serde_json::Value {
-        let mut config = serde_json::to_value(&self.config).unwrap();
-        let policy = self.policy.read().unwrap();
-        config["mode"] = serde_json::to_value(&policy.mode).unwrap();
-        config["rules"] = serde_json::to_value(policy.raw_rules.as_ref()).unwrap();
+        let mut config = serde_json::to_value(&self.config).unwrap_or_default();
+        let policy = self.policy.read().unwrap_or_else(|e| e.into_inner());
+        config["mode"] = serde_json::to_value(&policy.mode).unwrap_or_default();
+        config["rules"] = serde_json::to_value(policy.raw_rules.as_ref()).unwrap_or_default();
         config
     }
     /// Lightweight configuration subset for FFI snapshots: avoids serializing
@@ -1163,7 +1500,7 @@ impl Core {
             "ipv6" => addresses.retain(SocketAddr::is_ipv6),
             "ipv4-prefer" => addresses.sort_by_key(|a| a.is_ipv6()),
             "ipv6-prefer" => addresses.sort_by_key(|a| a.is_ipv4()),
-            _ => {}
+            _ => addresses = interleave_addresses(addresses),
         }
         addresses.truncate(32);
         if self.config.tcp_concurrent {
@@ -1299,7 +1636,8 @@ impl Core {
         &self,
         proxy: &clyntis_config::Proxy,
         target: &Target,
-    ) -> Result<Arc<clyntis_protocol::hysteria2::Client>> {
+    ) -> Result<(Arc<clyntis_protocol::hysteria2::Client>, ActiveGuard)> {
+        let epoch = *self.network_epoch.borrow();
         let slot = self
             .hysteria2
             .lock()
@@ -1308,8 +1646,18 @@ impl Core {
             .or_default()
             .clone();
         let mut slot = slot.lock().await;
-        if let Some(client) = slot.as_ref().filter(|c| c.is_alive()) {
-            return Ok(client.clone());
+        if let Some(entry) = slot.as_mut() {
+            let stale = entry.epoch != epoch || !entry.client.is_alive();
+            let idle = entry.active.load(Ordering::Acquire) == 0
+                && entry.last_used.elapsed() >= HYSTERIA2_IDLE_TIMEOUT;
+            if !stale && !idle {
+                entry.last_used = Instant::now();
+                entry.active.fetch_add(1, Ordering::AcqRel);
+                return Ok((entry.client.clone(), ActiveGuard(entry.active.clone())));
+            }
+            if let Some(removed) = slot.take() {
+                removed.client.close();
+            }
         }
         let mut addresses: Vec<std::net::IpAddr> = self
             .resolver
@@ -1352,23 +1700,35 @@ impl Core {
             client.remote,
             target
         );
-        *slot = Some(client.clone());
-        Ok(client)
+        let active = Arc::new(AtomicUsize::new(1));
+        *slot = Some(CachedHysteria2 {
+            client: client.clone(),
+            epoch,
+            last_used: Instant::now(),
+            active: active.clone(),
+        });
+        Ok((client, ActiveGuard(active)))
     }
     async fn hysteria2_stream(
         &self,
         proxy: &clyntis_config::Proxy,
         target: &Target,
     ) -> Result<BoxStream> {
-        let client = self.hysteria2_client(proxy, target).await?;
+        let (client, guard) = self.hysteria2_client(proxy, target).await?;
         match client.tcp(target).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => Ok(Box::new(TrackedStream {
+                inner: stream,
+                _guard: guard,
+            })),
             // A connection that died since the last use: one fresh attempt.
             Err(_) if !client.is_alive() => {
-                self.hysteria2_client(proxy, target)
-                    .await?
-                    .tcp(target)
-                    .await
+                drop(guard);
+                let (client, guard) = self.hysteria2_client(proxy, target).await?;
+                let stream = client.tcp(target).await?;
+                Ok(Box::new(TrackedStream {
+                    inner: stream,
+                    _guard: guard,
+                }))
             }
             Err(error) => Err(error),
         }
@@ -1451,6 +1811,7 @@ impl Core {
         selected: Option<&str>,
         network: &str,
     ) -> Result<(BoxStream, RouteDecision)> {
+        self.note_dial();
         let target = self.restore_target(target);
         self.refuse_stale_fake(&target)?;
         // A served tailnet address sits on the point-to-point TUN, so the
@@ -1522,7 +1883,15 @@ impl Core {
         Ok((stream, decision))
     }
     pub async fn datagram(self: &Arc<Self>, target: &Target) -> Result<Arc<dyn Datagram>> {
-        self.datagram_with_global_id(target, None, None).await
+        self.datagram_with_global_id(target, None, None, None).await
+    }
+    pub async fn datagram_with_initial(
+        self: &Arc<Self>,
+        target: &Target,
+        initial_payload: &[u8],
+    ) -> Result<Arc<dyn Datagram>> {
+        self.datagram_with_global_id(target, None, None, Some(initial_payload))
+            .await
     }
     pub(crate) async fn datagram_for_source(
         self: &Arc<Self>,
@@ -1535,7 +1904,23 @@ impl Core {
         let digest = digest.finalize();
         let mut global_id = [0; 8];
         global_id.copy_from_slice(&digest[..8]);
-        self.datagram_with_global_id(target, Some(global_id), Some(source))
+        self.datagram_with_global_id(target, Some(global_id), Some(source), None)
+            .await
+    }
+    #[allow(dead_code)]
+    pub(crate) async fn datagram_for_source_with_initial(
+        self: &Arc<Self>,
+        target: &Target,
+        source: &str,
+        initial_payload: &[u8],
+    ) -> Result<Arc<dyn Datagram>> {
+        let mut digest = Sha256::new();
+        digest.update(self.xudp_key);
+        digest.update(source.as_bytes());
+        let digest = digest.finalize();
+        let mut global_id = [0; 8];
+        global_id.copy_from_slice(&digest[..8]);
+        self.datagram_with_global_id(target, Some(global_id), Some(source), Some(initial_payload))
             .await
     }
     async fn datagram_with_global_id(
@@ -1543,38 +1928,62 @@ impl Core {
         target: &Target,
         global_id: Option<[u8; 8]>,
         source: Option<&str>,
+        initial_payload: Option<&[u8]>,
     ) -> Result<Arc<dyn Datagram>> {
+        self.note_dial();
         let target = self.restore_target(target);
         self.refuse_stale_fake(&target)?;
+        let mut route_target = target.clone();
+        let mut dialed_ip = None;
+        if target.port == 443
+            && let Some(ip) = target.ip()
+            && let Some(payload) = initial_payload
+            && let Some(sni) = sniff::sniff_quic_initial(payload)
+        {
+            dialed_ip = Some(ip);
+            route_target.host = sni;
+        }
         tokio::select! {
             biased;
             _=self.stop.cancelled()=>bail!("core stopped"),
             result=tokio::time::timeout(Duration::from_secs(20),async {
                 let source=source.map(|source|source.split_once(':').map(|(_,value)|value).unwrap_or(source));
-                let mut decision=self.route_decision(&target,"udp").await?;
+                let mut decision=self.trace_route(&route_target,dialed_ip,"udp",true).await?.decision;
                 // QUIC fallback for MITM is an explicit policy; preserve prior
                 // REJECT decisions (adblock, module reject, user rules).
                 if decision.node != "REJECT"
-                    && target.port == 443
-                    && self.mitm.blocks_quic(&target.host)
+                    && route_target.port == 443
+                    && self.mitm.blocks_quic(&route_target.host)
                 {
                     decision=RouteDecision{node:"REJECT".into(),group:"REJECT".into(),rule:"MITM(QUIC)".into()};
                 }
                 if decision.node=="REJECT" {
                     if let Some(source)=source {
-                        Self::log_connection("UDP",source,&target,&decision);
+                        Self::log_connection("UDP",source,&route_target,&decision);
                     }
-                    self.requests.rejected("udp",source.unwrap_or_default(),&target,&decision);
+                    self.requests.rejected("udp",source.unwrap_or_default(),&route_target,&decision);
                     // Typed so the TUN can answer the app with an ICMP error.
                     return Err(Rejected(decision).into());
                 }
-                let inner=self.datagram_inner(&target,&decision.node,global_id).await?;
+                let destination = if dialed_ip.is_some()
+                    && self
+                        .config
+                        .sniffer
+                        .sniff
+                        .get("QUIC")
+                        .is_some_and(|s| s.override_destination)
+                {
+                    &route_target
+                } else {
+                    &target
+                };
+                let inner=self.datagram_inner(destination,&decision.node,global_id).await?;
                 if let Some(source)=source {
-                    Self::log_connection("UDP",source,&target,&decision);
+                    Self::log_connection("UDP",source,&route_target,&decision);
                 }
                 let routed=Routed::new(&decision,source.unwrap_or_default());
                 Ok::<Arc<dyn Datagram>,anyhow::Error>(Arc::new(traffic::PacketSession {
-                    inner,tracker:traffic::Tracker::new(self.clone(),target,routed,"udp")?
+                    inner,tracker:traffic::Tracker::new(self.clone(),route_target,routed,"udp")?
                 }))
             })=>result?,
         }
@@ -1615,6 +2024,7 @@ impl Core {
             return Ok(Arc::new(DirectUdp {
                 socket,
                 target: target.clone(),
+                scratch: std::sync::Mutex::default(),
             }));
         }
         let proxy = self
@@ -1653,8 +2063,11 @@ impl Core {
             }
             ProxyKind::Tailscale => bail!("UDP through Tailscale is not supported yet"),
             ProxyKind::Hysteria2 => {
-                let client = self.hysteria2_client(proxy, target).await?;
-                Ok(Arc::new(client.udp()?))
+                let (client, guard) = self.hysteria2_client(proxy, target).await?;
+                Ok(Arc::new(TrackedDatagram {
+                    inner: client.udp()?,
+                    _guard: guard,
+                }))
             }
             ProxyKind::Trojan => {
                 bail!("configured outbound protocol is unavailable in this build")
@@ -1822,6 +2235,7 @@ impl Core {
         if let Some(filter) = self.resolver.adblock() {
             filter.set_allow(&merged);
         }
+        self.bump_policy_epoch();
         Ok(())
     }
     /// Per-proxy status for the apps: kind-specific details, the last probe
@@ -1935,7 +2349,7 @@ impl Core {
         self.scripts.relieve_memory();
         self.traffic.lock().unwrap().relieve_memory();
         if include_network {
-            self.resolver.clear_cache();
+            self.resolver.set_max_bytes(256 * 1024);
             clyntis_protocol::tls::clear_caches();
         }
         packet::relieve_memory();
@@ -1986,6 +2400,7 @@ impl Core {
         // Rules compiled from here on read the stored network; these are set
         // after it is stored, so neither misses the change.
         self.mark_networks(&self.policy.read().unwrap().rules);
+        self.bump_policy_epoch();
         if previous != active {
             // Resources hold the GEOSITE/RULE-SET data policy keys may use.
             // The write lock orders this with resource refreshes and other
@@ -2035,14 +2450,15 @@ impl Core {
             // A slot being dialed holds its lock and is getting a fresh
             // connection anyway; waiting for it would delay the change.
             if let Ok(mut slot) = slot.try_lock()
-                && let Some(client) = slot.take()
+                && let Some(entry) = slot.take()
             {
-                client.close();
+                entry.client.close();
             }
         }
         self.resolver.clear_cache();
         self.network_epoch
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        self.bump_policy_epoch();
         let nodes: Vec<clyntis_tailscale::Node> =
             self.tailscale.lock().unwrap().values().cloned().collect();
         for node in nodes {
@@ -2125,15 +2541,19 @@ impl Core {
 fn try_recv_datagram(
     socket: &tokio::net::UdpSocket,
     target: &Target,
+    scratch: &std::sync::Mutex<Vec<u8>>,
 ) -> std::io::Result<(Target, Vec<u8>)> {
-    let mut scratch = [std::mem::MaybeUninit::<u8>::uninit(); 65535];
-    let mut buf = tokio::io::ReadBuf::uninit(&mut scratch);
-    socket.try_recv_buf(&mut buf)?;
-    Ok((target.clone(), buf.filled().to_vec()))
+    let mut buf = scratch.lock().unwrap_or_else(|e| e.into_inner());
+    if buf.len() < 65535 {
+        buf.resize(65535, 0);
+    }
+    let n = socket.try_recv(&mut buf)?;
+    Ok((target.clone(), buf[..n].to_vec()))
 }
 struct DirectUdp {
     socket: tokio::net::UdpSocket,
     target: Target,
+    scratch: std::sync::Mutex<Vec<u8>>,
 }
 #[async_trait]
 impl Datagram for DirectUdp {
@@ -2145,11 +2565,11 @@ impl Datagram for DirectUdp {
     async fn recv(&self) -> Result<(Target, Vec<u8>)> {
         // Copy out exactly the datagram: a truncated 64 KiB Vec keeps its full
         // capacity while queued for the TUN, which multiplied memory under
-        // QUIC-heavy direct traffic. Reading in a non-async helper keeps the
-        // stack scratch buffer off the async future state and off the heap.
+        // QUIC-heavy direct traffic. Reusing a heap scratch buffer avoids both
+        // per-packet allocations and a 64 KiB stack frame on iOS NE threads.
         loop {
             self.socket.readable().await?;
-            match try_recv_datagram(&self.socket, &self.target) {
+            match try_recv_datagram(&self.socket, &self.target, &self.scratch) {
                 Ok(datagram) => return Ok(datagram),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(error) => return Err(error.into()),

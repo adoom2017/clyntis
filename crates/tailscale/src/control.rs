@@ -10,8 +10,12 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use bytes::Bytes;
 use clyntis_protocol::BoxStream;
-use std::sync::Arc;
+use std::{io::Read, sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
+
+const MAX_MAP_JSON: u64 = 64 << 20;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_ERROR_LEN: usize = 512;
 
 /// Where the control server lives (`control-url`).
 #[derive(Clone, Debug)]
@@ -22,11 +26,16 @@ pub struct ServerUrl {
 }
 impl ServerUrl {
     pub fn parse(url: &str) -> Result<Self> {
+        Self::parse_insecure(url, false)
+    }
+
+    pub fn parse_insecure(url: &str, allow_insecure_http: bool) -> Result<Self> {
         let uri: http::Uri = url.parse().context("invalid control-url")?;
         let tls = match uri.scheme_str() {
             Some("https") => true,
-            Some("http") => false,
-            _ => bail!("control-url must be http(s)"),
+            Some("http") if allow_insecure_http => false,
+            Some("http") => bail!("control-url must use https://"),
+            _ => bail!("control-url must be https://"),
         };
         let host = uri.host().context("control-url needs a host")?.to_owned();
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
@@ -74,52 +83,62 @@ impl Control {
         server: &ServerUrl,
         machine: &Private,
     ) -> Result<Self> {
-        let control_key = server_key(&*dialer, server).await?;
+        let control_key = tokio::time::timeout(HANDSHAKE_TIMEOUT, server_key(&*dialer, server))
+            .await
+            .context("control key request timed out")??;
         let (init, pending) = noise::initiate(machine, &control_key, tailcfg::CAPABILITY_VERSION)?;
-        let mut stream = open(&*dialer, server).await?;
         let handshake = base64::engine::general_purpose::STANDARD.encode(&init);
-        let response = http1::request(
-            &mut stream,
-            "POST",
-            &server.host,
-            "/ts2021",
-            &[
-                ("Upgrade", "tailscale-control-protocol"),
-                ("Connection", "upgrade"),
-                ("X-Tailscale-Handshake", &handshake),
-                ("Content-Length", "0"),
-            ],
-        )
-        .await?;
-        if response.status != 101 {
-            let status = response.status;
-            let body = http1::body(&mut stream, response, 16 * 1024)
-                .await
-                .unwrap_or_default();
-            bail!(
-                "control upgrade failed: HTTP {status} {}",
-                String::from_utf8_lossy(&body).trim()
-            );
-        }
-        let mut data = response.rest;
-        let mut buf = [0u8; 1024];
-        // An error message is a 3-byte header plus text; a response is 51 bytes.
-        loop {
-            let want = if data.len() >= 3 && data[0] == 3 {
-                3 + u16::from_be_bytes([data[1], data[2]]) as usize
-            } else {
-                noise::RESPONSE_LEN
-            };
-            if data.len() >= want {
-                break;
+        let (pipe, _early) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            let mut stream = open(&*dialer, server).await?;
+            let response = http1::request(
+                &mut stream,
+                "POST",
+                &server.host,
+                "/ts2021",
+                &[
+                    ("Upgrade", "tailscale-control-protocol"),
+                    ("Connection", "upgrade"),
+                    ("X-Tailscale-Handshake", &handshake),
+                    ("Content-Length", "0"),
+                ],
+            )
+            .await?;
+            if response.status != 101 {
+                let status = response.status;
+                let body = http1::body(&mut stream, response, 16 * 1024)
+                    .await
+                    .unwrap_or_default();
+                bail!(
+                    "control upgrade failed: HTTP {status} {}",
+                    String::from_utf8_lossy(&body).trim()
+                );
             }
-            let n = stream.read(&mut buf).await?;
-            ensure!(n > 0, "control server closed during the handshake");
-            data.extend_from_slice(&buf[..n]);
-        }
-        let leftover = data.split_off(noise::RESPONSE_LEN.min(data.len()));
-        let ciphers = pending.finish(&data)?;
-        let (pipe, _early) = noise::transport(stream, leftover, ciphers).await?;
+            let mut data = response.rest;
+            let mut buf = [0u8; 1024];
+            // An error message is a 3-byte header plus text; a response is 51 bytes.
+            loop {
+                let want = if data.len() >= 3 && data[0] == 3 {
+                    3 + (u16::from_be_bytes([data[1], data[2]]) as usize).min(MAX_ERROR_LEN)
+                } else {
+                    noise::RESPONSE_LEN
+                };
+                if data.len() >= want {
+                    break;
+                }
+                let n = stream.read(&mut buf).await?;
+                ensure!(n > 0, "control server closed during the handshake");
+                data.extend_from_slice(&buf[..n]);
+            }
+            let leftover = if data.first() == Some(&3) {
+                Vec::new()
+            } else {
+                data.split_off(noise::RESPONSE_LEN.min(data.len()))
+            };
+            let ciphers = pending.finish(&data)?;
+            noise::transport(stream, leftover, ciphers).await
+        })
+        .await
+        .context("control Noise handshake timed out")??;
         let (send, connection) = h2::client::Builder::new()
             .initial_window_size(4 << 20)
             .initial_connection_window_size(8 << 20)
@@ -212,6 +231,21 @@ async fn read_all(mut body: h2::RecvStream, limit: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn decode_map_json(compressed: &[u8], limit: u64) -> Result<Vec<u8>> {
+    let mut decoder = zstd::stream::Decoder::new(compressed)
+        .context("invalid compressed network map")?
+        .take(limit + 1);
+    let mut json = Vec::new();
+    decoder
+        .read_to_end(&mut json)
+        .context("invalid compressed network map")?;
+    ensure!(
+        json.len() <= limit as usize,
+        "decompressed network map too large"
+    );
+    Ok(json)
+}
+
 /// Network-map messages: 4-byte little-endian size, then zstd-compressed JSON.
 pub struct MapStream {
     body: h2::RecvStream,
@@ -222,11 +256,13 @@ impl MapStream {
         loop {
             if self.buf.len() >= 4 {
                 let size = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
-                ensure!(size <= 64 << 20, "network map message too large");
+                ensure!(
+                    size <= MAX_MAP_JSON as usize,
+                    "network map message too large"
+                );
                 if self.buf.len() >= 4 + size {
                     let compressed: Vec<u8> = self.buf.drain(..4 + size).skip(4).collect();
-                    let json = zstd::stream::decode_all(&compressed[..])
-                        .context("invalid compressed network map")?;
+                    let json = decode_map_json(&compressed, MAX_MAP_JSON)?;
                     return Ok(Some(
                         serde_json::from_slice(&json).context("invalid network map")?,
                     ));
@@ -252,8 +288,24 @@ mod tests {
     fn parses_control_urls() {
         let url = ServerUrl::parse("https://controlplane.tailscale.com").unwrap();
         assert!(url.tls && url.port == 443 && url.host == "controlplane.tailscale.com");
-        let url = ServerUrl::parse("http://headscale.lan:8080").unwrap();
+        assert!(ServerUrl::parse("http://headscale.lan:8080").is_err());
+        let url = ServerUrl::parse_insecure("http://headscale.lan:8080", true).unwrap();
         assert!(!url.tls && url.port == 8080);
         assert!(ServerUrl::parse("ftp://x").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_zstd_network_map() {
+        let small = vec![b' '; 1024];
+        let compressed_small = zstd::stream::encode_all(&small[..], 3).unwrap();
+        assert_eq!(
+            decode_map_json(&compressed_small, 1024).unwrap().len(),
+            1024
+        );
+
+        let too_big = vec![0u8; (MAX_MAP_JSON as usize) + 1];
+        let compressed_big = zstd::stream::encode_all(&too_big[..], 1).unwrap();
+        assert!(compressed_big.len() < (MAX_MAP_JSON as usize));
+        assert!(decode_map_json(&compressed_big, MAX_MAP_JSON).is_err());
     }
 }

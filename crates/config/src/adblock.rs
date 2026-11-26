@@ -243,6 +243,34 @@ pub fn allow_pattern(builder: &mut DomainSetBuilder, pattern: &str) -> Result<()
     }
 }
 
+/// Destination for parsed domain rules; implemented by [`DomainSetBuilder`]
+/// and by streaming cache writers.
+pub trait DomainTarget {
+    fn exact(&mut self, domain: &str);
+    fn suffix(&mut self, domain: &str);
+    fn subdomain(&mut self, domain: &str);
+    fn keyword(&mut self, keyword: &str);
+    fn pattern(&mut self, pattern: &str) -> Result<()>;
+}
+
+impl DomainTarget for DomainSetBuilder {
+    fn exact(&mut self, domain: &str) {
+        DomainSetBuilder::exact(self, domain);
+    }
+    fn suffix(&mut self, domain: &str) {
+        DomainSetBuilder::suffix(self, domain);
+    }
+    fn subdomain(&mut self, domain: &str) {
+        DomainSetBuilder::subdomain(self, domain);
+    }
+    fn keyword(&mut self, keyword: &str) {
+        DomainSetBuilder::keyword(self, keyword);
+    }
+    fn pattern(&mut self, pattern: &str) -> Result<()> {
+        DomainSetBuilder::pattern(self, pattern)
+    }
+}
+
 /// Feeds one downloaded list into the block and allow sets and the blocked
 /// addresses; returns the number of entries taken. Lines that need the
 /// request itself (cosmetic, URL-path, regex or modifier rules) are skipped.
@@ -253,24 +281,42 @@ pub fn parse_list(
     allow: &mut DomainSetBuilder,
     addresses: &mut Vec<IpNet>,
 ) -> Result<usize> {
+    parse_list_into(data, format, block, allow, addresses)
+}
+
+/// Generic variant of [`parse_list`] writing into any [`DomainTarget`].
+pub fn parse_list_into(
+    data: &[u8],
+    format: &str,
+    block: &mut impl DomainTarget,
+    allow: &mut impl DomainTarget,
+    addresses: &mut Vec<IpNet>,
+) -> Result<usize> {
     ensure!(
         FORMATS.contains(&format),
         "unsupported adblock list format {format}"
     );
     if format == "adguard" {
-        let mut entries = Vec::new();
+        let mut meta = AdguardMeta::default();
         for raw_line in data.split(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(raw_line);
             if let Some(entry) = parse_adguard_line(&line) {
-                entries.push(entry);
+                meta.record(&entry);
             }
         }
-        return Ok(apply_adguard_entries(entries, block, allow));
+        let mut taken = 0;
+        for raw_line in data.split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(raw_line);
+            if let Some(entry) = parse_adguard_line(&line) {
+                taken += apply_adguard_entry(&entry, &meta, block, allow);
+            }
+        }
+        return Ok(taken);
     }
     let mut taken = 0;
     for raw_line in data.split(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(raw_line);
-        taken += parse_list_line(&line, format, block, allow, addresses);
+        taken += parse_list_line(&line, format, block, addresses);
     }
     Ok(taken)
 }
@@ -278,10 +324,22 @@ pub fn parse_list(
 /// Streaming variant of [`parse_list`] that reads line-by-line from `reader`
 /// into a single reusable line buffer without buffering the full file.
 pub fn parse_list_reader(
-    mut reader: impl std::io::BufRead,
+    reader: impl std::io::BufRead,
     format: &str,
     block: &mut DomainSetBuilder,
     allow: &mut DomainSetBuilder,
+    addresses: &mut Vec<IpNet>,
+    limit: usize,
+) -> Result<usize> {
+    parse_list_reader_into(reader, format, block, allow, addresses, limit)
+}
+
+/// Generic variant of [`parse_list_reader`] writing into any [`DomainTarget`].
+pub fn parse_list_reader_into(
+    mut reader: impl std::io::BufRead,
+    format: &str,
+    block: &mut impl DomainTarget,
+    allow: &mut impl DomainTarget,
     addresses: &mut Vec<IpNet>,
     limit: usize,
 ) -> Result<usize> {
@@ -292,7 +350,50 @@ pub fn parse_list_reader(
     let mut buf = Vec::with_capacity(256);
     let mut read_bytes = 0usize;
     let mut taken = 0usize;
-    let mut adguard_entries = (format == "adguard").then(Vec::new);
+    if format == "adguard" {
+        let mut meta = AdguardMeta::default();
+        let mut pending_allows: Vec<(String, bool, bool)> = Vec::new();
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            read_bytes = read_bytes.saturating_add(n);
+            ensure!(read_bytes <= limit, "resource exceeds size limit");
+            let line = String::from_utf8_lossy(&buf);
+            let Some(entry) = parse_adguard_line(&line) else {
+                continue;
+            };
+            if entry.badfilter || entry.important {
+                meta.record(&entry);
+            }
+            if entry.badfilter {
+                continue;
+            }
+            if entry.exception {
+                if !meta.is_badfiltered(true, entry.domain) {
+                    pending_allows.push((
+                        entry.domain.to_ascii_lowercase(),
+                        entry.is_pattern,
+                        entry.important,
+                    ));
+                }
+            } else if !meta.is_badfiltered(false, entry.domain) {
+                taken += push_adguard_rule(block, entry.domain, entry.is_pattern);
+            }
+        }
+        for (domain, is_pattern, important) in pending_allows {
+            if meta.is_badfiltered(true, &domain) {
+                continue;
+            }
+            if !important && meta.is_important_block(&domain) && !meta.is_important_allow(&domain) {
+                continue;
+            }
+            taken += push_adguard_rule(allow, &domain, is_pattern);
+        }
+        return Ok(taken);
+    }
     loop {
         buf.clear();
         let n = reader.read_until(b'\n', &mut buf)?;
@@ -302,29 +403,141 @@ pub fn parse_list_reader(
         read_bytes = read_bytes.saturating_add(n);
         ensure!(read_bytes <= limit, "resource exceeds size limit");
         let line = String::from_utf8_lossy(&buf);
-        if let Some(entries) = adguard_entries.as_mut() {
-            if let Some(entry) = parse_adguard_line(&line) {
-                entries.push(entry);
-            }
-        } else {
-            taken += parse_list_line(&line, format, block, allow, addresses);
-        }
-    }
-    if let Some(entries) = adguard_entries {
-        taken += apply_adguard_entries(entries, block, allow);
+        taken += parse_list_line(&line, format, block, addresses);
     }
     Ok(taken)
 }
 
-struct AdguardEntry {
-    domain: String,
+/// Two-pass streaming parser for a file on disk: for `adguard` lists, pass 1
+/// collects only `$badfilter`/`$important` metadata and pass 2 streams rules
+/// directly into `block` and `allow` with zero `AdguardEntry` buffering.
+pub fn parse_list_file_into(
+    path: &std::path::Path,
+    format: &str,
+    block: &mut impl DomainTarget,
+    allow: &mut impl DomainTarget,
+    addresses: &mut Vec<IpNet>,
+    limit: usize,
+) -> Result<usize> {
+    ensure!(
+        FORMATS.contains(&format),
+        "unsupported adblock list format {format}"
+    );
+    if format != "adguard" {
+        let reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+        return parse_list_reader_into(reader, format, block, allow, addresses, limit);
+    }
+    use std::io::BufRead;
+    let mut buf = Vec::with_capacity(256);
+    let mut meta = AdguardMeta::default();
+    let mut read_bytes = 0usize;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        read_bytes = read_bytes.saturating_add(n);
+        ensure!(read_bytes <= limit, "resource exceeds size limit");
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(entry) = parse_adguard_line(&line) {
+            meta.record(&entry);
+        }
+    }
+    let mut taken = 0usize;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if let Some(entry) = parse_adguard_line(&line) {
+            taken += apply_adguard_entry(&entry, &meta, block, allow);
+        }
+    }
+    Ok(taken)
+}
+
+struct AdguardParsed<'a> {
+    domain: &'a str,
     is_pattern: bool,
     exception: bool,
     important: bool,
     badfilter: bool,
 }
 
-fn parse_adguard_line(line: &str) -> Option<AdguardEntry> {
+#[derive(Default)]
+struct AdguardMeta {
+    badfilters: std::collections::HashSet<(bool, String)>,
+    important_blocks: std::collections::HashSet<String>,
+    important_allows: std::collections::HashSet<String>,
+}
+
+impl AdguardMeta {
+    fn record(&mut self, entry: &AdguardParsed<'_>) {
+        if entry.badfilter {
+            self.badfilters
+                .insert((entry.exception, entry.domain.to_ascii_lowercase()));
+        } else if entry.important {
+            let lower = entry.domain.to_ascii_lowercase();
+            if entry.exception {
+                self.important_allows.insert(lower);
+            } else {
+                self.important_blocks.insert(lower);
+            }
+        }
+    }
+
+    fn with_lower<R>(domain: &str, f: impl FnOnce(&str) -> R) -> R {
+        if !domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            return f(domain);
+        }
+        if domain.len() <= 256 && domain.is_ascii() {
+            let mut buf = [0u8; 256];
+            let len = domain.len();
+            buf[..len].copy_from_slice(domain.as_bytes());
+            buf[..len].make_ascii_lowercase();
+            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                return f(s);
+            }
+        }
+        f(&domain.to_ascii_lowercase())
+    }
+
+    fn is_badfiltered(&self, exception: bool, domain: &str) -> bool {
+        if self.badfilters.is_empty() {
+            return false;
+        }
+        Self::with_lower(domain, |lower| {
+            self.badfilters
+                .iter()
+                .any(|(ex, d)| *ex == exception && d == lower)
+        })
+    }
+
+    fn is_important_block(&self, domain: &str) -> bool {
+        if self.important_blocks.is_empty() {
+            return false;
+        }
+        Self::with_lower(domain, |lower| {
+            self.important_blocks.contains(lower) && !self.is_badfiltered(false, lower)
+        })
+    }
+
+    fn is_important_allow(&self, domain: &str) -> bool {
+        if self.important_allows.is_empty() {
+            return false;
+        }
+        Self::with_lower(domain, |lower| {
+            self.important_allows.contains(lower) && !self.is_badfiltered(true, lower)
+        })
+    }
+}
+
+fn parse_adguard_line(line: &str) -> Option<AdguardParsed<'_>> {
     let line = line.trim();
     let (exception, rule) = match line.strip_prefix("@@") {
         Some(rest) => (true, rest),
@@ -352,8 +565,8 @@ fn parse_adguard_line(line: &str) -> Option<AdguardEntry> {
     {
         return None;
     }
-    Some(AdguardEntry {
-        domain: domain.to_ascii_lowercase(),
+    Some(AdguardParsed {
+        domain,
         is_pattern: domain.contains('*'),
         exception,
         important,
@@ -361,73 +574,44 @@ fn parse_adguard_line(line: &str) -> Option<AdguardEntry> {
     })
 }
 
-fn apply_adguard_entries(
-    entries: Vec<AdguardEntry>,
-    block: &mut DomainSetBuilder,
-    allow: &mut DomainSetBuilder,
-) -> usize {
-    use std::collections::HashSet;
-
-    let badfilters: HashSet<(bool, String)> = entries
-        .iter()
-        .filter(|e| e.badfilter)
-        .map(|e| (e.exception, e.domain.clone()))
-        .collect();
-    let important_blocks: HashSet<String> = entries
-        .iter()
-        .filter(|e| {
-            !e.exception
-                && e.important
-                && !e.badfilter
-                && !badfilters.contains(&(false, e.domain.clone()))
-        })
-        .map(|e| e.domain.clone())
-        .collect();
-    let important_allows: HashSet<String> = entries
-        .iter()
-        .filter(|e| {
-            e.exception
-                && e.important
-                && !e.badfilter
-                && !badfilters.contains(&(true, e.domain.clone()))
-        })
-        .map(|e| e.domain.clone())
-        .collect();
-
-    let mut taken = 0;
-    for entry in entries {
-        if entry.badfilter || badfilters.contains(&(entry.exception, entry.domain.clone())) {
-            continue;
+fn push_adguard_rule(target: &mut impl DomainTarget, domain: &str, is_pattern: bool) -> usize {
+    if is_pattern {
+        if target.pattern(domain).is_err() {
+            return 0;
         }
-        if entry.exception
-            && !entry.important
-            && important_blocks.contains(&entry.domain)
-            && !important_allows.contains(&entry.domain)
-        {
-            continue;
-        }
-        let target = if entry.exception {
-            &mut *allow
-        } else {
-            &mut *block
-        };
-        if entry.is_pattern {
-            if target.pattern(&entry.domain).is_err() {
-                continue;
-            }
-        } else {
-            target.suffix(&entry.domain);
-        }
-        taken += 1;
+    } else {
+        target.suffix(domain);
     }
-    taken
+    1
+}
+
+fn apply_adguard_entry(
+    entry: &AdguardParsed<'_>,
+    meta: &AdguardMeta,
+    block: &mut impl DomainTarget,
+    allow: &mut impl DomainTarget,
+) -> usize {
+    if entry.badfilter || meta.is_badfiltered(entry.exception, entry.domain) {
+        return 0;
+    }
+    if entry.exception
+        && !entry.important
+        && meta.is_important_block(entry.domain)
+        && !meta.is_important_allow(entry.domain)
+    {
+        return 0;
+    }
+    if entry.exception {
+        push_adguard_rule(allow, entry.domain, entry.is_pattern)
+    } else {
+        push_adguard_rule(block, entry.domain, entry.is_pattern)
+    }
 }
 
 fn parse_list_line(
     line: &str,
     format: &str,
-    block: &mut DomainSetBuilder,
-    allow: &mut DomainSetBuilder,
+    block: &mut impl DomainTarget,
     addresses: &mut Vec<IpNet>,
 ) -> usize {
     match format {
@@ -484,42 +668,6 @@ fn parse_list_line(
                 }
             }
             taken
-        }
-        "adguard" => {
-            let line = line.trim();
-            let (exception, rule) = match line.strip_prefix("@@") {
-                Some(rest) => (true, rest),
-                None => (false, line),
-            };
-            let Some(rule) = rule.strip_prefix("||") else {
-                return 0;
-            };
-            // `$important` keeps its meaning at DNS level; other modifiers
-            // (badfilter, client, dnstype…) cannot be honoured: skip.
-            let (domain, modifiers) = rule.split_once('$').unwrap_or((rule, ""));
-            if !modifiers.is_empty() && modifiers != "important" {
-                return 0;
-            }
-            let Some(domain) = domain.strip_suffix('^') else {
-                return 0;
-            };
-            if domain.is_empty()
-                || domain.ends_with('.')
-                || !domain
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'*')
-            {
-                return 0;
-            }
-            let target = if exception { &mut *allow } else { &mut *block };
-            if domain.contains('*') {
-                if target.pattern(domain).is_err() {
-                    return 0;
-                }
-            } else {
-                target.suffix(domain);
-            }
-            1
         }
         _ => 0,
     }
@@ -723,5 +871,66 @@ mod tests {
             ..Settings::default()
         };
         assert!(bad.to_config().is_err());
+    }
+
+    #[test]
+    fn streams_adguard_reader_and_file_without_buffering() {
+        let rules = concat!(
+            "! comment\n",
+            "||ads.test^\n",
+            "||wild.*.test^\n",
+            "||bad.test^$badfilter\n",
+            "||bad.test^\n",
+            "@@||ok.ads.test^\n",
+            "@@||forced.test^\n",
+            "||forced.test^$important\n",
+            "||overridden.test^$important\n",
+            "@@||overridden.test^$important\n",
+        );
+        let mut block = DomainSetBuilder::default();
+        let mut allow = DomainSetBuilder::default();
+        let mut addrs = Vec::new();
+        let taken = parse_list_reader(
+            std::io::Cursor::new(rules.as_bytes()),
+            "adguard",
+            &mut block,
+            &mut allow,
+            &mut addrs,
+            1024 * 1024,
+        )
+        .unwrap();
+        let (block, allow) = (block.build(), allow.build());
+        assert_eq!(taken, 6);
+        assert!(block.matches("sub.ads.test"));
+        assert!(block.matches("wild.foo.test"));
+        assert!(!block.matches("bad.test"));
+        assert!(allow.matches("ok.ads.test"));
+        assert!(block.matches("forced.test") && !allow.matches("forced.test"));
+        assert!(block.matches("overridden.test") && allow.matches("overridden.test"));
+
+        // Two-pass file streaming also cancels rules whose `$badfilter` appears later.
+        let dir = std::env::temp_dir().join(format!("adguard-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("list.txt");
+        let out_of_order =
+            format!("||cancelled-late.test^\n{rules}||cancelled-late.test^$badfilter\n");
+        std::fs::write(&file_path, out_of_order).unwrap();
+        let mut f_block = DomainSetBuilder::default();
+        let mut f_allow = DomainSetBuilder::default();
+        let mut f_addrs = Vec::new();
+        let f_taken = parse_list_file_into(
+            &file_path,
+            "adguard",
+            &mut f_block,
+            &mut f_allow,
+            &mut f_addrs,
+            1024 * 1024,
+        )
+        .unwrap();
+        let (f_block, f_allow) = (f_block.build(), f_allow.build());
+        assert_eq!(f_taken, 6);
+        assert!(!f_block.matches("cancelled-late.test"));
+        assert!(f_allow.matches("ok.ads.test"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -112,6 +112,17 @@ impl fmt::Debug for Transport {
             .finish_non_exhaustive()
     }
 }
+/// Jitters `base` into `[base, base * 3 / 2]` so port hops do not fire on a
+/// predictable fixed cadence.
+fn next_hop_delay(base: Duration) -> Duration {
+    let min_ms = base.as_millis().min(u128::from(u64::MAX)) as u64;
+    let max_ms = min_ms.saturating_mul(3) / 2;
+    if max_ms <= min_ms {
+        return base;
+    }
+    Duration::from_millis(rand::thread_rng().gen_range(min_ms..=max_ms))
+}
+
 impl Transport {
     pub fn new(
         server: SocketAddr,
@@ -138,7 +149,7 @@ impl Transport {
                 previous: None,
                 port,
                 generation: 0,
-                next_hop: hopping.then(|| Instant::now() + hop_interval),
+                next_hop: hopping.then(|| Instant::now() + next_hop_delay(hop_interval)),
                 receiver: None,
             }),
         })
@@ -154,7 +165,7 @@ impl Transport {
         if now < due {
             return expired;
         }
-        sockets.next_hop = Some(now + interval);
+        sockets.next_hop = Some(now + next_hop_delay(interval));
         let socket = match (self.bind)(self.server).and_then(|s| TokioRuntime.wrap_udp_socket(s)) {
             Ok(socket) => socket,
             Err(error) => {
@@ -208,7 +219,7 @@ impl Transport {
 impl AsyncUdpSocket for Transport {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         let (inner, generation) = {
-            let sockets = self.sockets.lock().unwrap();
+            let sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
             (
                 sockets.current.clone().create_io_poller(),
                 sockets.generation,
@@ -223,7 +234,7 @@ impl AsyncUdpSocket for Transport {
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
         let (socket, port, _expired) = {
-            let mut sockets = self.sockets.lock().unwrap();
+            let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
             let expired = self.hop_if_due(&mut sockets);
             (sockets.current.clone(), sockets.port, expired)
         };
@@ -270,7 +281,7 @@ impl AsyncUdpSocket for Transport {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         let (current, previous, _expired) = {
-            let mut sockets = self.sockets.lock().unwrap();
+            let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
             sockets.receiver = Some(cx.waker().clone());
             let expired = if sockets.previous.is_some() {
                 sockets.expire_previous(Instant::now())
@@ -296,7 +307,7 @@ impl AsyncUdpSocket for Transport {
                 }
                 Poll::Ready(Err(_)) => {
                     let _dropped = {
-                        let mut sockets = self.sockets.lock().unwrap();
+                        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
                         if sockets
                             .previous
                             .as_ref()
@@ -315,23 +326,40 @@ impl AsyncUdpSocket for Transport {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.sockets.lock().unwrap().current.local_addr()
+        self.sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .local_addr()
     }
 
     fn max_transmit_segments(&self) -> usize {
         // Salamander salts each packet, so quinn must hand them over singly.
         match self.obfs {
             Some(_) => 1,
-            None => self.sockets.lock().unwrap().current.max_transmit_segments(),
+            None => self
+                .sockets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .current
+                .max_transmit_segments(),
         }
     }
 
     fn max_receive_segments(&self) -> usize {
-        self.sockets.lock().unwrap().current.max_receive_segments()
+        self.sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .max_receive_segments()
     }
 
     fn may_fragment(&self) -> bool {
-        self.sockets.lock().unwrap().current.may_fragment()
+        self.sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .may_fragment()
     }
 }
 
@@ -350,7 +378,11 @@ impl UdpPoller for Poller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let (current, generation) = {
-            let sockets = this.transport.sockets.lock().unwrap();
+            let sockets = this
+                .transport
+                .sockets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             (sockets.current.clone(), sockets.generation)
         };
         if generation != this.generation {
@@ -425,5 +457,16 @@ mod tests {
             );
             assert!(sockets.previous.is_none());
         }
+    }
+
+    #[test]
+    fn hop_interval_is_jittered_within_expected_range() {
+        let base = Duration::from_secs(20);
+        let max = Duration::from_secs(30);
+        for _ in 0..64 {
+            let delay = next_hop_delay(base);
+            assert!(delay >= base && delay <= max, "unexpected delay {delay:?}");
+        }
+        assert_eq!(next_hop_delay(Duration::ZERO), Duration::ZERO);
     }
 }

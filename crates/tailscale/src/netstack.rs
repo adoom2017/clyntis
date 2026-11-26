@@ -67,6 +67,9 @@ impl Gate {
                 if packet[9] != 6 || header < 20 {
                     return Admission::Pass;
                 }
+                if (u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff) != 0 {
+                    return Admission::Denied { syn: false };
+                }
                 let source: [u8; 4] = packet[12..16].try_into().unwrap();
                 (IpAddr::from(source), packet.get(header..))
             }
@@ -988,6 +991,17 @@ mod tests {
             served(47821, None).admits(&tcp_v4([100, 64, 0, 3], 47821, 0x02)),
             Admission::Pass
         );
+        // Fragmented IPv4 packets on controlled ports must be rejected.
+        let mut mf = tcp_v4([100, 64, 0, 2], 47821, 0x02);
+        mf[6] = 0x20;
+        assert_eq!(gate.admits(&mf), Admission::Denied { syn: false });
+        let mut offset = tcp_v4([100, 64, 0, 2], 47821, 0x02);
+        offset[7] = 0x01;
+        assert_eq!(gate.admits(&offset), Admission::Denied { syn: false });
+        // DF (Don't Fragment) is not fragmented and still passes for allowed peers.
+        let mut df = tcp_v4([100, 64, 0, 2], 47821, 0x02);
+        df[6] = 0x40;
+        assert_eq!(gate.admits(&df), Admission::Pass);
     }
 
     #[test]

@@ -10,10 +10,12 @@ use crate::{
 use anyhow::{Result, ensure};
 use clyntis_platform::PacketIo;
 use clyntis_protocol::Target;
+#[cfg(test)]
+use smoltcp::socket::udp;
 use smoltcp::{
     iface::{Config, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
-    socket::{tcp, udp},
+    socket::tcp,
     time::{Duration as NetDuration, Instant as NetInstant},
     wire::{
         HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Packet,
@@ -467,8 +469,52 @@ impl TxPool {
     }
 }
 
+const INGRESS_POOL_MAX_BUFFERS: usize = 128;
+const INGRESS_POOL_DEFAULT_CAP: usize = 2048;
+const INGRESS_POOL_MAX_CAP: usize = 16 * 1024;
+
+struct IngressPool(std::sync::Mutex<Vec<Vec<u8>>>);
+
+static INGRESS_POOL: IngressPool = IngressPool::new();
+
+impl IngressPool {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn take_slice(&self, src: &[u8]) -> Vec<u8> {
+        let mut buf = self
+            .0
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(src.len().max(INGRESS_POOL_DEFAULT_CAP)));
+        buf.clear();
+        buf.extend_from_slice(src);
+        buf
+    }
+
+    fn put(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > INGRESS_POOL_MAX_CAP {
+            return;
+        }
+        buf.clear();
+        let mut pool = self.0.lock().unwrap();
+        if pool.len() < INGRESS_POOL_MAX_BUFFERS {
+            pool.push(buf);
+        }
+    }
+
+    fn clear(&self) {
+        let mut pool = self.0.lock().unwrap();
+        pool.clear();
+        pool.shrink_to_fit();
+    }
+}
+
 pub(crate) fn relieve_memory() {
     TX_POOL.clear();
+    INGRESS_POOL.clear();
 }
 
 pub(crate) struct PacketDevice {
@@ -506,8 +552,17 @@ impl Device for PacketDevice {
     }
 }
 impl RxToken for Receive {
-    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(&self.0)
+    fn consume<R, F: FnOnce(&[u8]) -> R>(mut self, f: F) -> R {
+        let result = f(&self.0);
+        INGRESS_POOL.put(std::mem::take(&mut self.0));
+        result
+    }
+}
+impl Drop for Receive {
+    fn drop(&mut self) {
+        if self.0.capacity() > 0 {
+            INGRESS_POOL.put(std::mem::take(&mut self.0));
+        }
     }
 }
 impl TxToken for Transmit {
@@ -565,10 +620,19 @@ impl AsyncRead for ChannelStream {
         let n = buffer.remaining().min(bytes.len() - *offset);
         buffer.put_slice(&bytes[*offset..*offset + n]);
         *offset += n;
-        if *offset == bytes.len() {
-            this.pending = None;
+        if *offset == bytes.len()
+            && let Some((bytes, _)) = this.pending.take()
+        {
+            INGRESS_POOL.put(bytes);
         }
         Poll::Ready(Ok(()))
+    }
+}
+impl Drop for ChannelStream {
+    fn drop(&mut self) {
+        if let Some((bytes, _)) = self.pending.take() {
+            INGRESS_POOL.put(bytes);
+        }
     }
 }
 impl AsyncWrite for ChannelStream {
@@ -589,10 +653,13 @@ impl AsyncWrite for ChannelStream {
             Poll::Ready(Err(_)) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
             Poll::Ready(Ok(())) => {
                 let n = bytes.len().min(CHUNK);
-                let sent = output
-                    .send_item(bytes[..n].to_vec())
-                    .map(|()| n)
-                    .map_err(|_| io::ErrorKind::BrokenPipe.into());
+                let buf = INGRESS_POOL.take_slice(&bytes[..n]);
+                let sent = output.send_item(buf).map(|()| n).map_err(|err| {
+                    if let Some(buf) = err.into_inner() {
+                        INGRESS_POOL.put(buf);
+                    }
+                    io::ErrorKind::BrokenPipe.into()
+                });
                 this.wake.notify_one();
                 Poll::Ready(sent)
             }
@@ -609,7 +676,111 @@ impl AsyncWrite for ChannelStream {
     }
 }
 
+/// Bounded IPv4 UDP fragment reassembly for Direct L3/L4 UDP NAT.
+struct Ipv4Assembly {
+    created: std::time::Instant,
+    bytes: Vec<u8>,
+    received: smoltcp::storage::Assembler,
+    total: Option<usize>,
+    rejected: bool,
+}
+
+#[derive(Default)]
+struct Ipv4UdpReassembly {
+    pending: HashMap<(std::net::Ipv4Addr, std::net::Ipv4Addr, u16), Ipv4Assembly>,
+}
+
+impl Ipv4UdpReassembly {
+    const MAX_PACKETS: usize = 64;
+    const MAX_PAYLOAD: usize = 65535 - 20;
+    const LIFETIME: Duration = Duration::from_secs(30);
+
+    fn expire(&mut self, now: std::time::Instant) {
+        self.pending
+            .retain(|_, value| now.duration_since(value.created) < Self::LIFETIME);
+    }
+
+    fn accept<'a>(
+        &mut self,
+        bytes: &'a [u8],
+        now: std::time::Instant,
+    ) -> Option<std::borrow::Cow<'a, [u8]>> {
+        if bytes.first().copied()? >> 4 != 4 {
+            return Some(std::borrow::Cow::Borrowed(bytes));
+        }
+        let ip = Ipv4Packet::new_checked(bytes).ok()?;
+        let start = ((u16::from_be_bytes([bytes[6], bytes[7]]) & 0x1fff) as usize) * 8;
+        let more = ip.more_frags();
+        if ip.next_header() != IpProtocol::Udp || (start == 0 && !more) {
+            return Some(std::borrow::Cow::Borrowed(bytes));
+        }
+        if !ip.verify_checksum() {
+            return None;
+        }
+        let payload = ip.payload();
+        let end = start.checked_add(payload.len())?;
+        self.expire(now);
+        let key = (ip.src_addr(), ip.dst_addr(), ip.ident());
+        if !self.pending.contains_key(&key) {
+            if self.pending.len() >= Self::MAX_PACKETS {
+                return None;
+            }
+            self.pending.insert(
+                key,
+                Ipv4Assembly {
+                    created: now,
+                    bytes: Vec::with_capacity(end.min(2048)),
+                    received: smoltcp::storage::Assembler::new(),
+                    total: None,
+                    rejected: false,
+                },
+            );
+        }
+        let value = self.pending.get_mut(&key)?;
+        if value.rejected {
+            return None;
+        }
+        let invalid = payload.is_empty()
+            || (more && !payload.len().is_multiple_of(8))
+            || end > Self::MAX_PAYLOAD
+            || value.total.is_some_and(|total| {
+                end > total || (!more && end != total) || (more && end >= total)
+            })
+            || (!more && value.received.iter_data(0).any(|(_, to)| to > end))
+            || value
+                .received
+                .iter_data(0)
+                .any(|(from, to)| start < to && end > from);
+        if invalid || value.received.add(start, payload.len()).is_err() {
+            value.rejected = true;
+            value.bytes = Vec::new();
+            return None;
+        }
+        if end > value.bytes.len() {
+            value.bytes.resize(end, 0);
+        }
+        value.bytes[start..end].copy_from_slice(payload);
+        if !more {
+            value.total = Some(end);
+        }
+        let total = value.total?;
+        if value.received.peek_front() != total {
+            return None;
+        }
+        let value = self.pending.remove(&key)?;
+        let mut out = vec![0u8; 20 + total];
+        write_ipv4_header(&mut out[..20], key.0.octets(), key.1.octets(), 17, total);
+        out[20..].copy_from_slice(&value.bytes[..total]);
+        Some(std::borrow::Cow::Owned(out))
+    }
+}
+
+#[cfg(test)]
 fn sniff(bytes: &[u8]) -> Option<(Flow, bool)> {
+    sniff_packet(bytes).map(|(flow, syn, _)| (flow, syn))
+}
+
+fn sniff_packet(bytes: &[u8]) -> Option<(Flow, bool, &[u8])> {
     let (source, target, mut protocol, mut payload) = match IpVersion::of_packet(bytes).ok()? {
         IpVersion::Ipv4 => {
             let packet = Ipv4Packet::new_checked(bytes).ok()?;
@@ -644,7 +815,7 @@ fn sniff(bytes: &[u8]) -> Option<(Flow, bool)> {
         protocol = extension.next_header();
         payload = payload.get((extension.header_len() as usize + 1) * 8..)?;
     }
-    let (source_port, target_port, tcp, syn) = match protocol {
+    let (source_port, target_port, tcp, syn, l4_payload) = match protocol {
         IpProtocol::Tcp => {
             let packet = TcpPacket::new_checked(payload).ok()?;
             if !packet.syn() || packet.ack() {
@@ -653,15 +824,20 @@ fn sniff(bytes: &[u8]) -> Option<(Flow, bool)> {
             if !packet.verify_checksum(&source, &target) {
                 return None;
             }
-            (packet.src_port(), packet.dst_port(), true, true)
+            (packet.src_port(), packet.dst_port(), true, true, &[][..])
         }
         IpProtocol::Udp => {
-            // The initial fragment may contain only part of a UDP datagram.
-            if payload.len() < 8 {
+            let packet = UdpPacket::new_checked(payload).ok()?;
+            if !packet.verify_checksum(&source, &target) {
                 return None;
             }
-            let packet = UdpPacket::new_unchecked(payload);
-            (packet.src_port(), packet.dst_port(), false, false)
+            (
+                packet.src_port(),
+                packet.dst_port(),
+                false,
+                false,
+                packet.payload(),
+            )
         }
         _ => return None,
     };
@@ -675,6 +851,7 @@ fn sniff(bytes: &[u8]) -> Option<(Flow, bool)> {
             tcp,
         },
         syn,
+        l4_payload,
     ))
 }
 
@@ -686,63 +863,134 @@ const REFUSED_FOR: Duration = Duration::from_secs(10);
 /// timed out (seconds) before they tried TCP; an ICMP error fails a connected
 /// socket at once.
 fn refuse(device: &PacketDevice, flow: &Flow) {
-    if let Some(packet) = port_unreachable(flow) {
-        let _ = device.outgoing.try_send(packet);
+    if let Some(packet) = port_unreachable(flow)
+        && let Err(
+            mpsc::error::TrySendError::Full(packet) | mpsc::error::TrySendError::Closed(packet),
+        ) = device.outgoing.try_send(packet)
+    {
+        TX_POOL.put(packet);
+    }
+}
+
+/// Assembles a raw IPv4/IPv6 + UDP reply packet (from `flow.target` to
+/// `flow.source`) into a pooled TX buffer with valid L3/L4 checksums.
+fn build_udp_packet(flow: &Flow, payload: &[u8]) -> Option<Vec<u8>> {
+    let udp_len = 8usize.checked_add(payload.len())?;
+    if udp_len > u16::MAX as usize {
+        return None;
+    }
+    match (flow.target.addr, flow.source.addr) {
+        (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
+            let total_len = 20usize.checked_add(udp_len)?;
+            if total_len > u16::MAX as usize {
+                return None;
+            }
+            let mut buf = TX_POOL.take(total_len);
+            write_ipv4_header(&mut buf[..20], src.octets(), dst.octets(), 17, udp_len);
+            buf[20..22].copy_from_slice(&flow.target.port.to_be_bytes());
+            buf[22..24].copy_from_slice(&flow.source.port.to_be_bytes());
+            buf[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            buf[26..28].fill(0);
+            buf[28..].copy_from_slice(payload);
+            let pseudo =
+                partial_sum(&src.octets()) + partial_sum(&dst.octets()) + 17u32 + (udp_len as u32);
+            let mut sum = checksum(&buf[20..], pseudo);
+            if sum == 0 {
+                sum = 0xffff;
+            }
+            buf[26..28].copy_from_slice(&sum.to_be_bytes());
+            Some(buf)
+        }
+        (IpAddress::Ipv6(src), IpAddress::Ipv6(dst)) => {
+            let total_len = 40 + udp_len;
+            let mut buf = TX_POOL.take(total_len);
+            write_ipv6_header(&mut buf[..40], src.octets(), dst.octets(), 17, udp_len);
+            buf[40..42].copy_from_slice(&flow.target.port.to_be_bytes());
+            buf[42..44].copy_from_slice(&flow.source.port.to_be_bytes());
+            buf[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+            buf[46..48].fill(0);
+            buf[48..].copy_from_slice(payload);
+            let pseudo =
+                partial_sum(&src.octets()) + partial_sum(&dst.octets()) + (udp_len as u32) + 17u32;
+            let mut sum = checksum(&buf[40..], pseudo);
+            if sum == 0 {
+                sum = 0xffff;
+            }
+            buf[46..48].copy_from_slice(&sum.to_be_bytes());
+            Some(buf)
+        }
+        _ => None,
     }
 }
 
 /// An ICMP / ICMPv6 "port unreachable" from the flow's target to the app,
 /// quoting the IP and UDP headers of the refused datagram.
 fn port_unreachable(flow: &Flow) -> Option<Vec<u8>> {
-    let mut udp = Vec::with_capacity(8);
-    udp.extend(flow.source.port.to_be_bytes());
-    udp.extend(flow.target.port.to_be_bytes());
-    udp.extend(8u16.to_be_bytes());
-    udp.extend([0, 0]);
     match (flow.source.addr, flow.target.addr) {
         (IpAddress::Ipv4(app), IpAddress::Ipv4(remote)) => {
-            let mut icmp = vec![3, 3, 0, 0, 0, 0, 0, 0];
-            icmp.extend(ipv4_header(app.octets(), remote.octets(), 17, udp.len()));
-            icmp.extend(&udp);
-            let sum = checksum(&icmp, 0);
-            icmp[2..4].copy_from_slice(&sum.to_be_bytes());
-            let mut packet = ipv4_header(remote.octets(), app.octets(), 1, icmp.len());
-            packet.extend(icmp);
-            Some(packet)
+            // 20B outer IPv4 + 8B ICMPv4 + 20B quoted IPv4 + 8B quoted UDP = 56B
+            let mut buf = TX_POOL.take(56);
+            write_ipv4_header(&mut buf[0..20], remote.octets(), app.octets(), 1, 36);
+            buf[20..28].copy_from_slice(&[3, 3, 0, 0, 0, 0, 0, 0]);
+            write_ipv4_header(&mut buf[28..48], app.octets(), remote.octets(), 17, 8);
+            buf[48..50].copy_from_slice(&flow.source.port.to_be_bytes());
+            buf[50..52].copy_from_slice(&flow.target.port.to_be_bytes());
+            buf[52..54].copy_from_slice(&8u16.to_be_bytes());
+            buf[54..56].fill(0);
+            let sum = checksum(&buf[20..56], 0);
+            buf[22..24].copy_from_slice(&sum.to_be_bytes());
+            Some(buf)
         }
         (IpAddress::Ipv6(app), IpAddress::Ipv6(remote)) => {
-            let mut icmp = vec![1, 4, 0, 0, 0, 0, 0, 0];
-            icmp.extend(ipv6_header(app.octets(), remote.octets(), 17, udp.len()));
-            icmp.extend(&udp);
-            let mut pseudo = Vec::with_capacity(40);
-            pseudo.extend(remote.octets());
-            pseudo.extend(app.octets());
-            pseudo.extend((icmp.len() as u32).to_be_bytes());
-            pseudo.extend([0, 0, 0, 58]);
-            let sum = checksum(&icmp, partial_sum(&pseudo));
-            icmp[2..4].copy_from_slice(&sum.to_be_bytes());
-            let mut packet = ipv6_header(remote.octets(), app.octets(), 58, icmp.len());
-            packet.extend(icmp);
-            Some(packet)
+            // 40B outer IPv6 + 8B ICMPv6 + 40B quoted IPv6 + 8B quoted UDP = 96B
+            let mut buf = TX_POOL.take(96);
+            write_ipv6_header(&mut buf[0..40], remote.octets(), app.octets(), 58, 56);
+            buf[40..48].copy_from_slice(&[1, 4, 0, 0, 0, 0, 0, 0]);
+            write_ipv6_header(&mut buf[48..88], app.octets(), remote.octets(), 17, 8);
+            buf[88..90].copy_from_slice(&flow.source.port.to_be_bytes());
+            buf[90..92].copy_from_slice(&flow.target.port.to_be_bytes());
+            buf[92..94].copy_from_slice(&8u16.to_be_bytes());
+            buf[94..96].fill(0);
+            let pseudo = partial_sum(&remote.octets()) + partial_sum(&app.octets()) + 56u32 + 58u32;
+            let sum = checksum(&buf[40..96], pseudo);
+            buf[42..44].copy_from_slice(&sum.to_be_bytes());
+            Some(buf)
         }
         _ => None,
     }
 }
-fn ipv4_header(source: [u8; 4], target: [u8; 4], protocol: u8, payload: usize) -> Vec<u8> {
-    let mut header = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, protocol, 0, 0];
+fn write_ipv4_header(
+    header: &mut [u8],
+    source: [u8; 4],
+    target: [u8; 4],
+    protocol: u8,
+    payload: usize,
+) {
+    header[..12].copy_from_slice(&[0x45, 0, 0, 0, 0, 0, 0, 0, 64, protocol, 0, 0]);
     header[2..4].copy_from_slice(&((20 + payload) as u16).to_be_bytes());
-    header.extend(source);
-    header.extend(target);
-    let sum = checksum(&header, 0);
+    header[12..16].copy_from_slice(&source);
+    header[16..20].copy_from_slice(&target);
+    let sum = checksum(&header[..20], 0);
     header[10..12].copy_from_slice(&sum.to_be_bytes());
-    header
 }
-fn ipv6_header(source: [u8; 16], target: [u8; 16], next: u8, payload: usize) -> Vec<u8> {
-    let mut header = vec![0x60, 0, 0, 0];
-    header.extend((payload as u16).to_be_bytes());
-    header.extend([next, 64]);
-    header.extend(source);
-    header.extend(target);
+fn write_ipv6_header(
+    header: &mut [u8],
+    source: [u8; 16],
+    target: [u8; 16],
+    next: u8,
+    payload: usize,
+) {
+    header[0..4].copy_from_slice(&[0x60, 0, 0, 0]);
+    header[4..6].copy_from_slice(&(payload as u16).to_be_bytes());
+    header[6] = next;
+    header[7] = 64;
+    header[8..24].copy_from_slice(&source);
+    header[24..40].copy_from_slice(&target);
+}
+#[cfg(test)]
+fn ipv4_header(source: [u8; 4], target: [u8; 4], protocol: u8, payload: usize) -> Vec<u8> {
+    let mut header = vec![0u8; 20];
+    write_ipv4_header(&mut header, source, target, protocol, payload);
     header
 }
 fn partial_sum(data: &[u8]) -> u32 {
@@ -832,7 +1080,9 @@ async fn tcp_session(
                     response_bytes = response.len(),
                     "TUN DNS TCP query answered"
                 );
-                stream.write_u16(response.len() as u16).await?;
+                let len = u16::try_from(response.len())
+                    .map_err(|_| anyhow::anyhow!("TUN DNS TCP reply too large"))?;
+                stream.write_u16(len).await?;
                 stream.write_all(&response).await?;
             }
             Ok(())
@@ -892,11 +1142,14 @@ async fn udp_session_with_hijack(
         while let Some(packet) =
             tokio::time::timeout(Budget::for_config(&core.config).dns_idle(), input.recv()).await?
         {
-            match tokio::time::timeout(Duration::from_secs(10), core.resolver.answer(&packet)).await
-            {
+            let answer =
+                tokio::time::timeout(Duration::from_secs(10), core.resolver.answer(&packet)).await;
+            let request_bytes = packet.len();
+            INGRESS_POOL.put(packet);
+            match answer {
                 Ok(Ok(payload)) => {
                     tracing::debug!(
-                        request_bytes = packet.len(),
+                        request_bytes,
                         response_bytes = payload.len(),
                         "TUN DNS UDP query answered"
                     );
@@ -925,7 +1178,9 @@ async fn udp_session_with_hijack(
         while let Some(packet) =
             tokio::time::timeout(Budget::for_config(&core.config).udp_idle, input.recv()).await?
         {
-            session.send(&target, &packet).await?;
+            let res = session.send(&target, &packet).await;
+            INGRESS_POOL.put(packet);
+            res?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -1044,9 +1299,9 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     iface.set_any_ip(true);
     let mut sockets = SocketSet::new(vec![]);
     let mut tcp_flows: HashMap<Flow, TcpFlow> = HashMap::new();
-    let mut udp = UdpTable::new(budget.max_udp, budget.max_ports);
+    let mut udp = UdpTable::new(budget.max_udp);
     let drops = Arc::new(Drops::default());
-    let mut drops_logged = ([0u64; 8], Instant::now());
+    let mut drops_logged = ([0u64; 6], Instant::now());
     // TCP sessions that failed since the last summary, and the latest error.
     let mut tcp_failed = 0u64;
     // SYNs smoltcp answered with a reset because the flow table was full or
@@ -1070,6 +1325,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut packet = vec![0; 65535];
     let mut ipv6_dropped: u64 = 0;
     let mut fragments = ipv6::Reassembly::default();
+    let mut v4_fragments = Ipv4UdpReassembly::default();
     let mut last_expiry = Instant::now();
     let mut pending_relief: Option<Instant> = None;
     // UDP flows the route rejected: their next datagrams get an ICMP error at
@@ -1079,7 +1335,9 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let dns_hijack = DnsHijack::parse(&core.config.tun.dns_hijack);
     let hosted = budget.max_tcp == Budget::HOSTED.max_tcp;
     let incoming_cap = if hosted { 64 } else { 256 };
+    let mut retired: Vec<SocketHandle> = Vec::new();
     loop {
+        let mut tcp_active = !device.incoming.is_empty();
         tokio::select! {
             biased;
             _ = core.stop.cancelled() => break,
@@ -1100,65 +1358,113 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     continue;
                 }
                 let Some(packet) = fragments.accept(&packet[..n], Instant::now().into()) else { continue; };
-                if let Some((flow, syn)) = sniff(&packet) {
+                let Some(packet) = v4_fragments.accept(&packet, Instant::now().into()) else { continue; };
+                let mut forward_to_smoltcp = true;
+                if let Some((flow, syn, udp_payload)) = sniff_packet(&packet) {
                     if !core.config.ipv6 && matches!(flow.target.addr, IpAddress::Ipv6(_)) { continue; }
-                    let admit_tcp = flow.tcp && syn && !tcp_flows.contains_key(&flow);
-                    if admit_tcp && (guard.refuses_new_flow() || tcp_flows.len() >= budget.max_tcp) {
-                        tcp_refused += 1;
-                    }
-                    if admit_tcp && !guard.refuses_new_flow() && tcp_flows.len() < budget.max_tcp {
-                        guard.admitted_flow();
-                        let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]), tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]));
-                        socket.set_timeout(Some(NetDuration::from_secs(300)));
-                        socket.set_keep_alive(Some(NetDuration::from_secs(30)));
-                        socket.set_congestion_control(congestion);
-                        // Upstream reads arrive a segment at a time (1448 bytes behind
-                        // TCP timestamps), just under the TUN MSS. With Nagle each one
-                        // waits for every byte in flight to be ACKed, and macOS ACKs
-                        // only every few segments or on its delayed-ACK timer.
-                        socket.set_nagle_enabled(false);
-                        socket.listen(flow.target)?;
-                        let handle = sockets.add(socket);
-                        let (input, receiver) = mpsc::channel(budget.tcp_queue);
-                        let (sender, output) = mpsc::channel(budget.tcp_queue);
-                        let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
-                        let core = core.clone();
-                        let dns = dns_hijack.matches(flow.target, true);
-                        let task = tasks.spawn(async move { (flow, 0, tcp_session(core, flow, dns, stream).await) });
-                        tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), time_wait_since: None, task });
-                    } else if !flow.tcp && !udp.ports.contains_key(&flow.target) {
-                        let dns = dns_hijack.matches(flow.target, false);
-                        let socket = || {
-                            let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0; budget.udp_buffer]);
-                            let mut socket = udp::Socket::new(buffer(), buffer());
-                            // The endpoint is a valid unicast target: binding cannot fail.
-                            let _ = socket.bind(flow.target);
-                            socket
-                        };
-                        if let Err(refusal) = udp.admit_port(flow.target, dns, guard.refuses_new_flow(), Instant::now(), &mut sockets, socket) {
-                            // Refused here rather than by smoltcp, which would
-                            // answer every retransmission with an ICMP error.
-                            drops.refused(refusal);
-                            if udp.notice(flow, Instant::now()) {
-                                refuse(&device, &flow);
+                    if !flow.tcp {
+                        forward_to_smoltcp = false;
+                        if refused
+                            .get(&flow)
+                            .is_some_and(|since| since.elapsed() < REFUSED_FOR)
+                        {
+                            refuse(&device, &flow);
+                        } else {
+                            let admitted = if udp.flows.contains_key(&flow) {
+                                true
+                            } else {
+                                let dns = dns_hijack.matches(flow.target, false);
+                                match udp.admit_session(&flow, dns, guard.refuses_new_flow()) {
+                                    Ok(false) => true,
+                                    Ok(true) => {
+                                        if !dns {
+                                            guard.admitted_flow();
+                                        }
+                                        let (input, receiver) = mpsc::channel(budget.udp_queue);
+                                        let core = core.clone();
+                                        let replies = replies.clone();
+                                        let drops = drops.clone();
+                                        udp.insert(flow, dns, input, |generation| {
+                                            tasks.spawn(async move {
+                                                let result = udp_session_with_hijack(
+                                                    core, flow, generation, dns, receiver, replies, drops,
+                                                )
+                                                .await;
+                                                (flow, generation, result)
+                                            })
+                                        });
+                                        true
+                                    }
+                                    Err(refusal) => {
+                                        // A full table used to drop these silently: the app saw a
+                                        // black hole until its own timeout.
+                                        drops.refused(refusal);
+                                        if udp.notice(flow, Instant::now()) {
+                                            refuse(&device, &flow);
+                                        }
+                                        false
+                                    }
+                                }
+                            };
+                            if admitted && let Some(session) = udp.flows.get(&flow) {
+                                match session.input.try_reserve() {
+                                    Ok(permit) => {
+                                        permit.send(INGRESS_POOL.take_slice(udp_payload));
+                                    }
+                                    Err(_) => {
+                                        drops.input_full.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                             }
-                            continue;
+                        }
+                    } else {
+                        let admit_tcp = syn && !tcp_flows.contains_key(&flow);
+                        if admit_tcp && (guard.refuses_new_flow() || tcp_flows.len() >= budget.max_tcp) {
+                            tcp_refused += 1;
+                        }
+                        if admit_tcp && !guard.refuses_new_flow() && tcp_flows.len() < budget.max_tcp {
+                            guard.admitted_flow();
+                            let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]), tcp::SocketBuffer::new(vec![0; budget.tcp_buffer]));
+                            socket.set_timeout(Some(NetDuration::from_secs(300)));
+                            socket.set_keep_alive(Some(NetDuration::from_secs(30)));
+                            socket.set_congestion_control(congestion);
+                            // Upstream reads arrive a segment at a time (1448 bytes behind
+                            // TCP timestamps), just under the TUN MSS. With Nagle each one
+                            // waits for every byte in flight to be ACKed, and macOS ACKs
+                            // only every few segments or on its delayed-ACK timer.
+                            socket.set_nagle_enabled(false);
+                            socket.listen(flow.target)?;
+                            let handle = sockets.add(socket);
+                            let (input, receiver) = mpsc::channel(budget.tcp_queue);
+                            let (sender, output) = mpsc::channel(budget.tcp_queue);
+                            let stream = ChannelStream { input: receiver, pending: None, output: Some(PollSender::new(sender)), wake: wake.clone() };
+                            let core = core.clone();
+                            let dns = dns_hijack.matches(flow.target, true);
+                            let task = tasks.spawn(async move { (flow, 0, tcp_session(core, flow, dns, stream).await) });
+                            tcp_flows.insert(flow, TcpFlow { handle, input: Some(input), output, pending: None, eof: false, created: Instant::now(), time_wait_since: None, task });
                         }
                     }
                 }
-                device.incoming.push_back(packet.into_owned());
+                if forward_to_smoltcp {
+                    device.incoming.push_back(INGRESS_POOL.take_slice(&packet));
+                    tcp_active = true;
+                }
             },
-            _ = wake.notified() => {},
+            _ = wake.notified() => { tcp_active = true; },
             received = incoming_replies.recv(), if reply.is_none() => reply = received,
             result = tasks.join_next(), if !tasks.is_empty() && finished.is_none() => finished = result,
             // Replies smoltcp could not transmit wait for room in the queue.
-            permit = room.reserve(), if room.capacity() == 0 => drop(permit),
-            _ = &mut sleep => {},
+            permit = room.reserve(), if room.capacity() == 0 => {
+                drop(permit);
+                tcp_active = true;
+            },
+            _ = &mut sleep => { tcp_active = true; },
         }
         if last_expiry.elapsed() >= Duration::from_secs(1) {
             last_expiry = Instant::now();
             fragments.expire(last_expiry.into());
-            udp.expire(budget.udp_idle, last_expiry, &mut sockets);
+            v4_fragments.expire(last_expiry.into());
+            udp.expire(last_expiry);
             refused.retain(|_, since| since.elapsed() < REFUSED_FOR);
             if drops_logged.1.elapsed() >= DROPS_LOG_EVERY {
                 let now = drops.snapshot();
@@ -1166,24 +1472,19 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                     let [
                         memory,
                         sessions,
-                        ports,
                         input_full,
                         reply_full,
-                        socket_full,
                         xudp_inbox_full,
                         hysteria2_inbox_full,
                     ] = now;
                     tracing::info!(
                         memory,
                         sessions,
-                        ports,
                         input_full,
                         reply_full,
-                        socket_full,
                         xudp_inbox_full,
                         hysteria2_inbox_full,
                         udp_sessions = udp.flows.len(),
-                        udp_ports = udp.ports.len(),
                         "UDP datagrams refused or dropped since start"
                     );
                 }
@@ -1214,14 +1515,13 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             let closed = guard.check(&core, memory::usage(), || Load {
                 tcp_flows: tcp_flows.len(),
                 udp_flows: udp.flows.len(),
-                udp_ports: udp.ports.len(),
+                udp_ports: 0,
                 queued_packets: device.incoming.len(),
                 tasks: tasks.len(),
             });
             if closed {
-                // Closing the tracked connections misses flows still dialing
-                // and leaves UDP sockets that would invite new sessions.
-                let (udp_sessions, udp_ports) = udp.purge(&mut sockets);
+                // Closing the tracked connections misses flows still dialing.
+                let udp_sessions = udp.purge();
                 let tcp_count = tcp_flows.len();
                 for (_, state) in tcp_flows.drain() {
                     state.task.abort();
@@ -1231,14 +1531,15 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 tcp_flows.shrink_to_fit();
                 device.incoming = VecDeque::new();
                 fragments = ipv6::Reassembly::default();
+                v4_fragments = Ipv4UdpReassembly::default();
                 reply = None;
                 finished = None;
                 while tasks.try_join_next().is_some() {}
                 TX_POOL.clear();
+                INGRESS_POOL.clear();
                 pending_relief = Some(Instant::now() + Duration::from_millis(150));
                 tracing::warn!(
                     udp_sessions,
-                    udp_ports,
                     tcp_flows = tcp_count,
                     "memory critical; released the TUN's flows"
                 );
@@ -1248,6 +1549,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             pending_relief = None;
             while tasks.try_join_next().is_some() {}
             TX_POOL.clear();
+            INGRESS_POOL.clear();
             let released = memory::relieve();
             if released >= MIB {
                 tracing::info!(
@@ -1256,170 +1558,127 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 );
             }
         }
-        poll(&mut iface, now(), &mut device, &mut sockets);
+        if tcp_active {
+            poll(&mut iface, now(), &mut device, &mut sockets);
+        }
         while let Some(result) = finished.take().or_else(|| tasks.try_join_next()) {
-            if let Ok((flow, generation, result)) = result {
-                if flow.tcp {
-                    if let Err(error) = result {
-                        tracing::debug!(source = %flow.source, target = %flow.target, %error, "TUN TCP session failed");
-                        tcp_failed += 1;
-                        last_tcp_error = Some(format!("{}: {error:#}", flow.target));
-                        if let Some(state) = tcp_flows.get_mut(&flow) {
-                            sockets.get_mut::<tcp::Socket>(state.handle).abort();
+            match result {
+                Ok((flow, generation, result)) => {
+                    if flow.tcp {
+                        tcp_active = true;
+                        if let Err(error) = result {
+                            tracing::debug!(source = %flow.source, target = %flow.target, %error, "TUN TCP session failed");
+                            tcp_failed += 1;
+                            last_tcp_error = Some(format!("{}: {error:#}", flow.target));
+                            if let Some(state) = tcp_flows.get_mut(&flow) {
+                                sockets.get_mut::<tcp::Socket>(state.handle).abort();
+                            }
                         }
-                    }
-                } else if udp.ended(&flow, generation)
-                    && let Err(error) = result
-                    && error.downcast_ref::<crate::Rejected>().is_some()
-                {
-                    refused.insert(flow, Instant::now());
-                    refuse(&device, &flow);
-                }
-            }
-        }
-        let mut retired = vec![];
-        let tcp_pressure = hosted && (tcp_flows.len() >= budget.max_tcp * 3 / 4 || guard.shedding);
-        tcp_flows.retain(|_, state| {
-            let socket = sockets.get_mut::<tcp::Socket>(state.handle);
-            // Keepalive ACKs count as liveness in smoltcp. Do not impose a
-            // separate application-data deadline on an established stream.
-            if matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
-                && state.created.elapsed() > Duration::from_secs(30)
-            {
-                socket.abort();
-            }
-            if hosted {
-                if matches!(
-                    socket.state(),
-                    tcp::State::Closing
-                        | tcp::State::TimeWait
-                        | tcp::State::LastAck
-                        | tcp::State::Closed
-                ) {
-                    state.pending = None;
-                }
-                if socket.state() == tcp::State::TimeWait {
-                    let since = *state.time_wait_since.get_or_insert_with(Instant::now);
-                    if tcp_pressure || since.elapsed() >= Duration::from_secs(3) {
-                        socket.abort();
-                    }
-                }
-            }
-            while socket.can_recv() {
-                let Some(input) = &state.input else {
-                    socket.abort();
-                    break;
-                };
-                let Ok(permit) = input.try_reserve() else {
-                    if input.is_closed() {
-                        socket.abort();
-                    }
-                    break;
-                };
-                let _ = socket.recv(|bytes| {
-                    let n = bytes.len().min(CHUNK);
-                    permit.send(bytes[..n].to_vec());
-                    (n, ())
-                });
-            }
-            if !socket.may_recv()
-                && !matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
-            {
-                state.input.take();
-            }
-            while socket.can_send() {
-                if state.pending.is_none() && !state.eof {
-                    match state.output.try_recv() {
-                        Ok(bytes) => state.pending = Some((bytes, 0)),
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            state.eof = true;
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                    }
-                }
-                let Some((bytes, offset)) = state.pending.as_mut() else {
-                    if state.eof {
-                        socket.close();
-                    }
-                    break;
-                };
-                let n = socket.send_slice(&bytes[*offset..]).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                *offset += n;
-                if *offset == bytes.len() {
-                    state.pending = None;
-                }
-            }
-            if !socket.is_open() {
-                state.task.abort();
-                retired.push(state.handle);
-                false
-            } else {
-                true
-            }
-        });
-        let mut datagrams = vec![];
-        for (endpoint, port) in &mut udp.ports {
-            let socket = sockets.get_mut::<udp::Socket>(port.handle);
-            while let Ok((bytes, metadata)) = socket.recv() {
-                port.last = Instant::now();
-                let flow = Flow {
-                    source: metadata.endpoint,
-                    target: *endpoint,
-                    tcp: false,
-                };
-                datagrams.push((flow, bytes.to_vec()));
-            }
-        }
-        for (flow, bytes) in datagrams {
-            if refused
-                .get(&flow)
-                .is_some_and(|since| since.elapsed() < REFUSED_FOR)
-            {
-                refuse(&device, &flow);
-                continue;
-            }
-            let dns = !udp.flows.contains_key(&flow) && dns_hijack.matches(flow.target, false);
-            match udp.admit_session(&flow, dns, guard.refuses_new_flow()) {
-                Ok(false) => {}
-                Ok(true) => {
-                    if !dns {
-                        guard.admitted_flow();
-                    }
-                    let (input, receiver) = mpsc::channel(budget.udp_queue);
-                    let core = core.clone();
-                    let replies = replies.clone();
-                    let drops = drops.clone();
-                    udp.insert(flow, dns, input, |generation| {
-                        tasks.spawn(async move {
-                            let result = udp_session_with_hijack(
-                                core, flow, generation, dns, receiver, replies, drops,
-                            )
-                            .await;
-                            (flow, generation, result)
-                        })
-                    });
-                }
-                Err(refusal) => {
-                    // A full table used to drop these silently: the app saw a
-                    // black hole until its own timeout.
-                    drops.refused(refusal);
-                    if udp.notice(flow, Instant::now()) {
+                    } else if udp.ended(&flow, generation)
+                        && let Err(error) = result
+                        && error.downcast_ref::<crate::Rejected>().is_some()
+                    {
+                        refused.insert(flow, Instant::now());
                         refuse(&device, &flow);
                     }
-                    continue;
+                }
+                Err(_) => {
+                    tcp_active = true;
                 }
             }
-            if let Some(session) = udp.flows.get(&flow)
-                && session.input.try_send(bytes).is_err()
-            {
-                drops.input_full.fetch_add(1, Ordering::Relaxed);
+        }
+        if tcp_active && !tcp_flows.is_empty() {
+            retired.clear();
+            let tcp_pressure =
+                hosted && (tcp_flows.len() >= budget.max_tcp * 3 / 4 || guard.shedding);
+            tcp_flows.retain(|_, state| {
+                let socket = sockets.get_mut::<tcp::Socket>(state.handle);
+                // Keepalive ACKs count as liveness in smoltcp. Do not impose a
+                // separate application-data deadline on an established stream.
+                if matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
+                    && state.created.elapsed() > Duration::from_secs(30)
+                {
+                    socket.abort();
+                }
+                if hosted {
+                    if matches!(
+                        socket.state(),
+                        tcp::State::Closing
+                            | tcp::State::TimeWait
+                            | tcp::State::LastAck
+                            | tcp::State::Closed
+                    ) && let Some((bytes, _)) = state.pending.take()
+                    {
+                        INGRESS_POOL.put(bytes);
+                    }
+                    if socket.state() == tcp::State::TimeWait {
+                        let since = *state.time_wait_since.get_or_insert_with(Instant::now);
+                        if tcp_pressure || since.elapsed() >= Duration::from_secs(3) {
+                            socket.abort();
+                        }
+                    }
+                }
+                while socket.can_recv() {
+                    let Some(input) = &state.input else {
+                        socket.abort();
+                        break;
+                    };
+                    let Ok(permit) = input.try_reserve() else {
+                        if input.is_closed() {
+                            socket.abort();
+                        }
+                        break;
+                    };
+                    let _ = socket.recv(|bytes| {
+                        let n = bytes.len().min(CHUNK);
+                        permit.send(INGRESS_POOL.take_slice(&bytes[..n]));
+                        (n, ())
+                    });
+                }
+                if !socket.may_recv()
+                    && !matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
+                {
+                    state.input.take();
+                }
+                while socket.can_send() {
+                    if state.pending.is_none() && !state.eof {
+                        match state.output.try_recv() {
+                            Ok(bytes) => state.pending = Some((bytes, 0)),
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                state.eof = true;
+                            }
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                        }
+                    }
+                    let Some((bytes, offset)) = state.pending.as_mut() else {
+                        if state.eof {
+                            socket.close();
+                        }
+                        break;
+                    };
+                    let n = socket.send_slice(&bytes[*offset..]).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    *offset += n;
+                    if *offset == bytes.len()
+                        && let Some((bytes, _)) = state.pending.take()
+                    {
+                        INGRESS_POOL.put(bytes);
+                    }
+                }
+                if !socket.is_open() {
+                    state.task.abort();
+                    retired.push(state.handle);
+                    false
+                } else {
+                    true
+                }
+            });
+            for handle in retired.drain(..) {
+                sockets.remove(handle);
             }
         }
-        // A destination's smoltcp socket queues 16 datagrams: a burst of
-        // replies is flushed to the TUN as it fills instead of dropped.
         'replies: for _ in 0..256 {
             let Some(next) = reply.take().or_else(|| incoming_replies.try_recv().ok()) else {
                 break;
@@ -1427,38 +1686,17 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
             if udp.superseded(&next.flow, next.generation) {
                 continue;
             }
-            for flushed in [false, true] {
-                let Some(port) = udp.ports.get_mut(&next.flow.target) else {
-                    break;
-                };
-                port.last = Instant::now();
-                let socket = sockets.get_mut::<udp::Socket>(port.handle);
-                match socket.send_slice(&next.payload, next.flow.source) {
-                    Ok(()) => break,
-                    // Queued datagrams leave on a poll, if the writer has room.
-                    Err(udp::SendError::BufferFull) if socket.send_queue() > 0 => {
-                        if flushed && room.capacity() == 0 {
-                            // Retried once room frees (see `room` below).
-                            reply = Some(next);
-                            break 'replies;
-                        }
-                        if flushed {
-                            drops.socket_full.fetch_add(1, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    // Larger than the socket's whole buffer, or unaddressable.
-                    Err(_) => {
-                        drops.socket_full.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                poll(&mut iface, now(), &mut device, &mut sockets);
+            let Ok(permit) = device.outgoing.clone().try_reserve_owned() else {
+                // Retried once room frees (see `room` below).
+                reply = Some(next);
+                break 'replies;
+            };
+            if let Some(pkt) = build_udp_packet(&next.flow, &next.payload) {
+                let _ = permit.send(pkt);
             }
         }
-        poll(&mut iface, now(), &mut device, &mut sockets);
-        for handle in retired {
-            sockets.remove(handle);
+        if tcp_active {
+            poll(&mut iface, now(), &mut device, &mut sockets);
         }
         let mut delay = iface
             .poll_delay(now(), &sockets)
@@ -1702,8 +1940,8 @@ mod guard_tests {
         assert_eq!(core.resolver.cache_entry_count(), 1);
 
         // Rising from inspection pause to budget.shed_above runs full relief
-        // immediately (clearing DNS cache), and periodic relief keeps doing so
-        // while shedding stays active.
+        // immediately (shrinking DNS cache cap to 256 KiB without wiping hot
+        // entries), and periodic relief keeps doing so while shedding stays active.
         let t_pause = t0 + Duration::from_secs(7);
         assert!(!guard.check_at(&core, usage(INSPECTION_PAUSE_ABOVE), t_pause, empty_load));
         assert_eq!(core.resolver.cache_entry_count(), 1);
@@ -1718,23 +1956,31 @@ mod guard_tests {
             core.requests.detail(id3).unwrap()["responseBody"]["text"],
             ""
         );
-        assert_eq!(core.resolver.cache_entry_count(), 0);
+        assert_eq!(core.resolver.cache_entry_count(), 1);
 
-        core.resolver.seed_test_cache_entry();
+        seed_body();
         assert!(!guard.check_at(
             &core,
             usage(budget.shed_above),
             t_shed + Duration::from_secs(1),
             empty_load
         ));
-        assert_eq!(core.resolver.cache_entry_count(), 1);
+        let id4 = core.requests.list(id3, 10).0[0].id;
+        assert_eq!(
+            core.requests.detail(id4).unwrap()["responseBody"]["text"],
+            "payload-bytes"
+        );
         assert!(!guard.check_at(
             &core,
             usage(budget.shed_above),
             t_shed + RELIEF_EVERY,
             empty_load
         ));
-        assert_eq!(core.resolver.cache_entry_count(), 0);
+        assert_eq!(
+            core.requests.detail(id4).unwrap()["responseBody"]["text"],
+            ""
+        );
+        assert_eq!(core.resolver.cache_entry_count(), 1);
 
         // Recovering out of shedding while inspection stays paused uses
         // lightweight relief and preserves DNS cache until inspection resumes.
@@ -1758,7 +2004,7 @@ mod guard_tests {
         // threshold can persist even after all sessions have drained.
         let t1 = t0 + Duration::from_secs(20);
         assert!(guard.check_at(&core, usage(budget.close_above), t1, empty_load));
-        assert_eq!(core.resolver.cache_entry_count(), 0);
+        assert_eq!(core.resolver.cache_entry_count(), 1);
         assert!(guard.refuses_new_flow());
         let plateau = budget.close_above - 2 * MIB;
         assert!(!guard.check_at(
@@ -1890,5 +2136,112 @@ mod budget_tests {
             pool.put(Vec::with_capacity(TX_POOL_DEFAULT_CAP));
         }
         assert_eq!(pool.0.lock().unwrap().len(), TX_POOL_MAX_BUFFERS);
+    }
+
+    #[test]
+    fn ingress_pool_reuses_slice_buffers_and_caps_capacity() {
+        let pool = IngressPool::new();
+        let buf = pool.take_slice(b"hello world");
+        assert_eq!(&buf, b"hello world");
+        let cap = buf.capacity();
+        assert!(cap >= INGRESS_POOL_DEFAULT_CAP);
+        let ptr = buf.as_ptr();
+        pool.put(buf);
+
+        let reused = pool.take_slice(b"next");
+        assert_eq!(&reused, b"next");
+        assert_eq!(reused.capacity(), cap);
+        assert_eq!(reused.as_ptr(), ptr);
+
+        pool.put(Vec::with_capacity(INGRESS_POOL_MAX_CAP + 1));
+        assert!(pool.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_udp_packet_ipv4_and_ipv6_valid_headers_and_checksums() {
+        let v4_flow = Flow {
+            source: IpEndpoint::new("198.18.0.2".parse().unwrap(), 52805),
+            target: IpEndpoint::new("8.8.8.8".parse().unwrap(), 53),
+            tcp: false,
+        };
+        let payload = b"direct-udp-v4-payload";
+        let v4_pkt = build_udp_packet(&v4_flow, payload).unwrap();
+        let ip4 = Ipv4Packet::new_checked(&v4_pkt).unwrap();
+        assert!(ip4.verify_checksum());
+        assert_eq!(
+            ip4.src_addr(),
+            "8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            ip4.dst_addr(),
+            "198.18.0.2".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(ip4.next_header(), IpProtocol::Udp);
+        let udp4 = UdpPacket::new_checked(ip4.payload()).unwrap();
+        assert!(udp4.verify_checksum(&ip4.src_addr().into(), &ip4.dst_addr().into()));
+        assert_eq!((udp4.src_port(), udp4.dst_port()), (53, 52805));
+        assert_eq!(udp4.payload(), payload);
+        TX_POOL.put(v4_pkt);
+
+        let v6_flow = Flow {
+            source: IpEndpoint::new("fdfe:dcba:9876::2".parse().unwrap(), 40000),
+            target: IpEndpoint::new("2001:4860:4860::8888".parse().unwrap(), 443),
+            tcp: false,
+        };
+        let v6_payload = b"direct-udp-v6-payload";
+        let v6_pkt = build_udp_packet(&v6_flow, v6_payload).unwrap();
+        let ip6 = Ipv6Packet::new_checked(&v6_pkt).unwrap();
+        assert_eq!(
+            ip6.src_addr(),
+            "2001:4860:4860::8888"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+        );
+        assert_eq!(
+            ip6.dst_addr(),
+            "fdfe:dcba:9876::2".parse::<std::net::Ipv6Addr>().unwrap()
+        );
+        assert_eq!(ip6.next_header(), IpProtocol::Udp);
+        let udp6 = UdpPacket::new_checked(ip6.payload()).unwrap();
+        assert!(udp6.verify_checksum(&ip6.src_addr().into(), &ip6.dst_addr().into()));
+        assert_eq!((udp6.src_port(), udp6.dst_port()), (443, 40000));
+        assert_eq!(udp6.payload(), v6_payload);
+        TX_POOL.put(v6_pkt);
+
+        // Oversized and mismatched IP family return None.
+        assert!(build_udp_packet(&v4_flow, &vec![0u8; 65508]).is_none());
+        let mixed = Flow {
+            source: v4_flow.source,
+            target: v6_flow.target,
+            tcp: false,
+        };
+        assert!(build_udp_packet(&mixed, b"x").is_none());
+    }
+
+    #[test]
+    fn packet_device_rx_token_returns_buffer_to_ingress_pool() {
+        INGRESS_POOL.clear();
+        let buf = INGRESS_POOL.take_slice(b"tcp-syn-packet");
+        let ptr = buf.as_ptr();
+        let cap = buf.capacity();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut device = PacketDevice {
+            incoming: VecDeque::from([buf]),
+            outgoing: tx,
+            mtu: 1500,
+        };
+        let (rx_token, _tx_token) = device.receive(NetInstant::ZERO).unwrap();
+        rx_token.consume(|bytes| assert_eq!(bytes, b"tcp-syn-packet"));
+
+        let reused = INGRESS_POOL.take_slice(b"next");
+        assert_eq!(reused.as_ptr(), ptr);
+        assert_eq!(reused.capacity(), cap);
+        // Dropping an unconsumed Receive also returns its buffer to INGRESS_POOL.
+        device.incoming.push_back(reused);
+        let (rx_token, _) = device.receive(NetInstant::ZERO).unwrap();
+        drop(rx_token);
+        let reused_again = INGRESS_POOL.take_slice(b"after-drop");
+        assert_eq!(reused_again.as_ptr(), ptr);
+        INGRESS_POOL.put(reused_again);
     }
 }

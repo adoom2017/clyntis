@@ -192,8 +192,8 @@ struct ClosedHost {
     upload: u64,
     download: u64,
     connections: u64,
-    chains: Vec<String>,
-    rule: String,
+    chains: Arc<[String]>,
+    rule: Arc<str>,
     last_seen: u64,
     last_seq: u64,
 }
@@ -230,15 +230,15 @@ fn insert_host_or_accumulate(
     download: u64,
     last_seen: u64,
     seq: u64,
-    chains: &[String],
-    rule: &str,
+    chains: &Arc<[String]>,
+    rule: &Arc<str>,
 ) {
     entry.upload = entry.upload.saturating_add(upload);
     entry.download = entry.download.saturating_add(download);
     entry.connections = entry.connections.saturating_add(1);
     if last_seen >= entry.last_seen {
-        entry.chains = chains.to_vec();
-        entry.rule = rule.to_owned();
+        entry.chains = Arc::clone(chains);
+        entry.rule = Arc::clone(rule);
         entry.last_seen = last_seen;
     }
     entry.last_seq = seq;
@@ -312,8 +312,8 @@ impl Ledger {
                     upload,
                     download,
                     connections: 1,
-                    chains: state.info.chains.clone(),
-                    rule: state.info.rule.clone(),
+                    chains: Arc::clone(&state.info.chains),
+                    rule: Arc::clone(&state.info.rule),
                     last_seen,
                     last_seq: seq,
                 },
@@ -447,8 +447,8 @@ impl Ledger {
                     host: state.info.metadata.host.clone(),
                     port: state.info.metadata.port,
                     network: state.info.network.clone(),
-                    chains: state.info.chains.clone(),
-                    rule: state.info.rule.clone(),
+                    chains: state.info.chains.to_vec(),
+                    rule: state.info.rule.as_ref().to_owned(),
                     source: state.info.source.clone(),
                     upload,
                     download,
@@ -485,12 +485,26 @@ impl Ledger {
         self.active.len()
     }
 
+    /// Cancels every active connection whose `chains` contains `group`, without
+    /// cloning [`Connection`] snapshots. Returns how many were signalled.
+    #[allow(dead_code)]
+    pub fn cancel_by_chain(&self, group: &str) -> usize {
+        let mut cancelled = 0;
+        for state in self.active.values() {
+            if state.info.chains.iter().any(|chain| chain == group) {
+                state.info.cancel.cancel();
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// Counts open connections per proxy chain name, without cloning
     /// [`Connection`] snapshots.
     pub fn active_chain_counts(&self) -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for state in self.active.values() {
-            for chain in &state.info.chains {
+            for chain in state.info.chains.iter() {
                 if let Some(count) = counts.get_mut(chain.as_str()) {
                     *count += 1;
                 } else {
@@ -546,8 +560,8 @@ impl Ledger {
                         download: entry.download,
                         active_connections: 0,
                         total_connections: entry.connections,
-                        chains: entry.chains.clone(),
-                        rule: entry.rule.clone(),
+                        chains: entry.chains.to_vec(),
+                        rule: entry.rule.as_ref().to_owned(),
                         last_seen: entry.last_seen,
                     },
                 )
@@ -555,29 +569,30 @@ impl Ledger {
             .collect();
 
         for state in self.active.values() {
-            let info = state.snapshot();
+            let upload = state.upload.load(Ordering::Relaxed);
+            let download = state.download.load(Ordering::Relaxed);
             let active_ms = state.active.load(Ordering::Relaxed);
             let duration = state.lifetime().as_millis() as u64;
             let snap_last_seen = state.started_unix.saturating_add(active_ms / 1000);
 
-            active_upload = active_upload.saturating_add(info.upload);
-            active_download = active_download.saturating_add(info.download);
+            active_upload = active_upload.saturating_add(upload);
+            active_download = active_download.saturating_add(download);
 
-            let key = normalize_host(&info.metadata.host);
+            let key = normalize_host(&state.info.metadata.host);
             let matches_filter = connection_host
                 .as_deref()
                 .is_none_or(|target| target == key);
 
             match merged_hosts.get_mut(&key) {
                 Some(entry) => {
-                    entry.upload = entry.upload.saturating_add(info.upload);
-                    entry.download = entry.download.saturating_add(info.download);
+                    entry.upload = entry.upload.saturating_add(upload);
+                    entry.download = entry.download.saturating_add(download);
                     let had_active = entry.active_connections > 0;
                     entry.active_connections += 1;
                     entry.total_connections = entry.total_connections.saturating_add(1);
                     if !had_active || snap_last_seen >= entry.last_seen {
-                        entry.chains = info.chains.clone();
-                        entry.rule = info.rule.clone();
+                        entry.chains = state.info.chains.to_vec();
+                        entry.rule = state.info.rule.as_ref().to_owned();
                     }
                     entry.last_seen = entry.last_seen.max(snap_last_seen);
                 }
@@ -586,12 +601,12 @@ impl Ledger {
                         key.clone(),
                         HostTraffic {
                             host: key,
-                            upload: info.upload,
-                            download: info.download,
+                            upload,
+                            download,
                             active_connections: 1,
                             total_connections: 1,
-                            chains: info.chains.clone(),
-                            rule: info.rule.clone(),
+                            chains: state.info.chains.to_vec(),
+                            rule: state.info.rule.as_ref().to_owned(),
                             last_seen: snap_last_seen,
                         },
                     );
@@ -600,15 +615,15 @@ impl Ledger {
 
             if matches_filter {
                 active_conns.push(ConnectionTraffic {
-                    id: info.id,
-                    host: info.metadata.host,
-                    port: info.metadata.port,
-                    network: info.network,
-                    chains: info.chains,
-                    rule: info.rule,
-                    source: info.source,
-                    upload: info.upload,
-                    download: info.download,
+                    id: state.info.id.clone(),
+                    host: state.info.metadata.host.clone(),
+                    port: state.info.metadata.port,
+                    network: state.info.network.clone(),
+                    chains: state.info.chains.to_vec(),
+                    rule: state.info.rule.as_ref().to_owned(),
+                    source: state.info.source.clone(),
+                    upload,
+                    download,
                     start: state.started_unix,
                     duration,
                     active: true,
@@ -725,8 +740,19 @@ impl Ledger {
     }
 }
 
+struct ConnectionInfo {
+    id: String,
+    metadata: Target,
+    network: String,
+    chains: Arc<[String]>,
+    rule: Arc<str>,
+    source: String,
+    start: String,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
 pub(crate) struct State {
-    info: Connection,
+    info: ConnectionInfo,
     upload: AtomicU64,
     download: AtomicU64,
     started_unix: u64,
@@ -789,10 +815,18 @@ impl State {
         self.reason.lock().unwrap().clone()
     }
     pub(crate) fn snapshot(&self) -> Connection {
-        let mut info = self.info.clone();
-        info.upload = self.upload.load(Ordering::Relaxed);
-        info.download = self.download.load(Ordering::Relaxed);
-        info
+        Connection {
+            id: self.info.id.clone(),
+            metadata: self.info.metadata.clone(),
+            network: self.info.network.clone(),
+            chains: self.info.chains.to_vec(),
+            rule: self.info.rule.as_ref().to_owned(),
+            source: self.info.source.clone(),
+            upload: self.upload.load(Ordering::Relaxed),
+            download: self.download.load(Ordering::Relaxed),
+            start: self.info.start.clone(),
+            cancel: self.info.cancel.clone(),
+        }
     }
 }
 pub(crate) struct Tracker {
@@ -811,15 +845,13 @@ impl Tracker {
         let started_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let info = Connection {
+        let info = ConnectionInfo {
             id: uuid::Uuid::new_v4().to_string(),
             metadata: target,
             network: network.into(),
-            chains: vec![routed.node],
-            rule: routed.rule,
+            chains: Arc::from([routed.node]),
+            rule: Arc::from(routed.rule.as_str()),
             source: routed.source,
-            upload: 0,
-            download: 0,
             start: started_unix.to_string(),
             cancel: core.stop.child_token(),
         };
@@ -1040,15 +1072,13 @@ mod tests {
         download: u64,
     ) -> Arc<State> {
         Arc::new(State {
-            info: Connection {
+            info: ConnectionInfo {
                 id: id.into(),
                 metadata: Target::new(host, port).unwrap(),
                 network: "tcp".into(),
-                chains: vec![chain.into()],
-                rule: rule.into(),
+                chains: Arc::from([chain.to_owned()]),
+                rule: Arc::from(rule),
                 source: "127.0.0.1".into(),
-                upload: 0,
-                download: 0,
                 start: started_unix.to_string(),
                 cancel: tokio_util::sync::CancellationToken::new(),
             },
@@ -1550,6 +1580,61 @@ mod tests {
         assert!(a.info.cancel.is_cancelled());
         assert!(b.info.cancel.is_cancelled());
         assert!(c.info.cancel.is_cancelled());
+    }
+
+    #[test]
+    fn ledger_cancel_by_chain_interrupts_matching_connections_only() {
+        let log = Arc::new(crate::requests::Requests::new(false));
+        let mut ledger = Ledger::new(false);
+        let a = make_state(
+            log.clone(),
+            "a",
+            "a.test",
+            443,
+            "ProxyGroup",
+            "Match",
+            1,
+            10,
+            20,
+        );
+        let b = Arc::new(State {
+            info: ConnectionInfo {
+                id: "b".into(),
+                metadata: Target::new("b.test", 443).unwrap(),
+                network: "tcp".into(),
+                chains: Arc::from(["ProxyGroup".to_owned(), "NodeA".to_owned()]),
+                rule: Arc::from("Match"),
+                source: "127.0.0.1".into(),
+                start: "2".into(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+            upload: AtomicU64::new(30),
+            download: AtomicU64::new(40),
+            started_unix: 2,
+            created: Instant::now(),
+            active: AtomicU64::new(0),
+            chunks: AtomicU32::new(0),
+            touched_bytes: AtomicU64::new(0),
+            half_closed: AtomicBool::new(false),
+            ended: Notify::new(),
+            reason: Mutex::new(None),
+            exchanges: AtomicU32::new(0),
+            log: log.clone(),
+        });
+        let c = make_state(log, "c", "c.test", 443, "DIRECT", "Match", 3, 50, 60);
+        ledger.insert_active(a.clone()).unwrap();
+        ledger.insert_active(b.clone()).unwrap();
+        ledger.insert_active(c.clone()).unwrap();
+
+        assert_eq!(ledger.cancel_by_chain("NonExistent"), 0);
+        assert!(!a.info.cancel.is_cancelled());
+        assert!(!b.info.cancel.is_cancelled());
+        assert!(!c.info.cancel.is_cancelled());
+
+        assert_eq!(ledger.cancel_by_chain("ProxyGroup"), 2);
+        assert!(a.info.cancel.is_cancelled());
+        assert!(b.info.cancel.is_cancelled());
+        assert!(!c.info.cancel.is_cancelled());
     }
 
     #[test]

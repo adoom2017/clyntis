@@ -92,50 +92,7 @@ fn parse_alpn(mut value: &[u8]) -> ClientHelloAlpn {
     }
 }
 
-pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
-    if data.is_empty() {
-        return ClientHelloStatus::Incomplete;
-    }
-    if data[0] != 22 {
-        return ClientHelloStatus::Invalid;
-    }
-    let mut records = data;
-    let mut hello: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(&[]);
-    while !records.is_empty() {
-        if records.len() < 5 {
-            return ClientHelloStatus::Incomplete;
-        }
-        let header = &records[..5];
-        if header[0] != 22 {
-            return ClientHelloStatus::Invalid;
-        }
-        let n = u16::from_be_bytes([header[3], header[4]]) as usize;
-        if n == 0 || hello.len().saturating_add(n) > MAX_CLIENT_HELLO {
-            return ClientHelloStatus::Invalid;
-        }
-        if records.len() < 5 + n {
-            return ClientHelloStatus::Incomplete;
-        }
-        let fragment = &records[5..5 + n];
-        if hello.is_empty() {
-            hello = std::borrow::Cow::Borrowed(fragment);
-        } else {
-            hello.to_mut().extend_from_slice(fragment);
-        }
-        records = &records[5 + n..];
-        if hello.len() >= 4 {
-            if hello[0] != 1 {
-                return ClientHelloStatus::Invalid;
-            }
-            let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
-            if size + 4 > MAX_CLIENT_HELLO {
-                return ClientHelloStatus::Invalid;
-            }
-            if hello.len() >= size + 4 {
-                break;
-            }
-        }
-    }
+fn parse_client_hello_handshake(hello: &[u8]) -> ClientHelloStatus {
     if hello.len() < 4 {
         return ClientHelloStatus::Incomplete;
     }
@@ -206,8 +163,273 @@ pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
     ClientHelloStatus::Complete(ClientHello { sni, alpn })
 }
 
+pub(crate) fn parse_client_hello(data: &[u8]) -> ClientHelloStatus {
+    if data.is_empty() {
+        return ClientHelloStatus::Incomplete;
+    }
+    if data[0] != 22 {
+        return ClientHelloStatus::Invalid;
+    }
+    let mut records = data;
+    let mut hello: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(&[]);
+    while !records.is_empty() {
+        if records.len() < 5 {
+            return ClientHelloStatus::Incomplete;
+        }
+        let header = &records[..5];
+        if header[0] != 22 {
+            return ClientHelloStatus::Invalid;
+        }
+        let n = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if n == 0 || hello.len().saturating_add(n) > MAX_CLIENT_HELLO {
+            return ClientHelloStatus::Invalid;
+        }
+        if records.len() < 5 + n {
+            return ClientHelloStatus::Incomplete;
+        }
+        let fragment = &records[5..5 + n];
+        if hello.is_empty() {
+            hello = std::borrow::Cow::Borrowed(fragment);
+        } else {
+            hello.to_mut().extend_from_slice(fragment);
+        }
+        records = &records[5 + n..];
+        if hello.len() >= 4 {
+            if hello[0] != 1 {
+                return ClientHelloStatus::Invalid;
+            }
+            let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
+            if size + 4 > MAX_CLIENT_HELLO {
+                return ClientHelloStatus::Invalid;
+            }
+            if hello.len() >= size + 4 {
+                break;
+            }
+        }
+    }
+    parse_client_hello_handshake(&hello)
+}
+
 pub(crate) fn tls(data: &[u8]) -> Option<String> {
     match parse_client_hello(data) {
+        ClientHelloStatus::Complete(hello) => hello.sni,
+        ClientHelloStatus::Incomplete | ClientHelloStatus::Invalid => None,
+    }
+}
+
+#[allow(dead_code)]
+fn quic_varint(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let first = *data.get(*pos)?;
+    let len = 1usize << (first >> 6);
+    let end = pos.checked_add(len)?;
+    let slice = data.get(*pos..end)?;
+    let mut val = (first & 0x3f) as u64;
+    for &b in &slice[1..] {
+        val = (val << 8) | b as u64;
+    }
+    *pos = end;
+    usize::try_from(val).ok()
+}
+
+#[allow(dead_code)]
+fn hkdf_extract_sha256(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(salt).expect("HMAC key");
+    mac.update(ikm);
+    mac.finalize().into_bytes().into()
+}
+
+#[allow(dead_code)]
+fn hkdf_expand_label_sha256(secret: &[u8; 32], label: &[u8], out_len: usize) -> Vec<u8> {
+    use hmac::Mac;
+    let full_label_len = 6 + label.len();
+    let mut info = Vec::with_capacity(4 + full_label_len + 1);
+    info.extend_from_slice(&(out_len as u16).to_be_bytes());
+    info.push(full_label_len as u8);
+    info.extend_from_slice(b"tls13 ");
+    info.extend_from_slice(label);
+    info.push(0); // empty context
+    info.push(1); // counter = 0x01 (out_len <= 32)
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC key");
+    mac.update(&info);
+    let digest = mac.finalize().into_bytes();
+    digest[..out_len].to_vec()
+}
+
+#[allow(dead_code)]
+fn aes_128_ecb_block(key: &[u8], block: &[u8]) -> Option<[u8; 16]> {
+    let mut crypter = boring::symm::Crypter::new(
+        boring::symm::Cipher::aes_128_ecb(),
+        boring::symm::Mode::Encrypt,
+        key,
+        None,
+    )
+    .ok()?;
+    crypter.pad(false);
+    let mut out = [0u8; 32];
+    let mut count = crypter.update(block, &mut out).ok()?;
+    count += crypter.finalize(&mut out[count..]).ok()?;
+    if count < 16 {
+        return None;
+    }
+    let mut result = [0u8; 16];
+    result.copy_from_slice(&out[..16]);
+    Some(result)
+}
+
+/// Extracts the TLS ClientHello SNI from a QUIC v1 (RFC 9001) or v2 (RFC 9369)
+/// Initial packet.
+#[allow(dead_code)]
+pub fn sniff_quic_initial(packet: &[u8]) -> Option<String> {
+    const QUIC_V1: u32 = 0x0000_0001;
+    const QUIC_V2: u32 = 0x6b33_43cf;
+    const V1_SALT: [u8; 20] = [
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c,
+        0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+    ];
+    const V2_SALT: [u8; 20] = [
+        0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d,
+        0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
+    ];
+
+    if packet.len() < 7 {
+        return None;
+    }
+    let first_byte = packet[0];
+    if (first_byte & 0xc0) != 0xc0 {
+        return None;
+    }
+    let version = u32::from_be_bytes(packet[1..5].try_into().ok()?);
+    let pkt_type = (first_byte >> 4) & 0x03;
+    let (salt, key_label, iv_label, hp_label): (&[u8; 20], &[u8], &[u8], &[u8]) =
+        match (version, pkt_type) {
+            (QUIC_V1, 0) => (&V1_SALT, b"quic key", b"quic iv", b"quic hp"),
+            (QUIC_V2, 1) => (&V2_SALT, b"quicv2 key", b"quicv2 iv", b"quicv2 hp"),
+            _ => return None,
+        };
+
+    let dcid_len = packet[5] as usize;
+    if dcid_len > 20 || packet.len() < 6 + dcid_len + 1 {
+        return None;
+    }
+    let dcid = &packet[6..6 + dcid_len];
+    let mut pos = 6 + dcid_len;
+
+    let scid_len = *packet.get(pos)? as usize;
+    pos += 1;
+    if scid_len > 20 || packet.len() < pos + scid_len {
+        return None;
+    }
+    pos += scid_len;
+
+    let token_len = quic_varint(packet, &mut pos)?;
+    pos = pos.checked_add(token_len)?;
+    if packet.len() < pos {
+        return None;
+    }
+
+    let payload_len = quic_varint(packet, &mut pos)?;
+    let pn_offset = pos;
+    if payload_len < 20 || packet.len() < pn_offset.checked_add(payload_len)? {
+        return None;
+    }
+    let sample = &packet[pn_offset + 4..pn_offset + 20];
+
+    let initial_secret = hkdf_extract_sha256(salt, dcid);
+    let client_secret_vec = hkdf_expand_label_sha256(&initial_secret, b"client in", 32);
+    let client_secret: [u8; 32] = client_secret_vec.try_into().ok()?;
+    let key = hkdf_expand_label_sha256(&client_secret, key_label, 16);
+    let iv = hkdf_expand_label_sha256(&client_secret, iv_label, 12);
+    let hp = hkdf_expand_label_sha256(&client_secret, hp_label, 16);
+
+    let mask = aes_128_ecb_block(&hp, sample)?;
+    let unprotected_first = first_byte ^ (mask[0] & 0x0f);
+    let pn_len = ((unprotected_first & 0x03) + 1) as usize;
+    if payload_len < pn_len + 16 {
+        return None;
+    }
+
+    let mut pn_bytes = [0u8; 4];
+    let mut pn = 0u64;
+    for i in 0..pn_len {
+        let b = packet[pn_offset + i] ^ mask[1 + i];
+        pn_bytes[i] = b;
+        pn = (pn << 8) | b as u64;
+    }
+
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&iv);
+    let pn_be = pn.to_be_bytes();
+    for i in 0..8 {
+        nonce[4 + i] ^= pn_be[i];
+    }
+
+    let mut aad = packet[..pn_offset + pn_len].to_vec();
+    aad[0] = unprotected_first;
+    aad[pn_offset..pn_offset + pn_len].copy_from_slice(&pn_bytes[..pn_len]);
+
+    let ct_start = pn_offset + pn_len;
+    let ct_end = pn_offset + payload_len;
+    let ct = &packet[ct_start..ct_end - 16];
+    let tag = &packet[ct_end - 16..ct_end];
+    let plaintext = boring::symm::decrypt_aead(
+        boring::symm::Cipher::aes_128_gcm(),
+        &key,
+        Some(&nonce),
+        &aad,
+        ct,
+        tag,
+    )
+    .ok()?;
+
+    let mut segments: Vec<(usize, &[u8])> = Vec::new();
+    let mut fpos = 0usize;
+    while fpos < plaintext.len() {
+        let frame_type = quic_varint(&plaintext, &mut fpos)?;
+        match frame_type {
+            0x00 | 0x01 => {}
+            0x02 | 0x03 => {
+                let _largest_ack = quic_varint(&plaintext, &mut fpos)?;
+                let _ack_delay = quic_varint(&plaintext, &mut fpos)?;
+                let ack_range_count = quic_varint(&plaintext, &mut fpos)?;
+                let _first_ack_range = quic_varint(&plaintext, &mut fpos)?;
+                for _ in 0..ack_range_count {
+                    let _gap = quic_varint(&plaintext, &mut fpos)?;
+                    let _ack_len = quic_varint(&plaintext, &mut fpos)?;
+                }
+                if frame_type == 0x03 {
+                    let _ect0 = quic_varint(&plaintext, &mut fpos)?;
+                    let _ect1 = quic_varint(&plaintext, &mut fpos)?;
+                    let _ecn_ce = quic_varint(&plaintext, &mut fpos)?;
+                }
+            }
+            0x06 => {
+                let offset = quic_varint(&plaintext, &mut fpos)?;
+                let len = quic_varint(&plaintext, &mut fpos)?;
+                let end = fpos.checked_add(len)?;
+                let data = plaintext.get(fpos..end)?;
+                fpos = end;
+                segments.push((offset, data));
+            }
+            _ => break,
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    segments.sort_by_key(|(offset, _)| *offset);
+    let mut crypto = Vec::new();
+    for (offset, data) in segments {
+        if offset > crypto.len() || crypto.len() >= MAX_CLIENT_HELLO {
+            break;
+        }
+        let overlap = crypto.len() - offset;
+        if overlap < data.len() {
+            let take_len = (data.len() - overlap).min(MAX_CLIENT_HELLO - crypto.len());
+            crypto.extend_from_slice(&data[overlap..overlap + take_len]);
+        }
+    }
+    match parse_client_hello_handshake(&crypto) {
         ClientHelloStatus::Complete(hello) => hello.sni,
         ClientHelloStatus::Incomplete | ClientHelloStatus::Invalid => None,
     }
@@ -323,7 +545,7 @@ impl crate::Core {
             return Ok((route, destination, prefix));
         }
         let s = &self.config.sniffer;
-        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        let _ = tokio::time::timeout(Duration::from_millis(300), async {
             loop {
                 prefix.reserve(4096);
                 let n = stream.read_buf(&mut prefix).await?;
@@ -702,5 +924,143 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(route.host, "grok.com");
         assert_eq!(destination.host, "157.240.2.14");
+    }
+
+    fn build_quic_initial_packet(
+        version: u32,
+        dcid: &[u8],
+        scid: &[u8],
+        pn: u32,
+        frames: &[u8],
+    ) -> Vec<u8> {
+        const QUIC_V1: u32 = 0x0000_0001;
+        const QUIC_V2: u32 = 0x6b33_43cf;
+        const V1_SALT: [u8; 20] = [
+            0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
+            0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+        ];
+        const V2_SALT: [u8; 20] = [
+            0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26,
+            0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9,
+        ];
+
+        let (pkt_type, salt, key_label, iv_label, hp_label): (u8, &[u8; 20], &[u8], &[u8], &[u8]) =
+            if version == QUIC_V2 {
+                (1, &V2_SALT, b"quicv2 key", b"quicv2 iv", b"quicv2 hp")
+            } else {
+                assert_eq!(version, QUIC_V1);
+                (0, &V1_SALT, b"quic key", b"quic iv", b"quic hp")
+            };
+
+        let initial_secret = hkdf_extract_sha256(salt, dcid);
+        let client_secret: [u8; 32] = hkdf_expand_label_sha256(&initial_secret, b"client in", 32)
+            .try_into()
+            .unwrap();
+        let key = hkdf_expand_label_sha256(&client_secret, key_label, 16);
+        let iv = hkdf_expand_label_sha256(&client_secret, iv_label, 12);
+        let hp = hkdf_expand_label_sha256(&client_secret, hp_label, 16);
+
+        let pn_bytes = pn.to_be_bytes();
+        let pn_len = 2usize; // encode 2-byte packet number
+        let payload_len = pn_len + frames.len() + 16;
+        assert!(payload_len < 16384);
+
+        let mut header = Vec::new();
+        header.push(0xc0 | (pkt_type << 4) | ((pn_len as u8) - 1));
+        header.extend_from_slice(&version.to_be_bytes());
+        header.push(dcid.len() as u8);
+        header.extend_from_slice(dcid);
+        header.push(scid.len() as u8);
+        header.extend_from_slice(scid);
+        header.push(0); // token len = 0
+        // 2-byte QUIC varint for payload_len
+        header.push(0x40 | ((payload_len >> 8) as u8));
+        header.push((payload_len & 0xff) as u8);
+        let pn_offset = header.len();
+        header.extend_from_slice(&pn_bytes[4 - pn_len..]);
+
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&iv);
+        let pn_be = (pn as u64).to_be_bytes();
+        for i in 0..8 {
+            nonce[4 + i] ^= pn_be[i];
+        }
+
+        let mut tag = [0u8; 16];
+        let ct = boring::symm::encrypt_aead(
+            boring::symm::Cipher::aes_128_gcm(),
+            &key,
+            Some(&nonce),
+            &header,
+            frames,
+            &mut tag,
+        )
+        .unwrap();
+
+        let mut packet = header;
+        packet.extend_from_slice(&ct);
+        packet.extend_from_slice(&tag);
+
+        let sample = packet[pn_offset + 4..pn_offset + 20].to_vec();
+        let mask = aes_128_ecb_block(&hp, &sample).unwrap();
+        packet[0] ^= mask[0] & 0x0f;
+        for i in 0..pn_len {
+            packet[pn_offset + i] ^= mask[1 + i];
+        }
+        packet
+    }
+
+    #[test]
+    fn sniff_quic_initial_extracts_sni_v1_v2_and_rejects_invalid() {
+        let record = client_hello_with_alpn("quic.example.test", &[b"h3"]);
+        let handshake = &record[5..]; // strip 5-byte TLS record header
+
+        // Single CRYPTO frame + PADDING in QUIC v1
+        let mut frames_v1 = vec![0x00, 0x00, 0x06, 0x00];
+        let hlen = handshake.len();
+        frames_v1.push(0x40 | ((hlen >> 8) as u8));
+        frames_v1.push((hlen & 0xff) as u8);
+        frames_v1.extend_from_slice(handshake);
+        while frames_v1.len() < 64 {
+            frames_v1.push(0x00);
+        }
+        let pkt_v1 = build_quic_initial_packet(
+            0x0000_0001,
+            b"\x83\x94\xc8\xf0\x3e\x51\x57\x08",
+            b"",
+            1,
+            &frames_v1,
+        );
+        assert_eq!(
+            sniff_quic_initial(&pkt_v1).as_deref(),
+            Some("quic.example.test")
+        );
+
+        // Split out-of-order CRYPTO frames in QUIC v2
+        let record_v2 = client_hello_with_alpn("v2.quic.test", &[b"h3"]);
+        let hs_v2 = &record_v2[5..];
+        let mid = hs_v2.len() / 2;
+        let mut frames_v2 = Vec::new();
+        // Second half first
+        frames_v2.push(0x06);
+        frames_v2.push(mid as u8);
+        frames_v2.push((hs_v2.len() - mid) as u8);
+        frames_v2.extend_from_slice(&hs_v2[mid..]);
+        // First half second
+        frames_v2.push(0x06);
+        frames_v2.push(0x00);
+        frames_v2.push(mid as u8);
+        frames_v2.extend_from_slice(&hs_v2[..mid]);
+        let pkt_v2 =
+            build_quic_initial_packet(0x6b33_43cf, b"\x01\x02\x03\x04", b"\xaa", 7, &frames_v2);
+        assert_eq!(sniff_quic_initial(&pkt_v2).as_deref(), Some("v2.quic.test"));
+
+        // Corrupted / truncated / non-Initial packets return None
+        let mut corrupted = pkt_v1.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        assert_eq!(sniff_quic_initial(&corrupted), None);
+        assert_eq!(sniff_quic_initial(&pkt_v1[..10]), None);
+        assert_eq!(sniff_quic_initial(&[0x40; 32]), None); // short header
     }
 }

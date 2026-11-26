@@ -4,7 +4,7 @@ use crate::{BoxStream, Datagram, Target, vless};
 use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     sync::{
         Arc, Mutex as StdMutex, Weak,
@@ -39,6 +39,7 @@ struct Writer {
     stream: WriteHalf<BoxStream>,
     first: bool,
     usable: bool,
+    buf: Vec<u8>,
 }
 
 struct Reader {
@@ -65,6 +66,7 @@ impl Session {
                 stream: writer,
                 first: true,
                 usable: true,
+                buf: Vec::new(),
             }),
         }
     }
@@ -78,15 +80,28 @@ struct Route {
     sender: mpsc::Sender<RoutedPacket>,
 }
 
+struct MuxWriter {
+    stream: WriteHalf<BoxStream>,
+    buf: Vec<u8>,
+}
+
+#[derive(Default)]
+struct Routes {
+    active: HashMap<u16, Route>,
+    closing: HashSet<u16>,
+}
+
 struct Shared {
-    writer: Mutex<WriteHalf<BoxStream>>,
-    routes: StdMutex<HashMap<u16, Route>>,
+    writer: Mutex<MuxWriter>,
+    routes: StdMutex<Routes>,
     next_id: AtomicU16,
     alive: AtomicBool,
     /// Cancelled when the stream fails or the last owner leaves: pending END
     /// frames stop and release the stream.
     closed: CancellationToken,
     pending_ends: AtomicUsize,
+    pending_writes: AtomicUsize,
+    needs_flush: AtomicBool,
 }
 
 /// One physical VLESS command-3 stream shared by independent UDP flows.
@@ -99,12 +114,17 @@ impl Multiplexer {
     pub fn new(stream: BoxStream) -> Arc<Self> {
         let (reader, writer) = tokio::io::split(stream);
         let shared = Arc::new(Shared {
-            writer: Mutex::new(writer),
-            routes: StdMutex::new(HashMap::new()),
+            writer: Mutex::new(MuxWriter {
+                stream: writer,
+                buf: Vec::new(),
+            }),
+            routes: StdMutex::new(Routes::default()),
             next_id: AtomicU16::new(0),
             alive: AtomicBool::new(true),
             closed: CancellationToken::new(),
             pending_ends: AtomicUsize::new(0),
+            pending_writes: AtomicUsize::new(0),
+            needs_flush: AtomicBool::new(false),
         });
         let reader = tokio::spawn(read_multiplexed(reader, Arc::downgrade(&shared))).abort_handle();
         Arc::new(Self { shared, reader })
@@ -121,15 +141,15 @@ impl Multiplexer {
     ) -> Result<MuxSession> {
         ensure!(self.is_alive(), "XUDP multiplexer is closed");
         let (sender, receiver) = mpsc::channel(64);
-        let mut routes = self.shared.routes.lock().unwrap();
+        let mut routes = self.shared.routes.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(self.is_alive(), "XUDP multiplexer is closed");
         let id = (0..=u16::MAX)
             .find_map(|_| {
                 let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-                (!routes.contains_key(&id)).then_some(id)
+                (!routes.active.contains_key(&id) && !routes.closing.contains(&id)).then_some(id)
             })
             .ok_or_else(|| anyhow::anyhow!("XUDP session ID space exhausted"))?;
-        routes.insert(
+        routes.active.insert(
             id,
             Route {
                 target: target.clone(),
@@ -190,8 +210,12 @@ fn fail_multiplexer(shared: &Shared, message: &str) {
     if !shared.alive.swap(false, Ordering::AcqRel) {
         return;
     }
-    let routes = std::mem::take(&mut *shared.routes.lock().unwrap());
-    for route in routes.into_values() {
+    let active = {
+        let mut routes = shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+        routes.closing.clear();
+        std::mem::take(&mut routes.active)
+    };
+    for route in active.into_values() {
         let _ = route.sender.try_send(Err(message.to_owned()));
     }
 }
@@ -264,9 +288,20 @@ async fn read_multiplexed(mut reader: ReadHalf<BoxStream>, shared: Weak<Shared>)
                 continue;
             }
             let route = if metadata.status == END {
-                shared.routes.lock().unwrap().remove(&metadata.id)
+                shared
+                    .routes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .active
+                    .remove(&metadata.id)
             } else {
-                shared.routes.lock().unwrap().get(&metadata.id).cloned()
+                shared
+                    .routes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .active
+                    .get(&metadata.id)
+                    .cloned()
             };
             let Some(route) = route else {
                 continue;
@@ -293,23 +328,82 @@ async fn read_multiplexed(mut reader: ReadHalf<BoxStream>, shared: Weak<Shared>)
     }
 }
 
+struct PendingWrite<'a> {
+    shared: &'a Arc<Shared>,
+    acquired: bool,
+}
+
+impl<'a> PendingWrite<'a> {
+    fn enter(shared: &'a Arc<Shared>) -> Self {
+        shared.pending_writes.fetch_add(1, Ordering::AcqRel);
+        Self {
+            shared,
+            acquired: false,
+        }
+    }
+
+    fn mark_acquired(mut self) {
+        self.acquired = true;
+    }
+}
+
+impl Drop for PendingWrite<'_> {
+    fn drop(&mut self) {
+        let remaining = self.shared.pending_writes.fetch_sub(1, Ordering::AcqRel) - 1;
+        if !self.acquired
+            && remaining == 0
+            && self.shared.needs_flush.load(Ordering::Acquire)
+            && self.shared.alive.load(Ordering::Acquire)
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let shared = self.shared.clone();
+            handle.spawn(async move {
+                let mut writer = shared.writer.lock().await;
+                if !shared.alive.load(Ordering::Acquire)
+                    || !shared.needs_flush.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                if writer.stream.flush().await.is_ok() {
+                    shared.needs_flush.store(false, Ordering::Release);
+                }
+            });
+        }
+    }
+}
+
 #[async_trait]
 impl Datagram for MuxSession {
     async fn send(&self, target: &Target, payload: &[u8]) -> Result<()> {
         ensure!(target == &self.target, "XUDP session target changed");
         ensure!(self.mux.is_alive(), "XUDP multiplexer is closed");
+        ensure!(payload.len() <= MAX_PAYLOAD, "XUDP payload exceeds limit");
         let mut state = self.send.lock().await;
         ensure!(state.usable, "XUDP writer interrupted or closed");
-        let frame = packet(self.id, target, payload, state.first, self.global_id)?;
-        state.usable = false;
+        let pending = PendingWrite::enter(&self.mux.shared);
         let mut writer = self.mux.shared.writer.lock().await;
+        pending.mark_acquired();
         ensure!(self.mux.is_alive(), "XUDP multiplexer is closed");
+        let w = &mut *writer;
+        write_packet(
+            &mut w.buf,
+            self.id,
+            target,
+            payload,
+            state.first,
+            self.global_id,
+        )?;
+        state.usable = false;
         let mut attempt = WriteAttempt {
             shared: self.mux.shared.clone(),
             committed: false,
         };
-        writer.write_all(&frame).await?;
-        writer.flush().await?;
+        w.stream.write_all(&w.buf).await?;
+        self.mux.shared.needs_flush.store(true, Ordering::Release);
+        if self.mux.shared.pending_writes.load(Ordering::Acquire) == 0 {
+            w.stream.flush().await?;
+            self.mux.shared.needs_flush.store(false, Ordering::Release);
+        }
         attempt.committed = true;
         state.first = false;
         state.usable = true;
@@ -328,18 +422,11 @@ impl Datagram for MuxSession {
 
 impl Drop for MuxSession {
     fn drop(&mut self) {
-        if self
-            .mux
-            .shared
-            .routes
-            .lock()
-            .unwrap()
-            .remove(&self.id)
-            .is_none()
-        {
+        let shared = self.mux.shared.clone();
+        let mut routes = shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+        if routes.active.remove(&self.id).is_none() {
             return;
         }
-        let shared = self.mux.shared.clone();
         if !shared.alive.load(Ordering::Acquire) {
             return;
         }
@@ -355,8 +442,13 @@ impl Drop for MuxSession {
             return;
         }
         let id = self.id;
+        routes.closing.insert(id);
+        drop(routes);
         handle.spawn(async move {
-            let _pending = PendingEnd(shared.clone());
+            let _pending = PendingEnd {
+                shared: shared.clone(),
+                id,
+            };
             tokio::select! {
                 _ = shared.closed.cancelled() => {}
                 _ = tokio::time::timeout(END_DEADLINE, send_end(&shared, id)) => {}
@@ -365,11 +457,20 @@ impl Drop for MuxSession {
     }
 }
 
-/// Counts an END frame in flight until its task ends, however it ends.
-struct PendingEnd(Arc<Shared>);
+/// Counts an END frame in flight and guards `id` against reuse until its task ends.
+struct PendingEnd {
+    shared: Arc<Shared>,
+    id: u16,
+}
 impl Drop for PendingEnd {
     fn drop(&mut self) {
-        self.0.pending_ends.fetch_sub(1, Ordering::AcqRel);
+        self.shared
+            .routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .closing
+            .remove(&self.id);
+        self.shared.pending_ends.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -386,24 +487,26 @@ async fn send_end(shared: &Arc<Shared>, id: u16) {
         committed: false,
     };
     let frame = [0, 4, (id >> 8) as u8, id as u8, END, 0];
-    if writer.write_all(&frame).await.is_ok() && writer.flush().await.is_ok() {
+    if writer.stream.write_all(&frame).await.is_ok() && writer.stream.flush().await.is_ok() {
         attempt.committed = true;
     }
 }
 
-fn packet(
+fn write_packet(
+    frame: &mut Vec<u8>,
     session_id: u16,
     target: &Target,
     payload: &[u8],
     first: bool,
     global_id: Option<[u8; 8]>,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     ensure!(payload.len() <= MAX_PAYLOAD, "XUDP payload exceeds limit");
-    let mut frame = Vec::with_capacity(32 + target.host.len() + payload.len());
+    frame.clear();
+    frame.reserve(32 + target.host.len() + payload.len());
     frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(&session_id.to_be_bytes());
     frame.extend_from_slice(&[if first { NEW } else { KEEP }, DATA, UDP]);
-    vless::encode_address(target, &mut frame)?;
+    vless::encode_address(target, frame)?;
     if first && let Some(global_id) = global_id {
         frame.extend_from_slice(&global_id);
     }
@@ -411,6 +514,19 @@ fn packet(
     frame[..2].copy_from_slice(&size.to_be_bytes());
     frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     frame.extend_from_slice(payload);
+    Ok(())
+}
+
+#[cfg(test)]
+fn packet(
+    session_id: u16,
+    target: &Target,
+    payload: &[u8],
+    first: bool,
+    global_id: Option<[u8; 8]>,
+) -> Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    write_packet(&mut frame, session_id, target, payload, first, global_id)?;
     Ok(frame)
 }
 
@@ -457,15 +573,16 @@ impl Datagram for Session {
     async fn send(&self, target: &Target, payload: &[u8]) -> Result<()> {
         ensure!(target == &self.target, "XUDP session target changed");
         let mut writer = self.writer.lock().await;
-        ensure!(writer.usable, "XUDP writer interrupted or closed");
-        let frame = packet(SESSION_ID, target, payload, writer.first, None)?;
+        let w = &mut *writer;
+        ensure!(w.usable, "XUDP writer interrupted or closed");
+        write_packet(&mut w.buf, SESSION_ID, target, payload, w.first, None)?;
         // An interrupted frame cannot be retried on this byte stream. Mark it
         // unusable before the first await, including when the future is dropped.
-        writer.usable = false;
-        writer.stream.write_all(&frame).await?;
-        writer.stream.flush().await?;
-        writer.first = false;
-        writer.usable = true;
+        w.usable = false;
+        w.stream.write_all(&w.buf).await?;
+        w.stream.flush().await?;
+        w.first = false;
+        w.usable = true;
         Ok(())
     }
 
@@ -690,5 +807,172 @@ mod tests {
         );
         let error = session.recv().await.unwrap_err();
         assert!(error.to_string().contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn session_send_reuses_write_buffer_across_datagrams() {
+        let (local, mut peer) = tokio::io::duplex(64 * 1024);
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let session = Session::new(Box::new(local), target.clone());
+        let reader = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            peer.read_to_end(&mut buf).await.unwrap();
+            buf
+        });
+
+        session.send(&target, &[1u8; 512]).await.unwrap();
+        let cap_after_first = session.writer.lock().await.buf.capacity();
+        let ptr_after_first = session.writer.lock().await.buf.as_ptr();
+        assert!(cap_after_first >= 512);
+
+        session.send(&target, b"small").await.unwrap();
+        let writer = session.writer.lock().await;
+        assert_eq!(writer.buf.capacity(), cap_after_first);
+        assert_eq!(writer.buf.as_ptr(), ptr_after_first);
+        drop(writer);
+        drop(session);
+
+        let wire = reader.await.unwrap();
+        assert!(!wire.is_empty());
+    }
+
+    struct CountingStream {
+        written: Arc<StdMutex<Vec<u8>>>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for CountingStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CountingStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn multiplexer_coalesces_flush_when_writes_are_queued() {
+        let written = Arc::new(StdMutex::new(Vec::new()));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mux = Multiplexer::new(Box::new(CountingStream {
+            written: written.clone(),
+            flushes: flushes.clone(),
+        }));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let s1 = mux.session(target.clone(), None).unwrap();
+        let s2 = mux.session(target.clone(), None).unwrap();
+        let s3 = mux.session(target.clone(), None).unwrap();
+
+        let busy = mux.shared.writer.lock().await;
+        let t1 = target.clone();
+        let t2 = target.clone();
+        let t3 = target.clone();
+        let h1 = tokio::spawn(async move {
+            s1.send(&t1, b"one").await.unwrap();
+            s1
+        });
+        let h2 = tokio::spawn(async move {
+            s2.send(&t2, b"two").await.unwrap();
+            s2
+        });
+        let h3 = tokio::spawn(async move {
+            s3.send(&t3, b"three").await.unwrap();
+            s3
+        });
+        while mux.shared.pending_writes.load(Ordering::Acquire) < 3 {
+            tokio::task::yield_now().await;
+        }
+        drop(busy);
+
+        let _s1 = h1.await.unwrap();
+        let _s2 = h2.await.unwrap();
+        let _s3 = h3.await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert!(!written.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_id_is_not_reused_until_send_end_finishes() {
+        let written = Arc::new(StdMutex::new(Vec::new()));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mux = Multiplexer::new(Box::new(CountingStream { written, flushes }));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let s0 = mux.session(target.clone(), None).unwrap();
+        assert_eq!(s0.id, 0);
+
+        let busy = mux.shared.writer.lock().await;
+        drop(s0);
+        // Reset next_id to 0 to simulate u16 wraparound while END for id 0 is still pending.
+        mux.shared.next_id.store(0, Ordering::Relaxed);
+        let s_next = mux.session(target.clone(), None).unwrap();
+        assert_ne!(s_next.id, 0);
+        drop(busy);
+
+        while mux.shared.pending_ends.load(Ordering::Acquire) > 0 {
+            tokio::task::yield_now().await;
+        }
+        mux.shared.next_id.store(0, Ordering::Relaxed);
+        let s_reused = mux.session(target, None).unwrap();
+        assert_eq!(s_reused.id, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_write_flushes_stranded_frames() {
+        let written = Arc::new(StdMutex::new(Vec::new()));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mux = Multiplexer::new(Box::new(CountingStream {
+            written: written.clone(),
+            flushes: flushes.clone(),
+        }));
+        let target = Target::new("1.1.1.1", 53).unwrap();
+        let s1 = mux.session(target.clone(), None).unwrap();
+        let s2 = mux.session(target.clone(), None).unwrap();
+
+        let busy = mux.shared.writer.lock().await;
+        let t1 = target.clone();
+        let h1 = tokio::spawn(async move { s1.send(&t1, b"one").await });
+        let h2 = tokio::spawn(async move { s2.send(&target, b"two").await });
+        while mux.shared.pending_writes.load(Ordering::Acquire) < 2 {
+            tokio::task::yield_now().await;
+        }
+        // Cancel s2 while s1 is queued; s1 will skip flush seeing pending_writes > 0,
+        // and s2's PendingWrite::drop must ensure the stranded frame is flushed.
+        drop(busy);
+        h2.abort();
+        h1.await.unwrap().unwrap();
+        let _ = h2.await;
+        while mux.shared.needs_flush.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(flushes.load(Ordering::SeqCst) >= 1);
+        assert!(!written.lock().unwrap().is_empty());
     }
 }

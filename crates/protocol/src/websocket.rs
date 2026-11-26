@@ -18,6 +18,10 @@ const MAX_HEADERS: usize = 32 * 1024;
 /// Largest WebSocket frame accepted from the peer. Mihomo and Xray write at
 /// most a few tens of KiB per frame; anything larger only buffers memory.
 const MAX_FRAME: usize = 4 * 1024 * 1024;
+/// RFC 6455 §5.5 maximum payload length for control frames (Close/Ping/Pong).
+const MAX_CONTROL_FRAME: usize = 125;
+/// Pause reading/parsing when buffered outgoing control replies reach this cap.
+const MAX_OUTGOING: usize = 64 * 1024;
 /// Largest data frame we write; one `poll_write` frames at most this much.
 const WRITE_CHUNK: usize = 16 * 1024;
 /// Buffers grown past this by an unusually large frame are released once
@@ -27,6 +31,21 @@ const KEEP_CAPACITY: usize = 16 * 1024;
 fn release_if_large(buffer: &mut Vec<u8>) {
     if buffer.is_empty() && buffer.capacity() > KEEP_CAPACITY {
         *buffer = Vec::new();
+    }
+}
+
+/// Applies the 4-byte WebSocket XOR mask in place using 64-bit word operations.
+fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
+    let mask64 = u64::from_ne_bytes([
+        mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
+    ]);
+    let mut chunks = data.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let word = u64::from_ne_bytes(chunk.try_into().unwrap());
+        chunk.copy_from_slice(&(word ^ mask64).to_ne_bytes());
+    }
+    for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte ^= mask[i & 3];
     }
 }
 
@@ -55,6 +74,17 @@ pub async fn connect(
     options: &clyntis_config::WsOptions,
     early: &[u8],
 ) -> Result<(BoxStream, usize)> {
+    ensure!(
+        !options
+            .path
+            .chars()
+            .any(|c| c == '\r' || c == '\n' || c.is_whitespace()),
+        "invalid WebSocket path"
+    );
+    ensure!(
+        !authority.contains(['\r', '\n']),
+        "invalid WebSocket authority"
+    );
     let (mut path, max_early, early_header) = split_ed(
         &options.path,
         options.max_early_data,
@@ -73,6 +103,12 @@ pub async fn connect(
     rand::thread_rng().fill_bytes(&mut nonce);
     let key = STANDARD.encode(nonce);
     let raw = options.v2ray_http_upgrade;
+    for (name, value) in &options.headers {
+        ensure!(
+            !name.contains(['\r', '\n', ':']) && !value.contains(['\r', '\n']),
+            "invalid WebSocket header"
+        );
+    }
     let host = options
         .headers
         .iter()
@@ -88,13 +124,13 @@ pub async fn connect(
         ));
     }
     if consumed > 0 && !early_header.is_empty() {
+        ensure!(
+            !early_header.contains(['\r', '\n', ':']),
+            "invalid WebSocket early-data header"
+        );
         request.push_str(&format!("{early_header}: {encoded}\r\n"));
     }
     for (name, value) in &options.headers {
-        ensure!(
-            !name.contains(['\r', '\n', ':']) && !value.contains(['\r', '\n']),
-            "invalid WebSocket header"
-        );
         if name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("connection")
             || name.eq_ignore_ascii_case("upgrade")
@@ -226,16 +262,33 @@ impl WsStream {
         let mut mask = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut mask);
         out.extend_from_slice(&mask);
-        out.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        let start = out.len();
+        out.extend_from_slice(bytes);
+        apply_mask(&mut out[start..], mask);
     }
     fn parse_frame(&mut self) -> io::Result<bool> {
         if self.incoming.len() < 2 {
             return Ok(false);
         }
+        let fin = self.incoming[0] & 0x80 != 0;
         let opcode = self.incoming[0] & 0x0f;
         let masked = self.incoming[1] & 0x80 != 0;
         let mut at = 2;
         let mut len = usize::from(self.incoming[1] & 0x7f);
+        if matches!(opcode, 8..=10) {
+            if !fin {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fragmented WebSocket control frame",
+                ));
+            }
+            if len > MAX_CONTROL_FRAME {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "oversized WebSocket control frame",
+                ));
+            }
+        }
         if len == 126 {
             if self.incoming.len() < 4 {
                 return Ok(false);
@@ -270,9 +323,7 @@ impl WsStream {
             return Ok(false);
         }
         if let Some(mask) = mask {
-            for (i, b) in self.incoming[at..end].iter_mut().enumerate() {
-                *b ^= mask[i % 4];
-            }
+            apply_mask(&mut self.incoming[at..end], mask);
         }
         match opcode {
             0 | 2 if len == 0 => {}
@@ -378,6 +429,9 @@ impl AsyncRead for WsStream {
             if self.closed {
                 ready!(flushed)?;
                 return Poll::Ready(Ok(()));
+            }
+            if self.outgoing.len() >= MAX_OUTGOING {
+                ready!(flushed)?;
             }
             if self.parse_frame()? {
                 // A Ping/Pong or empty data frame may be followed by an event
@@ -668,5 +722,115 @@ mod tests {
         assert_eq!(&received[payload.len()..], b"tail");
         assert!(stream.incoming.capacity() <= KEEP_CAPACITY);
         assert!(stream.payload.capacity() <= KEEP_CAPACITY);
+    }
+
+    #[test]
+    fn word_sized_mask_matches_bytewise_across_all_alignments() {
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        for len in (0..=33).chain([127, 128, 129, 1023, 1024, 1031]) {
+            let original: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let expected: Vec<u8> = original
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i % 4])
+                .collect();
+
+            let mut masked = original.clone();
+            apply_mask(&mut masked, mask);
+            assert_eq!(masked, expected, "mismatch for len {len}");
+
+            apply_mask(&mut masked, mask);
+            assert_eq!(masked, original, "roundtrip mismatch for len {len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn control_frames_enforce_fin_and_125_byte_limit() {
+        for frame in [
+            vec![0x09, 0x00],                          // fragmented Ping (FIN=0)
+            vec![0x89, 126, 0, 126],                   // Ping > 125 bytes
+            vec![0x88, 126, 0, 126],                   // Close > 125 bytes
+            vec![0x8a, 127, 0, 0, 0, 0, 0, 0, 0, 126], // Pong > 125 bytes
+        ] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut stream = upgraded_stream(client);
+            server.write_all(&frame).await.unwrap();
+            let err = stream.read(&mut [0; 16]).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn backpressure_pauses_parsing_when_outgoing_reaches_limit() {
+        use std::task::Waker;
+        struct PendingWriteStream(Vec<u8>);
+        impl AsyncRead for PendingWriteStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let n = buf.remaining().min(self.0.len());
+                buf.put_slice(&self.0[..n]);
+                self.0.drain(..n);
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for PendingWriteStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut ws = WsStream::new(
+            Box::new(PendingWriteStream(b"\x89\x04ping\x82\x02ok".to_vec())),
+            false,
+            None,
+        );
+        ws.upgraded = true;
+        ws.outgoing = vec![0u8; MAX_OUTGOING];
+        let mut out = [0u8; 16];
+        let mut buf = ReadBuf::new(&mut out);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut ws).poll_read(&mut cx, &mut buf),
+            Poll::Pending
+        ));
+        // Neither Ping nor Binary frame was parsed while outgoing is backed up.
+        assert_eq!(ws.outgoing.len(), MAX_OUTGOING);
+        assert!(ws.incoming.is_empty());
+        assert!(ws.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_crlf_in_path_and_authority() {
+        let (client, _server) = tokio::io::duplex(1024);
+        let bad_path = clyntis_config::WsOptions {
+            path: "/ws\r\nEvil: 1".into(),
+            ..Default::default()
+        };
+        assert!(
+            connect(Box::new(client), "example.com", &bad_path, &[])
+                .await
+                .is_err()
+        );
+
+        let (client, _server) = tokio::io::duplex(1024);
+        let opts = clyntis_config::WsOptions::default();
+        assert!(
+            connect(Box::new(client), "example.com\r\nEvil: 1", &opts, &[])
+                .await
+                .is_err()
+        );
     }
 }

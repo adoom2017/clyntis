@@ -19,13 +19,59 @@ const MSG_RECORD: u8 = 4;
 const MAX_MESSAGE: usize = 4096;
 const TAG: usize = 16;
 const MAX_PLAINTEXT: usize = MAX_MESSAGE - 3 - TAG;
+const MAX_ERROR_TEXT: usize = 512;
 pub const RESPONSE_LEN: usize = 51;
 /// Prefix of the optional JSON message the server sends before HTTP/2.
 const EARLY_PAYLOAD_MAGIC: &[u8] = b"\xff\xff\xffTS";
 
+fn zeroize_bytes(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: `byte` is a valid, aligned, non-null mutable reference.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+struct ZeroizingKey([u8; 32]);
+impl std::ops::Deref for ZeroizingKey {
+    type Target = [u8; 32];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for ZeroizingKey {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
+
+struct ZeroizingBuf(Vec<u8>);
+impl std::ops::Deref for ZeroizingBuf {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ZeroizingBuf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for ZeroizingBuf {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
+
 struct Symmetric {
     h: [u8; 32],
     ck: [u8; 32],
+}
+impl Drop for Symmetric {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.h);
+        zeroize_bytes(&mut self.ck);
+    }
 }
 impl Symmetric {
     fn new() -> Self {
@@ -39,14 +85,22 @@ impl Symmetric {
         self.h = hasher.finalize().into();
     }
     /// HKDF(ck, DH) -> (ck, k), as in Noise's MixKey.
-    fn mix_dh(&mut self, private: &Private, public: &Public) -> Result<[u8; 32]> {
-        let shared = private.dh(public)?;
+    fn mix_dh(&mut self, private: &Private, public: &Public) -> Result<ZeroizingKey> {
+        let mut shared = private.dh(public)?;
         let (_, hkdf) = hkdf::SimpleHkdf::<Blake2s256>::extract(Some(&self.ck), &shared);
+        zeroize_bytes(&mut shared);
         let mut out = [0u8; 64];
-        hkdf.expand(&[], &mut out)
-            .map_err(|_| anyhow::anyhow!("HKDF"))?;
+        let expanded = hkdf
+            .expand(&[], &mut out)
+            .map_err(|_| anyhow::anyhow!("HKDF"));
+        if let Err(err) = expanded {
+            zeroize_bytes(&mut out);
+            return Err(err);
+        }
         self.ck.copy_from_slice(&out[..32]);
-        Ok(out[32..].try_into().unwrap())
+        let key: [u8; 32] = out[32..].try_into().unwrap();
+        zeroize_bytes(&mut out);
+        Ok(ZeroizingKey(key))
     }
     fn encrypt_and_hash(&mut self, key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         let cipher = ChaCha20Poly1305::new(key.into());
@@ -80,7 +134,10 @@ impl Symmetric {
         let (_, hkdf) = hkdf::SimpleHkdf::<Blake2s256>::extract(Some(&self.ck), &[]);
         let mut out = [0u8; 64];
         hkdf.expand(&[], &mut out).expect("HKDF length");
-        (out[..32].try_into().unwrap(), out[32..].try_into().unwrap())
+        let tx = out[..32].try_into().unwrap();
+        let rx = out[32..].try_into().unwrap();
+        zeroize_bytes(&mut out);
+        (tx, rx)
     }
 }
 
@@ -129,6 +186,12 @@ pub struct Ciphers {
     tx: [u8; 32],
     rx: [u8; 32],
 }
+impl Drop for Ciphers {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.tx);
+        zeroize_bytes(&mut self.rx);
+    }
+}
 
 impl Pending {
     /// Completes the handshake with the server's response message.
@@ -136,7 +199,8 @@ impl Pending {
         ensure!(response.len() >= 3, "short control handshake response");
         if response[0] == MSG_ERROR {
             let len = u16::from_be_bytes([response[1], response[2]]) as usize;
-            let text = String::from_utf8_lossy(&response[3..(3 + len).min(response.len())]);
+            let end = (3 + len.min(MAX_ERROR_TEXT)).min(response.len());
+            let text = String::from_utf8_lossy(&response[3..end]);
             bail!("control server refused the handshake: {text}");
         }
         ensure!(
@@ -177,6 +241,7 @@ pub async fn transport(
     let (mut reader, mut writer) = tokio::io::split(stream);
     let rx = ChaCha20Poly1305::new((&ciphers.rx).into());
     let tx = ChaCha20Poly1305::new((&ciphers.tx).into());
+    drop(ciphers);
     let mut rx_nonce = Nonce(0);
     let mut pending = leftover;
     async fn record(
@@ -252,7 +317,7 @@ pub async fn transport(
     });
     tokio::spawn(async move {
         let mut tx_nonce = Nonce(0);
-        let mut buf = vec![0u8; MAX_PLAINTEXT];
+        let mut buf = ZeroizingBuf(vec![0u8; MAX_PLAINTEXT]);
         let result: Result<()> = async {
             loop {
                 let n = pipe_read.read(&mut buf).await?;

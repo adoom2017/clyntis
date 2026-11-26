@@ -371,7 +371,9 @@ async fn cache_preserves_negative_answers_ttls_and_query_flags() {
             resolver.answer(&different.to_vec().unwrap()).await.unwrap();
             assert_eq!(count.load(Ordering::Relaxed), 2);
             for entry in resolver.cache.lock().unwrap().entries.values_mut() {
-                entry.expires = Instant::now();
+                let now = Instant::now();
+                entry.expires = now;
+                entry.stale_expires = now;
             }
             resolver
                 .answer(&request("cache.test", 50).to_vec().unwrap())

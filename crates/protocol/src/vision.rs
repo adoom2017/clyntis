@@ -289,6 +289,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
         // Writes accepted into our bounded frame buffer must not wait for a
         // second application write before reaching the peer.
         if let Poll::Ready(Err(error)) = this.flush_frame(cx) {
+            this.failed = true;
             return Poll::Ready(Err(error));
         }
         let mut frames = 0;
@@ -331,6 +332,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
             }
             if this.command != 0 {
                 if this.command == 2 {
+                    debug_assert!(this.read_header.is_empty());
                     this.inner.inner_mut().read_direct();
                 }
                 this.read_plain = true;
@@ -410,7 +412,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
         }
         let bytes = &bytes[..bytes.len().min(8192 - 21)];
         this.sniff.observe(bytes, false);
-        let command = if this.sniff.tls && bytes.starts_with(b"\x17\x03\x03") {
+        let is_app_data = bytes.starts_with(b"\x17\x03\x03")
+            || bytes.starts_with(b"\x14\x03\x03\x00\x01\x01\x17\x03\x03");
+        let command = if this.sniff.tls && !this.sniff.server.done {
+            if this.sniff.remaining == 0 { 1 } else { 0 }
+        } else if this.sniff.tls && is_app_data {
             if this.sniff.tls13 { 2 } else { 1 }
         } else if this.sniff.remaining == 0 || (!this.sniff.tls && this.sniff.client.len() >= 8) {
             1

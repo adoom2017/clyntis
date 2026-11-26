@@ -190,7 +190,10 @@ pub(crate) fn install(
     for (index, chunk) in options.short_id.as_bytes().chunks(2).enumerate() {
         short_id[index] = u8::from_str_radix(std::str::from_utf8(chunk)?, 16)?;
     }
-    let now = clock.unix_seconds().context("invalid REALITY clock")? as u32;
+    let now = clock
+        .unix_seconds()
+        .and_then(|secs| u32::try_from(secs).ok())
+        .context("invalid REALITY clock")?;
     let state = Arc::new(State {
         public,
         short_id,

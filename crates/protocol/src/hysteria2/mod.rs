@@ -501,6 +501,8 @@ impl Message {
     }
 }
 
+const MAX_REASSEMBLED_UDP: usize = 65535;
+
 /// Reassembles one fragmented packet at a time per session, as Hysteria does:
 /// a fragment of a newer packet discards the unfinished older one.
 #[derive(Default)]
@@ -508,30 +510,42 @@ struct Defragger {
     packet: u16,
     parts: Vec<Option<Bytes>>,
     received: usize,
+    total_bytes: usize,
 }
 impl Defragger {
     fn feed(&mut self, message: Message) -> Option<(String, Bytes)> {
         if message.fragments == 1 {
-            return Some((message.address, message.payload));
+            return (message.payload.len() <= MAX_REASSEMBLED_UDP)
+                .then_some((message.address, message.payload));
         }
         if message.packet != self.packet || self.parts.len() != usize::from(message.fragments) {
             self.packet = message.packet;
             self.parts = vec![None; usize::from(message.fragments)];
             self.received = 0;
+            self.total_bytes = 0;
         }
         let slot = &mut self.parts[usize::from(message.fragment)];
         if slot.is_none() {
+            let next_total = self.total_bytes.saturating_add(message.payload.len());
+            if next_total > MAX_REASSEMBLED_UDP {
+                self.parts.clear();
+                self.received = 0;
+                self.total_bytes = 0;
+                return None;
+            }
             *slot = Some(message.payload);
             self.received += 1;
+            self.total_bytes = next_total;
         }
         if self.received < self.parts.len() {
             return None;
         }
-        let mut whole = Vec::new();
+        let mut whole = Vec::with_capacity(self.total_bytes);
         for part in self.parts.drain(..).flatten() {
             whole.extend_from_slice(&part);
         }
         self.received = 0;
+        self.total_bytes = 0;
         Some((message.address, whole.into()))
     }
 }
@@ -545,12 +559,14 @@ struct Sessions {
 }
 impl Sessions {
     fn open(&self, inbox: Inbox) -> u32 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.open
-            .lock()
-            .unwrap()
-            .insert(id, (inbox, Defragger::default()));
-        id
+        let mut open = self.open.lock().unwrap();
+        loop {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            if let std::collections::hash_map::Entry::Vacant(e) = open.entry(id) {
+                e.insert((inbox, Defragger::default()));
+                return id;
+            }
+        }
     }
     /// Hands each datagram to its session until the connection ends; then
     /// every session's receiver sees the end.

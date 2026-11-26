@@ -29,6 +29,7 @@ struct CacheEntry {
     response: Vec<u8>,
     inserted: Instant,
     expires: Instant,
+    stale_expires: Instant,
     size: usize,
 }
 const CACHE_ENTRIES: usize = 4096;
@@ -39,6 +40,12 @@ const CACHE_OVERHEAD: usize = 256;
 /// Fallback negative cache TTL (seconds) for NODATA/NXDOMAIN responses that
 /// omit an authority SOA record, so IPv4-only hosts cache negative AAAA answers.
 const NEGATIVE_FALLBACK_TTL: u32 = 30;
+/// Optimistic stale-while-revalidate window after a record's TTL expires.
+const OPTIMISTIC_WINDOW: Duration = Duration::from_secs(3600);
+/// Short-TTL RDRC-style negative cache for SERVFAIL/REFUSED responses.
+const RDRC_NEGATIVE_TTL: u32 = 15;
+/// Maximum idle pooled connections per server key.
+const MAX_POOLED_CONNS_PER_KEY: usize = 4;
 /// How long nameserver-policy servers not yet heard from on this network
 /// answer alone before the plain nameservers are asked too.
 const POLICY_HEAD_START: Duration = Duration::from_millis(500);
@@ -118,6 +125,11 @@ fn cache_ttl(response: &Message) -> u32 {
     };
     ttl.min(3600)
 }
+enum CacheLookup {
+    Fresh(Message),
+    Stale(Message),
+    Miss,
+}
 struct Cache {
     entries: HashMap<Vec<u8>, CacheEntry>,
     total_bytes: usize,
@@ -155,26 +167,43 @@ impl Cache {
             }
         }
     }
-    fn get(&mut self, key: &[u8], id: u16) -> Option<Message> {
+    fn decode_entry(entry: &CacheEntry, id: u16, stale: bool, now: Instant) -> Option<Message> {
+        let mut response = Message::from_vec(&entry.response).ok()?;
+        response.set_id(id);
+        let elapsed = now
+            .saturating_duration_since(entry.inserted)
+            .as_secs()
+            .min(u32::MAX as u64) as u32;
+        let update_ttl = |record: &mut Record| {
+            if stale {
+                record.set_ttl(1);
+            } else {
+                record.set_ttl(record.ttl().saturating_sub(elapsed));
+            }
+        };
+        for record in response.answers_mut().iter_mut() {
+            update_ttl(record);
+        }
+        for record in response.name_servers_mut().iter_mut() {
+            update_ttl(record);
+        }
+        for record in response.additionals_mut().iter_mut() {
+            update_ttl(record);
+        }
+        Some(response)
+    }
+    fn get(&mut self, key: &[u8], id: u16) -> CacheLookup {
         let now = Instant::now();
         let expired = match self.entries.get(key) {
             Some(entry) if entry.expires > now => {
-                if let Ok(mut response) = Message::from_vec(&entry.response) {
-                    response.set_id(id);
-                    let elapsed = now
-                        .saturating_duration_since(entry.inserted)
-                        .as_secs()
-                        .min(u32::MAX as u64) as u32;
-                    for record in response.answers_mut().iter_mut() {
-                        record.set_ttl(record.ttl().saturating_sub(elapsed));
-                    }
-                    for record in response.name_servers_mut().iter_mut() {
-                        record.set_ttl(record.ttl().saturating_sub(elapsed));
-                    }
-                    for record in response.additionals_mut().iter_mut() {
-                        record.set_ttl(record.ttl().saturating_sub(elapsed));
-                    }
-                    return Some(response);
+                if let Some(response) = Self::decode_entry(entry, id, false, now) {
+                    return CacheLookup::Fresh(response);
+                }
+                false
+            }
+            Some(entry) if entry.stale_expires > now => {
+                if let Some(response) = Self::decode_entry(entry, id, true, now) {
+                    return CacheLookup::Stale(response);
                 }
                 false
             }
@@ -184,12 +213,12 @@ impl Cache {
         if expired && let Some(prev) = self.entries.remove(key) {
             self.total_bytes = self.total_bytes.saturating_sub(prev.size);
         }
-        None
+        CacheLookup::Miss
     }
     fn prune_expired(&mut self, now: Instant) {
         let mut removed_bytes = 0usize;
         self.entries.retain(|_, entry| {
-            if entry.expires > now {
+            if entry.stale_expires > now {
                 true
             } else {
                 removed_bytes += entry.size;
@@ -198,7 +227,7 @@ impl Cache {
         });
         self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
     }
-    fn insert(&mut self, mut key: Vec<u8>, mut bytes: Vec<u8>, ttl: u32) {
+    fn insert(&mut self, mut key: Vec<u8>, mut bytes: Vec<u8>, ttl: u32, optimistic: bool) {
         bytes.shrink_to_fit();
         key.shrink_to_fit();
         let size = key.len() + bytes.len() + CACHE_OVERHEAD;
@@ -225,12 +254,19 @@ impl Cache {
                 self.total_bytes = self.total_bytes.saturating_sub(removed.size);
             }
         }
+        let expires = now + Duration::from_secs(ttl as u64);
+        let stale_expires = if optimistic {
+            expires + OPTIMISTIC_WINDOW
+        } else {
+            expires
+        };
         self.entries.insert(
             key,
             CacheEntry {
                 response: bytes,
                 inserted: now,
-                expires: now + Duration::from_secs(ttl as u64),
+                expires,
+                stale_expires,
                 size,
             },
         );
@@ -240,13 +276,14 @@ impl Cache {
 
 type InflightResult = std::result::Result<Message, String>;
 type InflightSlot = tokio::sync::watch::Receiver<Option<InflightResult>>;
+type InflightMap = Arc<Mutex<HashMap<(bool, Vec<u8>), InflightSlot>>>;
 
-struct InflightGuard<'a> {
-    map: &'a Mutex<HashMap<(bool, Vec<u8>), InflightSlot>>,
+struct InflightGuard {
+    map: InflightMap,
     key: Option<(bool, Vec<u8>)>,
     tx: Option<tokio::sync::watch::Sender<Option<InflightResult>>>,
 }
-impl InflightGuard<'_> {
+impl InflightGuard {
     fn finish_ok(mut self, response: &Message) {
         if let Some(key) = self.key.take() {
             self.map.lock().unwrap().remove(&key);
@@ -268,7 +305,7 @@ impl InflightGuard<'_> {
         }
     }
 }
-impl Drop for InflightGuard<'_> {
+impl Drop for InflightGuard {
     fn drop(&mut self) {
         if let Some(key) = self.key.take()
             && let Ok(mut map) = self.map.lock()
@@ -415,19 +452,160 @@ impl FakeMap {
         anyhow::bail!("fake-IP pool exhausted")
     }
 }
+type HandshakeResult = std::result::Result<(), String>;
+type HandshakeSlot = tokio::sync::watch::Receiver<Option<HandshakeResult>>;
+
+struct ConnPoolState<T> {
+    conns: HashMap<String, VecDeque<T>>,
+    inflight: HashMap<String, HandshakeSlot>,
+}
+
+impl<T> Default for ConnPoolState<T> {
+    fn default() -> Self {
+        Self {
+            conns: HashMap::new(),
+            inflight: HashMap::new(),
+        }
+    }
+}
+
+struct HandshakeGuard<T> {
+    state: Arc<Mutex<ConnPoolState<T>>>,
+    key: Option<String>,
+    tx: Option<tokio::sync::watch::Sender<Option<HandshakeResult>>>,
+}
+
+impl<T> HandshakeGuard<T> {
+    fn finish_ok(mut self) {
+        if let Some(key) = self.key.take() {
+            self.state.lock().unwrap().inflight.remove(&key);
+        }
+        if let Some(tx) = self.tx.take()
+            && tx.receiver_count() > 0
+        {
+            let _ = tx.send(Some(Ok(())));
+        }
+    }
+
+    fn finish_err(mut self, error: &anyhow::Error) {
+        if let Some(key) = self.key.take() {
+            self.state.lock().unwrap().inflight.remove(&key);
+        }
+        if let Some(tx) = self.tx.take()
+            && tx.receiver_count() > 0
+        {
+            let _ = tx.send(Some(Err(format!("{error:#}"))));
+        }
+    }
+}
+
+impl<T> Drop for HandshakeGuard<T> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take()
+            && let Ok(mut state) = self.state.lock()
+        {
+            state.inflight.remove(&key);
+        }
+    }
+}
+
+enum AcquireConn<T> {
+    Conn(T),
+    Lead(HandshakeGuard<T>),
+    Wait(HandshakeSlot),
+}
+
+struct ConnPool<T> {
+    state: Arc<Mutex<ConnPoolState<T>>>,
+}
+
+impl<T> Default for ConnPool<T> {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ConnPoolState::default())),
+        }
+    }
+}
+
+impl<T> ConnPool<T> {
+    fn pop(&self, key: &str) -> Option<T> {
+        let mut state = self.state.lock().unwrap();
+        state.conns.get_mut(key)?.pop_front()
+    }
+
+    fn push(&self, key: &str, conn: T) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(queue) = state.conns.get_mut(key) {
+            if queue.len() >= MAX_POOLED_CONNS_PER_KEY {
+                queue.pop_front();
+            }
+            queue.push_back(conn);
+        } else {
+            let mut queue = VecDeque::with_capacity(1);
+            queue.push_back(conn);
+            state.conns.insert(key.to_owned(), queue);
+        }
+    }
+
+    /// Atomically pops an idle pooled connection or claims/joins the per-server
+    /// cold-handshake singleflight slot so concurrent bursts share one TLS handshake.
+    fn pop_or_enter_handshake(&self, key: &str) -> AcquireConn<T> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(queue) = state.conns.get_mut(key)
+            && let Some(conn) = queue.pop_front()
+        {
+            return AcquireConn::Conn(conn);
+        }
+        if let Some(rx) = state.inflight.get(key) {
+            return AcquireConn::Wait(rx.clone());
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let owned = key.to_owned();
+        state.inflight.insert(owned.clone(), rx);
+        AcquireConn::Lead(HandshakeGuard {
+            state: Arc::clone(&self.state),
+            key: Some(owned),
+            tx: Some(tx),
+        })
+    }
+
+    fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.conns.clear();
+        state.inflight.clear();
+    }
+
+    #[cfg(test)]
+    fn len_for(&self, key: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .conns
+            .get(key)
+            .map_or(0, VecDeque::len)
+    }
+}
+
+struct DohConn {
+    sender: hyper::client::conn::http1::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    _driver: tokio_util::task::AbortOnDropHandle<std::result::Result<(), hyper::Error>>,
+}
+
 pub struct Resolver {
     pub config: Dns,
     hooks: Hooks,
     clock: Arc<clyntis_protocol::tls::Clock>,
-    cache: Mutex<Cache>,
-    proxy_cache: Mutex<Cache>,
+    cache: Arc<Mutex<Cache>>,
+    proxy_cache: Arc<Mutex<Cache>>,
     proxy_cache_bytes: AtomicUsize,
-    inflight: Mutex<HashMap<(bool, Vec<u8>), InflightSlot>>,
+    inflight: InflightMap,
     fake: Mutex<FakeMap>,
-    policy: RwLock<DnsPolicy>,
+    policy: Arc<RwLock<DnsPolicy>>,
     /// Whether each nameserver-policy server list answered on this network;
     /// forgotten with the cache when the network changes.
-    reachable: Mutex<HashMap<Vec<String>, bool>>,
+    reachable: Arc<Mutex<HashMap<Vec<String>, bool>>>,
+    doh_pool: Arc<ConnPool<DohConn>>,
+    dot_pool: Arc<ConnPool<clyntis_protocol::BoxStream>>,
     tailnet: RwLock<Option<TailnetNames>>,
     adblock: RwLock<Option<Arc<crate::adblock::Filter>>>,
     /// Kept across resource refreshes so counts survive list updates.
@@ -494,20 +672,42 @@ impl Resolver {
             config,
             hooks,
             clock,
-            policy: RwLock::new(DnsPolicy {
+            policy: Arc::new(RwLock::new(DnsPolicy {
                 filters,
                 ..DnsPolicy::default()
-            }),
-            reachable: Mutex::new(HashMap::new()),
+            })),
+            reachable: Arc::new(Mutex::new(HashMap::new())),
+            doh_pool: Arc::new(ConnPool::default()),
+            dot_pool: Arc::new(ConnPool::default()),
             tailnet: RwLock::new(None),
             adblock: RwLock::new(None),
             adblock_stats: Default::default(),
             configured: AtomicBool::new(false),
-            cache: Mutex::new(Cache::default()),
-            proxy_cache: Mutex::new(Cache::default()),
+            cache: Arc::new(Mutex::new(Cache::default())),
+            proxy_cache: Arc::new(Mutex::new(Cache::default())),
             proxy_cache_bytes: AtomicUsize::new(CACHE_BYTES),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
             fake: Mutex::new(FakeMap::new(FAKE_CAPACITY)),
+        }
+    }
+    fn bg_clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            hooks: self.hooks.clone(),
+            clock: self.clock.clone(),
+            cache: Arc::clone(&self.cache),
+            proxy_cache: Arc::clone(&self.proxy_cache),
+            proxy_cache_bytes: AtomicUsize::new(self.proxy_cache_bytes.load(Ordering::Relaxed)),
+            inflight: Arc::clone(&self.inflight),
+            fake: Mutex::new(FakeMap::new(0)),
+            policy: Arc::clone(&self.policy),
+            reachable: Arc::clone(&self.reachable),
+            doh_pool: Arc::clone(&self.doh_pool),
+            dot_pool: Arc::clone(&self.dot_pool),
+            tailnet: RwLock::new(None),
+            adblock: RwLock::new(None),
+            adblock_stats: Arc::clone(&self.adblock_stats),
+            configured: AtomicBool::new(self.configured.load(Ordering::Relaxed)),
         }
     }
     pub fn clock(&self) -> Arc<clyntis_protocol::tls::Clock> {
@@ -760,11 +960,16 @@ impl Resolver {
         }
         Ok(())
     }
+    pub fn set_max_bytes(&self, max_bytes: usize) {
+        self.cache.lock().unwrap().set_max_bytes(max_bytes);
+    }
     pub fn clear_cache(&self) {
         *self.cache.lock().unwrap() = Cache::default();
         *self.proxy_cache.lock().unwrap() =
             Cache::new(self.proxy_cache_bytes.load(Ordering::Relaxed));
         self.reachable.lock().unwrap().clear();
+        self.doh_pool.clear();
+        self.dot_pool.clear();
     }
     #[cfg(test)]
     pub(crate) fn seed_test_cache_entry(&self) {
@@ -772,6 +977,7 @@ impl Resolver {
             b"test.example".to_vec(),
             b"cached-dns-response".to_vec(),
             60,
+            true,
         );
     }
     #[cfg(test)]
@@ -893,13 +1099,63 @@ impl Resolver {
         Ok(response.answers().to_vec())
     }
     fn cache_store(cache: &Mutex<Cache>, key: Vec<u8>, response: &Message) -> Result<()> {
-        let ttl = cache_ttl(response);
-        if ttl > 0 {
-            // Encoders reserve far more than a typical answer needs.
+        if answered(response) {
+            let ttl = cache_ttl(response);
+            if ttl > 0 {
+                // Encoders reserve far more than a typical answer needs.
+                let bytes = response.to_vec()?;
+                cache.lock().unwrap().insert(key, bytes, ttl, true);
+            }
+        } else if matches!(
+            response.response_code(),
+            ResponseCode::ServFail | ResponseCode::Refused
+        ) && !response.truncated()
+        {
             let bytes = response.to_vec()?;
-            cache.lock().unwrap().insert(key, bytes, ttl);
+            cache
+                .lock()
+                .unwrap()
+                .insert(key, bytes, RDRC_NEGATIVE_TTL, false);
         }
         Ok(())
+    }
+    fn spawn_refresh(&self, request: &Message, key: Vec<u8>, proxy: bool) {
+        let inflight_key = (proxy, key.clone());
+        let guard = {
+            let mut inflight = self.inflight.lock().unwrap();
+            if inflight.contains_key(&inflight_key) {
+                return;
+            }
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            inflight.insert(inflight_key.clone(), rx);
+            InflightGuard {
+                map: Arc::clone(&self.inflight),
+                key: Some(inflight_key),
+                tx: Some(tx),
+            }
+        };
+        let bg = self.bg_clone();
+        let req = request.clone();
+        tokio::spawn(async move {
+            let cache = if proxy { &bg.proxy_cache } else { &bg.cache };
+            let result = if proxy {
+                bg.race(&bg.config.proxy_server_nameserver, &req).await
+            } else {
+                bg.exchange(&req).await
+            };
+            match result {
+                Ok(response) => {
+                    if let Err(error) = Self::cache_store(cache, key, &response) {
+                        guard.finish_err(&error);
+                    } else {
+                        guard.finish_ok(&response);
+                    }
+                }
+                Err(error) => {
+                    guard.finish_err(&error);
+                }
+            }
+        });
     }
     async fn cached_exchange(&self, request: &Message) -> Result<Message> {
         self.cached_exchange_in(request, false).await
@@ -912,8 +1168,13 @@ impl Resolver {
         };
         let key = cache_key(request)?;
         loop {
-            if let Some(response) = cache.lock().unwrap().get(&key, request.id()) {
-                return Ok(response);
+            match cache.lock().unwrap().get(&key, request.id()) {
+                CacheLookup::Fresh(response) => return Ok(response),
+                CacheLookup::Stale(response) => {
+                    self.spawn_refresh(request, key, proxy);
+                    return Ok(response);
+                }
+                CacheLookup::Miss => {}
             }
             let inflight_key = (proxy, key.clone());
             let role = {
@@ -924,13 +1185,19 @@ impl Resolver {
                     // Re-check cache under the inflight lock so a leader that
                     // just stored into cache and removed its slot cannot race
                     // with a new caller and trigger a duplicate upstream query.
-                    if let Some(response) = cache.lock().unwrap().get(&key, request.id()) {
-                        return Ok(response);
+                    match cache.lock().unwrap().get(&key, request.id()) {
+                        CacheLookup::Fresh(response) => return Ok(response),
+                        CacheLookup::Stale(response) => {
+                            drop(inflight);
+                            self.spawn_refresh(request, key, proxy);
+                            return Ok(response);
+                        }
+                        CacheLookup::Miss => {}
                     }
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     inflight.insert(inflight_key.clone(), rx);
                     Ok(InflightGuard {
-                        map: &self.inflight,
+                        map: Arc::clone(&self.inflight),
                         key: Some(inflight_key),
                         tx: Some(tx),
                     })
@@ -1157,11 +1424,14 @@ impl Resolver {
                 .set_recursion_desired(true)
                 .add_query(Query::query(absolute_name(&host)?, kind));
             let key = cache_key(&msg)?;
-            if let Some(cached) = self.cache.lock().unwrap().get(&key, msg.id()) {
-                if let Some(addr) = self.first_bootstrap_addr(&cached, port) {
-                    return Ok(addr);
+            match self.cache.lock().unwrap().get(&key, msg.id()) {
+                CacheLookup::Fresh(cached) | CacheLookup::Stale(cached) => {
+                    if let Some(addr) = self.first_bootstrap_addr(&cached, port) {
+                        return Ok(addr);
+                    }
+                    continue;
                 }
-                continue;
+                CacheLookup::Miss => {}
             }
             let mut negative = None;
             for server in &self.config.default_nameserver {
@@ -1192,83 +1462,175 @@ impl Resolver {
         }
         anyhow::bail!("DNS bootstrap failed")
     }
-    async fn query_upstream(&self, server: &str, request: &Message) -> Result<Message> {
-        if server.starts_with("https://") {
-            use http_body_util::{BodyExt, Full, Limited};
-            let uri: http::Uri = server.parse()?;
-            let target = Target::from_uri(&uri, 443)?;
-            let addr = self.bootstrap(&target.host, target.port).await?;
-            let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
-            let tls = clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
-                .connect(
-                    Box::new(socket),
-                    &clyntis_protocol::tls::TlsConnectConfig {
-                        server_name: target.host,
-                        alpn: vec!["http/1.1".into()],
-                        verify_cert: true,
-                        fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
-                        reality: None,
-                    },
-                )
-                .await?;
-            let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
-                .max_buf_size(16384)
-                .handshake(hyper_util::rt::TokioIo::new(tls))
-                .await?;
-            let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
-            let path = uri
-                .path_and_query()
-                .map(|v| v.as_str())
-                .unwrap_or("/dns-query");
-            let outgoing = http::Request::post(path)
-                .header(
-                    http::header::HOST,
-                    uri.authority().context("DoH authority missing")?.as_str(),
-                )
-                .header(http::header::CONTENT_TYPE, "application/dns-message")
-                .header(http::header::ACCEPT, "application/dns-message")
-                .body(Full::new(bytes::Bytes::from(request.to_vec()?)))?;
-            let response = sender.send_request(outgoing).await?;
-            ensure!(response.status() == http::StatusCode::OK, "DoH HTTP error");
-            ensure!(
-                response
-                    .headers()
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|v| v
-                        .split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("application/dns-message")),
-                "DoH content type mismatch"
-            );
-            let body = Limited::new(response.into_body(), 65535)
-                .collect()
-                .await
-                .map_err(anyhow::Error::from_boxed)?
-                .to_bytes();
-            let response = Message::from_vec(&body)?;
-            validate_response(request, &response)?;
+    async fn connect_doh(&self, server: &str) -> Result<(http::Uri, DohConn)> {
+        let uri: http::Uri = server.parse()?;
+        let target = Target::from_uri(&uri, 443)?;
+        let addr = self.bootstrap(&target.host, target.port).await?;
+        let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
+        let tls = clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
+            .connect(
+                Box::new(socket),
+                &clyntis_protocol::tls::TlsConnectConfig {
+                    server_name: target.host,
+                    alpn: vec!["http/1.1".into()],
+                    verify_cert: true,
+                    fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
+                    reality: None,
+                },
+            )
+            .await?;
+        let (sender, connection) = hyper::client::conn::http1::Builder::new()
+            .max_buf_size(16384)
+            .handshake(hyper_util::rt::TokioIo::new(tls))
+            .await?;
+        let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        Ok((
+            uri,
+            DohConn {
+                sender,
+                _driver: driver,
+            },
+        ))
+    }
+    async fn send_doh_on(
+        conn: &mut DohConn,
+        uri: &http::Uri,
+        wire: &[u8],
+        request: &Message,
+    ) -> Result<(Message, bool)> {
+        use http_body_util::{BodyExt, Full, Limited};
+        conn.sender.ready().await?;
+        let path = uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or("/dns-query");
+        let outgoing = http::Request::post(path)
+            .header(
+                http::header::HOST,
+                uri.authority().context("DoH authority missing")?.as_str(),
+            )
+            .header(http::header::CONTENT_TYPE, "application/dns-message")
+            .header(http::header::ACCEPT, "application/dns-message")
+            .body(Full::new(bytes::Bytes::copy_from_slice(wire)))?;
+        let response = conn.sender.send_request(outgoing).await?;
+        ensure!(response.status() == http::StatusCode::OK, "DoH HTTP error");
+        ensure!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/dns-message")),
+            "DoH content type mismatch"
+        );
+        let close = response
+            .headers()
+            .get(http::header::CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+        let body = Limited::new(response.into_body(), 65535)
+            .collect()
+            .await
+            .map_err(anyhow::Error::from_boxed)?
+            .to_bytes();
+        let msg = Message::from_vec(&body)?;
+        validate_response(request, &msg)?;
+        let keep_alive = !close && !conn.sender.is_closed();
+        Ok((msg, keep_alive))
+    }
+    async fn query_doh(&self, server: &str, request: &Message) -> Result<Message> {
+        let uri: http::Uri = server.parse()?;
+        let wire = request.to_vec()?;
+        // Note: `clyntis-core` depends on `hyper` with `http1` only (no `h2`),
+        // so DoH uses HTTP/1.1 keep-alive connections with per-server cold
+        // handshake singleflight to coalesce concurrent A/AAAA bursts.
+        loop {
+            match self.doh_pool.pop_or_enter_handshake(server) {
+                AcquireConn::Conn(mut conn) => {
+                    if let Ok((msg, keep_alive)) =
+                        Self::send_doh_on(&mut conn, &uri, &wire, request).await
+                    {
+                        if keep_alive {
+                            self.doh_pool.push(server, conn);
+                        }
+                        return Ok(msg);
+                    }
+                }
+                AcquireConn::Lead(guard) => {
+                    let (_, mut conn) = match self.connect_doh(server).await {
+                        Ok(res) => res,
+                        Err(err) => {
+                            guard.finish_err(&err);
+                            return Err(err);
+                        }
+                    };
+                    match Self::send_doh_on(&mut conn, &uri, &wire, request).await {
+                        Ok((msg, keep_alive)) => {
+                            if keep_alive {
+                                self.doh_pool.push(server, conn);
+                            }
+                            guard.finish_ok();
+                            return Ok(msg);
+                        }
+                        Err(err) => {
+                            guard.finish_ok();
+                            return Err(err);
+                        }
+                    }
+                }
+                AcquireConn::Wait(mut rx) => loop {
+                    if let Some(res) = rx.borrow_and_update().as_ref() {
+                        match res {
+                            Ok(()) => break,
+                            Err(err) => anyhow::bail!("{err}"),
+                        }
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                },
+            }
+        }
+    }
+    async fn connect_dot(&self, raw: &str) -> Result<clyntis_protocol::BoxStream> {
+        let target = parse_server(raw, 853)?;
+        let addr = self.bootstrap(&target.host, target.port).await?;
+        let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
+        clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
+            .connect(
+                Box::new(socket),
+                &clyntis_protocol::tls::TlsConnectConfig {
+                    server_name: target.host,
+                    alpn: Vec::new(),
+                    verify_cert: true,
+                    fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
+                    reality: None,
+                },
+            )
+            .await
+    }
+    async fn query_dot(&self, server: &str, raw: &str, request: &Message) -> Result<Message> {
+        if let Some(mut stream) = self.dot_pool.pop(server)
+            && let Ok(response) = Self::exchange_stream_ref(&mut stream, request).await
+        {
+            self.dot_pool.push(server, stream);
             return Ok(response);
         }
+        let mut stream = self.connect_dot(raw).await?;
+        let response = Self::exchange_stream_ref(&mut stream, request).await?;
+        self.dot_pool.push(server, stream);
+        Ok(response)
+    }
+    async fn query_upstream(&self, server: &str, request: &Message) -> Result<Message> {
+        if server.starts_with("https://") {
+            return self.query_doh(server, request).await;
+        }
         if let Some(raw) = server.strip_prefix("tls://") {
-            let target = parse_server(raw, 853)?;
-            let addr = self.bootstrap(&target.host, target.port).await?;
-            let socket = clyntis_platform::tcp_connect(addr, &*self.hooks).await?;
-            let stream = clyntis_protocol::tls::SecureConnector::new(self.clock.clone())
-                .connect(
-                    Box::new(socket),
-                    &clyntis_protocol::tls::TlsConnectConfig {
-                        server_name: target.host,
-                        alpn: Vec::new(),
-                        verify_cert: true,
-                        fingerprint: clyntis_protocol::tls::TlsFingerprint::Native,
-                        reality: None,
-                    },
-                )
-                .await?;
-            return Self::exchange_stream(stream, request).await;
+            return self.query_dot(server, raw, request).await;
         }
         let tcp = server.starts_with("tcp://");
         let raw = server
@@ -1325,8 +1687,15 @@ impl Resolver {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        Self::exchange_stream_ref(&mut socket, request).await
+    }
+    async fn exchange_stream_ref<S>(socket: &mut S, request: &Message) -> Result<Message>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
         let bytes = request.to_vec()?;
-        socket.write_u16(bytes.len() as u16).await?;
+        let len = u16::try_from(bytes.len()).context("DNS TCP request too large")?;
+        socket.write_u16(len).await?;
         socket.write_all(&bytes).await?;
         let n = socket.read_u16().await?;
         let mut bytes = vec![0; n as usize];
@@ -1727,29 +2096,32 @@ mod perf_tests {
         assert_eq!(cache.total_bytes, 0);
 
         // Insert and overwrite with different payload sizes.
-        cache.insert(b"k1".to_vec(), vec![1u8; 100], 60);
+        cache.insert(b"k1".to_vec(), vec![1u8; 100], 60, true);
         assert_eq!(cache.total_bytes, sum(&cache));
-        cache.insert(b"k1".to_vec(), vec![2u8; 250], 60);
+        cache.insert(b"k1".to_vec(), vec![2u8; 250], 60, true);
         assert_eq!(cache.total_bytes, sum(&cache));
-        cache.insert(b"k2".to_vec(), vec![3u8; 150], 60);
+        cache.insert(b"k2".to_vec(), vec![3u8; 150], 60, true);
         assert_eq!(cache.total_bytes, sum(&cache));
 
-        // Lazy expiry on get decrements total_bytes.
-        cache.entries.get_mut(b"k2".as_slice()).unwrap().expires =
-            Instant::now() - Duration::from_secs(1);
-        assert!(cache.get(b"k2", 1).is_none());
+        // Lazy expiry on get decrements total_bytes once past optimistic window.
+        let past = Instant::now() - Duration::from_secs(1);
+        let entry = cache.entries.get_mut(b"k2".as_slice()).unwrap();
+        entry.expires = past;
+        entry.stale_expires = past;
+        assert!(matches!(cache.get(b"k2", 1), CacheLookup::Miss));
         assert!(!cache.entries.contains_key(b"k2".as_slice()));
         assert_eq!(cache.total_bytes, sum(&cache));
 
         // Prune expired and byte-limit eviction maintain exact total_bytes.
         let big = vec![0u8; 64 * 1024];
         for i in 0..24u32 {
-            cache.insert(format!("big-{i}").into_bytes(), big.clone(), 60);
+            cache.insert(format!("big-{i}").into_bytes(), big.clone(), 60, true);
             assert!(cache.total_bytes <= CACHE_BYTES);
             assert_eq!(cache.total_bytes, sum(&cache));
         }
         for entry in cache.entries.values_mut() {
-            entry.expires = Instant::now() - Duration::from_secs(1);
+            entry.expires = past;
+            entry.stale_expires = past;
         }
         cache.prune_expired(Instant::now());
         assert_eq!(cache.entries.len(), 0);
@@ -1906,5 +2278,434 @@ mod perf_tests {
         let mut msg_aaaa = msg_b.clone();
         msg_aaaa.queries_mut()[0].set_query_type(RecordType::AAAA);
         assert_ne!(cache_key(&msg_a).unwrap(), cache_key(&msg_aaaa).unwrap());
+    }
+
+    #[tokio::test]
+    async fn optimistic_cache_returns_stale_and_triggers_singleflight_refresh() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = udp.local_addr().unwrap().to_string();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let hits_server = hits.clone();
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                    let mut reply = Message::from_vec(&buf[..n]).unwrap();
+                    let count = hits_server.fetch_add(1, Ordering::SeqCst) + 1;
+                    let qname = reply.queries()[0].name().clone();
+                    reply
+                        .set_message_type(MessageType::Response)
+                        .set_recursion_available(true);
+                    let ip = if count == 1 { "192.0.2.1" } else { "192.0.2.2" };
+                    reply.add_answer(Record::from_rdata(
+                        qname,
+                        60,
+                        RData::A(A(ip.parse().unwrap())),
+                    ));
+                    udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                }
+            }));
+            let resolver = Resolver::new(
+                Dns {
+                    nameserver: vec![address],
+                    enhanced_mode: "redir-host".into(),
+                    ipv6: false,
+                    ..Dns::default()
+                },
+                Arc::new(clyntis_platform::DefaultHooks),
+            );
+
+            // First query populates cache with 192.0.2.1.
+            assert_eq!(
+                resolver.lookup("opt.test", 443).await.unwrap(),
+                vec!["192.0.2.1:443".parse::<SocketAddr>().unwrap()]
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+            // Expire the entry's fresh TTL while keeping it in the optimistic window.
+            {
+                let mut cache = resolver.cache.lock().unwrap();
+                for entry in cache.entries.values_mut() {
+                    entry.expires = Instant::now() - Duration::from_secs(1);
+                    entry.stale_expires = Instant::now() + Duration::from_secs(60);
+                }
+            }
+
+            // Concurrent stale hits return stale 192.0.2.1 immediately and coalesce
+            // the background refresh into a single upstream query.
+            let (r1, r2) = tokio::join!(
+                resolver.lookup("opt.test", 443),
+                resolver.lookup("opt.test", 443)
+            );
+            assert_eq!(
+                r1.unwrap(),
+                vec!["192.0.2.1:443".parse::<SocketAddr>().unwrap()]
+            );
+            assert_eq!(
+                r2.unwrap(),
+                vec!["192.0.2.1:443".parse::<SocketAddr>().unwrap()]
+            );
+
+            // Wait for background refresh to store 192.0.2.2.
+            for _ in 0..40 {
+                if hits.load(Ordering::SeqCst) >= 2 && resolver.inflight.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                resolver.lookup("opt.test", 443).await.unwrap(),
+                vec!["192.0.2.2:443".parse::<SocketAddr>().unwrap()]
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rdrc_negative_caching_caches_servfail_and_refused() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for code in [ResponseCode::ServFail, ResponseCode::Refused] {
+                let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let address = udp.local_addr().unwrap().to_string();
+                let hits = Arc::new(AtomicUsize::new(0));
+                let hits_server = hits.clone();
+                let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                        let mut reply = Message::from_vec(&buf[..n]).unwrap();
+                        hits_server.fetch_add(1, Ordering::SeqCst);
+                        reply
+                            .set_message_type(MessageType::Response)
+                            .set_response_code(code);
+                        udp.send_to(&reply.to_vec().unwrap(), peer).await.unwrap();
+                    }
+                }));
+                let resolver = Resolver::new(
+                    Dns {
+                        nameserver: vec![address],
+                        enhanced_mode: "redir-host".into(),
+                        ipv6: false,
+                        ..Dns::default()
+                    },
+                    Arc::new(clyntis_platform::DefaultHooks),
+                );
+                let req1 = make_query("fail.test", 1, RecordType::A).to_vec().unwrap();
+                let req2 = make_query("fail.test", 2, RecordType::A).to_vec().unwrap();
+                let res1 = Message::from_vec(&resolver.answer(&req1).await.unwrap()).unwrap();
+                let res2 = Message::from_vec(&resolver.answer(&req2).await.unwrap()).unwrap();
+                assert_eq!(res1.response_code(), code);
+                assert_eq!(res2.response_code(), code);
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+                // Negative RDRC entries do NOT serve optimistically past expiry.
+                {
+                    let mut cache = resolver.cache.lock().unwrap();
+                    for entry in cache.entries.values_mut() {
+                        assert_eq!(entry.expires, entry.stale_expires);
+                        let past = Instant::now() - Duration::from_secs(1);
+                        entry.expires = past;
+                        entry.stale_expires = past;
+                    }
+                }
+                let req3 = make_query("fail.test", 3, RecordType::A).to_vec().unwrap();
+                let res3 = Message::from_vec(&resolver.answer(&req3).await.unwrap()).unwrap();
+                assert_eq!(res3.response_code(), code);
+                assert_eq!(hits.load(Ordering::SeqCst), 2);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn resolver_set_max_bytes_shrinks_cache_cleanly() {
+        let resolver = Resolver::new(Dns::default(), Arc::new(clyntis_platform::DefaultHooks));
+        {
+            let mut cache = resolver.cache.lock().unwrap();
+            for i in 0..10u32 {
+                cache.insert(format!("key-{i}").into_bytes(), vec![1u8; 512], 60, true);
+            }
+        }
+        let initial_count = resolver.cache_entry_count();
+        assert_eq!(initial_count, 10);
+        // Each entry is ~512 + 5 + 256 = 773 bytes; cap at 2500 bytes keeps ~3 entries.
+        resolver.set_max_bytes(2500);
+        let cache = resolver.cache.lock().unwrap();
+        assert!(cache.total_bytes <= 2500);
+        assert!(!cache.entries.is_empty() && cache.entries.len() < initial_count);
+    }
+
+    #[tokio::test]
+    async fn doh_and_dot_pool_eviction_and_retry_on_stale_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let pool: ConnPool<clyntis_protocol::BoxStream> = ConnPool::default();
+        let key = "tls://dns.test:853";
+
+        // 1. Reuse healthy pooled DoT stream across two exchanges.
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let len = server.read_u16().await.unwrap() as usize;
+                let mut req_buf = vec![0; len];
+                server.read_exact(&mut req_buf).await.unwrap();
+                let mut reply = Message::from_vec(&req_buf).unwrap();
+                reply.set_message_type(MessageType::Response);
+                let out = reply.to_vec().unwrap();
+                server.write_u16(out.len() as u16).await.unwrap();
+                server.write_all(&out).await.unwrap();
+            }
+        });
+        pool.push(key, Box::new(client));
+        for id in [101u16, 102u16] {
+            let mut stream = pool.pop(key).unwrap();
+            let reply = Resolver::exchange_stream_ref(
+                &mut stream,
+                &make_query("pool.test.", id, RecordType::A),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.id(), id);
+            pool.push(key, stream);
+        }
+        assert_eq!(pool.len_for(key), 1);
+        server_task.await.unwrap();
+
+        // 2. Stale/EOF pooled DoT stream fails and is evicted (not pushed back).
+        let (stale_client, stale_server) = tokio::io::duplex(64);
+        drop(stale_server);
+        pool.clear();
+        pool.push(key, Box::new(stale_client));
+        let mut stale = pool.pop(key).unwrap();
+        assert!(
+            Resolver::exchange_stream_ref(
+                &mut stale,
+                &make_query("stale.test.", 103, RecordType::A)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(pool.len_for(key), 0);
+
+        // 3. DoH pool: reuse healthy HTTP/1.1 connection and evict EOF connection.
+        let (doh_client, doh_server) = tokio::io::duplex(8192);
+        let doh_server_task = tokio::spawn(async move {
+            let service = hyper::service::service_fn(
+                |req: hyper::Request<hyper::body::Incoming>| async move {
+                    use http_body_util::BodyExt;
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    let mut reply = Message::from_vec(&body).unwrap();
+                    reply.set_message_type(MessageType::Response);
+                    let resp = hyper::Response::builder()
+                        .status(200)
+                        .header(http::header::CONTENT_TYPE, "application/dns-message")
+                        .body(http_body_util::Full::new(bytes::Bytes::from(
+                            reply.to_vec().unwrap(),
+                        )))
+                        .unwrap();
+                    Ok::<_, hyper::Error>(resp)
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(doh_server), service)
+                .await;
+        });
+        let (sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(hyper_util::rt::TokioIo::new(doh_client))
+            .await
+            .unwrap();
+        let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(conn));
+        let doh_pool: ConnPool<DohConn> = ConnPool::default();
+        let doh_key = "https://dns.test/dns-query";
+        doh_pool.push(
+            doh_key,
+            DohConn {
+                sender,
+                _driver: driver,
+            },
+        );
+        let uri: http::Uri = "https://dns.test/dns-query".parse().unwrap();
+        for id in [201u16, 202u16] {
+            let req = make_query("doh.test.", id, RecordType::A);
+            let wire = req.to_vec().unwrap();
+            let mut c = doh_pool.pop(doh_key).unwrap();
+            let (msg, keep_alive) = Resolver::send_doh_on(&mut c, &uri, &wire, &req)
+                .await
+                .unwrap();
+            assert_eq!(msg.id(), id);
+            assert!(keep_alive);
+            doh_pool.push(doh_key, c);
+        }
+        assert_eq!(doh_pool.len_for(doh_key), 1);
+
+        // Drop server so pooled DoH connection hits EOF and is evicted.
+        drop(doh_pool);
+        doh_server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh_singleflight_coalesces_cold_handshakes_and_handles_cancel_or_error() {
+        let pool: Arc<ConnPool<DohConn>> = Arc::new(ConnPool::default());
+        let server = "https://dns.test/dns-query";
+        let uri: http::Uri = server.parse().unwrap();
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let server_tasks = Arc::new(Mutex::new(Vec::new()));
+
+        let spawn_doh_conn = {
+            let handshakes = Arc::clone(&handshakes);
+            let server_tasks = Arc::clone(&server_tasks);
+            move || {
+                handshakes.fetch_add(1, Ordering::SeqCst);
+                let (doh_client, doh_server) = tokio::io::duplex(16384);
+                let srv = tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |req: hyper::Request<hyper::body::Incoming>| async move {
+                            use http_body_util::BodyExt;
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let mut reply = Message::from_vec(&body).unwrap();
+                            reply.set_message_type(MessageType::Response);
+                            let resp = hyper::Response::builder()
+                                .status(200)
+                                .header(http::header::CONTENT_TYPE, "application/dns-message")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(
+                                    reply.to_vec().unwrap(),
+                                )))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(doh_server), service)
+                        .await;
+                });
+                server_tasks.lock().unwrap().push(srv);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let (sender, conn) = hyper::client::conn::http1::Builder::new()
+                        .handshake(hyper_util::rt::TokioIo::new(doh_client))
+                        .await
+                        .unwrap();
+                    let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(conn));
+                    DohConn {
+                        sender,
+                        _driver: driver,
+                    }
+                }
+            }
+        };
+
+        // 1. Concurrent A + AAAA cold burst performs a single handshake and reuses it.
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for (idx, kind) in [(0u16, RecordType::A), (1u16, RecordType::AAAA)] {
+            let pool = Arc::clone(&pool);
+            let uri = uri.clone();
+            let barrier = Arc::clone(&barrier);
+            let mut ready_rx = ready_rx.clone();
+            let spawn_doh_conn = spawn_doh_conn.clone();
+            let ready_tx = if idx == 0 {
+                Some(ready_tx.clone())
+            } else {
+                None
+            };
+            tasks.push(tokio::spawn(async move {
+                let req = make_query("burst.test.", 300 + idx, kind);
+                let wire = req.to_vec().unwrap();
+                barrier.wait().await;
+                if idx != 0 {
+                    let _ = ready_rx.wait_for(|v| *v).await;
+                }
+                loop {
+                    match pool.pop_or_enter_handshake(server) {
+                        AcquireConn::Conn(mut conn) => {
+                            let (msg, keep_alive) =
+                                Resolver::send_doh_on(&mut conn, &uri, &wire, &req)
+                                    .await
+                                    .unwrap();
+                            if keep_alive {
+                                pool.push(server, conn);
+                            }
+                            return msg.id();
+                        }
+                        AcquireConn::Lead(guard) => {
+                            if let Some(tx) = &ready_tx {
+                                let _ = tx.send(true);
+                            }
+                            let mut doh = spawn_doh_conn().await;
+                            let (msg, keep_alive) =
+                                Resolver::send_doh_on(&mut doh, &uri, &wire, &req)
+                                    .await
+                                    .unwrap();
+                            if keep_alive {
+                                pool.push(server, doh);
+                            }
+                            guard.finish_ok();
+                            return msg.id();
+                        }
+                        AcquireConn::Wait(mut rx) => loop {
+                            if let Some(res) = rx.borrow_and_update().as_ref() {
+                                res.as_ref().unwrap();
+                                break;
+                            }
+                            if rx.changed().await.is_err() {
+                                break;
+                            }
+                        },
+                    }
+                }
+            }));
+        }
+        let mut ids = Vec::new();
+        for t in tasks {
+            ids.push(t.await.unwrap());
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![300, 301]);
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.len_for(server), 1);
+        drop(pool);
+        let servers: Vec<_> = server_tasks.lock().unwrap().drain(..).collect();
+        for srv in servers {
+            srv.await.unwrap();
+        }
+
+        // 2. Leader cancellation wakes waiter; leader error propagates to waiter.
+        let pool2: ConnPool<DohConn> = ConnPool::default();
+        let lead = match pool2.pop_or_enter_handshake(server) {
+            AcquireConn::Lead(g) => g,
+            _ => panic!("expected Lead"),
+        };
+        let mut wait_rx = match pool2.pop_or_enter_handshake(server) {
+            AcquireConn::Wait(rx) => rx,
+            _ => panic!("expected Wait"),
+        };
+        drop(lead);
+        assert!(wait_rx.changed().await.is_err());
+
+        let lead2 = match pool2.pop_or_enter_handshake(server) {
+            AcquireConn::Lead(g) => g,
+            _ => panic!("expected Lead after cancel"),
+        };
+        let mut wait_rx2 = match pool2.pop_or_enter_handshake(server) {
+            AcquireConn::Wait(rx) => rx,
+            _ => panic!("expected Wait"),
+        };
+        lead2.finish_err(&anyhow::anyhow!("tls handshake failed"));
+        assert!(wait_rx2.changed().await.is_ok());
+        assert_eq!(
+            wait_rx2
+                .borrow_and_update()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err(),
+            "tls handshake failed"
+        );
     }
 }

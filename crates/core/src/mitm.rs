@@ -188,8 +188,13 @@ fn cert_fingerprint(cert: &X509) -> Result<String> {
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn normalize_host(host: &str) -> String {
-    host.trim().trim_end_matches('.').to_ascii_lowercase()
+fn normalize_host(host: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = host.trim().trim_end_matches('.');
+    if !trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(trimmed)
+    } else {
+        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+    }
 }
 
 struct Authority {
@@ -200,7 +205,7 @@ struct Authority {
     fingerprint: String,
     /// One key for every host certificate.
     leaf_key: PKey<Private>,
-    leaves: Mutex<HashMap<String, (u64, Arc<SslAcceptor>)>>,
+    leaves: RwLock<HashMap<String, (AtomicU64, Arc<SslAcceptor>)>>,
     leaf_tick: AtomicU64,
 }
 impl Authority {
@@ -223,13 +228,16 @@ impl Authority {
             ca_key: mitm.ca_key.clone(),
             fingerprint,
             leaf_key: ec_key()?,
-            leaves: Mutex::default(),
+            leaves: RwLock::default(),
             leaf_tick: AtomicU64::new(0),
         })
     }
     fn acceptor(&self, host: &str, limit: usize) -> Result<Arc<SslAcceptor>> {
-        if let Some((used, acceptor)) = self.leaves.lock().unwrap().get_mut(host) {
-            *used = self.leaf_tick.fetch_add(1, Ordering::Relaxed);
+        if let Some((used, acceptor)) = self.leaves.read().unwrap().get(host) {
+            used.store(
+                self.leaf_tick.fetch_add(1, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             return Ok(acceptor.clone());
         }
         let leaf = self.leaf(host)?;
@@ -255,21 +263,24 @@ impl Authority {
         });
         let acceptor = Arc::new(builder.build());
         if limit > 0 {
-            let mut leaves = self.leaves.lock().unwrap();
-            if let Some((used, existing)) = leaves.get_mut(host) {
-                *used = self.leaf_tick.fetch_add(1, Ordering::Relaxed);
+            let mut leaves = self.leaves.write().unwrap();
+            if let Some((used, existing)) = leaves.get(host) {
+                used.store(
+                    self.leaf_tick.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
                 return Ok(existing.clone());
             }
             if leaves.len() >= limit
                 && let Some(evict) = leaves
                     .iter()
-                    .min_by_key(|(_, (used, _))| *used)
+                    .min_by_key(|(_, (used, _))| used.load(Ordering::Relaxed))
                     .map(|(k, _)| k.clone())
             {
                 leaves.remove(&evict);
             }
             let tick = self.leaf_tick.fetch_add(1, Ordering::Relaxed);
-            leaves.insert(host.to_owned(), (tick, acceptor.clone()));
+            leaves.insert(host.to_owned(), (AtomicU64::new(tick), acceptor.clone()));
         }
         Ok(acceptor)
     }
@@ -540,6 +551,8 @@ pub(crate) struct Interceptor {
     persist_lock: Mutex<()>,
     /// Tests talk to servers with their own certificates.
     verify_upstream: AtomicBool,
+    enable: AtomicBool,
+    quic_fallback: AtomicBool,
     hosted: bool,
     leaf_limit: usize,
     inspection_limit: usize,
@@ -570,6 +583,8 @@ impl Interceptor {
             storage_path: Some(directory.join(BYPASS_FILE_NAME)),
             persist_lock: Mutex::default(),
             verify_upstream: true.into(),
+            enable: false.into(),
+            quic_fallback: false.into(),
             hosted,
             leaf_limit: if hosted { HOSTED_LEAVES } else { LEAVES },
             inspection_limit,
@@ -632,7 +647,7 @@ impl Interceptor {
             if entry.reason != BypassReason::ClientCertificateRefused {
                 continue;
             }
-            let host = normalize_host(&entry.host);
+            let host = normalize_host(&entry.host).into_owned();
             if host.is_empty() {
                 continue;
             }
@@ -713,7 +728,7 @@ impl Interceptor {
             .is_some_and(|a| a.ca_cert == mitm.ca_cert && a.ca_key == mitm.ca_key);
         let result = if !mitm.enable {
             if let Some(authority) = &prev_authority {
-                authority.leaves.lock().unwrap().clear();
+                authority.leaves.write().unwrap().clear();
             }
             if !same_loaded_ca {
                 *self.authority.write().unwrap() = None;
@@ -761,6 +776,9 @@ impl Interceptor {
         *self.error.write().unwrap() = result.as_ref().err().map(|e| format!("{e:#}"));
         {
             let mut settings = self.settings.write().unwrap();
+            self.enable.store(mitm.enable, Ordering::Release);
+            self.quic_fallback
+                .store(mitm.quic_fallback, Ordering::Release);
             *settings = mitm;
             let modules = self.module_hosts.read().unwrap();
             *self.host_matcher.write().unwrap() = HostMatcher::new(&settings.hostname, &modules);
@@ -768,7 +786,7 @@ impl Interceptor {
         result
     }
     fn active(&self) -> Option<Arc<Authority>> {
-        if !self.settings.read().unwrap().enable {
+        if !self.enable.load(Ordering::Acquire) {
             return None;
         }
         self.authority.read().unwrap().clone()
@@ -798,11 +816,11 @@ impl Interceptor {
         let key = normalize_host(host);
         let now = unix_now();
         let mut bypass = self.bypass.lock().unwrap();
-        if let Some(entry) = bypass.get(&key) {
+        if let Some(entry) = bypass.get(key.as_ref()) {
             if entry.expires_at > now {
                 return true;
             }
-            bypass.remove(&key);
+            bypass.remove(key.as_ref());
         }
         false
     }
@@ -855,17 +873,27 @@ impl Interceptor {
     }
     /// Whether UDP 443 (QUIC) to `host` should be rejected to induce TCP fallback.
     pub(crate) fn blocks_quic(&self, host: &str) -> bool {
-        if !self.can_inspect() || !self.settings.read().unwrap().quic_fallback {
+        if !self.can_inspect()
+            || !self.enable.load(Ordering::Acquire)
+            || !self.quic_fallback.load(Ordering::Acquire)
+        {
             return false;
         }
         if !self.intercepts(host) {
             return false;
         }
         let key = normalize_host(host);
-        let now = unix_now();
         let mut skipped = self.alpn_bypass.lock().unwrap();
-        skipped.retain(|_, expires_at| *expires_at > now);
-        !skipped.contains_key(&key)
+        let Some(&expires_at) = skipped.get(key.as_ref()) else {
+            return true;
+        };
+        let now = unix_now();
+        if expires_at > now {
+            false
+        } else {
+            skipped.remove(key.as_ref());
+            true
+        }
     }
     /// Listed by the user or a module; the user's exclusions win.
     fn listed(&self, host: &str) -> bool {
@@ -924,9 +952,9 @@ impl Interceptor {
         let inserted = {
             let mut bypass = self.bypass.lock().unwrap();
             bypass.retain(|_, entry| entry.expires_at > now);
-            if bypass.len() < BYPASS || bypass.contains_key(&key) {
+            if bypass.len() < BYPASS || bypass.contains_key(key.as_ref()) {
                 bypass.insert(
-                    key,
+                    key.into_owned(),
                     BypassEntry {
                         reason,
                         expires_at: now + ttl_secs,
@@ -970,14 +998,14 @@ impl Interceptor {
         let now = unix_now();
         let mut skipped = self.alpn_bypass.lock().unwrap();
         skipped.retain(|_, expires_at| *expires_at > now);
-        let is_new = !skipped.contains_key(&key);
+        let is_new = !skipped.contains_key(key.as_ref());
         if is_new && skipped.len() < BYPASS {
-            skipped.insert(key, now + ALPN_BYPASS_TTL_SECS);
+            skipped.insert(key.into_owned(), now + ALPN_BYPASS_TTL_SECS);
             tracing::warn!(
                 "[MITM] {host}: client ALPN does not offer http/1.1 (e.g. HTTP/2 or gRPC); passing connection through without decryption or rewrite"
             );
         } else if !is_new {
-            skipped.insert(key, now + ALPN_BYPASS_TTL_SECS);
+            skipped.insert(key.into_owned(), now + ALPN_BYPASS_TTL_SECS);
         }
     }
     pub(crate) fn clear_bypass(&self) {
@@ -988,7 +1016,7 @@ impl Interceptor {
     /// Drops cached per-host TLS acceptors under memory pressure.
     pub(crate) fn relieve_memory(&self) {
         if let Some(authority) = self.authority.read().unwrap().as_ref() {
-            let mut leaves = authority.leaves.lock().unwrap();
+            let mut leaves = authority.leaves.write().unwrap();
             leaves.clear();
             leaves.shrink_to_fit();
         }
@@ -3126,20 +3154,20 @@ hostname = ads.test
         let interceptor = Interceptor::new(&settings, dir.path(), false);
         let authority = interceptor.active().unwrap();
         authority.acceptor("a.ads.test", LEAVES).unwrap();
-        assert_eq!(authority.leaves.lock().unwrap().len(), 1);
+        assert_eq!(authority.leaves.read().unwrap().len(), 1);
 
         interceptor.relieve_memory();
-        assert!(authority.leaves.lock().unwrap().is_empty());
+        assert!(authority.leaves.read().unwrap().is_empty());
 
         authority.acceptor("b.ads.test", LEAVES).unwrap();
-        assert_eq!(authority.leaves.lock().unwrap().len(), 1);
+        assert_eq!(authority.leaves.read().unwrap().len(), 1);
         interceptor
             .set(Mitm {
                 enable: false,
                 ..settings
             })
             .unwrap();
-        assert!(authority.leaves.lock().unwrap().is_empty());
+        assert!(authority.leaves.read().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3379,7 +3407,7 @@ hostname = ads.test
         assert!(Arc::ptr_eq(&a1, &a2));
         // Inserting `c.test` at capacity 2 must evict only `b.test`, not clear `a.test`.
         let _c = authority.acceptor("c.test", 2).unwrap();
-        let leaves = authority.leaves.lock().unwrap();
+        let leaves = authority.leaves.read().unwrap();
         assert_eq!(leaves.len(), 2);
         assert!(leaves.contains_key("a.test"));
         assert!(leaves.contains_key("c.test"));
