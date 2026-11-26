@@ -757,7 +757,7 @@ impl Core {
         if self.config.profile.store_fake_ip || self.config.profile.store_selected {
             let core = self.clone();
             tasks.spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
                 loop {
                     tokio::select! {
                         _ = core.stop.cancelled() => break,

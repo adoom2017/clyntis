@@ -182,15 +182,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Moves core logs into the shared log file every 5 s while a core exists.
-    /// The core buffers 2000 lines; collecting every second kept the tunnel
-    /// waking up for little more than a few lines. The leeway lets iOS
-    /// coalesce it with other wakeups.
+    /// Moves core logs into the shared log file every 60 s while a core exists.
+    /// Draining every 5–30 s dirtied a 16 KiB APFS page on each flush and
+    /// contributed to iOS daily disk-write limits; 60 s with 10 s leeway
+    /// batches lines while keeping the 2000-line core buffer well below capacity.
     private func collectLogs() {
         logTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
-        timer.setEventHandler { [watchdog] in watchdog.track("collect logs") { Diagnostics.collectCoreLogs() } }
+        timer.schedule(deadline: .now() + 60, repeating: 60, leeway: .seconds(10))
+        timer.setEventHandler { Diagnostics.collectCoreLogs() }
         logTimer = timer
         timer.resume()
     }
@@ -630,13 +630,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 ticks += 1
                 if ticks % 6 == 0 {
                     let connections = (state?["connections"] as? NSNumber)?.intValue ?? 0
+                    let routineInfo = ticks % 120 == 0
                     // Counting open descriptors scans up to RLIMIT_NOFILE via fcntl; keep it off the packet queue.
                     self.metricsQueue.async {
                         let files = Diagnostics.openFileDescriptors()
                         let limit = Diagnostics.fileLimit()
-                        let line = "running: memory=\(memory()) connections=\(connections) files=\(files)/\(limit)"
+                        let memMiB = Diagnostics.footprintMiB()
+                        let highMem = memMiB >= 35
+                        let nearFdLimit = limit > 0 && files * 10 >= limit * 8
+                        guard nearFdLimit || highMem || routineInfo else { return }
+                        let line = String(format: "running: memory=%.1f MiB connections=%d files=%d/%d",
+                                          memMiB, connections, files, limit)
                         // Near the limit new sockets fail; say so above the routine line.
-                        if limit > 0, files * 10 >= limit * 8 { log.warning(line) } else { log.info(line) }
+                        if nearFdLimit || highMem { log.warning(line) } else { log.info(line) }
                     }
                 }
             } catch { self.fail(error) }
@@ -950,10 +956,13 @@ private final class TunnelWatchdog {
         }
         guard let heartbeat else { return }
         let blockedSeconds = Int(blocked)
-        let changed = operation != lastHeartbeatOperation
-            || (blockedSeconds > 0) != (lastHeartbeatBlocked > 0)
-            || (blockedSeconds > 10 && blockedSeconds != lastHeartbeatBlocked)
-        guard changed || now - lastHeartbeatWrite >= 15 else { return }
+        // Only write the heartbeat on initial start or when a real block (> 10 s)
+        // is observed (throttled to once every 60 s), and overwrite in place
+        // instead of `.atomic` temp-file+rename to stay well below iOS's daily
+        // disk-write budget.
+        let isInitial = lastHeartbeatWrite == 0
+        let shouldWrite = isInitial || (blockedSeconds > 10 && now - lastHeartbeatWrite >= 60)
+        guard shouldWrite else { return }
         lastHeartbeatWrite = now
         lastHeartbeatOperation = operation
         lastHeartbeatBlocked = blockedSeconds
@@ -964,7 +973,7 @@ private final class TunnelWatchdog {
             "blocked": blockedSeconds,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: beat) {
-            try? data.write(to: heartbeat, options: .atomic)
+            try? data.write(to: heartbeat)
         }
     }
 }
