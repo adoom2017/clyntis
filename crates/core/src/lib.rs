@@ -314,23 +314,30 @@ impl<'a> LowerHost<'a> {
 }
 
 fn interleave_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    let mut v6 = addresses.iter().copied().filter(SocketAddr::is_ipv6);
-    let mut v4 = addresses.iter().copied().filter(SocketAddr::is_ipv4);
+    let primary_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let mut primary = addresses
+        .iter()
+        .copied()
+        .filter(|addr| addr.is_ipv6() == primary_v6);
+    let mut secondary = addresses
+        .iter()
+        .copied()
+        .filter(|addr| addr.is_ipv6() != primary_v6);
     let mut out = Vec::with_capacity(addresses.len());
     loop {
-        match (v6.next(), v4.next()) {
+        match (primary.next(), secondary.next()) {
             (Some(a), Some(b)) => {
                 out.push(a);
                 out.push(b);
             }
             (Some(a), None) => {
                 out.push(a);
-                out.extend(v6);
+                out.extend(primary);
                 break;
             }
             (None, Some(b)) => {
                 out.push(b);
-                out.extend(v4);
+                out.extend(secondary);
                 break;
             }
             (None, None) => break,
