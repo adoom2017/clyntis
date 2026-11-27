@@ -26,7 +26,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     pin::Pin,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -587,6 +590,36 @@ impl TxToken for Transmit {
     }
 }
 
+#[derive(Default)]
+struct TcpWake {
+    notify: Notify,
+    pending: AtomicBool,
+}
+
+impl TcpWake {
+    fn notify_one(&self) {
+        self.pending.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
+fn should_poll_tcp(
+    sleep_elapsed: bool,
+    has_tcp_flows: bool,
+    wake_pending: bool,
+    overdue_timer: bool,
+) -> bool {
+    sleep_elapsed || (has_tcp_flows && (wake_pending || overdue_timer))
+}
+
 /// A TCP flow as seen by its proxy session. Every queue change wakes the
 /// packet loop, so data queued between packets is forwarded at once instead
 /// of waiting for the next packet or timer.
@@ -594,7 +627,7 @@ struct ChannelStream {
     input: mpsc::Receiver<Vec<u8>>,
     pending: Option<(Vec<u8>, usize)>,
     output: Option<PollSender<Vec<u8>>>,
-    wake: Arc<Notify>,
+    wake: Arc<TcpWake>,
 }
 impl AsyncRead for ChannelStream {
     fn poll_read(
@@ -1311,7 +1344,7 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
     let mut failures_logged = [0u64; 2];
     let mut tasks = JoinSet::new();
     let (replies, mut incoming_replies) = mpsc::channel::<Reply>(256);
-    let wake = Arc::new(Notify::new());
+    let wake = Arc::new(TcpWake::default());
     // The loop sleeps until smoltcp's next timer (retransmission, delayed
     // ACK, keepalive), housekeeping or an event: a packet, a queue change
     // of a TCP session, a UDP reply, a finished session or room in the TUN
@@ -1587,6 +1620,15 @@ pub(crate) async fn run(core: Arc<Core>, io: Arc<dyn PacketIo>) -> Result<()> {
                 }
             }
         }
+        let wake_pending = wake.take_pending();
+        let overdue =
+            !tcp_flows.is_empty() && iface.poll_delay(now(), &sockets) == Some(NetDuration::ZERO);
+        tcp_active |= should_poll_tcp(
+            sleep.is_elapsed(),
+            !tcp_flows.is_empty(),
+            wake_pending,
+            overdue,
+        );
         if tcp_active && !tcp_flows.is_empty() {
             retired.clear();
             let tcp_pressure =
@@ -2243,5 +2285,160 @@ mod budget_tests {
         let reused_again = INGRESS_POOL.take_slice(b"after-drop");
         assert_eq!(reused_again.as_ptr(), ptr);
         INGRESS_POOL.put(reused_again);
+    }
+}
+
+#[cfg(test)]
+mod tcp_starvation_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use clyntis_config::Config as CoreConfig;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{Ipv4Address, Ipv4Repr, TcpControl, TcpRepr, UdpRepr};
+    use std::sync::atomic::AtomicUsize;
+
+    fn make_ipv4_tcp_syn(
+        src: Ipv4Address,
+        src_port: u16,
+        dst: Ipv4Address,
+        dst_port: u16,
+    ) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port,
+            dst_port,
+            control: TcpControl::Syn,
+            seq_number: smoltcp::wire::TcpSeqNumber(1000),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1460),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut buf = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
+        ip.emit(&mut ip_pkt, &ChecksumCapabilities::default());
+        let mut tcp_pkt = TcpPacket::new_unchecked(ip_pkt.payload_mut());
+        tcp.emit(
+            &mut tcp_pkt,
+            &src.into(),
+            &dst.into(),
+            &ChecksumCapabilities::default(),
+        );
+        buf
+    }
+
+    fn make_ipv4_udp(src: Ipv4Address, src_port: u16, dst: Ipv4Address, dst_port: u16) -> Vec<u8> {
+        let payload = b"udp-flood";
+        let udp = UdpRepr { src_port, dst_port };
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Udp,
+            payload_len: udp.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let mut buf = vec![0u8; ip.buffer_len() + udp.header_len() + payload.len()];
+        let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
+        ip.emit(&mut ip_pkt, &ChecksumCapabilities::default());
+        let mut udp_pkt = UdpPacket::new_unchecked(ip_pkt.payload_mut());
+        udp.emit(
+            &mut udp_pkt,
+            &src.into(),
+            &dst.into(),
+            payload.len(),
+            |out| out.copy_from_slice(payload),
+            &ChecksumCapabilities::default(),
+        );
+        buf
+    }
+
+    struct UdpFloodIo {
+        syn: Vec<u8>,
+        udp: Vec<u8>,
+        recvs: AtomicUsize,
+        syn_acks: AtomicUsize,
+        second_syn_ack: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl PacketIo for UdpFloodIo {
+        async fn recv(&self, packet: &mut [u8]) -> Result<usize> {
+            let n = self.recvs.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                packet[..self.syn.len()].copy_from_slice(&self.syn);
+                return Ok(self.syn.len());
+            }
+            // Yield so timers can advance, while keeping `io.recv` immediately
+            // ready on every select! pass to simulate sustained UDP traffic.
+            tokio::task::yield_now().await;
+            packet[..self.udp.len()].copy_from_slice(&self.udp);
+            Ok(self.udp.len())
+        }
+
+        async fn send(&self, packet: &[u8]) -> Result<()> {
+            if let Ok(ip) = Ipv4Packet::new_checked(packet)
+                && ip.next_header() == IpProtocol::Tcp
+                && let Ok(tcp) = TcpPacket::new_checked(ip.payload())
+                && tcp.syn()
+                && tcp.ack()
+                && self.syn_acks.fetch_add(1, Ordering::Relaxed) + 1 >= 2
+            {
+                self.second_syn_ack.notify_one();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn should_poll_tcp_and_tcp_wake_progress_when_sleep_elapses_or_wake_pending() {
+        assert!(!should_poll_tcp(false, true, false, false));
+        assert!(should_poll_tcp(true, false, false, false));
+        assert!(should_poll_tcp(false, true, true, false));
+        assert!(should_poll_tcp(false, true, false, true));
+        assert!(!should_poll_tcp(false, false, true, true));
+
+        let wake = TcpWake::default();
+        assert!(!wake.take_pending());
+        wake.notify_one();
+        assert!(wake.take_pending());
+        assert!(!wake.take_pending());
+    }
+
+    #[tokio::test]
+    async fn tcp_retransmit_progresses_under_sustained_udp_traffic() {
+        let core = Core::new(
+            CoreConfig::default(),
+            Arc::new(clyntis_platform::DefaultHooks),
+        )
+        .unwrap();
+        let src = Ipv4Address::new(198, 18, 0, 2);
+        let dst = Ipv4Address::new(93, 184, 216, 34);
+        let second_syn_ack = Arc::new(Notify::new());
+        let io = Arc::new(UdpFloodIo {
+            syn: make_ipv4_tcp_syn(src, 40000, dst, 80),
+            udp: make_ipv4_udp(src, 40001, dst, 9999),
+            recvs: AtomicUsize::new(0),
+            syn_acks: AtomicUsize::new(0),
+            second_syn_ack: Arc::clone(&second_syn_ack),
+        });
+        let runner = tokio::spawn(run(Arc::clone(&core), io.clone()));
+        let result = tokio::time::timeout(Duration::from_secs(5), second_syn_ack.notified()).await;
+        core.stop.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), runner).await;
+        assert!(
+            result.is_ok(),
+            "TCP SYN-ACK retransmit was starved by sustained UDP traffic (syn_acks={})",
+            io.syn_acks.load(Ordering::Relaxed)
+        );
     }
 }

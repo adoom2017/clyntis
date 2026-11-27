@@ -148,12 +148,11 @@ impl Cache {
             max_bytes,
         }
     }
-    fn set_max_bytes(&mut self, max_bytes: usize) {
-        self.max_bytes = max_bytes;
-        if self.total_bytes > self.max_bytes {
+    fn evict_to_bytes(&mut self, max_bytes: usize) {
+        if self.total_bytes > max_bytes {
             self.prune_expired(Instant::now());
         }
-        while self.total_bytes > self.max_bytes {
+        while self.total_bytes > max_bytes {
             let Some(oldest) = self
                 .entries
                 .iter()
@@ -166,6 +165,10 @@ impl Cache {
                 self.total_bytes = self.total_bytes.saturating_sub(removed.size);
             }
         }
+    }
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.evict_to_bytes(max_bytes);
     }
     fn decode_entry(entry: &CacheEntry, id: u16, stale: bool, now: Instant) -> Option<Message> {
         let mut response = Message::from_vec(&entry.response).ok()?;
@@ -962,6 +965,12 @@ impl Resolver {
     }
     pub fn set_max_bytes(&self, max_bytes: usize) {
         self.cache.lock().unwrap().set_max_bytes(max_bytes);
+    }
+    /// Evicts entries down to `max_bytes` under transient memory pressure
+    /// without permanently lowering the configured ceiling.
+    pub fn shrink_to_bytes(&self, max_bytes: usize) {
+        self.cache.lock().unwrap().evict_to_bytes(max_bytes);
+        self.proxy_cache.lock().unwrap().evict_to_bytes(max_bytes);
     }
     pub fn clear_cache(&self) {
         *self.cache.lock().unwrap() = Cache::default();
@@ -2438,6 +2447,53 @@ mod perf_tests {
         let cache = resolver.cache.lock().unwrap();
         assert!(cache.total_bytes <= 2500);
         assert!(!cache.entries.is_empty() && cache.entries.len() < initial_count);
+    }
+
+    #[test]
+    fn resolver_shrink_to_bytes_preserves_ceiling() {
+        let resolver = Resolver::new(Dns::default(), Arc::new(clyntis_platform::DefaultHooks));
+        {
+            let mut cache = resolver.cache.lock().unwrap();
+            let mut proxy_cache = resolver.proxy_cache.lock().unwrap();
+            for i in 0..40u32 {
+                cache.insert(
+                    format!("cache-{i}").into_bytes(),
+                    vec![1u8; 8 * 1024],
+                    60,
+                    true,
+                );
+                proxy_cache.insert(
+                    format!("proxy-{i}").into_bytes(),
+                    vec![2u8; 8 * 1024],
+                    60,
+                    true,
+                );
+            }
+            assert!(cache.total_bytes > 256 * 1024);
+            assert!(proxy_cache.total_bytes > 256 * 1024);
+        }
+
+        resolver.shrink_to_bytes(256 * 1024);
+
+        {
+            let mut cache = resolver.cache.lock().unwrap();
+            let proxy_cache = resolver.proxy_cache.lock().unwrap();
+            assert!(cache.total_bytes <= 256 * 1024);
+            assert!(proxy_cache.total_bytes <= 256 * 1024);
+            assert_eq!(cache.max_bytes, CACHE_BYTES);
+            assert_eq!(proxy_cache.max_bytes, CACHE_BYTES);
+
+            for i in 40..80u32 {
+                cache.insert(
+                    format!("cache-{i}").into_bytes(),
+                    vec![1u8; 8 * 1024],
+                    60,
+                    true,
+                );
+            }
+            assert!(cache.total_bytes > 256 * 1024);
+            assert!(cache.total_bytes <= CACHE_BYTES);
+        }
     }
 
     #[tokio::test]

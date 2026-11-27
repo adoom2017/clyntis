@@ -352,6 +352,7 @@ pub fn parse_list_reader_into(
     let mut taken = 0usize;
     if format == "adguard" {
         let mut meta = AdguardMeta::default();
+        let mut pending_blocks: Vec<(String, bool)> = Vec::new();
         let mut pending_allows: Vec<(String, bool, bool)> = Vec::new();
         loop {
             buf.clear();
@@ -380,8 +381,14 @@ pub fn parse_list_reader_into(
                     ));
                 }
             } else if !meta.is_badfiltered(false, entry.domain) {
-                taken += push_adguard_rule(block, entry.domain, entry.is_pattern);
+                pending_blocks.push((entry.domain.to_ascii_lowercase(), entry.is_pattern));
             }
+        }
+        for (domain, is_pattern) in pending_blocks {
+            if meta.is_badfiltered(false, &domain) {
+                continue;
+            }
+            taken += push_adguard_rule(block, &domain, is_pattern);
         }
         for (domain, is_pattern, important) in pending_allows {
             if meta.is_badfiltered(true, &domain) {
@@ -512,9 +519,7 @@ impl AdguardMeta {
             return false;
         }
         Self::with_lower(domain, |lower| {
-            self.badfilters
-                .iter()
-                .any(|(ex, d)| *ex == exception && d == lower)
+            self.badfilters.contains(&(exception, lower.to_owned()))
         })
     }
 
@@ -932,5 +937,33 @@ mod tests {
         assert!(!f_block.matches("cancelled-late.test"));
         assert!(f_allow.matches("ok.ads.test"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reader_mode_supports_trailing_badfilter() {
+        let rules = concat!(
+            "||kept.test^\n",
+            "||cancelled-late.test^\n",
+            "@@||allow-late.test^\n",
+            "||cancelled-late.test^$badfilter\n",
+            "@@||allow-late.test^$badfilter\n",
+        );
+        let mut block = DomainSetBuilder::default();
+        let mut allow = DomainSetBuilder::default();
+        let mut addrs = Vec::new();
+        let taken = parse_list_reader(
+            std::io::Cursor::new(rules.as_bytes()),
+            "adguard",
+            &mut block,
+            &mut allow,
+            &mut addrs,
+            1024 * 1024,
+        )
+        .unwrap();
+        let (block, allow) = (block.build(), allow.build());
+        assert_eq!(taken, 1);
+        assert!(block.matches("sub.kept.test"));
+        assert!(!block.matches("cancelled-late.test"));
+        assert!(!allow.matches("allow-late.test"));
     }
 }

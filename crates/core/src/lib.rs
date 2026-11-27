@@ -887,10 +887,13 @@ impl Core {
                 let mut interval = tokio::time::interval(Duration::from_secs(group.interval));
                 let mut network = core.network_epoch.subscribe();
                 loop {
+                    let notified = core.url_test_wake.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if core.dial_idle_elapsed() >= URL_TEST_IDLE_TIMEOUT {
                         tokio::select! {
                             _ = core.stop.cancelled() => break,
-                            _ = core.url_test_wake.notified() => {
+                            _ = &mut notified => {
                                 interval.reset();
                             }
                             changed = network.changed() => {
@@ -939,13 +942,15 @@ impl Core {
                                 tracing::info!(group = %group.name, from = ?current, to = %next, "url-test group switched");
                             }
                             policy.selection.insert(group.name.clone(), next);
+                            if changed {
+                                core.bump_policy_epoch();
+                            }
                             changed
                         } else {
                             false
                         }
                     };
                     if switched {
-                        core.bump_policy_epoch();
                         core.traffic.lock().unwrap().cancel_by_chain(&group.name);
                     }
                 }
@@ -1220,12 +1225,13 @@ impl Core {
             }
             return Ok(Trace::new("REJECT", "REJECT", "Module(REJECT)", None));
         }
-        let (mode, rules, raw_rules) = {
+        let (mode, rules, raw_rules, epoch) = {
             let p = self.policy.read().unwrap();
             (
                 p.mode.clone(),
                 Arc::clone(&p.rules),
                 Arc::clone(&p.raw_rules),
+                self.policy_epoch.load(Ordering::Acquire),
             )
         };
         if mode == Mode::Direct {
@@ -1245,7 +1251,6 @@ impl Core {
         let mut looked_up = false;
         let lower_host = LowerHost::new(&target.host);
         let host = lower_host.as_str();
-        let epoch = self.policy_epoch.load(Ordering::Acquire);
         if let Some(cached) =
             self.route_cache
                 .lock()
@@ -1352,14 +1357,14 @@ impl Core {
     }
     fn note_dial(&self) {
         let now_ms = self.started_at.elapsed().as_millis() as u64;
-        let prev_ms = self.last_dial_ms.swap(now_ms, Ordering::Relaxed);
+        let prev_ms = self.last_dial_ms.swap(now_ms, Ordering::AcqRel);
         if now_ms.saturating_sub(prev_ms) >= URL_TEST_IDLE_TIMEOUT.as_millis() as u64 {
             self.url_test_wake.notify_waiters();
         }
     }
     fn dial_idle_elapsed(&self) -> Duration {
         let now_ms = self.started_at.elapsed().as_millis() as u64;
-        let last_ms = self.last_dial_ms.load(Ordering::Relaxed);
+        let last_ms = self.last_dial_ms.load(Ordering::Acquire);
         Duration::from_millis(now_ms.saturating_sub(last_ms))
     }
     fn evict_idle_hysteria2(&self) {
@@ -1391,21 +1396,24 @@ impl Core {
             config.proxies.iter().any(|p| p == name),
             "node not in group"
         );
-        let previous = self
-            .policy
-            .write()
-            .unwrap()
-            .selection
-            .insert(group.into(), name.into());
-        if previous.as_deref() != Some(name) {
-            self.bump_policy_epoch();
+        let changed = {
+            let mut policy = self.policy.write().unwrap();
+            let previous = policy.selection.insert(group.into(), name.into());
+            let changed = previous.as_deref() != Some(name);
+            if changed {
+                self.bump_policy_epoch();
+            }
+            changed
+        };
+        if changed {
             self.traffic.lock().unwrap().cancel_by_chain(group);
         }
         self.save_profile()?;
         Ok(())
     }
     pub fn set_mode(&self, mode: Mode) {
-        self.policy.write().unwrap().mode = mode;
+        let mut policy = self.policy.write().unwrap();
+        policy.mode = mode;
         self.bump_policy_epoch();
     }
     pub fn replace_rules(&self, rules: impl AsRef<[String]>) -> Result<()> {
@@ -2356,7 +2364,7 @@ impl Core {
         self.scripts.relieve_memory();
         self.traffic.lock().unwrap().relieve_memory();
         if include_network {
-            self.resolver.set_max_bytes(256 * 1024);
+            self.resolver.shrink_to_bytes(256 * 1024);
             clyntis_protocol::tls::clear_caches();
         }
         packet::relieve_memory();

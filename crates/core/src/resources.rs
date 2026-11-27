@@ -1947,7 +1947,7 @@ async fn asset(
             bytes,
             meta: http_meta,
         }) => {
-            write_http_meta(path, &http_meta);
+            pending.set_http_meta(&temp, http_meta);
             tracing::info!(
                 file = %path.file_name().unwrap_or_default().to_string_lossy(),
                 bytes,
@@ -1994,9 +1994,15 @@ fn read_with_limit(path: &Path, limit: usize) -> Result<Vec<u8>> {
 /// geoip.dat is never held in memory). Routing files commit after validation;
 /// independent rewrite caches commit per download. Dropping without `commit`
 /// removes the temporary files.
+struct StagedFile {
+    temp: PathBuf,
+    path: PathBuf,
+    meta: Option<HttpCacheMeta>,
+}
+
 #[derive(Default)]
 struct Staged {
-    files: Vec<(PathBuf, PathBuf)>,
+    files: Vec<StagedFile>,
 }
 impl Staged {
     fn create(&mut self, path: &Path) -> Result<(PathBuf, std::fs::File)> {
@@ -2004,22 +2010,35 @@ impl Staged {
             std::fs::create_dir_all(parent)?;
         }
         let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        self.files.push((temp.clone(), path.into()));
+        self.files.push(StagedFile {
+            temp: temp.clone(),
+            path: path.into(),
+            meta: None,
+        });
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
         Ok((temp, file))
     }
+    fn set_http_meta(&mut self, temp: &Path, meta: HttpCacheMeta) {
+        if let Some(entry) = self.files.iter_mut().find(|entry| entry.temp == temp) {
+            entry.meta = Some(meta);
+        }
+    }
     fn discard(&mut self, temp: &Path) {
-        self.files.retain(|(staged, _)| staged != temp);
+        self.files.retain(|entry| entry.temp != temp);
         let _ = std::fs::remove_file(temp);
     }
     fn commit(mut self) -> Result<()> {
-        for (temp, path) in &self.files {
-            std::fs::rename(temp, path)
-                .with_context(|| format!("cannot commit routing resource {}", path.display()))?;
-            tracing::debug!(file = %path.display(), "routing resource cached");
+        for entry in &self.files {
+            std::fs::rename(&entry.temp, &entry.path).with_context(|| {
+                format!("cannot commit routing resource {}", entry.path.display())
+            })?;
+            if let Some(meta) = &entry.meta {
+                write_http_meta(&entry.path, meta);
+            }
+            tracing::debug!(file = %entry.path.display(), "routing resource cached");
         }
         self.files.clear();
         Ok(())
@@ -2027,8 +2046,8 @@ impl Staged {
 }
 impl Drop for Staged {
     fn drop(&mut self) {
-        for (temp, _) in &self.files {
-            let _ = std::fs::remove_file(temp);
+        for entry in &self.files {
+            let _ = std::fs::remove_file(&entry.temp);
         }
     }
 }
@@ -3029,34 +3048,40 @@ mod rule_cache {
         let mut reader = BufReader::with_capacity(64 * 1024, std::fs::File::open(path)?);
         let entries =
             read_header(&mut reader, KIND_ADBLOCK, stamp, config_hash)?.unwrap_or_default();
+        let mut tmp_block = DomainSetBuilder::default();
+        let mut tmp_allow = DomainSetBuilder::default();
+        let mut tmp_addresses = Vec::new();
         let mut scratch = Vec::with_capacity(256);
         while let Some(tag) = read_tag(&mut reader)? {
             match tag {
-                TAG_BLOCK_EXACT => block.exact(read_str(&mut reader, &mut scratch)?),
-                TAG_BLOCK_SUFFIX => block.suffix(read_str(&mut reader, &mut scratch)?),
-                TAG_BLOCK_SUBDOMAIN => block.subdomain(read_str(&mut reader, &mut scratch)?),
-                TAG_BLOCK_KEYWORD => block.keyword(read_str(&mut reader, &mut scratch)?),
-                TAG_BLOCK_PATTERN => block.pattern(read_str(&mut reader, &mut scratch)?)?,
-                TAG_ALLOW_EXACT => allow.exact(read_str(&mut reader, &mut scratch)?),
-                TAG_ALLOW_SUFFIX => allow.suffix(read_str(&mut reader, &mut scratch)?),
-                TAG_ALLOW_SUBDOMAIN => allow.subdomain(read_str(&mut reader, &mut scratch)?),
-                TAG_ALLOW_KEYWORD => allow.keyword(read_str(&mut reader, &mut scratch)?),
-                TAG_ALLOW_PATTERN => allow.pattern(read_str(&mut reader, &mut scratch)?)?,
+                TAG_BLOCK_EXACT => tmp_block.exact(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_SUFFIX => tmp_block.suffix(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_SUBDOMAIN => tmp_block.subdomain(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_KEYWORD => tmp_block.keyword(read_str(&mut reader, &mut scratch)?),
+                TAG_BLOCK_PATTERN => tmp_block.pattern(read_str(&mut reader, &mut scratch)?)?,
+                TAG_ALLOW_EXACT => tmp_allow.exact(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_SUFFIX => tmp_allow.suffix(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_SUBDOMAIN => tmp_allow.subdomain(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_KEYWORD => tmp_allow.keyword(read_str(&mut reader, &mut scratch)?),
+                TAG_ALLOW_PATTERN => tmp_allow.pattern(read_str(&mut reader, &mut scratch)?)?,
                 TAG_IPV4 => {
                     let mut buf = [0u8; 5];
                     reader.read_exact(&mut buf)?;
                     let addr = Ipv4Addr::from(<[u8; 4]>::try_from(&buf[..4]).unwrap());
-                    addresses.push(ipnet::IpNet::new(IpAddr::V4(addr), buf[4])?);
+                    tmp_addresses.push(ipnet::IpNet::new(IpAddr::V4(addr), buf[4])?);
                 }
                 TAG_IPV6 => {
                     let mut buf = [0u8; 17];
                     reader.read_exact(&mut buf)?;
                     let addr = Ipv6Addr::from(<[u8; 16]>::try_from(&buf[..16]).unwrap());
-                    addresses.push(ipnet::IpNet::new(IpAddr::V6(addr), buf[16])?);
+                    tmp_addresses.push(ipnet::IpNet::new(IpAddr::V6(addr), buf[16])?);
                 }
                 _ => bail!("unknown adblock cache tag {tag}"),
             }
         }
+        block.extend(&tmp_block);
+        allow.extend(&tmp_allow);
+        addresses.extend(tmp_addresses);
         Ok(entries)
     }
 }
@@ -5327,6 +5352,141 @@ rules:
         assert!(
             new_mtime > old_time,
             "expected mtime to advance: old={old_time:?}, new={new_mtime:?}"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_drop_without_commit_does_not_overwrite_http_meta() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for etag in ["\"v1\"", "\"v2\""] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let body = format!("payload-{etag}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {etag}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("meta-uncommitted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("list.txt");
+        let url = format!("http://{addr}/list.txt");
+        let resolver =
+            crate::dns::Resolver::new(Default::default(), Arc::new(clyntis_platform::DefaultHooks));
+        let hooks: clyntis_platform::Hooks = Arc::new(clyntis_platform::DefaultHooks);
+        let fetch = Fetch {
+            resolver: &resolver,
+            hooks: &hooks,
+            proxy: None,
+            download: true,
+            limit: LIMIT,
+        };
+
+        let mut staged1 = Staged::default();
+        let _ = asset(&target, &url, Some(3600), true, &fetch, &mut staged1)
+            .await
+            .unwrap();
+        staged1.commit().unwrap();
+        assert_eq!(
+            read_http_meta(&target).unwrap().etag.as_deref(),
+            Some("\"v1\"")
+        );
+
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        // Second download succeeds with ETag "v2", but Staged is dropped without commit().
+        let mut staged2 = Staged::default();
+        let temp2 = asset(&target, &url, Some(3600), true, &fetch, &mut staged2)
+            .await
+            .unwrap();
+        assert_ne!(temp2, target);
+        drop(staged2);
+        server.await.unwrap();
+
+        assert!(!temp2.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload-\"v1\"");
+        assert_eq!(
+            read_http_meta(&target).unwrap().etag.as_deref(),
+            Some("\"v1\"")
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn truncated_adblock_rcache_falls_back_cleanly() {
+        let dir = std::env::temp_dir().join(format!("rcache-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let list_path = dir.join("ads.list");
+        let cache_path = rule_cache::cache_path(&list_path);
+        std::fs::write(
+            &list_path,
+            "DOMAIN-SUFFIX,ad.example\nIP-CIDR,203.0.113.0/24\n",
+        )
+        .unwrap();
+        let stamp = Stamp::of(&list_path).unwrap();
+        let config_hash = rule_cache::hash_strs(&["clash"]);
+
+        let mut b0 = DomainSetBuilder::default();
+        let mut a0 = DomainSetBuilder::default();
+        let mut ips0 = Vec::new();
+        let n0 = load_or_parse_adblock_list(
+            &list_path,
+            &cache_path,
+            Some(stamp),
+            config_hash,
+            "clash",
+            LIMIT,
+            &mut b0,
+            &mut a0,
+            &mut ips0,
+        )
+        .unwrap();
+        assert_eq!(n0, 2);
+        assert!(cache_path.is_file());
+
+        // Truncate the `.rcache` mid-stream after the header + first entry.
+        let raw = std::fs::read(&cache_path).unwrap();
+        assert!(raw.len() > 50);
+        std::fs::write(&cache_path, &raw[..raw.len() - 4]).unwrap();
+
+        let mut b1 = DomainSetBuilder::default();
+        let mut a1 = DomainSetBuilder::default();
+        let mut ips1 = Vec::new();
+        let n1 = load_or_parse_adblock_list(
+            &list_path,
+            &cache_path,
+            Some(stamp),
+            config_hash,
+            "clash",
+            LIMIT,
+            &mut b1,
+            &mut a1,
+            &mut ips1,
+        )
+        .unwrap();
+        assert_eq!(n1, 2);
+        assert!(b1.build().matches("x.ad.example"));
+        assert_eq!(
+            ips1,
+            vec!["203.0.113.0/24".parse::<ipnet::IpNet>().unwrap()]
         );
 
         std::fs::remove_dir_all(dir).unwrap();

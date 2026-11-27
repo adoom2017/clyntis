@@ -723,8 +723,8 @@ impl Config {
                     let t = &p.tailscale;
                     if let Some(url) = &t.control_url {
                         ensure!(
-                            url.starts_with("https://") || url.starts_with("http://"),
-                            "proxy {}: control-url must be http(s)",
+                            url.starts_with("https://"),
+                            "proxy {}: control-url must use https://",
                             p.name
                         );
                     }
@@ -1265,6 +1265,12 @@ mod tailscale_tests {
         assert!(
             Config::parse(b"proxies:\n  - {name: ts, type: tailscale, state-dir: nodes/home}\n")
                 .is_ok()
+        );
+        assert!(
+            Config::parse(
+                b"proxies:\n  - {name: ts, type: tailscale, control-url: 'http://headscale.example'}\n"
+            )
+            .is_err()
         );
         // The auth key never leaves through serialization.
         assert!(!serde_json::to_string(&config).unwrap().contains("tskey"));
